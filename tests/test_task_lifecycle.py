@@ -357,6 +357,113 @@ def test_task_add_accepts_design_doc_kind_with_prose_only_criteria(tmp_path, mon
 
 
 # --------------------------------------------------------------------------- #
+# nh task add — plain-text intake (bare sentence, no --title)                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_task_add_files_a_bare_sentence_as_a_freeform_task(tmp_path, monkeypatch):
+    """A plain sentence positional SOURCE files a freeform task using the
+    sentence as the title, instead of failing with 'not a recognized task
+    URL/id' — the error that used to point users at Jira/issue-URL intake
+    even for the plain-text case the conversational shell handles."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "Fix the flaky E2E test",
+        "--repo", str(repo), "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert "created task" in result.output
+    assert "not a recognized task URL/id" not in result.output
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_go())
+    assert len(tasks) == 1
+    assert tasks[0].title == "Fix the flaky E2E test"
+
+
+def test_task_add_still_refuses_a_bare_tracker_key(tmp_path, monkeypatch):
+    """URL/id intake behaviour is unchanged: a source-shaped token that is
+    not an issue URL is still refused, not filed as plain text."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "PROJ-42",
+        "--repo", str(repo), "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "intake failed" in result.output
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_go())
+    assert tasks == []
+
+
+def test_task_add_bare_sentence_accepts_criteria(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "Add greet(name)",
+        "--repo", str(repo), "--criteria", "returns hi, X",
+        "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    task_id = _created_task_id(result.output)
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.find_task(task_id)
+    t = asyncio.run(_go())
+    assert t is not None
+    assert t.acceptance_criteria == ["returns hi, X"]
+
+
+def test_task_add_bare_sentence_and_title_together_is_refused(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "Add greet(name)", "--title", "Add greet(name)",
+        "--repo", str(repo), "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "not both" in result.output
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_go())
+    assert tasks == []
+
+
+def test_task_add_help_documents_the_plain_text_form():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["task", "add", "--help"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "plain sentence" in result.output
+    assert "PROJ-42" in result.output
+
+
+# --------------------------------------------------------------------------- #
 # nh task add — repo default budgets (SCRUM-48)                                #
 # --------------------------------------------------------------------------- #
 

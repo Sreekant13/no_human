@@ -37,7 +37,13 @@ from ..core.events import EventPersister
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.runtime import build_orchestrator
 from ..core.task import Task, TaskStatus
-from ..intake import classify_kind, ingest_from_url, kind_criteria_mismatch, parse_source
+from ..intake import (
+    classify_kind,
+    ingest_from_url,
+    is_plain_text_task,
+    kind_criteria_mismatch,
+    parse_source,
+)
 from ..notify import build_notifier
 from ..vcs.task_pr import task_has_pr_evidence
 
@@ -853,18 +859,20 @@ def task() -> None:
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")
 def task_add(source, title, repo, description, criteria, external_id, kind, linked_repo, run, verbose, grill, backend, approve_plan):
-    """Add a task — from a GitHub/GitLab issue URL, or a freeform --title.
+    """Add a task — from a GitHub/GitLab issue URL, a plain sentence, or --title.
 
-    A positional SOURCE must be an issue URL: `parse_source` only recognises a
-    URL containing /issues/ or /-/issues/ and calls everything else freeform,
-    which `ingest_from_url` rejects — so a bare ticket key (PROJ-42) exits 1
-    with "not a recognized task URL/id". Use --title for that. The standalone
-    tracker adapter that once accepted bare keys was removed; Jira issues
-    arrive through the poller instead (`integrations.jira` in config.yaml —
-    see docs/adapters.md#jira).
+    A positional SOURCE is either an issue URL or a plain sentence: an issue
+    URL (one containing /issues/ or /-/issues/) is ingested from its source;
+    a plain sentence is filed directly, using it as the task title, same as
+    --title. A source-shaped token that is not an issue URL — a bare ticket
+    key (PROJ-42) or `owner/repo#12` — is still refused with "not a
+    recognized task URL/id": the standalone tracker adapter that once
+    accepted bare keys was removed; Jira issues arrive through the poller
+    instead (`integrations.jira` in config.yaml — see docs/adapters.md#jira).
 
     Examples:
       nh task add https://code.example.com/org/repo/issues/12 --repo ~/repo
+      nh task add "Fix the flaky E2E test" --repo ~/repo
       nh task add --title "Fix X" --repo ~/repo --criteria "..."
     """
     config, _ = _bootstrap()
@@ -881,7 +889,19 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
 
     async def _go():
         async with Store(config.db_path) as store:
-            if source:
+            if source and is_plain_text_task(source):
+                if title:
+                    console.print(
+                        "[red]pass either a plain-text description or --title, "
+                        "not both[/]"
+                    )
+                    sys.exit(1)
+                t = Task.new(source.strip(), repo_path=str(Path(repo).resolve()),
+                             description=description, external_id=external_id)
+                t.acceptance_criteria = list(criteria)
+                if grill:
+                    t = await _run_cli_grill(config, t, store)
+            elif source:
                 ref = parse_source(source)
                 console.print(f"[blue]ingesting[/] {ref.kind}: {ref.ref}")
                 try:

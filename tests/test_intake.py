@@ -2,7 +2,7 @@
 
 import pytest
 
-from no_human.intake import parse_source
+from no_human.intake import is_plain_text_task, parse_source
 from no_human.intake.base import clean_html, dv, html_list_items
 from no_human.intake.github_issues import GitHubAdapter, parse_issue_url
 from no_human.intake.gitlab_issues import GitLabAdapter
@@ -61,6 +61,29 @@ def test_gitlab_normalize():
     assert task.source == "gitlab"
     assert task.external_id == "g/s/p#3"
     assert task.acceptance_criteria == ["retries 3x"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Fix the flaky E2E test", True),
+    ("add retries", True),
+    ("PROJ-42", False),
+    ("owner/repo#12", False),
+    ("#12", False),
+    ("https://github.com/o/r/issues/9", False),
+    ("https://example.com/x", False),
+    ("git@github.com:o/r.git", False),
+])
+def test_is_plain_text_task_separates_prose_from_sources(text, expected):
+    assert is_plain_text_task(text) is expected
+
+
+def test_is_plain_text_task_leaves_url_and_bare_key_intake_unchanged():
+    """URL/id intake behaviour is unchanged by the new plain-text predicate."""
+    from no_human.intake import ingest_from_url
+
+    assert parse_source("https://github.com/o/r/issues/9").kind == "github"
+    with pytest.raises(ValueError, match="not a recognized task URL/id"):
+        ingest_from_url("PROJ-42")
 
 
 def test_a_bare_tracker_key_is_rejected_not_ingested_as_freeform():

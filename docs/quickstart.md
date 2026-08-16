@@ -187,6 +187,9 @@ paste it into any bug report.
 uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo \
   --description "..." --criteria "the test passes 20 runs in a row"
 
+# From a plain sentence (equivalent to --title above):
+uv run nh task add "Fix the flaky E2E test" --repo ~/git/my-repo
+
 # From a GitHub or GitLab issue URL:
 uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
 ```
@@ -201,12 +204,14 @@ uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo \
   --criteria "the test passes 20 runs in a row" --no-grill
 ```
 
-`nh task add` takes **a GitHub/GitLab issue URL, or `--title`**. A bare
-ticket key such as `PROJ-42` is *not* a supported argument: `ingest_from_url`
+`nh task add` takes **a GitHub/GitLab issue URL, a plain sentence, or
+`--title`**. A plain sentence (anything that isn't a URL or a source-shaped
+token) is filed directly, using it as the task title — same as `--title`. A
+bare ticket key such as `PROJ-42` is *not* a supported argument: `ingest_from_url`
 raises, the CLI prints `intake failed: not a recognized task URL/id` and exits
 1 — the standalone tracker adapter that once accepted it has been removed. Use
-`--title` if you want that text as a freeform task. Jira issues come in through
-the **poller** instead, not through `nh task add`; see
+`--title` (or a plain sentence) if you want that text as a freeform task. Jira
+issues come in through the **poller** instead, not through `nh task add`; see
 [adapters.md](adapters.md#jira) for the `integrations.jira` config block.
 
 ## 5. Run one in the foreground
@@ -310,8 +315,8 @@ If the proving step prints `[FAILED] test: … (exit N)`, run that command yours
 in the repo to see the real error — onboarding does not yet show it.
 
 **`intake failed: not a recognized task URL/id`**
-→ `nh task add` takes an issue URL or `--title "…"`. A bare tracker key is not
-an accepted argument; see step 4.
+→ `nh task add` takes an issue URL, a plain sentence, or `--title "…"`. A bare
+tracker key is not an accepted argument; see step 4.
 
 **`nh: command not found`**
 → `uv sync` installs `nh` into `.venv`, not onto your `PATH`. Use `uv run nh …`,

@@ -18,18 +18,22 @@ detected by `parse_source` and routed to an adapter that produces a `Task`
 | **GitHub Issues** | `gh api` | includes GitHub Enterprise hosts |
 | **GitLab Issues** | `glab api` | includes self-hosted GitLab |
 | **Freeform** | `--title` / `--description` / `--criteria` | no external system |
+| **Plain text** | positional SOURCE (a prose sentence) | no external system |
 
 ```bash
 nh task add https://github.com/org/repo/issues/12 --repo /path/to/repo
+nh task add "Add greet(name)" --repo /path/to/repo
 nh task add --title "Add greet(name)" --repo /path/to/repo --criteria "returns 'hi, X'"
 ```
 
-A positional source must be an **issue URL** — `parse_source` routes on
-`/issues/` (GitHub) or `/-/issues/` (GitLab) and classifies everything else as
-freeform, which `ingest_from_url` then rejects. **Anything else — including a
-bare ticket key like `PROJ-42` — is not an intake source**: the CLI prints
-`intake failed: not a recognized task URL/id` and exits 1. Use `--title` to
-file that text as a freeform task. The standalone tracker adapter that used to
+A positional source is either an **issue URL** — `parse_source` routes on
+`/issues/` (GitHub) or `/-/issues/` (GitLab) — or a **plain sentence**, which
+is filed directly using it as the task title (`is_plain_text_task`). **A
+source-shaped token that is neither — including a bare ticket key like
+`PROJ-42` or `owner/repo#12` — is not an intake source**: the CLI prints
+`intake failed: not a recognized task URL/id` and exits 1. Use `--title` (or
+just type the sentence positionally) to file that text as a freeform task.
+The standalone tracker adapter that used to
 accept bare keys has been removed; the trackers below are pollers, so a key
 that exists in one arrives on its own rather than by being typed. The error
 names what IS accepted, because typing the key is the first thing a developer

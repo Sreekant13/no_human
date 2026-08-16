@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..core.task import Task
-from .base import SourceRef, parse_source
+from .base import SourceRef, is_plain_text_task, parse_source
 from .classify import (
     KindVerdict,
     TaskKind,
@@ -18,7 +18,7 @@ from .github_issues import GitHubAdapter
 from .gitlab_issues import GitLabAdapter
 
 __all__ = [
-    "SourceRef", "parse_source", "get_adapter", "ingest_from_url",
+    "SourceRef", "parse_source", "is_plain_text_task", "get_adapter", "ingest_from_url",
     "TaskKind", "KindVerdict", "classify", "classify_kind",
     "kind_criteria_mismatch",
     "GrillQuestion", "GrillResult", "grill_step",
@@ -51,7 +51,9 @@ def ingest_from_url(text: str, config: dict[str, Any] | None = None) -> Task:
             "  file it directly:  nh task add --title \"...\" --repo <path> "
             "--criteria \"...\"\n"
             "  from Jira:         configure integrations.jira and let `nh serve` "
-            "poll it (docs/adapters.md#jira)"
+            "poll it (docs/adapters.md#jira)\n"
+            "  plain text:        nh task add \"<a sentence describing the work>\" "
+            "--repo <path>"
         )
     adapter = get_adapter(ref.kind, config)
     raw = adapter.fetch_raw(ref.ref)

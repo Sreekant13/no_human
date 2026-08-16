@@ -36,6 +36,25 @@ def parse_source(text: str) -> SourceRef:
     return SourceRef("freeform", s, text)
 
 
+_TRACKER_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")      # PROJ-42
+_REPO_ISSUE = re.compile(r"^[\w.\-]+/[\w.\-]+#\d+$")          # owner/repo#12
+_BARE_ISSUE = re.compile(r"^#\d+$")                           # #12
+
+
+def is_plain_text_task(text: str) -> bool:
+    """True when `text` is prose to file as a task title, not a source to fetch."""
+    s = text.strip()
+    if not s:
+        return False
+    if "://" in s or s.startswith("www.") or s.startswith("git@"):
+        return False
+    if "/issues/" in s or "/-/issues/" in s:
+        return False
+    if _TRACKER_KEY.match(s) or _REPO_ISSUE.match(s) or _BARE_ISSUE.match(s):
+        return False
+    return True
+
+
 # ------------------------------- HTML helpers ------------------------------ #
 
 
