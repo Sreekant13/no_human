@@ -555,6 +555,43 @@ def _sched(request: Request):
     return getattr(request.app.state, "scheduler", None)
 
 
+# --------------------------------------------------------------------------- #
+# feature_used — CLOSED vocabulary.                                            #
+#                                                                              #
+# telemetry.record("feature_used", name=...) carries exactly one prop, and its #
+# value must come from THIS set and nowhere else. Never a title, path, ticket  #
+# key, integration name, filename or any other operator/request-derived        #
+# string: the prop is a fixed literal chosen at the call site, so no operator  #
+# content can ever reach the wire through it. Adding a name here is a privacy  #
+# decision — it is pinned by tests/test_feature_used_telemetry.py.             #
+# --------------------------------------------------------------------------- #
+FEATURE_BACKLOG_IMPORT = "backlog_import"
+FEATURE_ATTACHMENT_ADDED = "attachment_added"
+FEATURE_INTEGRATION_SAVED = "integration_saved"
+
+FEATURE_NAMES = frozenset({
+    FEATURE_BACKLOG_IMPORT,
+    FEATURE_ATTACHMENT_ADDED,
+    FEATURE_INTEGRATION_SAVED,
+})
+
+# Sources that count as a backlog import/start for feature_used purposes.
+# NOT the same set as create_task's own source clamp — see the call site.
+# "linear" is a real value the web client sends: web/src/App.jsx's backlog-seed
+# effect sets `source: tracker` where `tracker` is "linear" for a Linear-origin
+# ticket (App.jsx ~L907), and TaskComposer passes that straight through to this
+# endpoint's `body.source` (TaskComposer.jsx ~L153, L404).
+_BACKLOG_IMPORT_SOURCES = frozenset({"jira", "linear"})
+
+
+def _record_feature_used(request: Request, name: str) -> None:
+    """One `feature_used` emission. `name` MUST be a FEATURE_* constant."""
+    from .. import telemetry as _telemetry
+    cfg = getattr(request.app.state, "config", None)
+    _telemetry.record("feature_used",
+                      config=cfg.data if cfg is not None else {}, name=name)
+
+
 @app.get("/api/tasks", response_model=list[TaskSummaryOut])
 async def list_tasks(request: Request) -> list[TaskSummaryOut]:
     return await _board_tasks(_store(request), scheduler=_sched(request))
@@ -593,6 +630,12 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     # "mcp" added for the MCP bridge (SCRUM-63): its tasks must stay
     # attributable, and jira sync already filters on source == "jira".
     source = body.source if body.source in ("board", "jira", "mcp") else "board"
+    # A create is a backlog import/start when the client declares a tracker as
+    # its origin. Read from the REQUEST, not the resolved `source` above: the
+    # resolved value clamps "linear" to "board" (Task.source's own allowlist),
+    # which would silently drop every Linear start. This reads only; it does
+    # not widen what reaches Task.source.
+    _is_backlog_import = body.source in _BACKLOG_IMPORT_SOURCES
     # Jira dedup key (SCRUM-32): only honored for source == "jira"; trim then
     # cap to 64 chars, exact-match only (no case/char normalization).
     external_id: str | None = None
@@ -629,6 +672,8 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
         profile = await store.get_profile(repo_path)
         task.config = apply_default_task_config(profile, task.config)
     await store.create_task(task)
+    if _is_backlog_import:
+        _record_feature_used(request, FEATURE_BACKLOG_IMPORT)
     summary = TaskSummaryOut.from_task(
         task, max_pr_conflict_rounds=_max_pr_conflict_rounds())
     tasks = await _board_tasks(store, scheduler=_sched(request))
@@ -1282,6 +1327,7 @@ async def add_attachment(
     attachments = list((task.context or {}).get("attachments") or [])
     attachments.append({"name": safe, "path": str(dest)})
     task.context = await store.merge_context(task.id, {"attachments": attachments})
+    _record_feature_used(request, FEATURE_ATTACHMENT_ADDED)
     return {"ok": True, "name": safe, "path": str(dest), "count": len(attachments)}
 
 
@@ -3452,6 +3498,7 @@ async def save_integration_config_endpoint(
 
     refreshed = load_config(CONFIG_PATH)
     request.app.state.config.data = refreshed.data
+    _record_feature_used(request, FEATURE_INTEGRATION_SAVED)
     out = asdict(status)
     out["fields"] = integration_fields(name, refreshed.data)
     return out
