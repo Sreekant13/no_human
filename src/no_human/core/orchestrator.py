@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -329,17 +330,50 @@ def _summarize_tool_sig(tool: str, inp: dict) -> str:
 
     Produces a short deterministic summary of a tool invocation so
     ``StuckDetector.record_tool_call`` can compare consecutive calls.
+
+    THE SIGNATURE MUST SEPARATE PROGRESS FROM RETRY. On 2026-08-16 two
+    healthy attempts were hard-aborted as "doom-loop: identical tool call
+    repeated 9x" while progressively window-reading one 2,805-line file:
+    the Read signature was the file path ALONE, so reads at offsets
+    415/600/1000/... were identical by construction. ~19M weighted tokens
+    of correct work died to the false positive. Every branch below now
+    carries the parameters that distinguish a NEW action on the same
+    target from the SAME action retried:
+
+    * Read/View  - offset+limit ride along; re-reading the same window 9x
+      is still a loop, scanning nine windows is not.
+    * Edit family - a hash of the change payload; nine DIFFERENT edits to
+      one file are work (the separate edit-loop counter still watches
+      volume), nine identical ones are a loop.
+    * Bash - a hash of the FULL command; long worktree-path prefixes made
+      distinct commands collide inside any prefix truncation.
     """
     if tool in ("Read", "View"):
-        return inp.get("file_path") or inp.get("path") or ""
+        path = inp.get("file_path") or inp.get("path") or ""
+        # `pages` included for the same reason as offset: walking a PDF
+        # page-range by page-range is progress, not retry (review follow-up).
+        return (f"{path}#o={inp.get('offset', 0)},l={inp.get('limit', 0)}"
+                f",p={inp.get('pages', '')}")
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        return inp.get("file_path") or inp.get("path") or ""
+        path = inp.get("file_path") or inp.get("path") or ""
+        payload = "".join(
+            str(inp.get(k, "")) for k in
+            # replace_all included: a failed unique-match Edit legitimately
+            # retried WITH replace_all is a different action, and must not
+            # count toward the same-signature streak (review follow-up).
+            ("old_string", "new_string", "content", "edits", "new_source",
+             "replace_all")
+        )
+        digest = hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:10]
+        return f"{path}#{digest}"
     if tool in ("Grep", "Search"):
         q = inp.get("query") or inp.get("pattern") or ""
         p = inp.get("path") or inp.get("search_path") or ""
         return f"{q[:60]}|{p}"
     if tool in ("Bash", "Terminal"):
-        return inp.get("command") or inp.get("cmd") or ""
+        cmd = inp.get("command") or inp.get("cmd") or ""
+        digest = hashlib.sha1(cmd.encode("utf-8", "replace")).hexdigest()[:10]
+        return f"{cmd[:80]}#{digest}"
     first = next(iter(inp.values()), "") if inp else ""
     return str(first)[:80]
 

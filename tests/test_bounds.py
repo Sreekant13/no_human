@@ -254,3 +254,91 @@ def test_investigation_overlay_keeps_base_caps():
     assert b.max_turns_per_attempt == 80
     assert b.attempt_tokens == 123
     assert b.lifetime_tokens == 456
+
+
+# ------- 2026-08-16 false doom-loop regression (ticket 32fae028) ----------- #
+# Two healthy attempts were hard-aborted as "identical tool call repeated 9x"
+# while window-reading one 2,805-line file: the Read signature was the path
+# alone, and bounds' [:100] prefix truncation re-collapsed whatever the
+# summarizer did distinguish behind a ~95-char worktree path. These tests run
+# the REAL pipeline — _summarize_tool_sig output fed to record_tool_call —
+# with incident-shaped inputs, in both directions (progress stays quiet, true
+# repeats still fire).
+
+from no_human.core.orchestrator import _summarize_tool_sig  # noqa: E402
+
+# Same order of magnitude as the worktree paths in the incident (~95 chars).
+_WT = ("/private/tmp/claude-501/some-project-slug/0000000000000000/scratchpad/"
+       "train44/web/src/SlideOver.jsx")
+assert len(_WT) > 90
+
+
+def test_windowed_reads_of_one_long_path_file_are_progress():
+    """The incident, replayed: nine different windows of one file must not
+    fire the detector even though the path eats the whole truncation head."""
+    d = StuckDetector(doom_loop_threshold=3)
+    for i, offset in enumerate([1, 200, 415, 600, 800, 1000, 1400, 2000, 2400]):
+        sig = _summarize_tool_sig("Read", {"file_path": _WT,
+                                           "offset": offset, "limit": 200})
+        assert d.record_tool_call("Read", sig) is False, f"fired at window {i}"
+
+
+def test_rereading_the_same_window_is_still_a_loop():
+    d = StuckDetector(doom_loop_threshold=3)
+    sig = _summarize_tool_sig("Read", {"file_path": _WT,
+                                       "offset": 415, "limit": 200})
+    assert d.record_tool_call("Read", sig) is False
+    assert d.record_tool_call("Read", sig) is False
+    assert d.record_tool_call("Read", sig) is True  # 3rd identical → stuck
+
+
+def test_different_edits_to_one_file_are_progress():
+    d = StuckDetector(doom_loop_threshold=3)
+    for i in range(9):
+        sig = _summarize_tool_sig("Edit", {
+            "file_path": _WT,
+            "old_string": f"const before{i} = null",
+            "new_string": f"const after{i} = null",
+        })
+        assert d.record_tool_call("Edit", sig) is False, f"fired at edit {i}"
+
+
+def test_identical_edit_retried_is_still_a_loop():
+    d = StuckDetector(doom_loop_threshold=3)
+    inp = {"file_path": _WT, "old_string": "a", "new_string": "b"}
+    assert d.record_tool_call("Edit", _summarize_tool_sig("Edit", inp)) is False
+    assert d.record_tool_call("Edit", _summarize_tool_sig("Edit", inp)) is False
+    assert d.record_tool_call("Edit", _summarize_tool_sig("Edit", inp)) is True
+
+
+def test_distinct_bash_commands_sharing_a_long_prefix_are_progress():
+    """Long worktree-path prefixes made distinct commands collide inside any
+    prefix truncation; the trailing command hash must keep them apart."""
+    d = StuckDetector(doom_loop_threshold=3)
+    for target in ("tests/test_a.py", "tests/test_b.py", "tests/test_c.py"):
+        sig = _summarize_tool_sig(
+            "Bash", {"command": f"cd {_WT[:70]} && python -m pytest {target} -q"})
+        assert d.record_tool_call("Bash", sig) is False
+
+
+def test_identical_bash_command_retried_is_still_a_loop():
+    d = StuckDetector(doom_loop_threshold=3)
+    cmd = {"command": f"cd {_WT[:70]} && python -m pytest tests/test_a.py -q"}
+    assert d.record_tool_call("Bash", _summarize_tool_sig("Bash", cmd)) is False
+    assert d.record_tool_call("Bash", _summarize_tool_sig("Bash", cmd)) is False
+    assert d.record_tool_call("Bash", _summarize_tool_sig("Bash", cmd)) is True
+
+
+def test_pdf_page_walk_is_progress_and_replace_all_is_a_different_edit():
+    """Review follow-ups: `pages` discriminates Read (a page-by-page PDF walk
+    must not collapse to one signature), and `replace_all` discriminates Edit
+    (a failed unique-match Edit retried with replace_all is a new action)."""
+    d = StuckDetector(doom_loop_threshold=3)
+    for pages in ("1-5", "6-10", "11-15"):
+        sig = _summarize_tool_sig("Read", {"file_path": _WT, "pages": pages})
+        assert d.record_tool_call("Read", sig) is False
+    e1 = _summarize_tool_sig("Edit", {"file_path": _WT, "old_string": "a",
+                                      "new_string": "b"})
+    e2 = _summarize_tool_sig("Edit", {"file_path": _WT, "old_string": "a",
+                                      "new_string": "b", "replace_all": True})
+    assert e1 != e2

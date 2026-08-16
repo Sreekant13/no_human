@@ -222,7 +222,13 @@ class StuckDetector:
         A doom-loop is the same tool+input repeated consecutively — the agent
         is retrying the exact same action expecting different results.
         """
-        sig = f"{tool_name}:{tool_input_summary[:100]}"
+        # The summary's discriminating parameters (offset/limit, content
+        # hash) ride at the END, after a path that can alone exceed 100
+        # chars in a worktree - a prefix truncation here re-collapses what
+        # _summarize_tool_sig just distinguished (the 2026-08-16 false
+        # doom-loop aborts). Keep a readable head, always keep the tail.
+        head, tail = tool_input_summary[:100], tool_input_summary[-24:]
+        sig = f"{tool_name}:{head}…{tail}"
         if self._tool_signatures and self._tool_signatures[-1] == sig:
             self._consecutive_repeats += 1
         else:
