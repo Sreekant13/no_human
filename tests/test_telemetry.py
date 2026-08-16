@@ -147,7 +147,11 @@ def test_enabled_flush_posts_the_contract_body(temp_home, no_network, no_thread)
     from no_human import __version__
     assert body["version"] == __version__
     [event] = body["events"]
-    assert event["kind"] == "task_completed"
+    # "name" is the WIRE contract — the ingestion Lambda validates
+    # event.get("name") and 400s anything else (learned live: "kind" made
+    # every batch bounce while the client logged nothing, fail-open).
+    assert event["name"] == "task_completed"
+    assert "kind" not in event
     assert event["props"] == {"status": "done", "duration_bucket": "<10m",
                              "attempts": 2}
     # sent events leave the queue — a second flush sends nothing
@@ -306,3 +310,148 @@ async def test_consent_enable_mints_stable_id_persists_and_widens_csp(
     r = await client.put("/api/telemetry/consent", json={"enabled": True},
                          headers=origin)
     assert yaml.safe_load(cfg_path.read_text())["telemetry"]["instance_id"] == minted
+
+
+def test_legacy_kind_queue_lines_drain_as_name(temp_home, no_network, no_thread):
+    """Queue lines from the first release carried "kind"; flush must
+    normalize them to the wire's "name" so old queues drain, not 400."""
+    path = temp_home / ".no_human" / "telemetry-queue.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"kind":"app_started","ts":1786889836,"props":{}}\n')
+    assert telemetry.flush(_ENABLED) == 1
+    [(req, _)] = no_network
+    [event] = json.loads(req.data.decode())["events"]
+    assert event["name"] == "app_started"
+    assert "kind" not in event
+
+
+def test_missing_instance_id_mints_persists_and_still_sends(
+        temp_home, no_network, no_thread, monkeypatch):
+    """The hand-edited-config activation path can leave instance_id empty;
+    the Lambda 400s the whole batch on a non-uuid4 id. Flush must mint,
+    persist, and ship the batch — never wedge (review round 2)."""
+    import uuid
+
+    import yaml
+
+    from no_human import config as config_mod
+    cfg_path = temp_home / ".no_human" / "config.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text("telemetry:\n  enabled: true\n")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg_path)
+
+    section = {"enabled": True, "endpoint": "https://ingest.invalid/collect",
+               "instance_id": ""}
+    telemetry.record("app_started", config={"telemetry": section})
+    assert telemetry.flush(dict(section)) == 1
+    [(req, _)] = no_network
+    sent_id = json.loads(req.data.decode())["instance_id"]
+    assert uuid.UUID(sent_id).version == 4  # a valid id shipped
+    on_disk = yaml.safe_load(cfg_path.read_text())["telemetry"]
+    assert on_disk["instance_id"] == sent_id  # and it persisted, stable
+
+
+def test_poisoned_queue_line_is_dropped_not_wedging(temp_home, no_network,
+                                                    no_thread):
+    """The Lambda rejects a batch wholesale on one bad event; a poisoned
+    line must be dropped like corrupt JSON, not block every later flush."""
+    path = temp_home / ".no_human" / "telemetry-queue.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"name":"task_opened","ts":1786889836,"props":{}}\n'      # bad kind
+        '{"kind":"x","name":"app_started","ts":1,"props":{}}\n'    # extra key
+        '{"name":"app_started","ts":1786889836,"props":{"t":1}}\n' # bad prop
+        '{"name":"app_started","ts":1786889836,"props":{}}\n')     # good
+    assert telemetry.flush(_ENABLED) == 1
+    [(req, _)] = no_network
+    events = json.loads(req.data.decode())["events"]
+    assert events == [{"name": "app_started", "ts": 1786889836, "props": {}}]
+    assert not path.read_text().strip()  # poisoned lines gone, queue drained
+
+
+def test_client_allowlist_matches_the_deployed_lambda_contract():
+    """CONTRACT FIXTURE — the hosted ingestion endpoint validates batches
+    WHOLESALE against its own closed allowlist, so a client-side event the
+    server doesn't know silently 400s every batch (the server carries the
+    mirror of this pin). This is the server's allowlist as deployed
+    2026-08-16; if this test fails you are adding a client event — ship the
+    server-side allowlist change FIRST, then update this fixture."""
+    deployed_lambda_events = {
+        "app_started": frozenset(),
+        "task_created": frozenset({"source"}),
+        "task_completed": frozenset({"status", "duration_bucket", "attempts"}),
+        "task_failed": frozenset({"category"}),
+        "approve_clicked": frozenset(),
+        "feature_used": frozenset({"name"}),
+    }
+    assert telemetry._ALLOWED_EVENTS == deployed_lambda_events
+    # The server also regex-validates `version` (semver-ish, MAJOR.MINOR.
+    # PATCH + optional short suffix) and 400s the whole batch otherwise —
+    # a release-versioning change must trip THIS test, not the fleet.
+    import re
+    from no_human import __version__
+    assert re.match(
+        r"^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(?:[-+][0-9A-Za-z.\-]{1,16})?$",
+        __version__)
+
+
+def test_bad_ts_and_bad_prop_values_are_dropped_not_wedging(temp_home,
+                                                            no_network,
+                                                            no_thread):
+    """Round 3: the server also validates ts bounds and prop VALUE shapes;
+    a reset-clock ts=0 line or an oversize prop value must be dropped, not
+    400 the batch forever."""
+    path = temp_home / ".no_human" / "telemetry-queue.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    long = "x" * 129
+    path.write_text(
+        '{"name":"app_started","ts":0,"props":{}}\n'                # reset clock
+        '{"name":"app_started","ts":true,"props":{}}\n'             # bool ts
+        f'{{"name":"feature_used","ts":1786889836,"props":{{"name":"{long}"}}}}\n'
+        '{"name":"task_completed","ts":1786889836,"props":{"attempts":4294967296}}\n'
+        '{"name":"app_started","ts":1786889836,"props":{}}\n')      # good
+    assert telemetry.flush(_ENABLED) == 1
+    [(req, _)] = no_network
+    events = json.loads(req.data.decode())["events"]
+    assert events == [{"name": "app_started", "ts": 1786889836, "props": {}}]
+
+
+def test_noncanonical_uuid_in_config_is_canonicalized(temp_home, no_network,
+                                                      no_thread, monkeypatch):
+    """uuid.UUID accepts braced/dashless forms the server's 36-char check
+    rejects; the client must ship the canonical dashed form."""
+    from no_human import config as config_mod
+    cfg_path = temp_home / ".no_human" / "config.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text("telemetry:\n  enabled: true\n")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg_path)
+    dashless = "11111111222243338444555555555555"  # a v4, dashless
+    section = {"enabled": True, "endpoint": "https://ingest.invalid/collect",
+               "instance_id": dashless}
+    telemetry.record("app_started", config={"telemetry": section})
+    assert telemetry.flush(dict(section)) == 1
+    [(req, _)] = no_network
+    sent = json.loads(req.data.decode())["instance_id"]
+    assert sent == "11111111-2222-4333-8444-555555555555"
+    assert len(sent) == 36
+
+
+def test_all_poisoned_batch_is_deleted_without_posting(temp_home, no_network,
+                                                       no_thread):
+    """Round 4: an all-dropped batch must DELETE its lines and POST nothing —
+    the server 400s an empty events array, and a POST-then-fail path would
+    pin the poisoned head of the queue forever (organically reachable via a
+    reset clock). Later good lines then flush normally."""
+    path = temp_home / ".no_human" / "telemetry-queue.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"name":"app_started","ts":0,"props":{}}\n'
+        '{"name":["app_started"],"ts":1786889836,"props":{}}\n'  # unhashable
+        '{"name":"task_opened","ts":1786889836,"props":{}}\n')
+    assert telemetry.flush(_ENABLED) == 0
+    assert no_network == []                      # nothing POSTed
+    assert not path.read_text().strip()          # poisoned head deleted
+    # and the queue is not wedged: a good event now flushes fine
+    telemetry.record("app_started", config={"telemetry": _ENABLED})
+    assert telemetry.flush(_ENABLED) == 1
+    assert len(no_network) == 1

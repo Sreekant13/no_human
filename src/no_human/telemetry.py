@@ -29,6 +29,49 @@ _ALLOWED_EVENTS: dict[str, frozenset[str]] = {
     "feature_used": frozenset({"name"}),
 }
 
+# Mirror of the server's per-event validation. The server rejects a batch
+# WHOLESALE on one bad event and a rejected batch stays queued, so every
+# check the server enforces must be enforced here too or one bad line
+# wedges all flushing behind invisible 400s: exact key set, allowlisted
+# name, allowlisted prop KEYS, ts an int (not bool) in the server's
+# 2020-2100 band, and prop VALUES str<=128 / int<2^31 / bool.
+_MIN_TS = 1577836800          # 2020-01-01, the server's lower bound
+_MAX_TS = 4102444800          # 2100-01-01, the server's upper bound
+_MAX_PROP_STR = 128
+
+
+def _sendable(event: Any) -> bool:
+    if not isinstance(event, dict) or not set(event) <= {"name", "ts", "props"}:
+        return False
+    name = event.get("name")
+    # isinstance first: an unhashable name (list/dict from a corrupted line)
+    # would make the allowlist lookup RAISE, and flush's fail-open except
+    # would then retain the batch — the wedge again (review round 4).
+    if not isinstance(name, str):
+        return False
+    allowed = _ALLOWED_EVENTS.get(name)
+    if allowed is None:
+        return False
+    ts = event.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, int) or not _MIN_TS <= ts <= _MAX_TS:
+        return False
+    props = event.get("props", {})
+    if not isinstance(props, dict) or not set(props) <= allowed:
+        return False
+    for value in props.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, str):
+            if len(value) > _MAX_PROP_STR:
+                return False
+        elif isinstance(value, int):
+            if abs(value) > 2 ** 31:  # server: abs(value) > MAX_PROP_INT
+                return False
+        else:
+            return False
+    return True
+
+
 MAX_QUEUE_LINES = 500   # bounded buffer; oldest lines dropped first
 FLUSH_BATCH = 50        # max events per POST
 _HTTP_TIMEOUT = 3.0
@@ -85,7 +128,11 @@ def record(kind: str, config: dict[str, Any] | None = None, **props: Any) -> Non
         if not (bool(section.get("enabled"))
                 and str(section.get("endpoint") or "").strip()):
             return
-        event = {"kind": kind, "ts": int(time.time()), "props": props}
+        # Wire field is "name" — the ingestion Lambda's closed contract
+        # (telemetry_lambda/handler.py validates event.get("name")). Found
+        # live 2026-08-16: the first deploy sent "kind" and every batch got
+        # a 400; the queue never drained. The wire name is pinned by test.
+        event = {"name": kind, "ts": int(time.time()), "props": props}
         _append(event)
         _spawn_flush(section)
     except ValueError:
@@ -113,6 +160,38 @@ def _spawn_flush(section: dict[str, Any]) -> None:
     ).start()
 
 
+def _usable_instance_id(section: dict[str, Any]) -> str:
+    """The Lambda 400s the WHOLE batch unless instance_id is a uuid4 string.
+
+    The GUI consent toggle mints one — but the hand-edited-config.yaml
+    activation path (the only way to set `endpoint` today) doesn't, and an
+    empty id would wedge the queue behind invisible 400s (review round 2).
+    So flush validates, and mints + best-effort-persists when needed: the
+    batch always ships with a valid id; persistence keeps it stable.
+    """
+    import uuid
+    raw = str(section.get("instance_id") or "")
+    try:
+        parsed = uuid.UUID(raw)
+        if parsed.version == 4:
+            # CANONICALIZED: uuid.UUID also accepts braced/dashless/urn
+            # forms, which the server's exact-36-char check rejects — a
+            # hand-edited id in any of those forms would wedge every batch
+            # while validating fine here (review round 3).
+            return str(parsed)
+    except Exception:
+        pass
+    minted = str(uuid.uuid4())
+    section["instance_id"] = minted  # this process reuses it even if persist fails
+    try:
+        from .config import CONFIG_PATH
+        from .integrations import _write_config_values
+        _write_config_values(CONFIG_PATH, {"telemetry.instance_id": minted})
+    except Exception:
+        pass  # fail-open: an unpersisted id still beats a wedged queue
+    return minted
+
+
 def flush(section: dict[str, Any] | None = None,
           config: dict[str, Any] | None = None) -> int:
     """POST up to `FLUSH_BATCH` queued events to the ingestion endpoint.
@@ -137,12 +216,38 @@ def flush(section: dict[str, Any] | None = None,
         events = []
         for ln in batch_lines:
             try:
-                events.append(json.loads(ln))
+                event = json.loads(ln)
             except json.JSONDecodeError:
                 continue  # a corrupt line is dropped, never re-sent forever
+            if "name" not in event and "kind" in event:
+                # Queue lines written by the first release used "kind";
+                # normalize on the way out so they drain instead of 400ing.
+                event["name"] = event.pop("kind")
+            # The Lambda rejects a batch WHOLESALE on one bad event, and a
+            # rejected batch stays queued — one poisoned line would block
+            # every later flush until drop-oldest eviction. Non-conforming
+            # events are dropped here like corrupt JSON lines are.
+            if not _sendable(event):
+                continue
+            events.append(event)
+        if not events:
+            # Every line in this batch was corrupt/non-conforming. The server
+            # 400s an empty events array, and lines are only removed after a
+            # successful POST — so POSTing here would wedge the queue behind
+            # the poisoned head forever (review round 4: organically reachable
+            # via >=50 reset-clock lines). Delete the batch, send nothing.
+            with _LOCK:
+                current = []
+                if path.exists():
+                    current = [ln for ln in path.read_text().splitlines()
+                               if ln.strip()]
+                dropped = set(batch_lines)
+                kept = [ln for ln in current if ln not in dropped]
+                path.write_text("\n".join(kept) + "\n" if kept else "")
+            return 0
         from . import __version__  # the same string `nh --version` prints
         body = json.dumps({
-            "instance_id": str(section.get("instance_id") or ""),
+            "instance_id": _usable_instance_id(section),
             "version": __version__,
             "events": events,
         }).encode()
