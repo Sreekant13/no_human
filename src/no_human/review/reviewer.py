@@ -1,8 +1,9 @@
 """Independent adversarial reviewer (PLAN.md Part 4.4, §3.3).
 
 A fresh-context Agent SDK session told to *find faults and refute "done."*
-Runs as ``claude-opus-5`` (different model from the implementer) with a
-read-only guard so it can inspect the repo but cannot modify it.
+Runs as the configured ``llm.review_model`` (a different model from the
+implementer) with a read-only guard so it can inspect the repo but cannot
+modify it.
 
 Contract:
   - Returns a pass/fail ``ReviewDecision`` with evidence-backed ``ChecklistItem``s.

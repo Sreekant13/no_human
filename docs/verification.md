@@ -34,8 +34,8 @@ the model. The PR lands in `awaiting_approval` and waits.
 
 [`src/no_human/review/reviewer.py`](../src/no_human/review/reviewer.py) opens a
 fresh Agent SDK session with read-only tools, on a different model from the
-implementer by default (`claude-opus-5` reviewing `claude-sonnet-5` —
-`llm.review_model` and `llm.primary_model` in
+implementer by default (an Opus-tier reviewer over the Sonnet-tier coder —
+the current IDs are `llm.review_model` and `llm.primary_model` in
 [`DEFAULT_CONFIG`](../src/no_human/config.py)), and tells it to refute
 "done". It returns a checklist of findings with `file`, `line` and severity — a
 boolean verdict, never a score. Three things make that verdict hard to game:
@@ -101,14 +101,15 @@ hour to review.
 - **Ambitious tasks are not the target.** It is aimed at well-scoped work:
   bugfixes, test gaps, small features, investigations. A vague ticket produces
   an escalation, which is the intended behaviour, not a workaround.
-- **No published catch-rate for the reviewer.** The last full measurement
-  against the seeded-defect corpus ran on `claude-opus-4-8`. The shipping
-  reviewer has been `claude-opus-5` since 2026-07-26 and has **not** been
-  re-measured, and the one A/B that did run scored Opus 5 lower on that corpus.
-  Quoting the old number would be attributing it to a model it does not
-  describe, so no number is published anywhere here. The method is in
-  [REVIEWER_RECALL_METHOD.md](REVIEWER_RECALL_METHOD.md); regenerate with
-  `nh bench report --reviewer-recall`.
+- **No published catch-rate for the reviewer.** The reviewer tier moved to
+  `claude-opus-5` on 2026-07-26 and was reverted to `claude-opus-4-8` on
+  2026-08-11, after an A/B scored Opus 5 lower on the seeded-defect corpus at
+  roughly 3x the round duration. The corpus and its control set have also grown
+  across those runs, and the committed run records do not state which model
+  they measured, so quoting any of them would attribute a number to a
+  configuration it may not describe. No number is published anywhere here. The
+  method is in [REVIEWER_RECALL_METHOD.md](REVIEWER_RECALL_METHOD.md);
+  regenerate with `nh bench report --reviewer-recall`.
 - **The benchmark is self-run and you cannot reproduce it.** There is a harness
   that replays real past tasks through the real pipeline and scores against what
   the human actually did; the committed run is

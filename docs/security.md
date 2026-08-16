@@ -51,7 +51,8 @@ blocked unconditionally.
 
 - **Tamper guard**: any net reduction in test count / assertions between the base
   and the change is blocked *before* the reviewer runs (cheap, deterministic).
-- **Independent reviewer**: a fresh-context `claude-opus-5` subagent told to
+- **Independent reviewer**: a fresh-context subagent on a separate Opus-tier
+  model (`llm.review_model`) told to
   refute "done", producing an evidence-cited pass/fail checklist — **never a
   numeric self-score**. Reviewer crash → fail-closed.
 - **Held-out tests**: `tests/held_out/` are run by the orchestrator and given to
