@@ -386,8 +386,14 @@ def test_no_module_outside_the_two_stampers_posts_a_pr_comment():
             # the public export drops the directory outright, so on that tree
             # existence itself is the wrong assertion — but a root we EXPECT
             # files under must still exist, or the scan went dark (2026-08-17,
-            # first public CI run).
-            excluded[root] = "absent (dropped from the public export)"
+            # first public CI run). Recorded as 0 SCANNED files — the floor
+            # check below still runs for it, and `excluded` stays a
+            # {function-key: count} map the final allowlist equality compares
+            # (a reason-string entry here broke that equality AND the floor
+            # loop KeyError'd on the missing root: the absent-dir branch was
+            # only ever exercised on the tree where the dir exists — caught by
+            # the second public CI run, 2026-08-17).
+            scanned[root] = 0
             continue
         assert d.is_dir(), f"scan root does not exist, so it scanned nothing: {d}"
         scanned[root] = 0
