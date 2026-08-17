@@ -3979,6 +3979,20 @@ async def onboarding_onboard_repo(
         return cands[0].command if cands else ""
 
     github_hosts = (config.data.get("git") or {}).get("github_hosts") or ["github.com"]
+    # Re-profiling must not destroy verified state. A proof attests that ONE
+    # exact command string exited clean in this cwd (onboard.py's prove
+    # contract), so when re-derivation lands on the SAME commands the old
+    # proof still holds — carry it forward. Any changed command resets to
+    # unproven, because the proof no longer describes what would run.
+    # Observed 2026-08-17: "Profile N repos" silently wiped proven+confirmed
+    # for every already-proven repo it re-derived.
+    prior = await store.get_profile(str(repo))
+    carry = bool(
+        prior
+        and prior.install_cmd == _first("install")
+        and prior.test_cmd == _first("test")
+        and prior.lint_cmd == _first("lint")
+    )
     profile = ProjectProfile(
         repo_path=str(repo),
         ecosystem=derived.ecosystem,
@@ -3992,10 +4006,11 @@ async def onboarding_onboard_repo(
         required_credentials=derive_required_credentials(
             derived.ci, vcs_host, derived.human_gated_steps, github_hosts),
         derived_from=sorted(set(derived.sources)),
-        proven={},          # unproven — prove via /repos/prove (or `nh onboard`)
-        confirmed=False,
-        notes="derived in onboarding wizard (unproven — prove it to give the "
-              "review gate a test command to run)",
+        proven=dict(prior.proven) if carry else {},
+        confirmed=prior.confirmed if carry else False,
+        notes=(prior.notes if carry else
+               "derived in onboarding wizard (unproven — prove it to give the "
+               "review gate a test command to run)"),
     )
     await store.upsert_profile(profile)
     return {
@@ -4006,7 +4021,7 @@ async def onboarding_onboard_repo(
         "test_cmd": profile.test_cmd,
         "lint_cmd": profile.lint_cmd,
         "required_credentials": profile.required_credentials,
-        "proven": False,
+        "proven": bool(profile.proven.get("test_cmd")),
     }
 
 

@@ -94,6 +94,65 @@ async def test_onboard_repo_persists_unproven_profile(client, store, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reonboard_with_unchanged_commands_keeps_the_proof(client, store, tmp_path):
+    """Re-profiling must not destroy verified state (observed 2026-08-17:
+    "Profile N repos" wiped proven+confirmed for every already-proven repo).
+    Same derived commands ⇒ the proof still describes what would run ⇒ carried."""
+    repo = tmp_path / "svc"
+    (repo / ".git").mkdir(parents=True)
+    repo.joinpath("package.json").write_text('{"scripts":{"test":"jest","lint":"eslint"}}')
+    repo.joinpath("package-lock.json").write_text("{}")
+
+    r = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r.status_code == 200, r.text
+    prof = await store.get_profile(str(repo.resolve()))
+    prof.proven = {"test_cmd": True}
+    prof.confirmed = True
+    await store.upsert_profile(prof)
+
+    r2 = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["proven"] is True
+    prof2 = await store.get_profile(str(repo.resolve()))
+    assert prof2.proven.get("test_cmd") is True
+    assert prof2.confirmed is True
+    assert prof2.is_usable is True
+
+
+@pytest.mark.asyncio
+async def test_reonboard_with_changed_test_command_resets_the_proof(client, store, tmp_path):
+    """The other direction: a proof attests ONE exact command string, so a
+    changed derivation must reset proven+confirmed — carrying it forward would
+    let the review gate run a command nobody ever proved."""
+    repo = tmp_path / "svc"
+    (repo / ".git").mkdir(parents=True)
+    repo.joinpath("package.json").write_text('{"scripts":{"test":"jest","lint":"eslint"}}')
+    repo.joinpath("package-lock.json").write_text("{}")
+
+    r = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r.status_code == 200, r.text
+    prof = await store.get_profile(str(repo.resolve()))
+    assert prof.test_cmd  # premise: a test command was derived at all
+    prof.proven = {"test_cmd": True}
+    prof.confirmed = True
+    await store.upsert_profile(prof)
+
+    # Change what derivation RETURNS, not what the script maps to: `npm test`
+    # is the derived string whether the script runs jest or vitest, and a
+    # same-string re-derivation correctly keeps the proof. Dropping the script
+    # and declaring a Makefile target flips the derived command itself.
+    repo.joinpath("package.json").write_text('{"scripts":{"lint":"eslint"}}')
+    repo.joinpath("Makefile").write_text("test:\n\techo ok\n")
+    r2 = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["proven"] is False
+    prof2 = await store.get_profile(str(repo.resolve()))
+    assert prof2.proven == {}
+    assert prof2.confirmed is False
+    assert prof2.test_cmd != prof.test_cmd  # premise: the derivation really changed
+
+
+@pytest.mark.asyncio
 async def test_onboard_rejects_non_repo(client, tmp_path):
     d = tmp_path / "plain"
     d.mkdir()
