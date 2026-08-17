@@ -436,6 +436,16 @@ test("the app ships the brand icon, not Electron's stock atom", () => {
   assert.equal(builderConfig.directories.buildResources, "build",
     "buildResources no longer points at desktop/build");
   const icns = path.join(here, "build", "icon.icns");
+  // The icns half is derivable only on macOS (sips/iconutil —
+  // derive-icons.mjs prints SKIP elsewhere), and build/ outputs are
+  // untracked, so on a Linux CI runner the file CANNOT exist and its absence
+  // proves nothing about the mac build (first public CI run, 2026-08-17).
+  // On darwin absence stays a hard failure — that is where the mac build
+  // happens and where the 2026-07-31 stock-atom regression would recur. If
+  // the file exists anywhere, its bytes are validated regardless.
+  if (process.platform !== "darwin" && !fs.existsSync(icns)) {
+    return; // .ico parity test below still runs on every platform
+  }
   assert.ok(fs.existsSync(icns), "desktop/build/icon.icns is missing");
   // icns magic bytes, so a truncated or mislabeled file cannot pass.
   const buf = fs.readFileSync(icns);

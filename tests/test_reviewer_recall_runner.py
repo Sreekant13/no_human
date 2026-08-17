@@ -422,7 +422,13 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # for before. 12 other files also changed this pass (core/orchestrator.py
     # x5, api/app.py x6, test_profile.py) but were already marked `scrubbed`
     # for unrelated reasons, so they do not move this count.
-    assert scrubbed == 33, scrubbed
+    # 33 -> 34 on 2026-08-17 (publication-shape alignment): the pseudonymous
+    # db name (BASE_FIXTURE_SCRUB's 9-char 2026-08-17 rule) now scrubs to
+    # metrics-core in fixtures, matching the publication map. control-cli-
+    # budgets/base/tests/test_task_lifecycle.py newly carries a scrub;
+    # control-bench-baseline/base/tests/test_bench_publish.py was already
+    # marked for an earlier rule, so only one file moves this count.
+    assert scrubbed == 34, scrubbed
 
 
 def test_manifest_declares_the_scrub_without_indexing_the_original():
@@ -658,7 +664,13 @@ def test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub():
     # 32 -> 33 on 2026-08-13 (P1 part 2) — see the sibling byte-pin test above
     # for which file newly moved.
     assert checked == 77, checked
-    assert scrubbed == 33, scrubbed
+    # 33 -> 34 on 2026-08-17 (publication-shape alignment): the pseudonymous
+    # db name (BASE_FIXTURE_SCRUB's 9-char 2026-08-17 rule) now scrubs to
+    # metrics-core in fixtures, matching the publication map. control-cli-
+    # budgets/base/tests/test_task_lifecycle.py newly carries a scrub;
+    # control-bench-baseline/base/tests/test_bench_publish.py was already
+    # marked for an earlier rule, so only one file moves this count.
+    assert scrubbed == 34, scrubbed
 
 
 def test_materialiser_refuses_to_run_with_no_de_identification_rules(

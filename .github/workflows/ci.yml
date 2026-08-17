@@ -251,6 +251,13 @@ jobs:
 
       - run: npm ci
 
+      # The bundle-scan tests (landed-override strings, term absence) read
+      # web/dist, which is a build OUTPUT and not tracked — on a fresh
+      # checkout there is nothing to scan and they fail with "web/dist/assets
+      # is missing" (first public CI run, 2026-08-17). Build it first so the
+      # scan runs against the same artefact a release would ship.
+      - run: npm run build
+
       - run: npm test
 
   desktop:
@@ -280,6 +287,13 @@ jobs:
       # platform binary. The suite does not need it: Electron is stubbed
       # through desktop/testing/electronLoader.mjs.
       - run: npm ci --ignore-scripts
+
+      # Icons are build OUTPUTS (untracked); packagedFiles.test.mjs checks the
+      # .ico bytes on every platform, so derive them first. Only the .ico half
+      # is derivable on Linux — derive-icons.mjs prints SKIP for icns, and the
+      # test treats a non-darwin missing icns as underivable, not as the
+      # stock-atom regression (first public CI run, 2026-08-17).
+      - run: node ../packaging/derive-icons.mjs
 
       # `npm test` is `node --test .`, which Node 22 rejects, so the files are
       # listed explicitly. uiPages.test.mjs is the one suite that does need the
@@ -402,6 +416,13 @@ jobs:
       - name: Install the desktop shell's dependencies
         working-directory: desktop
         run: npm ci --ignore-scripts
+
+      # Same reason as the ubuntu desktop job: icons are untracked build
+      # outputs and the .ico byte checks need one. Windows derives the .ico
+      # (Node-only) and skips icns, which the test treats as underivable here.
+      - name: Derive icons
+        working-directory: desktop
+        run: node ../packaging/derive-icons.mjs
 
       - name: Desktop shell tests
         working-directory: desktop

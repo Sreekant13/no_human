@@ -345,7 +345,13 @@ def test_unresolvable_installer_is_allowed_and_logged(tmp_path, caplog):
     this gap — the fallback is allow-and-log, not a silent, unobserved
     pass."""
     primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
-    no_pip_env = {"PATH": "/usr/bin:/bin", "VIRTUAL_ENV": primary_venv}
+    # PATH must be a dir where `pip` provably does NOT resolve. "/usr/bin:/bin"
+    # only encoded that on macOS — Ubuntu CI runners ship /usr/bin/pip, the
+    # token resolved, and the allow-and-log branch never ran (first public CI
+    # run, 2026-08-17). An empty tmp dir makes the premise true everywhere.
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    no_pip_env = {"PATH": str(empty_bin), "VIRTUAL_ENV": primary_venv}
     import logging
     with caplog.at_level(logging.WARNING, logger="no_human.agent.venv_install_guard"):
         r = venv_install_guard.denial_reason("pip install foo", cwd=wt, env=no_pip_env)

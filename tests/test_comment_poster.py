@@ -380,6 +380,15 @@ def test_no_module_outside_the_two_stampers_posts_a_pr_comment():
     offenders = []
     for root in _SCAN_ROOTS:
         d = _SRC_ROOT / root
+        if _SCAN_ROOTS[root] == 0 and not d.is_dir():
+            # A floor of 0 already declares "may contain no scannable files".
+            # `integrations/` ships nothing (no pinned .py; a JS Forge app) and
+            # the public export drops the directory outright, so on that tree
+            # existence itself is the wrong assertion — but a root we EXPECT
+            # files under must still exist, or the scan went dark (2026-08-17,
+            # first public CI run).
+            excluded[root] = "absent (dropped from the public export)"
+            continue
         assert d.is_dir(), f"scan root does not exist, so it scanned nothing: {d}"
         scanned[root] = 0
         for p in sorted(d.rglob("*.py")):

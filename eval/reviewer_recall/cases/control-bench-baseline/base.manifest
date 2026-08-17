@@ -1,7 +1,7 @@
 253e5a3900dc1ec8159def8017a1fb234ff2c408  src/no_human/cli/commands.py  scrubbed
 2ac5207abe31510db49ecdbb99e11728053a32ed  web/src/styles.css  scrubbed
+306f0fa2f59174791b3864674a2259f9bb016d39  tests/test_bench_publish.py  scrubbed
 38732065496be02390948dc91d16621488d90932  src/no_human/api/app.py  scrubbed
 78b5929eed22b84108ecb6758eccffcf749670bf  tests/test_bench_api.py
 82c1a5bc574a48ba291a178a52ba99c5dcbaff0e  src/no_human/eval/northstar_card.py
 8ea2c0e81cede74c814ae002eed9c0c0a3d09064  web/src/Stats.jsx
-df4cddfde938b7c34a245a2f42bda06c9912acff  tests/test_bench_publish.py  scrubbed

@@ -19,8 +19,8 @@ test("proposals group by project with counts", () => {
   ];
   const groups = groupLearningsByProject(items);
   assert.equal(groups.length, 3);
-  const metrics-core = groups.find((g) => g.label === "metrics-core");
-  assert.equal(metrics-core.count, 2);
+  const metricsCore = groups.find((g) => g.label === "metrics-core");
+  assert.equal(metricsCore.count, 2);
   const unscoped = groups.find((g) => g.label === "Unscoped");
   assert.equal(unscoped.count, 2);  // "" and null merge
 });
