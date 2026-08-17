@@ -65,7 +65,7 @@ test("isAppOrigin: same-origin stays in-window, everything else leaves", () => {
 // ------------------------------ E2 tests ---------------------------------- //
 
 import { CLI_HINT_DIRS, NH_EXE_NAME, POSIX_CLI_HINT_DIRS, WINDOWS_CLI_HINT_DIRS,
-         bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer,
+         bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer, widenPath,
          taskkillArgs, windowsPathLookup } from "./server.mjs";
 import { mkdirSync } from "node:fs";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
@@ -298,6 +298,37 @@ test("mergePath: a Windows PATH is split on ';' and never shredded on ':'", () =
     "a drive-qualified entry must survive intact");
   assert.equal(mergePath(base, [], exists, ";"), base,
     "with nothing to add the PATH must come back byte-identical");
+});
+
+// THE DEFECT this guards (2026-08-17, packaged Windows app). `process.env` is a
+// case-insensitive proxy, but the SPREAD COPY handed to spawn is a plain
+// object keyed by the OS spelling — `Path` on Windows. `copy.PATH` was
+// undefined, so the child got a PATH of hint dirs only and its inherited
+// `Path` was dropped: no System32, no git, every task crashed on the first
+// `git` spawn (WinError 2) and `icacls` was "not found". Only Git Bash, whose
+// env says `PATH`, ever launched a working server.
+test("widenPath: widens the inherited `Path` spelling in place, never a bare PATH beside it", () => {
+  const merge = (v) => `${v ?? "<undefined>"};C:\hints`;
+  const env = widenPath({ Path: "C:\Windows\System32;C:\Program Files\Git\cmd", HOME: "x" }, merge);
+  assert.deepEqual(Object.keys(env).filter((k) => k.toUpperCase() === "PATH"), ["Path"],
+    "exactly ONE path variable, in the spelling the OS gave us");
+  assert.equal(env.Path, "C:\Windows\System32;C:\Program Files\Git\cmd;C:\hints",
+    "the inherited entries survive and the hints are appended");
+  assert.equal(env.HOME, "x", "unrelated variables are untouched");
+});
+
+test("widenPath: an exact PATH override still outranks the inherited spelling, and the duplicate is collapsed", () => {
+  const merge = (v) => `${v};H`;
+  const env = widenPath({ Path: "inherited", PATH: "override" }, merge);
+  assert.deepEqual(Object.keys(env), ["PATH"], "the losing spelling is removed so the child cannot receive two");
+  assert.equal(env.PATH, "override;H");
+});
+
+test("widenPath: POSIX shape (PATH) and a missing variable behave as before", () => {
+  const merge = (v) => `${v ?? ""}:/opt/hint`.replace(/^:/, "");
+  assert.deepEqual(widenPath({ PATH: "/usr/bin" }, merge), { PATH: "/usr/bin:/opt/hint" });
+  assert.deepEqual(widenPath({ HOME: "/h" }, merge), { HOME: "/h", PATH: "/opt/hint" },
+    "no variable at all still yields a PATH of the hints, as mergePath('') did");
 });
 
 test("mergePath: Windows entries are de-duplicated case-insensitively", () => {

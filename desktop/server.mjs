@@ -277,6 +277,33 @@ export function mergePath(basePath, extraDirs = CLI_HINT_DIRS,
 }
 
 /**
+ * Widen the PATH entry of a spawn env IN PLACE and return it — whatever the
+ * variable's spelling.
+ *
+ * `process.env` is a case-insensitive proxy on Windows, so `process.env.PATH`
+ * reads the variable however the OS spelled it. A SPREAD COPY of it is a plain
+ * object and keeps the OS spelling — on Windows that is `Path` (the registry
+ * name), so `copy.PATH` is undefined and `copy.PATH = mergePath(undefined)`
+ * used to hand the child a PATH made ONLY of the hint dirs, with the original
+ * `Path` dropped by the spawn (measured 2026-08-17: the packaged server ran
+ * with `~/.local/bin;%APPDATA%
+pm` and nothing else — no System32, no git,
+ * so every task died on its first `git` spawn with WinError 2, and `icacls`
+ * was "not found" for the credential ACL). Only a Git Bash launch, whose env
+ * says `PATH`, ever worked. Every same-name key is collapsed into ONE so the
+ * child can never receive two spellings; an exact `PATH` (a caller override)
+ * still outranks the inherited spelling, preserving the old precedence.
+ */
+export function widenPath(spawnEnv, merge = mergePath) {
+  const keys = Object.keys(spawnEnv).filter((k) => k.toUpperCase() === "PATH");
+  const key = keys.includes("PATH") ? "PATH" : (keys[0] ?? "PATH");
+  const merged = merge(spawnEnv[key]);
+  for (const k of keys) delete spawnEnv[k];
+  spawnEnv[key] = merged;
+  return spawnEnv;
+}
+
+/**
  * Bounded accumulator for a child's stdout+stderr. Capped so a chatty/looping
  * process cannot grow this without bound over a long-lived spawn — only the
  * TAIL matters for diagnosing a launch failure.
@@ -374,8 +401,7 @@ export async function ensureServer({
   // PATH is widened AFTER the merge so a caller-supplied env cannot silently
   // drop it: without this the Agent SDK cannot find `claude` and every task
   // fails, even though the board serves normally.
-  const spawnEnv = { ...process.env, ...env };
-  spawnEnv.PATH = mergePath(spawnEnv.PATH);
+  const spawnEnv = widenPath({ ...process.env, ...env });
   // stdout/stderr are PIPED (not ignored) so a launch failure's own diagnosis
   // — e.g. `_assert_backend_usable`'s "claude CLI was not found" — can reach
   // error.html instead of a generic lifecycle reason. Both streams are
