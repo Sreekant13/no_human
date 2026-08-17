@@ -1,17 +1,13 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
+import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
 import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
-import { selectBenchHeadline, footnoteLabel } from "./benchHeadline.js";
-import { selectPublishedRun, publishedEscalationPct, benchSpecCounts,
-         benchSuccessText, benchSuccessDenominator } from "./benchPublished.js";
 import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
 import { pluralize } from "./pluralize.js";
 import { costByProject, totalCost } from "./costGroups.js";
-import { formatBenchDate } from "./formatBenchDate.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -542,178 +538,6 @@ function SessionSearch() {
   );
 }
 
-// Bench instrument-trust card (Task 2): makes a REFUSED or UNMEASURED bench run
-// legible, because that is exactly the state that otherwise still looks fine.
-// Fed by GET /api/bench/latest (fetchBenchLatest). A refusal, an under-loaded
-// corpus, or a materially-unmeasured run each gets an ALERT (not a muted chip),
-// and the honest-escalation DENOMINATOR is always shown so "100% (2/2)" cannot
-// be mistaken for "100% (14/14)".
-function BenchTrust({ bench }) {
-  if (bench === undefined || bench === null) return null; // loading / endpoint absent -> hide
-  if (bench.norun) {
-    return (
-      <section className="bench-trust" aria-label="Benchmark">
-        <div className="bench-trust-head"><span className="bench-trust-title">Benchmark</span></div>
-        <div className="stats-empty" style={{ padding: "24px 0" }}>No bench run recorded yet.</div>
-      </section>
-    );
-  }
-  // SCRUM-25: headline the last PUBLISHED baseline (the one the gate
-  // accepted), never a probe. `bench.published` is only set once the backend
-  // has a clean baseline to offer (bench.published=true, bench.latest_run =
-  // the most recent run if newer and unpublished); older backends / no clean
-  // baseline at all send neither key, so `card` falls back to `bench` itself
-  // — today's behavior, unchanged.
-  const { headline, footnote } = selectBenchHeadline(
-    bench.published ? [bench] : [], bench.latest_run);
-  const card = headline || bench;
-
-  // SPEC counts, not row counts. `total`/`skipped`/`dead_specs` are recorded
-  // ROWS — one per (spec, trial) — so every "of the corpus" reading built on
-  // them is wrong by a factor of --trials. See benchSpecCounts.
-  const { specs: total, skippedSpecs: skipped, deadSpecs: dead,
-          unmeasured } = benchSpecCounts(card);
-  const corpus = Number(card.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
-  const refusals = Array.isArray(card.refusals) ? card.refusals : [];
-  const overrides = Array.isArray(card.override_reasons) ? card.override_reasons : [];
-  const escN = card.honest_escalations;
-  const escD = card.escalation_specs;
-  const haveEsc = Number.isFinite(escN) && Number.isFinite(escD) && escD > 0;
-
-  const refused = refusals.length > 0;
-  const undercorpus = corpus > 0 && total < corpus;
-  const materialUnmeasured = total > 0 && unmeasured / total >= 0.2;
-  const alerting = refused || undercorpus || materialUnmeasured;
-  const pct = (x) => (Number.isFinite(x) ? `${Math.round(x * 100)}%` : "—");
-
-  return (
-    <section className={`bench-trust${alerting ? " bench-trust-alert" : ""}`} aria-label="Benchmark">
-      <div className="bench-trust-head">
-        <span className="bench-trust-title">Benchmark</span>
-        {card.label && <span className="bench-trust-sub">{card.label}</span>}
-        {card.created_at && <span className="bench-trust-sub">{formatBenchDate(card.created_at)}</span>}
-      </div>
-
-      {refused && (
-        <div className="nh-alarm bench-alarm" role="alert">
-          <strong>This run was refused publication.</strong>
-          <ul className="bench-reasons">{refusals.map((r, i) => <li key={i}>{r}</li>)}</ul>
-        </div>
-      )}
-      {overrides.length > 0 && (
-        <div className="nh-alarm bench-alarm" role="alert">
-          <strong>A human forced past a publish refusal.</strong>
-          <ul className="bench-reasons">{overrides.map((r, i) => <li key={i}>{r}</li>)}</ul>
-        </div>
-      )}
-      {materialUnmeasured && (
-        <div className="nh-alarm bench-alarm" role="alert">
-          <strong>{unmeasured} of {total} specs went unmeasured</strong> ({skipped} skipped, {dead} dead)
-          {" — "}the success rate is over what ran, not the corpus.
-        </div>
-      )}
-      {undercorpus && (
-        <div className="nh-alarm bench-alarm" role="alert">
-          <strong>This run loaded {total} of {corpus} corpus specs.</strong> A run that filters to the
-          specs that resolve reads as perfect coverage — it is not.
-        </div>
-      )}
-
-      <dl className="bench-stats">
-        <div>
-          <dt>Success</dt>
-          {/* The percentage NEVER without its interval when the card records
-              one, and both halves from the SAME estimator (bench-v2 V1) — a
-              pooled `success_rate` beside a spec-mean interval is the pair
-              that printed 91.7% next to 97.5–99.9. */}
-          <dd>{benchSuccessText(card)}{benchSuccessDenominator(card)}</dd>
-        </div>
-        <div>
-          <dt>Honest escalation</dt>
-          <dd>
-            {haveEsc
-              ? <>{Math.round((escN / escD) * 100)}% <span className="bench-denom">({escN}/{escD})</span>
-                  {escD < 5 && <span className="bench-flag"> small sample</span>}</>
-              : <>{pct(card.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
-          </dd>
-        </div>
-        <div>
-          <dt>Unmeasured</dt>
-          <dd className={unmeasured > 0 ? "bench-bad" : ""}>{unmeasured} of {total} ({skipped} skipped · {dead} dead)</dd>
-        </div>
-        <div>
-          <dt>Corpus coverage</dt>
-          <dd className={undercorpus ? "bench-bad" : ""}>{corpus > 0 ? `${total} of ${corpus} loaded` : "unknown (older card)"}</dd>
-        </div>
-        {Number.isFinite(card.median_cost_ratio) && (
-          <div>
-            <dt>Median cost</dt>
-            <dd>
-              {card.median_cost_ratio}×{" "}
-              <span className="bench-cost-basis">
-                (basis: {card.median_cost_ratio_basis || "n/a"})
-              </span>
-            </dd>
-          </div>
-        )}
-      </dl>
-
-      {/* A newer refused/probe run is real information, but it is a footnote —
-          never the headline (SCRUM-25). */}
-      {footnote && (
-        <div className="bench-footnote">
-          <span className="bench-footnote-label">{footnoteLabel(footnote)}</span>
-        </div>
-      )}
-    </section>
-  );
-}
-
-// SCRUM-82: the panel above answers "was the last run refused / does it
-// trust its own numbers" — but never "what is the last trusted number".
-// This row headlines the last PUBLISHED baseline (never a refused/quick
-// run — selectPublishedRun guards on `bench.published === true`) so the
-// product's proof point is not invisible on its own stats page. BenchTrust
-// (above) is untouched; this only ADDS a row rendered directly above it.
-function BenchPublishedRow({ bench }) {
-  if (bench === undefined || bench === null) return null; // loading / endpoint absent -> hide, same as BenchTrust
-  const row = selectPublishedRun(bench);
-
-  if (!row) {
-    return (
-      <section className="bench-published" aria-label="Last published run">
-        <span className="bench-published-title">Last published run</span>
-        <span className="bench-published-empty">No published baseline yet.</span>
-      </section>
-    );
-  }
-
-  return (
-    <section className="bench-published" aria-label="Last published run">
-      <span className="bench-published-title">Last published run</span>
-      {row.label && <span className="bench-published-item">{row.label}</span>}
-      {row.created_at && <span className="bench-published-item">{formatBenchDate(row.created_at)}</span>}
-      <span className="bench-published-item">
-        <span className="bench-published-dt">Success</span>{" "}
-        {benchSuccessText(row)}
-        {benchSuccessDenominator(row)}
-      </span>
-      <span className="bench-published-item">
-        <span className="bench-published-dt">Honest escalation</span>{" "}
-        {publishedEscalationPct(row)}
-      </span>
-      {Number.isFinite(row.median_cost_ratio) && (
-        <span className="bench-published-item">
-          <span className="bench-published-dt">Cost</span> {row.median_cost_ratio}×{" "}
-          <span className="bench-cost-basis">
-            (basis: {row.median_cost_ratio_basis || "n/a"})
-          </span>
-        </span>
-      )}
-    </section>
-  );
-}
-
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
   // undefined = fetch in flight (loader) · null = fetch FAILED (honest
@@ -727,10 +551,6 @@ export default function Stats({ tasks }) {
       setMetrics((prev) => (m === null && prev ? prev : m)));
   }, [tasks.length]);
   const northStar = northStarTiles(metrics);
-  // The bench instrument-trust card (Task 2): fetched once, independent of task
-  // metrics. undefined = loading, null = endpoint absent (hide), {norun} = no run.
-  const [bench, setBench] = useState(undefined);
-  useEffect(() => { fetchBenchLatest().then(setBench); }, []);
 
   if (tasks.length === 0) {
     return (
@@ -768,10 +588,6 @@ export default function Stats({ tasks }) {
           ))}
         </div>
       )}
-
-      <BenchPublishedRow bench={bench} />
-      <BenchTrust bench={bench} />
-
 
       {/* Primary metric cards */}
       <div className="stats-cards">
