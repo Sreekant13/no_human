@@ -317,6 +317,19 @@ html, body, #root {
   padding: var(--sp-4) var(--sp-3);
   gap: var(--sp-5);
   z-index: 10;
+  /* The sidebar's rows have a fixed total height (brand + two nav groups +
+     the 24h ledger + the status foot + Settings). `.nh-shell` is
+     `height: 100%; overflow: hidden`, so on a viewport shorter than that
+     total the bottom rows were CLIPPED, not scrolled — Settings/About were
+     unreachable. Measured 2026-08-17 on the Windows app on a 4K laptop at
+     300 % (viewport 1280x672 CSS px): 716px of sidebar for 672px of height,
+     Settings below the fold and NOT reachable; a 1080p @ 100 % desktop with
+     the taskbar (1032px) is the same failure at a lower margin. The
+     column now scrolls when it must (overflow-y) instead of clipping;
+     overflow-x stays hidden so no horizontal bar can appear at 232px. */
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 /* Light theme: the dark gradient reads as an accidental gray wash on paper
    (before-gallery, 2026-07-17) — flat raised surface instead. */
@@ -412,6 +425,23 @@ html, body, #root {
 .drain-chip.tone-error {
   color: var(--red); background: color-mix(in oklab, var(--red) 14%, transparent);
   border-color: color-mix(in oklab, var(--red) 30%, transparent);
+}
+
+/* Short viewports (1080p with a taskbar = 1032px; a 4K laptop at 300 % =
+   672px, measured on the Windows app 2026-08-17): tighten the sidebar's own
+   spacing first — outer padding, the gap between nav groups, the foot rows —
+   so those cases fit WITHOUT scrolling (692px -> 664px of content at 672px)
+   and Settings stays visible at the bottom; the overflow-y above is the
+   backstop for anything shorter still. Every value stays on the --sp scale. */
+@media (max-height: 1080px) {
+  .nh-sidebar { gap: var(--sp-3); padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  /* Descendant selectors on purpose: .nh-ledger's base rule is defined
+     later in this file, and same-specificity order would silently win. */
+  .nh-sidebar .nh-sidenav { gap: var(--sp-3); }
+  .nh-sidebar .nh-navgroup { gap: var(--sp-1); }
+  .nh-sidebar .nh-sidebar-foot { gap: var(--sp-2); }
+  .nh-sidebar .nh-ledger { padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
+  .nh-sidebar .nh-ledger ~ .nh-sidebar-foot { margin-top: var(--sp-2); }
 }
 
 /* Mobile: the sidebar becomes a horizontal top bar so the board keeps its width. */
