@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,13 @@ RULES:
 1. Explore the codebase FIRST (use Read, Grep, Glob tools) to understand
    the existing code, patterns, and conventions. NEVER ask the user
    something the code already answers.
+   DISCOVERY IS REPO-SCOPED. Your working directory IS the task repository
+   root: {repo_root}. Find files with `find {repo_root}/ -name '<glob>'` and
+   search with `grep -r '<pattern>' {repo_root}/` (or the Glob/Grep tools).
+   NEVER scan the whole filesystem (`find /`, `grep -r <pattern> /`,
+   `ls -R /`): a pre-execution guard rejects those with 'must be
+   repo-scoped', and they exhaust your turn budget before you can emit the
+   block.
 2. Ask ONE question at a time. Provide 2-4 suggested answers (labeled
    A, B, C, D) based on what you found in the code.
 3. Each question must resolve a genuine ambiguity about INTENT, SCOPE,
@@ -160,6 +168,7 @@ async def grill_step(
     *,
     max_rounds: int = MAX_ROUNDS_DEFAULT,
     on_event: Any | None = None,
+    timeout: float = 120,
 ) -> GrillQuestion | GrillResult:
     """Run one step of the intake grill.
 
@@ -188,6 +197,8 @@ async def grill_step(
         else ""
     )
 
+    cwd = Path(repo_path).resolve() if repo_path else Path(tempfile.gettempdir())
+
     prompt = _GRILL_PROMPT.format(
         title=title,
         description=description or "(none provided)",
@@ -195,16 +206,16 @@ async def grill_step(
         round_n=round_n,
         max_rounds=max_rounds,
         force_clause=force_clause,
+        repo_root=str(cwd),
     )
 
-    cwd = Path(repo_path) if repo_path else Path.home()
     extra: dict[str, Any] = {}
     if on_event is not None:
         extra["on_event"] = on_event
     try:
         result = await asyncio.wait_for(
             backend.run(prompt, cwd=cwd, max_turns=4, effort="low", **extra),
-            timeout=120,
+            timeout=timeout,
         )
     except asyncio.TimeoutError:
         # KNOWN UNDER-REPORT: wait_for cancelled the call, so no result object

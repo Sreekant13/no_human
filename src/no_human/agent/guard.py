@@ -23,6 +23,8 @@ Blocks, before execution:
     `RemoteTrigger`) in a read-only session — a spawned subagent's own
     toolset, not the parent's readonly gate, decides what it can do, so
     spawning one is a capability-laundering channel out of readonly
+  - filesystem-wide scans (`find /`, `grep -r ... /`, `ls -R /`, ...) —
+    exploration must be repo-scoped, in every session mode
 
 Deliberately allowed (user, 2026-07-10): the agent may `git commit`, `git push`
 its own branch, `git merge` another ref *into* that branch, and open a PR. Only
@@ -158,6 +160,211 @@ _LIVE_SERVER = re.compile(
     r"(?:^|[|;&]\s*|`|\$\(|^\s*|/|\bsudo\s+|\benv\s+[^|;&]*?\s)"
     r"nh\s+(?:serve|start|watch|bench\s+run)\b"
 )
+
+# --------------------------------------------------------------------------- #
+# Filesystem-wide scans (`find /`, `grep -r ... /`, `ls -R /`, ...). Intake
+# exploration is meant to be repo-scoped — see `intake/grill.py` and
+# `intake/evaluator.py` — but a model can still type the wrong command, and a
+# whole-machine sweep burns the turn budget and never answers a repo question.
+#
+# Commands whose job is directory traversal.
+_SCAN_EXECUTABLES = frozenset({"find", "grep", "egrep", "fgrep", "rg", "ls", "du", "fd", "tree"})
+
+# Real temp roots this repo's own tests and agents legitimately scan —
+# scanning them is not a filesystem-wide sweep even though they live under a
+# system prefix (`/private/var/...` on macOS).
+_SCAN_EXEMPT_PREFIXES = ("/tmp", "/var/folders", "/private/var/folders", "/private/tmp")
+
+# First-level system directories. `/Users`/`/home` are included deliberately —
+# a repo checkout usually lives under one of them, which is exactly why the
+# cwd/exemption checks in `_operand_is_blocked_scan` run BEFORE this list is
+# consulted: a path under the session's own cwd is allowed even though it is
+# also, incidentally, under `/Users`.
+_SYSTEM_ROOTS = (
+    "/etc", "/usr", "/var", "/opt", "/System", "/Library", "/Applications",
+    "/home", "/Users", "/private", "/Volumes", "/proc", "/dev",
+)
+
+_REPO_SCOPE_REASON = (
+    "filesystem-wide scan blocked: {cmd}. Codebase exploration must be "
+    "repo-scoped — the session's working directory IS the repository root. "
+    "Run `find {root}/ -name '<glob>'` or `grep -r '<pattern>' {root}/` (or "
+    "the Grep/Glob tools) instead. Scanning {target} reads the whole "
+    "machine, burns your turn budget, and answers nothing about this task."
+)
+
+# Executables that ALWAYS traverse recursively when given a directory operand,
+# regardless of flags: `find`/`fd`/`tree`/`du` walk by default, and unlike GNU
+# grep, ripgrep has no non-recursive mode for a directory target — `rg TODO /`
+# sweeps the machine with no `-r` anywhere on the command line. Grouping `rg`
+# with `grep` under a flag-gated recursion test (an earlier version of this
+# guard did) is a bypass: `rg` belongs here, not in `_GREP_LIKE` below.
+_ALWAYS_RECURSIVE_SCAN = frozenset({"find", "fd", "tree", "du", "rg"})
+
+# grep-family tools: recursive only with an explicit flag.
+_GREP_LIKE = frozenset({"grep", "egrep", "fgrep"})
+_RECURSIVE_SHORT_FLAG = re.compile(r"^-[A-Za-z]*[rR][A-Za-z]*$")
+
+# grep/rg option flags that consume the NEXT token as a VALUE, not a path
+# operand — `-e`/`--regexp` and `-f`/`--file` also mean the search pattern was
+# supplied by the flag, so the usual "first positional is the pattern" rule
+# must not also eat the first path operand (`grep -r -e TODO /` must still
+# see `/` as a path operand and get blocked, not lose it to a phantom
+# "pattern" that was already consumed by `-e`).
+_GREP_VALUE_FLAGS = frozenset({
+    "-e", "--regexp", "-f", "--file", "-m", "--max-count", "--include",
+    "--exclude", "--exclude-dir", "-A", "--after-context", "-B",
+    "--before-context", "-C", "--context",
+})
+_GREP_PATTERN_FLAGS = frozenset({"-e", "--regexp", "-f", "--file"})
+
+
+def _is_scan_exe_name(name: str) -> bool:
+    return name in _SCAN_EXECUTABLES
+
+
+def _is_recursive_scan(name: str, args: list) -> bool:
+    """Whether this invocation traverses a directory tree at all — a
+    non-recursive `grep pattern file.txt` or `ls dir` never sweeps anything,
+    so only recursive scans are worth checking for a filesystem-wide target."""
+    if name in _ALWAYS_RECURSIVE_SCAN:
+        return True
+    if name == "ls":
+        for a in args:
+            if a == "--":
+                break
+            if a == "--recursive":
+                return True
+            if a.startswith("-") and not a.startswith("--") and "R" in a[1:]:
+                return True
+        return False
+    if name in _GREP_LIKE:
+        for a in args:
+            if a == "--":
+                break
+            if a in ("--recursive", "--dereference-recursive"):
+                return True
+            if a.startswith("-") and not a.startswith("--") and _RECURSIVE_SHORT_FLAG.match(a):
+                return True
+        return False
+    return False
+
+
+def _scan_path_operands(name: str, args: list) -> list:
+    """Non-flag operands that name a scan TARGET (as opposed to a pattern or
+    a flag value). For `find`, everything before the first primary
+    (`-name`, `(`, `!`, ...). For grep-family/`rg`, every non-flag token
+    except the one that supplies the search PATTERN — tracked explicitly so
+    a pattern given via `-e`/`-f` does not leave the next positional
+    (typically the real path) mis-consumed as a phantom pattern."""
+    if name == "find":
+        paths = []
+        for a in args:
+            if a.startswith("-") or a.startswith("(") or a.startswith("!"):
+                break
+            paths.append(a)
+        return paths
+
+    is_grep_like = name in _GREP_LIKE or name == "rg"
+    operands: list = []
+    pattern_consumed = not is_grep_like  # non-grep tools have no pattern slot
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--":
+            continue
+        if is_grep_like and a.startswith("--"):
+            flag_name = a.split("=", 1)[0]
+            if flag_name in _GREP_PATTERN_FLAGS:
+                pattern_consumed = True
+                if "=" not in a:
+                    skip_next = True
+            elif flag_name in _GREP_VALUE_FLAGS and "=" not in a:
+                skip_next = True
+            continue
+        if a.startswith("-") and a != "-":
+            if is_grep_like and a in _GREP_PATTERN_FLAGS:
+                pattern_consumed = True
+                skip_next = True
+            elif is_grep_like and a in _GREP_VALUE_FLAGS:
+                skip_next = True
+            continue
+        # positional token
+        if is_grep_like and not pattern_consumed:
+            pattern_consumed = True
+            continue
+        operands.append(a)
+    return operands
+
+
+def _operand_is_blocked_scan(operand: str, cwd: "str | None") -> bool:
+    """True when ``operand`` names a filesystem-wide or system-root scan
+    target. Pure string comparison — no filesystem access, matching the rest
+    of this module's guards.
+
+    Order matters: tmp exemptions and the session's own cwd are checked
+    BEFORE the system-root list, because a repo checkout commonly lives
+    under `/Users`/`/home` (both system roots) — without that ordering every
+    ordinary repo-scoped scan on such a machine would be denied."""
+    if not operand.startswith("/"):
+        return False  # relative operands are repo-scoped by construction
+    norm = operand.rstrip("/") or "/"
+    for prefix in _SCAN_EXEMPT_PREFIXES:
+        if norm == prefix or norm.startswith(prefix + "/"):
+            return False
+    if cwd is not None:
+        cwd_norm = str(cwd).rstrip("/") or "/"
+        if norm == cwd_norm or norm.startswith(cwd_norm + "/"):
+            return False
+    if norm in ("/", "/*"):
+        return True
+    for root in _SYSTEM_ROOTS:
+        if norm == root or norm.startswith(root + "/"):
+            return True
+    return False
+
+
+def root_scan_denial(cmd: str, cwd: "str | None") -> "str | None":
+    """Why this command's filesystem scan must be denied, or `None` to allow
+    it. Pure and side-effect-free, mirroring `_venv_install_denial`'s shape.
+
+    Pathless recursive scans (`grep -r pattern`, bare `find`) default to the
+    process's own cwd — GNU tools default to `.`, not `/` — so they are
+    ALLOWED whenever a session `cwd` is known (the backend always passes the
+    session's worktree, i.e. the repo root) and denied only when `cwd` is
+    `None`: the one case where the default target genuinely cannot be shown
+    to be the repo, per this module's conservative-deny convention."""
+    for seg in _CMD_SEP.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        argv = _strip_wrappers(tokens, _is_scan_exe_name)
+        if not argv:
+            continue
+        name = PurePosixPath(argv[0]).name
+        if name not in _SCAN_EXECUTABLES:
+            continue
+        args = argv[1:]
+        if not _is_recursive_scan(name, args):
+            continue
+        operands = _scan_path_operands(name, args)
+        if operands:
+            for op in operands:
+                if _operand_is_blocked_scan(op, cwd):
+                    return _REPO_SCOPE_REASON.format(cmd=seg, root=(cwd or "<repo>"), target=op)
+            continue
+        if cwd is None:
+            return _REPO_SCOPE_REASON.format(
+                cmd=seg, root="<repo>", target="the current directory (cwd unknown)")
+    return None
 
 # --------------------------------------------------------------------------- #
 # Installing into the shared developer venv — defence in depth. A coder
@@ -1330,6 +1537,12 @@ def evaluate(
                 "credentials regardless of checkout. Test CLI behavior through "
                 "the test suite (CliRunner), never a live process.",
             )
+        # Applies to EVERY session mode, coder included — a whole-filesystem
+        # sweep is never the right probe, and gating it on `readonly` would
+        # leave the expensive coder path unprotected.
+        scan_reason = root_scan_denial(cmd, cwd)
+        if scan_reason:
+            return GuardDecision(False, scan_reason)
         # Applies to EVERY session mode, like `_LIVE_SERVER` above — this is
         # about the operator's real primary checkout, not the repo's content.
         venv_reason = _venv_install_denial(cmd, cwd)

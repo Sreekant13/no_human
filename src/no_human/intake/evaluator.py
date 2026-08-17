@@ -609,7 +609,14 @@ _GRILL_ANSWERS_PROMPT = (
     "You have a LIMITED number of turns: explore at most a few files, and "
     "RESERVE YOUR FINAL TURN for the output block. The block is REQUIRED — "
     "partial or assumption answers are fine, but never end without emitting "
-    "it.\n\n"
+    "it.\n"
+    "DISCOVERY IS REPO-SCOPED. Your working directory IS the task repository "
+    "root: {repo_root}. Find files with `find {repo_root}/ -name '<glob>'` and "
+    "search with `grep -r '<pattern>' {repo_root}/` (or the Glob/Grep tools). "
+    "NEVER scan the whole filesystem (`find /`, `grep -r <pattern> /`, "
+    "`ls -R /`): a pre-execution guard rejects those with 'must be "
+    "repo-scoped', and they exhaust your turn budget before you can emit the "
+    "block.\n\n"
     "Output EXACTLY:\n"
     "GRILL_ANSWERS_START\n"
     '{"answers": [{"i": 0, "answer": "...", "source": '
@@ -737,14 +744,15 @@ async def grill_spec(
             q_text = "\n".join(
                 f"  {i}. {q.question} (decides: {q.decision_it_changes})"
                 for i, q in answerable)
+            cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             prompt = _render(
                 _GRILL_ANSWERS_PROMPT,
                 title=title,
                 description=description or "(none)",
                 criteria=criteria_text,
                 questions=q_text,
+                repo_root=str(cwd),
             )
-            cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             fallback_used = False
             outcome = "parsed_first_try"
             # The expensive one: max_turns=8, and it explores a real repo.
