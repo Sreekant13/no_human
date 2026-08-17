@@ -123,8 +123,13 @@ def _load_scrub() -> list[tuple[bytes, bytes]]:
         "_rr_vendor_terms_private", PRIVATE_TERMS_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # BASE_FIXTURE_SHAPE_SCRUB rides along: publication-shape pseudonym rules
+    # the materialiser must apply identically, kept in a separate list because
+    # its left column is deliberately NOT an armed `_TERM_SOURCES` needle
+    # (arming it was measured red on 5,063 approved-history blobs, 2026-08-17).
     pairs = [(bytes.fromhex(h), r.encode()) for h, r in
-             getattr(mod, "BASE_FIXTURE_SCRUB", [])]
+             (list(getattr(mod, "BASE_FIXTURE_SCRUB", []))
+              + list(getattr(mod, "BASE_FIXTURE_SHAPE_SCRUB", [])))]
     return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
 
 
