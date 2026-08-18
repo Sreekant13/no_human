@@ -12,6 +12,8 @@ cd desktop && npm install && npm run desktop
 ## Package (unsigned dmg, v1)
 ```bash
 cd desktop && npm run dist        # → desktop/dist/no_human-<v>.dmg
+cd desktop && npm run dist:win    # → desktop/dist/no_human-<v>-UNSIGNED.exe (on Windows)
+cd desktop && npm run dist:linux  # → desktop/dist/no_human-<v>-linux-amd64.deb + no_human-<v>-linux-x86_64.AppImage (on Linux; CI's `linux` job)
 ```
 The dmg is unsigned: on first launch either right-click → Open, or clear the
 quarantine bit: `xattr -dr com.apple.quarantine /Applications/no_human.app`.

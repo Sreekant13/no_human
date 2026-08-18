@@ -1002,8 +1002,8 @@ async def test_angles_run_only_for_complex_tier(tmp_path):
 
     t.context = {"complexity_tier": "complex"}
     await r.review(t, repo_path=tmp_path, diff_override="+ x = 1\n")
-    # D2 #6 added the silent-failure lens → main + 3 angles.
-    assert len(calls) == 4, f"expected main+3 angles, got {len(calls)}"
+    # D2 #6 added the silent-failure lens → main + 4 angles.
+    assert len(calls) == 5, f"expected main+4 angles, got {len(calls)}"
 
     calls.clear()
     t.context = {"complexity_tier": "simple"}
@@ -1051,8 +1051,8 @@ async def test_angle_timeout_never_fails_the_gate(tmp_path):
 
     assert d.passed is True, "an angle timeout must not fail the gate"
     notes = [i for i in d.checklist if "did not run" in i.label]
-    # D2 #6 added a third angle (silent-failure lens).
-    assert len(notes) == 3 and all(i.passed for i in notes)
+    # D2 #6 added a fourth angle (silent-failure lens).
+    assert len(notes) == 4 and all(i.passed for i in notes)
 
 
 def test_angle_prompt_warns_when_the_diff_is_truncated():

@@ -207,8 +207,109 @@ def test_silent_failure_angle_is_registered_and_distinct():
     from no_human.review.reviewer import REVIEW_ANGLES
 
     names = [n for n, _ in REVIEW_ANGLES]
-    assert names == ["security", "tests", "silent-failure"]
+    assert names == ["security", "tests", "maintainability", "silent-failure"]
     focus = dict(REVIEW_ANGLES)["silent-failure"]
     assert "empty catch" in focus and "swallowed" in focus
     # Each angle must stay single-purpose or they re-review each other's work.
     assert "security" not in focus.split("Ignore")[0].lower()
+
+
+def test_maintainability_angle_is_registered_and_capped():
+    """The dark-factory critique: tests catch bugs, not architectural decay —
+    the reviewer carries an explicit maintainability-trajectory lens. It must
+    stay concrete (no taste findings) and capped below blocking severity, so
+    it can never become a nit-driven retry loop."""
+    import re
+
+    from no_human.review.reviewer import ADVISORY_SEVERITIES, REVIEW_ANGLES
+
+    focus = dict(REVIEW_ANGLES)["maintainability"]
+    assert "NEXT change" in focus
+    assert "CONCRETE" in focus
+    assert "'Could be cleaner' is not a finding" in focus
+    # The cap is named as a severity and that severity must ACTUALLY be
+    # advisory in this codebase. Asserting the string alone is how the lens
+    # first shipped capped at "medium" — which _is_blocking() treats as
+    # blocking, the exact opposite of the docstring above.
+    capped = re.findall(r"Grade (?:these|every trajectory finding) '([a-z]+)'", focus)
+    assert capped, f"the lens must name the severity it caps at: {focus!r}"
+    assert set(capped) <= ADVISORY_SEVERITIES, (
+        f"maintainability findings are capped at {capped}, which blocks the "
+        f"gate; advisory severities are {sorted(ADVISORY_SEVERITIES)}")
+    # single-purpose: it must not re-review the other angles' ground
+    head = focus.split("Ignore")[0].lower()
+    assert "security" not in head and "injection" not in head
+
+
+def test_a_maintainability_finding_does_not_block_the_gate():
+    """The behaviour the cap exists for, asserted through the fold that
+    decides it — not through the prompt string. A trajectory finding at the
+    capped severity is recorded and the gate still passes; the same finding
+    graded blocking still fails, so this is not a test that passes for the
+    wrong reason."""
+    import re
+
+    from no_human.review.reviewer import (
+        ADVISORY_SEVERITIES,
+        ChecklistItem,
+        ReviewDecision,
+        REVIEW_ANGLES,
+        merge_angle_findings,
+    )
+
+    cap = re.findall(
+        r"Grade (?:these|every trajectory finding) '([a-z]+)'",
+        dict(REVIEW_ANGLES)["maintainability"],
+    )[0]
+    assert cap in ADVISORY_SEVERITIES
+
+    def fold(severity):
+        main = ReviewDecision(passed=True, checklist=[
+            ChecklistItem("acceptance criteria met", True)])
+        angle = ReviewDecision(passed=False, checklist=[
+            ChecklistItem(
+                "wrapper with one caller at api.py:20 forks the module's shape",
+                False, severity=severity)])
+        return merge_angle_findings(main, [("maintainability", angle)])
+
+    capped = fold(cap)
+    assert capped.passed is True, (
+        "a maintainability finding at the capped severity must not fail the gate")
+    assert any(i.label.startswith("maintainability: ") for i in capped.checklist), (
+        "the finding must still be recorded for the human")
+    # negative control: the fold DOES block when the reviewer grades higher.
+    assert fold("high").passed is False
+
+
+def test_the_gate_prompts_maintainability_cap_is_also_advisory():
+    """The angle only runs on the complex tier; this STAGE 2 text runs on
+    EVERY tier, so it is the higher-impact copy of the same cap — and it was
+    the one no test guarded when the lens first shipped capped at 'medium'.
+    Asserted on the RENDERED prompt, against the same threshold constant."""
+    import re
+
+    from no_human.review.reviewer import ADVISORY_SEVERITIES
+
+    t = Task.new("x")
+    t.acceptance_criteria = ["does the thing"]
+    prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
+    flat = " ".join(prompt.split())
+    assert "MAINTAINABILITY TRAJECTORY" in flat
+    capped = re.findall(r"Grade these '([a-z]+)'", flat)
+    assert capped, f"the gate's trajectory lens must name the severity it caps at: {flat[:0]!r}"
+    assert set(capped) <= ADVISORY_SEVERITIES, (
+        f"the gate caps trajectory findings at {capped}, which blocks; "
+        f"advisory severities are {sorted(ADVISORY_SEVERITIES)}")
+
+
+def test_gate_and_standalone_prompts_carry_the_maintainability_lens():
+    """Both prompt builders ask the trajectory question — the gate's STAGE 2
+    and the standalone review's PASS 2 — so the lens exists even for tiers
+    that never run the extra angle passes."""
+    import inspect
+
+    from no_human.review import reviewer as r
+
+    src = inspect.getsource(r)
+    assert src.count("MAINTAINABILITY TRAJECTORY") >= 3  # stage 2 + pass 2 + angle
+    assert "make the NEXT change" in src

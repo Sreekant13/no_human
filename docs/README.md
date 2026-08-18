@@ -10,3 +10,6 @@
 | [eval.md](eval.md) | Golden set, replay scoring, scorecard/CI gate, shadow mode |
 | [blockers.md](blockers.md) | Part 22 taxonomy, escalation, wake watcher, `nh reply` |
 | [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | Reproduced defects that are not fixed yet, and what a fix must prove |
+| [INSTALLER.md](INSTALLER.md) | The packaged apps: how the frozen server + shell are built, verified and installed (all platforms) |
+| [WINDOWS.md](WINDOWS.md) | The Windows app: audit, divergences from macOS, real-Windows test and acceptance runs |
+| [LINUX.md](LINUX.md) | The Linux app (`.deb` + AppImage): build, divergences from macOS, install/verify, acceptance status |

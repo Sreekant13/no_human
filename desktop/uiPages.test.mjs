@@ -24,8 +24,15 @@ const HERE = fileURLToPath(new URL(".", import.meta.url));
 const ELECTRON = createRequire(import.meta.url)("electron");
 
 const probe = (() => {
+  // npm_package_version is DELETED from the probe's env: `npm test` sets it,
+  // and the preload's last-resort fallback would then report a real version
+  // without the argument — turning the negative control below into a false
+  // "the argument is decorative" red. The probe must see what a packaged app
+  // sees: no npm env at all.
+  const env = { ...process.env };
+  delete env.npm_package_version;
   const out = execFileSync(ELECTRON, [path.join(HERE, "testing", "pageProbe.cjs")],
-    { encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "ignore"] });
+    { encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "ignore"], env });
   const line = out.split("\n").find((l) => l.startsWith("PROBE_JSON:"));
   assert.ok(line, `the page probe produced no measurement:\n${out.slice(0, 400)}`);
   return JSON.parse(line.slice("PROBE_JSON:".length));
@@ -93,4 +100,21 @@ test("[hidden] actually hides the retry link", () => {
 test("both shipped pages declare a language", () => {
   assert.equal(probe.token.lang, "en");
   assert.equal(probe.errPackaged.lang, "en");
+});
+
+test("the version the preload exposes comes from main's additionalArguments, not a require the sandbox forbids", () => {
+  // Measured live on Linux (Settings > Updates read "no_human dev", 2026-08-18):
+  // Electron sandboxes preloads by default and a sandboxed preload cannot
+  // require("./package.json"), so the old read fell to "dev" in EVERY packaged
+  // app. (Display only: the update CHECK itself runs in main on
+  // app.getVersion() and was never affected.) The value now travels from main
+  // via webPreferences.additionalArguments.
+  assert.equal(probe.versionWithArg, "9.9.9-probe",
+    "the preload did not pick the version out of --nh-app-version");
+  // Negative control: without the argument the sandboxed preload cannot reach
+  // package.json and falls back — proving the argument is load-bearing, not
+  // decorative. (npm_package_version is deleted from the probe env above.)
+  assert.equal(probe.versionWithoutArg, "dev",
+    "without the argument the sandboxed preload should have had nothing better than 'dev' — "
+    + "if it now finds a real version some other way, update this test to say how");
 });

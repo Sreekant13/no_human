@@ -35,7 +35,18 @@ on:
   # `scripts/nightly_eval.sh`, which invokes `./scripts/run_tests.sh nightly`.
   # A cron here is only worth adding once windows/desktop/web carry a
   # `github.event_name != 'schedule'` guard of their own.
+  #
+  # `linux_release`: a dispatch is ALSO the nightly lane's handle (above), so
+  # the linux job's package upload — the one place this workflow lets an
+  # installable app leave the runner — keys on this explicit input, never on
+  # the bare event. Default false: a dispatch fired for the guards produces no
+  # downloadable app and (below) does not run the linux job at all.
   workflow_dispatch:
+    inputs:
+      linux_release:
+        description: "Linux: build the release packages and keep them as a 7-day run artefact"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -289,8 +300,8 @@ jobs:
       - run: npm ci --ignore-scripts
 
       # Icons are build OUTPUTS (untracked); packagedFiles.test.mjs checks the
-      # .ico bytes on every platform, so derive them first. Only the .ico half
-      # is derivable on Linux — derive-icons.mjs prints SKIP for icns, and the
+      # .ico bytes on every platform, so derive them first. The .ico and .png
+      # halves derive on Linux; derive-icons.mjs prints SKIP for icns, and the
       # test treats a non-darwin missing icns as underivable, not as the
       # stock-atom regression (first public CI run, 2026-08-17).
       - run: node ../packaging/derive-icons.mjs
@@ -404,6 +415,10 @@ jobs:
       # Nothing is uploaded. This job is a build-and-test SIGNAL, not a release
       # channel: an unsigned server bundle parked as a downloadable CI artifact
       # reads like a deliverable and is not one. Releases have their own path.
+      # (The linux job below applies the same rule with one deliberate, named
+      # exception: packages ride as a 7-day artefact ONLY on a workflow_dispatch
+      # run with the linux_release input set, which docs/LINUX.md defines as
+      # the release build.)
       - name: Build the Windows bundle (UNSIGNED)
         run: |
           pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build-installer.ps1
@@ -472,3 +487,237 @@ jobs:
           ) + $skip
           uv @argv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Linux is the third member of ONE product (docs/LINUX.md). Same gating as
+  # `windows`: every push to main, opt-in `linux` label on PRs, and on demand
+  # via workflow_dispatch WITH linux_release=true (which is how a RELEASE build
+  # is produced — the artefact of that run is what the operator attaches to the
+  # GitHub release by hand; nothing here publishes anywhere).
+  #
+  # ubuntu-22.04 on purpose, not -latest: the frozen server links the runner's
+  # glibc, so the build host IS the compatibility floor (2.35 -> Ubuntu 22.04+,
+  # Debian 12+, Fedora 36+). Bumping this bumps the floor for every user, so it
+  # is a decision, not a drift.
+  #
+  # WHAT THIS JOB SEES that the Windows job cannot: it INSTALLS the .deb and
+  # LAUNCHES the installed app under Xvfb with a throwaway HOME, drives the
+  # first-run credential screen with a dummy token, proves the board and the
+  # bundled server answer, quits, and proves nothing is left running
+  # (packaging/linux-acceptance.mjs — docs/WINDOWS.md §5.4 made automatic).
+  # Screenshots ride in the run artefact so a human can look at what it saw.
+  #
+  # WHAT IT CANNOT SEE, so nobody reads more into a green tick than is there:
+  #   * a real desktop session — the GNOME/KDE launcher, the PATH a .desktop
+  #     launch inherits, the tray on a real panel;
+  #   * the AppImage's FUSE and AppArmor (Ubuntu 24.04 unprivileged-userns)
+  #     frictions — the runner runs it extracted, which sidesteps both;
+  #   * a real task reaching a PR (that needs a real Claude credential, which a
+  #     runner must never hold) — that is Lane B in docs/LINUX.md §7;
+  #   * anything but x86_64 glibc 2.35+.
+  linux:
+    name: Linux bundle (deb + AppImage) + installed-app run
+    # Same gate as windows, plus: a workflow_dispatch runs this job ONLY when
+    # linux_release is set — a dispatch fired for the nightly guards must not
+    # bill 15-25 minutes here nor produce packages (see the on: block).
+    if: >-
+      github.event_name == 'push'
+      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'linux'))
+      || (github.event_name == 'workflow_dispatch' && inputs.linux_release)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      # fetch-depth: 0 for the same reason as the windows job: the stale-
+      # checkout guard in build-installer.sh needs origin/main to exist, or it
+      # silently cannot fire.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Creates .venv/bin/pyinstaller, which build-installer.sh requires by that
+      # exact path. pyinstaller is in the `dev` dependency-group.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Install the board's dependencies
+        working-directory: web
+        run: npm ci
+
+      # A FULL install here (not --ignore-scripts): electron-builder needs the
+      # Electron binary to package, and the AppImage/deb tooling it downloads.
+      # The acceptance driver launches the INSTALLED app, not this copy.
+      - name: Install the desktop shell's dependencies
+        working-directory: desktop
+        run: npm ci
+
+      # The bundle gates run inside the script: 0 .py files, no ci_gate in the
+      # PYZ table, no private term inventory, no build-machine path, a stamped
+      # BUILD_STAMP. A failure here is a finding, never a step to soften.
+      - name: Freeze the server (packaging/build-installer.sh, gates armed)
+        run: bash packaging/build-installer.sh
+
+      # derive-icons.mjs runs inside the script (icon.ico + icon.png; icns is
+      # SKIPped off macOS, and the linux block never asks for it).
+      - name: Package the .deb and the AppImage (x64)
+        working-directory: desktop
+        run: npm run dist:linux
+
+      - name: What was built
+        run: ls -la desktop/dist/ && cat desktop/dist/linux-unpacked/resources/nh-server/BUILD_STAMP
+
+      # The stamp inside the artefact must name THIS commit and the board digest
+      # must match — the stale-DMG class (2026-08-05: a clean build of the wrong
+      # tree). This checkout IS the tree that built it, so the comparison is a
+      # tautology for provenance and verify_artefact.py says so: with
+      # --repo-built-this-artefact it exits 3 ("every check that ran passed,
+      # and at least one was weakened") — the same honest verdict make-dmg.sh
+      # accepts for every unsigned build. 3 is accepted HERE ONLY; any other
+      # non-zero (stamp missing, digest mismatch, dirty tree) fails the job.
+      - name: Verify the artefact against the source that built it
+        run: |
+          set +e
+          uv run python scripts/verify_artefact.py desktop/dist/linux-unpacked/resources/nh-server \
+            --repo . --repo-built-this-artefact
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then echo "verify_artefact: rc=3 — provenance tautological (built here), every check that ran passed"; exit 0; fi
+          exit "$rc"
+
+      # The runner image ships stale apt lists; the deb's Depends (libgtk-3-0,
+      # libnotify4, libnss3, …) are fetched from apt, and xvfb-run must exist
+      # for the installed-app run. Fetching them here fails loudly, before a
+      # 404 mid-install reads as "the package is broken".
+      - name: apt lists + Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Install the .deb the way a user would
+        run: sudo apt-get install -y ./desktop/dist/no_human-*-linux-amd64.deb
+
+      # Outside the repo, with no toolchain: the frozen binary runs on its own.
+      - name: The installed frozen server runs outside the repo
+        run: cd / && /opt/no_human/resources/nh-server/nh --version
+
+      # The product does not bundle the Claude Code CLI on any platform, and
+      # `nh start` REFUSES to serve without it (_assert_backend_usable: "the
+      # board would load but every task would fail at launch") — so a user's
+      # first step, and the runner's, is to install it. The REAL CLI, the way
+      # docs/LINUX.md §5 says (npm -g lands on the runner's PATH), not a stub:
+      # a stub would prove the refusal is bypassable, not that the documented
+      # install path works. No token is ever validated in this job — the dummy
+      # credential only satisfies the presence check; no task is started.
+      - name: Install the Claude Code CLI the way a user would
+        run: npm install -g @anthropic-ai/claude-code && command -v claude && claude --version
+
+      # ONE throwaway HOME for the install/acceptance/uninstall steps below:
+      # each `run:` is its own shell, so it rides in $GITHUB_ENV. The uninstall
+      # step asserts on THIS home — the one the app actually wrote to — not a
+      # fresh directory the package never touched.
+      - name: Throwaway HOME for the installed-app run
+        run: echo "NH_ACCEPT_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
+
+      # Sandboxed, like a user's launch: the .deb's .desktop Exec is the bare
+      # binary, and the driver passes chromiumSandbox: true so Playwright does
+      # not inject --no-sandbox — a broken chrome-sandbox / userns setup fails
+      # HERE, not only on a user's machine.
+      - name: Installed app — first run -> board -> quit (throwaway HOME, Xvfb)
+        run: |
+          O="$RUNNER_TEMP/linux-acceptance"
+          xvfb-run -a --server-args="-screen 0 1440x900x24" \
+            node packaging/linux-acceptance.mjs --exe /opt/no_human/no_human \
+              --home "$NH_ACCEPT_HOME" --out "$O" --mode setup
+
+      # The AppImage carries the same payload; run it EXTRACTED because the
+      # runner has no FUSE. That sidesteps the two real-desktop frictions
+      # (libfuse2, AppArmor userns) on purpose — they are Lane B's to observe.
+      - name: AppImage — the same run, extracted
+        run: |
+          H="$(mktemp -d)"; O="$RUNNER_TEMP/linux-acceptance-appimage"
+          A="$(ls "$PWD"/desktop/dist/no_human-*-linux-x86_64.AppImage)"; chmod +x "$A"
+          X="$RUNNER_TEMP/appimage"; mkdir -p "$X"; (cd "$X" && "$A" --appimage-extract >/dev/null)
+          # AppRun is the launcher a user's double-click reaches. The driver
+          # launches with chromiumSandbox: true (Playwright would otherwise
+          # inject --no-sandbox on Linux and short-circuit everything below), so
+          # AppRun's own `unshare -Ur true` probe actually runs (appImageUtil.js);
+          # on this 22.04 runner unprivileged userns WORKS, so the probe passes
+          # and the app runs SANDBOXED — the --no-sandbox path is never taken
+          # here. The generated .desktop Exec (`AppRun --no-sandbox %U`,
+          # AppImageTarget.js) is a different path a runner without a desktop
+          # cannot take — Lane B on a real 24.04 desktop is where both are
+          # observed (docs/LINUX.md §7 row 11).
+          xvfb-run -a --server-args="-screen 0 1440x900x24" \
+            node packaging/linux-acceptance.mjs --exe "$X/squashfs-root/AppRun" \
+              --home "$H" --out "$O" --mode setup
+
+      # Uninstall must not delete the operator's config and task history —
+      # the same row as docs/WINDOWS.md §5.4.
+      - name: Uninstall keeps the user's data
+        run: |
+          test -f "$NH_ACCEPT_HOME/.no_human/.env"      # written by the acceptance run above
+          test -f "$NH_ACCEPT_HOME/.no_human/no_human.db"
+          sudo apt-get remove -y no-human-desktop
+          test ! -e /opt/no_human/no_human
+          test -f "$NH_ACCEPT_HOME/.no_human/.env"
+          test -f "$NH_ACCEPT_HOME/.no_human/no_human.db"
+
+      - name: Checksums
+        working-directory: desktop/dist
+        run: sha256sum no_human-*-linux-amd64.deb no_human-*-linux-x86_64.AppImage | tee SHA256SUMS-linux.txt
+
+      # EVIDENCE always; the APP only on a release build. Two uploads, split on
+      # purpose: this workflow ships to the PUBLIC repo, where a run artefact is
+      # downloadable by any signed-in GitHub user for its retention window — so
+      # a .deb built from a random main push would be an unsigned, never-walked
+      # Linux app on offer, exactly what the windows job's comment above refuses
+      # ("an unsigned server bundle parked as a downloadable CI artifact reads
+      # like a deliverable and is not one") and what docs/LINUX.md's status
+      # block promises will not happen before §6/§7 are filled. Screenshots,
+      # sums and the stamp are what a human needs to READ the run; the packages
+      # ride only when a human asked for a release build via workflow_dispatch
+      # WITH linux_release=true — docs/LINUX.md §4 defines that run as the
+      # release build (a bare dispatch is the nightly guards' handle) — and even then
+      # for 7 days, to be attached to the GitHub release by hand after the sums
+      # are re-verified. latest-linux.yml is never attached to a release: no
+      # Linux update path ships (nhCanAutoUpdate is false on every platform).
+      - name: Gather the evidence under one root
+        if: always()
+        run: |
+          E="$RUNNER_TEMP/linux-evidence"; mkdir -p "$E"
+          cp desktop/dist/SHA256SUMS-linux.txt "$E/" 2>/dev/null || true
+          cp desktop/dist/linux-unpacked/resources/nh-server/BUILD_STAMP "$E/" 2>/dev/null || true
+          [ -d "$RUNNER_TEMP/linux-acceptance" ] && cp -R "$RUNNER_TEMP/linux-acceptance" "$E/deb" || true
+          [ -d "$RUNNER_TEMP/linux-acceptance-appimage" ] && cp -R "$RUNNER_TEMP/linux-acceptance-appimage" "$E/appimage" || true
+          ls -laR "$E"
+      - name: Upload the evidence (every run)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-x86_64-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/linux-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload the packages (release build only — workflow_dispatch with linux_release)
+        if: github.event_name == 'workflow_dispatch' && inputs.linux_release
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-${{ github.sha }}
+          path: |
+            desktop/dist/no_human-*-linux-amd64.deb
+            desktop/dist/no_human-*-linux-x86_64.AppImage
+            desktop/dist/latest-linux.yml
+            desktop/dist/SHA256SUMS-linux.txt
+            desktop/dist/linux-unpacked/resources/nh-server/BUILD_STAMP
+          if-no-files-found: error
+          retention-days: 7

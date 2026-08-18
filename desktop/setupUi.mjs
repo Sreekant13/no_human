@@ -34,7 +34,7 @@ export function labels(canReturn, mode = "subscription") {
     primary: "Save and start",
     secondary: "Quit",
     hint: mode === "api_key"
-      ? "The key is stored only on this Mac, in ~/.no_human/.env, and " +
+      ? "The key is stored only on this computer, in ~/.no_human/.env, and " +
         "bills your Anthropic account directly."
       : "Use the token from `claude setup-token`. Have your own Anthropic " +
         "API key instead? Switch the credential type above.",

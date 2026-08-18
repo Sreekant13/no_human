@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,34 @@ def _sanitize_commit_message(msg: str) -> str:
 
 class GitError(RuntimeError):
     pass
+
+
+#: Stderr signatures of git LOCK CONTENTION — another process (the coder's own
+#: git subprocess, an IDE, a parallel bench worker on the same volume) briefly
+#: holds a lock this invocation needs. Transient by definition, so the ONLY
+#: class of git failure that is retried; anything else (conflict, bad ref,
+#: protected branch) raises on the first attempt exactly as before. Two specs
+#: of main-6cec2140 (2026-08-07) crashed on this class: a `git add` and a
+#: `git checkout -B <agent-branch> bench-base` that both failed on locks and
+#: were booked as spec crashes.
+_TRANSIENT_GIT_STDERR = (
+    "index.lock",
+    "could not lock",
+    "cannot lock ref",
+    "unable to create",
+    "resource temporarily unavailable",
+)
+
+#: Backoffs before each retry (also the retry COUNT). Module-level so tests
+#: zero them. Short: a held git lock clears in milliseconds; this only has to
+#: outlive a peer process's single index write.
+_GIT_RETRY_BACKOFFS_S: tuple[float, ...] = (0.5, 2.0)
+
+
+def is_transient_git_failure(stderr: str) -> bool:
+    """True iff *stderr* carries a lock-contention signature (see above)."""
+    low = (stderr or "").lower()
+    return any(sig in low for sig in _TRANSIENT_GIT_STDERR)
 
 
 class ProtectedBranch(GitError):
@@ -79,9 +108,22 @@ class GitRepo:
             "-c", f"user.email={self.identity_email}",
             *args,
         ]
+        # Lock-contention retry, INLINE in both runners rather than a shared
+        # helper taking `cmd`: the egress-allowlist scanner resolves the git
+        # subcommand from the literal ["git", ...] construction at the
+        # subprocess.run site, and a helper parameter turns every call into
+        # an unclassifiable `exec:git <dynamic>` (test_egress_allowlist).
         proc = subprocess.run(
             cmd, cwd=self.path, capture_output=True, text=True
         )
+        if check:
+            for backoff in _GIT_RETRY_BACKOFFS_S:
+                if proc.returncode == 0 or not is_transient_git_failure(proc.stderr):
+                    break
+                time.sleep(backoff)
+                proc = subprocess.run(
+                    cmd, cwd=self.path, capture_output=True, text=True
+                )
         if check and proc.returncode != 0:
             raise GitError(
                 f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
@@ -108,6 +150,15 @@ class GitRepo:
         proc = subprocess.run(
             cmd, cwd=self.path, capture_output=True, text=True
         )
+        if check:
+            # Same inline lock-contention retry as `_run` (see the note there).
+            for backoff in _GIT_RETRY_BACKOFFS_S:
+                if proc.returncode == 0 or not is_transient_git_failure(proc.stderr):
+                    break
+                time.sleep(backoff)
+                proc = subprocess.run(
+                    cmd, cwd=self.path, capture_output=True, text=True
+                )
         if check and proc.returncode != 0:
             raise GitError(
                 f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"

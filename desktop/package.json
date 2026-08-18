@@ -4,6 +4,8 @@
   "private": true,
   "license": "MIT",
   "description": "Desktop shell for the no_human board \u2014 attaches to (or launches) the local nh server and wraps it in a native window.",
+  "homepage": "https://getnohuman.com",
+  "desktopName": "no_human.desktop",
   "type": "module",
   "main": "main.mjs",
   "scripts": {
@@ -13,7 +15,9 @@
     "dist:dir": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac dir --publish never",
     "dist:bundled": "bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac --publish never && bash ../packaging/make-dmg.sh",
     "dist:win": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
-    "dist:win:bundled": "powershell -NoProfile -ExecutionPolicy Bypass -File ../packaging/build-installer.ps1 && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never"
+    "dist:win:bundled": "powershell -NoProfile -ExecutionPolicy Bypass -File ../packaging/build-installer.ps1 && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
+    "dist:linux": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never",
+    "dist:linux:bundled": "bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never"
   },
   "devDependencies": {
     "electron": "38.2.1",

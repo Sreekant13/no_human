@@ -1013,6 +1013,15 @@ def _build_review_prompt(
         "  ARCHITECTURE — is this the right approach or a workaround? Does it\n"
         "  follow the existing patterns/conventions shown in the profile? Any\n"
         "  layering, coupling, or abstraction problems?\n"
+        "  MAINTAINABILITY TRAJECTORY — tests catch bugs, not decay: does this\n"
+        "  change make the NEXT change to this area harder? Is each new\n"
+        "  abstraction necessary (a second authority for something the repo\n"
+        "  already decides once, a wrapper with one caller, a pattern fork from\n"
+        "  the file's existing shape)? Flag only CONCRETE degradations with the\n"
+        "  file:line where the next author gets misled — 'could be cleaner' is\n"
+        "  not a finding. Grade these 'low' — advisory, recorded for the human,\n"
+        "  not blocking — unless the degradation breaks a stated criterion,\n"
+        "  which is graded on its own merits.\n"
         "  EDGE CASES — error handling, empty/null/boundary inputs, security\n"
         "  (injection, auth, secrets), concurrency, performance.\n"
         "  EXTERNAL INTEGRATIONS — for any call to an external system (CI/build\n"
@@ -1222,7 +1231,12 @@ def _build_code_review_prompt(
         "  return what it claims? Are the tests real (not asserting trivia)?\n"
         "PASS 2: ARCHITECTURE — is this the right approach or a workaround? Does\n"
         "  it follow the existing patterns/conventions shown in the profile? Any\n"
-        "  layering, coupling, or abstraction problems?\n"
+        "  layering, coupling, or abstraction problems? Also judge the\n"
+        "  MAINTAINABILITY TRAJECTORY: does this change make the NEXT change\n"
+        "  harder — an unnecessary abstraction, a second authority for a decided\n"
+        "  thing, a pattern fork from the file's existing shape? Concrete\n"
+        "  degradations only, cited file:line; 'could be cleaner' is not a\n"
+        "  finding.\n"
         "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
         "  security (injection, auth, secrets), concurrency, performance. For any\n"
         "  call to an external system (CI/build API, VCS/PR API, webhooks), verify\n"
@@ -1337,6 +1351,23 @@ REVIEW_ANGLES: tuple[tuple[str, str], ...] = (
      "and general correctness."),
     # D2 #6 (cc10x failure-hunter): the bug class reviewers most often miss —
     # code that cannot fail loudly. Report-only, cite lines.
+    # The dark-factory critique (field notes 2026-08-18): each change passes
+    # its tests while the system degrades — tests catch bugs, not
+    # architectural decay. Report-only lens for the decay itself: capped at
+    # 'low', which IS below the blocking threshold (ADVISORY_SEVERITIES =
+    # low/nit — 'medium' blocks), so it can never become a nit-driven retry
+    # loop. The cap and the threshold are pinned together in
+    # tests/test_gate_severity.py so they cannot drift apart again.
+    ("maintainability", "MAINTAINABILITY TRAJECTORY ONLY: does this change "
+     "make the NEXT change to this area harder? Unnecessary abstractions (a "
+     "wrapper with one caller, a second authority for something the repo "
+     "already decides once), pattern forks from the file's existing shape, "
+     "coupling that a future edit must now know about. Flag only CONCRETE "
+     "degradations, cite the file:line where the next author gets misled, and "
+     "say what the harder future change is. 'Could be cleaner' is not a "
+     "finding. Grade every trajectory finding 'low' — advisory, never blocking "
+     "— unless a stated acceptance criterion breaks. Ignore style, scope, "
+     "security, and general correctness."),
     ("silent-failure", "SILENT FAILURES ONLY: empty catch blocks, exceptions "
      "swallowed or logged-and-continued where the caller needs the failure, "
      "discarded return values that carry errors, bare except/except Exception "

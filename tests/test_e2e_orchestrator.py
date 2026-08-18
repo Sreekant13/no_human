@@ -3358,6 +3358,34 @@ class DoomLoopThenFailBackend:
         )
 
 
+async def test_a_failed_attempt_writes_the_fix_pair_ledger(bare_repo, tmp_path, store):
+    """The CALL SITE, not the method. Deleting the one line that invokes
+    `_record_and_lookup_fix_pair` from the failure path left every fix-pair
+    test green — the method was covered, its invocation was not, and a feature
+    nothing calls is a feature that does not exist.
+
+    So: run a task that actually fails, and require the ledger to carry a row
+    for it afterwards."""
+    from no_human.core.bounds import error_signature  # noqa: F401 (documents the key)
+
+    cfg = _config(tmp_path)
+    backend = DoomLoopThenFailBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=lambda e: None)
+    t = Task.new("fail so the ledger is written", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    rows = await store._fetchall(
+        "SELECT sig, task_id, error_excerpt, resolution FROM fix_pairs "
+        "WHERE task_id = ?", (t.id,))
+    assert rows, "a failed attempt recorded no friction — the seam is not wired"
+    # open friction, not a fix pair: this task never succeeded
+    assert all(r["resolution"] is None for r in rows)
+    assert all(r["error_excerpt"] for r in rows)
+
+
 async def test_doom_loop_reason_persists_into_attempt_log(bare_repo, tmp_path, store):
     """A doom-loop mid-attempt must change what the NEXT attempt is told —
     otherwise the 'stuck: resetting context' claim is just telemetry (the

@@ -483,6 +483,12 @@ with no error — which once shipped an app that could not launch at all.
 The build is **unsigned**, so Gatekeeper refuses a double-click. Right-click the
 app and choose **Open**, then confirm once. After that it launches normally.
 
+On **Windows** the installer is `no_human-<version>-UNSIGNED.exe` (SmartScreen:
+More info → Run anyway; see `WINDOWS.md`). On **Linux** install the `.deb`
+(`sudo apt install ./no_human-<version>-linux-amd64.deb`) or run the AppImage;
+see `LINUX.md` for the frictions Ubuntu 22.04+/24.04 add to the AppImage path.
+The Claude Code CLI has to be installed on that machine on every platform.
+
 **Claude Code must be installed on that Mac.** no_human runs coding tasks by
 launching the `claude` CLI through the Agent SDK; the CLI is *not* bundled (it is
 244 MB, and a friend needs it anyway for the `claude setup-token` step below).
@@ -533,6 +539,15 @@ The install directory is `no-human-desktop` (from the package `name`) while the
 app and the "Add or remove programs" entry read `no_human` — that is
 electron-builder's convention, not a mis-install. The NSIS installer is
 per-user, so it needs no administrator prompt.
+
+On **Linux** the `.deb` installs the app under `/opt/no_human`, so the same
+command reads (an extracted AppImage puts it under `squashfs-root/`):
+
+```bash
+/opt/no_human/resources/nh-server/nh doctor
+```
+
+The Linux build, its two formats and their known frictions are in `LINUX.md`.
 
 Verified output on Windows 11, from the installed artifact — same semantics,
 same exit code as macOS:

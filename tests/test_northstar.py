@@ -577,6 +577,110 @@ async def test_intent_judge_also_retries_on_transient(monkeypatch):
     assert be.calls == 2 and v.match is True
 
 
+# --- verdict-extraction robustness (main-6cec2140 lost 6/50 specs to
+# --- "no JUDGE_JSON block found" on DELIVERED tasks; each shape below is a
+# --- loss mode the extractor now rescues, or a fail-closed pin it must keep) --
+
+
+def test_parse_rescues_truncated_end_marker_with_complete_json():
+    """Quota-stress truncation can eat the END marker AFTER the JSON object is
+    complete — the verdict was fully stated, so it scores."""
+    from no_human.eval.judge import parse_goal_verdict
+    v = parse_goal_verdict(
+        'JUDGE_JSON_START\n{"satisfied": true, "evidence": "checked a.py:1"}')
+    assert v.satisfied is True and "a.py:1" in v.evidence
+
+
+def test_parse_rescues_bare_json_without_markers():
+    """Marker drift: the judge answers with a plain JSON object (often fenced)
+    and no markers at all — a complete boolean verdict still scores."""
+    from no_human.eval.judge import parse_goal_verdict
+    v = parse_goal_verdict(
+        'Verdict follows.\n```json\n{"satisfied": false, "evidence": '
+        '"handler.py:9 drops the retry"}\n```')
+    assert v.satisfied is False and "handler.py:9" in v.evidence
+    # and the same shape parses for the intent judge's key
+    from no_human.eval.judge import parse_verdict
+    m = parse_verdict('{"match": true, "evidence": "same hunks"}')
+    assert m.match is True
+
+
+def test_parse_last_block_wins():
+    """A judge that revises itself emits two blocks — the LAST one is the final
+    answer."""
+    from no_human.eval.judge import parse_goal_verdict
+    v = parse_goal_verdict(
+        'JUDGE_JSON_START\n{"satisfied": true, "evidence": "draft"}\n'
+        'JUDGE_JSON_END\nwait — re-checking the criteria…\n'
+        'JUDGE_JSON_START\n{"satisfied": false, "evidence": "misses crit 2"}\n'
+        'JUDGE_JSON_END')
+    assert v.satisfied is False and "crit 2" in v.evidence
+
+
+def test_parse_requires_a_boolean_verdict():
+    """A complete block whose verdict is not a bool ("yes", 1, null) is the
+    judge answering in the wrong shape — malformed, fail closed, NOT coerced
+    to True and NOT retried as a transient."""
+    from no_human.eval.judge import parse_goal_verdict
+    v = parse_goal_verdict(
+        'JUDGE_JSON_START\n{"satisfied": "yes", "evidence": "e"}\nJUDGE_JSON_END')
+    assert v.satisfied is False and v.evidence == "malformed JUDGE_JSON"
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_retry_names_the_failure(monkeypatch):
+    """The single retry must not re-issue the identical prompt — the identical
+    re-issue reproduced the identical block-less shape 6 times on
+    main-6cec2140. Attempt 2 carries the emit-ONLY-the-block re-ask."""
+    from no_human.eval import judge as judge_mod
+    _no_backoff(monkeypatch)
+
+    prompts = []
+
+    class _PromptCapture(_JudgeBackend):
+        async def run(self, prompt, **kw):
+            prompts.append(prompt)
+            kw.pop("on_event", None)    # base fake predates the collector
+            return await super().run(prompt, **kw)
+
+    be = _PromptCapture(["", _GOOD_JUDGE])
+    v = await judge_mod.GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert v.satisfied is True and len(prompts) == 2
+    assert judge_mod._REASK_SUFFIX not in prompts[0]
+    assert prompts[1].endswith(judge_mod._REASK_SUFFIX)
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_recovers_block_emitted_midrun(monkeypatch):
+    """`final_text` is only the LAST result event's text; a judge that emits
+    the block mid-run and closes with a remark must not fail-close — the
+    text-event collector recovers it, with no second (paid) attempt."""
+    from types import SimpleNamespace
+    from no_human.eval.judge import GoalJudge
+    from no_human.agent.claude_backend import AgentResult
+    _no_backoff(monkeypatch)
+
+    class _StreamingBackend:
+        calls = 0
+
+        async def run(self, prompt, *, cwd=None, max_turns=10, effort="high",
+                      on_event=None):
+            self.calls += 1
+            if on_event is not None:
+                on_event(SimpleNamespace(kind="text", text=_GOOD_JUDGE))
+                on_event(SimpleNamespace(kind="text", text="Verdict emitted."))
+            return AgentResult(final_text="Verdict emitted.", num_turns=2,
+                               is_error=False, tokens_used=1, session_id="s",
+                               stop_reason="end_turn")
+
+    be = _StreamingBackend()
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert v.satisfied is True
+    assert be.calls == 1
+
+
 @pytest.mark.asyncio
 async def test_score_diffs_against_pr_branch_not_head(tmp_path):
     """The orchestrator can leave the work-dir HEAD at base while the coder's

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Derive desktop/build/icon.icns and desktop/build/icon.ico from the single
-// shipped brand master, at package time — never committed.
+// Derive desktop/build/icon.icns, desktop/build/icon.ico and desktop/build/
+// icon.png (macOS, Windows, Linux) from the single shipped brand master, at
+// package time — never committed.
 //
 // WHY THIS EXISTS. The two icon binaries used to be committed. The mark they
 // were cut from (dropped 2026-08-15) compresses to a byte stream whose
@@ -112,6 +113,26 @@ function deriveIco(masterBuf, outDir) {
   console.log(`OK: wrote ${icoPath}`);
 }
 
+// The Linux icon. electron-builder takes ONE PNG >= 512x512 for `linux.icon`
+// and renders the hicolor size set itself, so the master (already 512x512
+// RGBA) is copied byte-for-byte — never re-encoded, because every re-encode
+// of this mark rolls fresh 3-byte coincidences against the identity scanner
+// (the class that made icon.icns/icon.ico derived-not-committed in the first
+// place). Same freshness contract as the ico: absent, older than the master,
+// or not the master's bytes => refuse.
+function deriveLinuxPng(masterBuf, outDir) {
+  const pngPath = path.join(outDir, "icon.png");
+  try {
+    fs.writeFileSync(pngPath, masterBuf);
+  } catch (e) {
+    fail(`could not write ${pngPath}: ${e.message}`);
+  }
+  if (!fs.readFileSync(pngPath).equals(masterBuf)) {
+    fail(`icon.png written to ${pngPath} does not match the master bytes`);
+  }
+  console.log(`OK: wrote ${pngPath}`);
+}
+
 function runTool(cmd, cmdArgs) {
   const r = spawnSync(cmd, cmdArgs, { stdio: ["ignore", "pipe", "pipe"] });
   if (r.error) {
@@ -147,6 +168,7 @@ function derive({ outDir, requireIcns }) {
   fs.mkdirSync(outDir, { recursive: true });
 
   deriveIco(masterBuf, outDir);
+  deriveLinuxPng(masterBuf, outDir);
 
   if (process.platform !== "darwin") {
     if (requireIcns) {
@@ -196,9 +218,20 @@ function verify({ outDir, requireIcns }) {
     fail(`--verify: ${icoPath} failed validation: ${e.message}`);
   }
 
+  const pngPath = path.join(outDir, "icon.png");
+  if (!fs.existsSync(pngPath)) {
+    fail(`--verify: no derived icon.png at ${pngPath} — run derive-icons.mjs first`);
+  }
+  if (fs.statSync(pngPath).mtimeMs < masterMtime) {
+    fail(`--verify: ${pngPath} is older than the master (${masterPath}) — stale, re-run derive-icons.mjs`);
+  }
+  if (!fs.readFileSync(pngPath).equals(fs.readFileSync(masterPath))) {
+    fail(`--verify: ${pngPath} is not the master's bytes — re-run derive-icons.mjs`);
+  }
+
   const wantIcns = process.platform === "darwin" || requireIcns;
   if (!wantIcns) {
-    console.log("OK: derived icons verified (ico only — icns needs macOS)");
+    console.log("OK: derived icons verified (ico + png — icns needs macOS)");
     return;
   }
 

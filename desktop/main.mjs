@@ -85,11 +85,14 @@ export const TRAY_ICON_WIN_B64 =
 // trayIcon.test.mjs, but nothing exercised the ROUTING, so deleting the win32
 // branch below put the mask back on Windows with all 281 tests green.
 export function trayIcon() {
-  // Windows: hand it the real-colour glyph and do NOT call setTemplateImage —
-  // it is a no-op off macOS, so the mask would render as its own black RGB.
-  // Linux is left on the mask deliberately: it has the same theoretical issue,
-  // but it is not this branch's platform and the change is unverified there.
-  if (process.platform === "win32") {
+  // Windows AND Linux: hand them the real-colour glyph and do NOT call
+  // setTemplateImage — it is a no-op off macOS, so the mask would render as
+  // its own black RGB. Only darwin wants the template (the menu bar recolours
+  // it for light/dark/highlight). Linux was left on the mask until 2026-08-18
+  // ("unverified there"); it is now routed by !== "darwin" so it cannot inherit
+  // the wrong bitmap by omission, and docs/LINUX.md records what the tray
+  // actually looked like on GNOME/KDE once walked.
+  if (process.platform !== "darwin") {
     return nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_WIN_B64, "base64"));
   }
   const img = nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_B64, "base64"));
@@ -807,6 +810,12 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       preload: path.join(__dirname, "preload.cjs"),
+      // The preload is sandboxed and cannot require("./package.json"), so the
+      // real app version is handed to it here — the documented channel for
+      // sandboxed preloads. Without this the board DISPLAYED "dev" in every
+      // packaged app (measured on Linux 2026-08-18); the update check itself
+      // runs here in main on app.getVersion() and was never affected.
+      additionalArguments: [`--nh-app-version=${app.getVersion()}`],
       // The board polls for fresh arrivals; a hidden window must keep ticking.
       backgroundThrottling: false,
     },

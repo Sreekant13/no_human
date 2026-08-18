@@ -336,6 +336,15 @@ test("the version handed to the board is the real one, not npm_package_version",
   const versionLine = preload.match(/version:\s*(.+),/)?.[1] ?? "";
   assert.doesNotMatch(versionLine, /npm_package_version/,
     "the exposed version must not come straight from npm_package_version");
+  // The require above is DEAD in a sandboxed preload (Electron's default) — a
+  // real renderer measured "dev" in every packaged app. main.mjs must hand the
+  // version over through additionalArguments and the preload must read it.
+  // The renderer-level proof lives in uiPages.test.mjs; this pins the wiring.
+  const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  assert.match(main, /additionalArguments:\s*\[`--nh-app-version=\$\{app\.getVersion\(\)\}`\]/,
+    "main.mjs must pass --nh-app-version=<app.getVersion()> to the board window's preload");
+  assert.match(preload, /--nh-app-version=/,
+    "preload.cjs must read --nh-app-version from process.argv");
 });
 
 test("no script publishes anything", () => {
@@ -543,37 +552,39 @@ test("main.mjs wires the Help handler and names the CANONICAL docs URL", () => {
 
 // ---------------------- mac / win parity (anti-drift) --------------------- //
 //
-// The Mac and Windows apps are ONE product. The realistic way they stop being
+// The Mac, Windows and Linux apps are ONE product. The realistic way they stop being
 // one is not a deliberate decision — it is someone fixing a Windows problem by
 // adding a `win.extraResources` or a Windows-only version, which works, ships,
-// and silently gives the two platforms different payloads or different version
+// and silently gives the platforms different payloads or different version
 // numbers. These tests exist so that edit fails CI instead.
 
-test("parity: extraResources is shared by both platforms, never per-platform", () => {
-  // ONE mapping at the top level, inherited by mac and win alike. A
+test("parity: extraResources is shared by every platform, never per-platform", () => {
+  // ONE mapping at the top level, inherited by mac, win and linux alike. A
   // platform-scoped extraResources REPLACES the top-level list for that
-  // platform, so the moment either block grows one, the two builds can ship
+  // platform, so the moment any block grows one, the builds can ship
   // different payloads — the frozen server, the docs, or a licence notice could
   // be present on one platform and absent on the other with no build error.
   assert.ok(Array.isArray(builderConfig.extraResources),
     "extraResources must be declared once, at the top level");
-  for (const p of ["mac", "win"]) {
+  for (const p of ["mac", "win", "linux"]) {
     assert.equal(builderConfig[p]?.extraResources, undefined,
       `${p}.extraResources exists — it would OVERRIDE the shared list and let `
-      + `${p} ship a different payload than the other platform`);
+      + `${p} ship a different payload than the other platforms`);
     assert.equal(builderConfig[p]?.files, undefined,
       `${p}.files exists — the asar allowlist must stay shared`);
   }
-  // Both platforms are actually built, or "parity" is vacuous.
+  // Every platform is actually built, or "parity" is vacuous.
   assert.ok(Array.isArray(builderConfig.mac?.target) && builderConfig.mac.target.length);
   assert.ok(Array.isArray(builderConfig.win?.target) && builderConfig.win.target.length);
+  assert.ok(Array.isArray(builderConfig.linux?.target) && builderConfig.linux.target.length,
+    "linux.target is missing or empty — the third platform is not built, so parity is vacuous");
   // The payload both of them mount.
   const server = builderConfig.extraResources.find((e) => (e.to ?? e) === "nh-server");
   assert.ok(server, "the shared extraResources no longer carries the frozen server");
   assert.match(server.from ?? "", /packaging\/dist\/nh-server$/);
 });
 
-test("parity: the updater feed is emitted for both platforms", () => {
+test("parity: the updater feed is emitted for all three platforms", () => {
   // The mac header explains why `zip` is in mac.target: Squirrel.Mac updates
   // from a zip and electron-builder only writes latest-mac.yml when a zip
   // target exists. The Windows equivalent is nsis -> latest.yml. Losing either
@@ -583,6 +594,9 @@ test("parity: the updater feed is emitted for both platforms", () => {
     + "updater fails with ERR_UPDATER_ZIP_FILE_NOT_FOUND");
   assert.ok(builderConfig.win.target.includes("nsis"),
     "win lost its nsis target — latest.yml stops being emitted");
+  const linuxTargets = (builderConfig.linux?.target ?? []).map((x) => (typeof x === "string" ? x : x.target));
+  assert.ok(linuxTargets.includes("AppImage"),
+    "linux lost its AppImage target — latest-linux.yml stops being emitted");
   assert.ok(builderConfig.publish, "no publish block: neither feed is generated");
 });
 
@@ -591,15 +605,15 @@ test("parity: one version source, with no platform-specific override", () => {
   // desktop/package.json, so the failure mode is not a mismatch today but a
   // Windows-only override added later.
   assert.match(pkg.version, /^\d+\.\d+\.\d+/, "package.json has no usable version");
-  for (const p of ["mac", "win"]) {
+  for (const p of ["mac", "win", "linux"]) {
     for (const key of ["version", "buildVersion"]) {
       assert.equal(builderConfig[p]?.[key], undefined,
         `${p}.${key} is set — that is a platform-specific version source and `
-        + "the two installers would report different versions");
+        + "the installers would report different versions");
     }
   }
   assert.equal(builderConfig.extraMetadata?.version, undefined,
-    "extraMetadata.version overrides the packaged version for BOTH platforms "
+    "extraMetadata.version overrides the packaged version for EVERY platform "
     + "and detaches it from package.json");
 });
 
@@ -653,4 +667,75 @@ test("parity: the Windows build has an icon, and it is a real .ico", () => {
   const firstOffset = buf.readUInt32LE(6 + 12);
   assert.equal(firstOffset, 102,
     `${icon}'s first payload must start at offset 102 (directory-first layout), got ${firstOffset}`);
+});
+
+test("parity: the Linux build has an icon, and it is the brand master's PNG bytes", () => {
+  // Without linux.icon electron-builder falls back to Electron's stock atom for
+  // the .deb's hicolor set and the AppImage's embedded icon — the same defect the
+  // mac icon.icns comment records. Checked as BYTES against the master: a
+  // re-encoded copy would roll new needle coincidences (the scanner-lottery
+  // class) and a PNG-named placeholder would satisfy a path check.
+  const icon = builderConfig.linux?.icon;
+  assert.ok(icon, "linux.icon is unset — the .deb and AppImage would wear Electron's icon");
+  const p = path.join(here, icon);
+  assert.ok(fs.existsSync(p),
+    `linux.icon points at a file that does not exist: ${icon} (run node ../packaging/derive-icons.mjs)`);
+  const master = fs.readFileSync(path.join(here, "..", "web", "public", "nh-mark-512.png"));
+  assert.ok(fs.readFileSync(p).equals(master), "linux.icon is not the brand master's bytes");
+});
+
+test("linux: deb primary, AppImage secondary, x64 only, filenames carry platform+arch", () => {
+  // docs/LINUX.md §3 #5/#6/#10:
+  // .deb is what most Linux developer desktops install from and ships a
+  // correctly-moded chrome-sandbox; AppImage is the distro-agnostic fallback;
+  // nothing else in v0.1.x; x86_64 only (arm64 is an optional later phase).
+  const targets = builderConfig.linux.target;
+  assert.deepEqual(targets.map((x) => (typeof x === "string" ? x : x.target)),
+    ["deb", "AppImage"], "linux.target must be exactly [deb, AppImage], in that order");
+  for (const x of targets) {
+    assert.equal(typeof x, "object", "each linux target must pin its arch explicitly");
+    assert.deepEqual(x.arch, ["x64"], `${x.target}: x86_64 only for v0.1.0`);
+  }
+  // `${arch}` renders per FORMAT's convention (measured on electron-builder
+  // 26.x, builder-util/arch.js getArtifactArchName): x64 -> `amd64` for .deb,
+  // `x86_64` for AppImage. So the shipped names are
+  // no_human-<v>-linux-amd64.deb and no_human-<v>-linux-x86_64.AppImage — the
+  // CI job's globs, docs/LINUX.md and the release notes all spell them so.
+  assert.equal(builderConfig.linux.artifactName,
+    "${productName}-${version}-linux-${arch}.${ext}",
+    "Linux artefacts must say which platform and arch they are for");
+  assert.equal(builderConfig.linux.category, "Development");
+  assert.equal(builderConfig.linux.executableName, "no_human",
+    "the installed binary is /opt/no_human/no_human — docs/LINUX.md and the "
+    + "acceptance driver depend on that path");
+  assert.match(builderConfig.linux.maintainer ?? "", /^no_human <[^@\s]+@getnohuman\.com>$/,
+    "deb Maintainer: must be the product plus a getnohuman.com role address (docs/LINUX.md §2.1)");
+  // electron-builder merges desktop.entry and then overwrites Comment (from
+  // linux.description) and Categories (from linux.category) — LinuxTargetHelper.js.
+  // So the tooltip and the menu category are pinned on the keys that actually
+  // land, and those two entry keys are asserted ABSENT so nobody re-adds dead
+  // config. StartupWMClass is different: an entry value would WIN — and could
+  // then disagree with the app_id Electron sets from desktopName — so it is
+  // asserted absent for that reason, with desktopName+syncDesktopName pinned above.
+  assert.equal(builderConfig.linux.description, "Stop babysitting Claude",
+    "linux.description is the ONLY place the launcher tooltip can be set");
+  for (const dead of ["Comment", "Categories"]) {
+    assert.equal(builderConfig.linux.desktop?.entry?.[dead], undefined,
+      `desktop.entry.${dead} is discarded by electron-builder — set the linux.* key instead`);
+  }
+  assert.equal(builderConfig.linux.desktop?.entry?.StartupWMClass, undefined,
+    "StartupWMClass must come from desktopName (what Electron sets as app_id), never from desktop.entry");
+});
+
+test("linux: the .deb has the metadata electron-builder refuses to build without, and the launcher can find the window", () => {
+  // Measured 2026-08-18 (dry run on the macOS host, stub payload): the deb
+  // target aborts with "Please specify project homepage" when package.json has
+  // none, and warns that without `desktopName` + `linux.syncDesktopName` the
+  // desktop environment "may not link running windows to this .desktop entry".
+  assert.match(pkg.homepage ?? "", /^https:\/\/getnohuman\.com\/?$/,
+    "package.json needs a homepage or the .deb does not build");
+  assert.equal(pkg.desktopName, "no_human.desktop",
+    "desktopName is what Electron uses as app_id / WM_CLASS on Linux");
+  assert.equal(builderConfig.linux.syncDesktopName, true,
+    "syncDesktopName makes the shipped .desktop filename match Electron's app_id");
 });

@@ -1234,3 +1234,103 @@ def test_a_repo_without_the_export_guard_spawns_nothing(repo_with_bare_remote):
 
     assert result.sha
     assert not (work / "guard_calls.txt").exists()
+
+
+# --- lock-contention retry (main-6cec2140 booked two specs `crashed` on a
+# --- `git add` and a `git checkout -B` that failed on briefly-held locks) ----
+
+
+def _lock_proc(cmd):
+    return subprocess.CompletedProcess(
+        cmd, 128, stdout="",
+        stderr="fatal: Unable to create '/w/.git/index.lock': File exists.")
+
+
+def test_run_retries_lock_contention_then_succeeds(repo_with_bare_remote,
+                                                   monkeypatch):
+    """A lock-contention failure is another process holding the lock for a
+    moment — one retried call must absorb it instead of crashing the task."""
+    from no_human.vcs import git as git_mod
+    monkeypatch.setattr(git_mod, "_GIT_RETRY_BACKOFFS_S", (0.0, 0.0))
+    repo = GitRepo(repo_with_bare_remote, identity_name="a",
+                   identity_email="a@x.y")
+    calls = []
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return _lock_proc(cmd)
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(git_mod.subprocess, "run", fake_run)
+    assert repo._run("rev-parse", "--verify", "HEAD")
+    assert len(calls) == 2
+
+
+def test_run_does_not_retry_a_genuine_failure(repo_with_bare_remote,
+                                              monkeypatch):
+    """Only the lock-contention class retries: a real failure (bad ref,
+    conflict) raises on the FIRST attempt — retrying it would just repeat and
+    mask it."""
+    from no_human.vcs import git as git_mod
+    from no_human.vcs.git import GitError
+    monkeypatch.setattr(git_mod, "_GIT_RETRY_BACKOFFS_S", (0.0, 0.0))
+    repo = GitRepo(repo_with_bare_remote, identity_name="a",
+                   identity_email="a@x.y")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 128, stdout="", stderr="fatal: bad revision 'nope'")
+
+    monkeypatch.setattr(git_mod.subprocess, "run", fake_run)
+    with pytest.raises(GitError):
+        repo._run("rev-parse", "--verify", "nope")
+    assert len(calls) == 1
+
+
+def test_run_gives_up_after_bounded_lock_retries(repo_with_bare_remote,
+                                                 monkeypatch):
+    """A PERSISTENTLY held lock still fails, after exactly the bounded number
+    of retries — the retry absorbs a blip, it does not wait out a wedged
+    process forever."""
+    from no_human.vcs import git as git_mod
+    from no_human.vcs.git import GitError
+    monkeypatch.setattr(git_mod, "_GIT_RETRY_BACKOFFS_S", (0.0, 0.0))
+    repo = GitRepo(repo_with_bare_remote, identity_name="a",
+                   identity_email="a@x.y")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _lock_proc(cmd)
+
+    monkeypatch.setattr(git_mod.subprocess, "run", fake_run)
+    with pytest.raises(GitError, match="index.lock"):
+        repo._run("add", "--", "app.py")
+    assert len(calls) == 3          # first attempt + the two bounded retries
+
+
+def test_bench_git_helper_shares_the_lock_retry(tmp_path, monkeypatch):
+    """The bench sandbox's own `_git` (eval/northstar.py) absorbs the same
+    contention class — that call site is where the two crashed specs died."""
+    from no_human.eval import northstar as ns
+    from no_human.vcs import git as git_mod
+    monkeypatch.setattr(git_mod, "_GIT_RETRY_BACKOFFS_S", (0.0, 0.0))
+    calls = []
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return _lock_proc(cmd)
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(ns.subprocess, "run", fake_run)
+    work = tmp_path / "w"
+    work.mkdir()
+    ns._git(work, "init", "-b", "main")
+    assert len(calls) == 2
+    assert (work / ".git").exists()

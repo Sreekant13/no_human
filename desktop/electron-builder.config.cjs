@@ -11,6 +11,10 @@
 //      Without this the app would have to guess whether it may auto-update,
 //      and guessing wrong means offering an install macOS will refuse.
 //
+// Three platform blocks — `mac`, `win`, `linux` — share ONE `files` allowlist,
+// ONE `extraResources` payload and ONE `extraMetadata`; the parity tests in
+// packagedFiles.test.mjs fail if any block grows its own copy.
+//
 // The `mac.target` list is not cosmetic: Squirrel.Mac updates from a ZIP, and
 // electron-builder only emits `latest-mac.yml` — the file electron-updater
 // fetches — when a zip target is present. With `["dmg"]` alone the updater
@@ -69,6 +73,7 @@ function requireFreshIcon(buildRelPath) {
 }
 
 requireFreshIcon("icon.ico");
+requireFreshIcon("icon.png");   // Linux: a byte-copy of the master, pure Node, every platform
 if (process.platform === "darwin") requireFreshIcon("icon.icns");
 
 const mac = {
@@ -112,7 +117,7 @@ const mac = {
 // watched work is exactly the "guessing wrong" this file's header rejects.
 const win = {
   target: ["nsis", "zip"],
-  // Same art as desktop/build/icon.icns, so both platforms wear the same
+  // Same art as desktop/build/icon.icns and icon.png, so every platform wears the same
   // mark. Both are derived at package time by packaging/derive-icons.mjs
   // from web/public/nh-mark-512.png — never committed (see the freshness
   // check above). packaging/make-win-icon.ps1 still exists as the Windows-
@@ -123,6 +128,81 @@ const win = {
   // believing it is shippable." The same must be true of the .exe, or Windows
   // becomes the soft spot in a rule macOS enforces.
   artifactName: "${productName}-${version}" + plan.artifactTag + ".${ext}",
+};
+
+// The Linux half. Same shape rule as `win`: as close to `mac` as the OS
+// allows, every difference forced by a platform convention and written down
+// in docs/LINUX.md.
+//
+// `deb` first because it is what most Linux developer desktops install from
+// (a double-click in GNOME Software, or `sudo apt install ./file.deb`), it
+// registers an application-menu entry with the brand icon, and its postinst
+// (app-builder-lib/templates/linux/after-install.tpl) does the sandbox work an
+// AppImage cannot: on Ubuntu 24.04+ it installs the bundled AppArmor profile to
+// /etc/apparmor.d/no_human so Electron's user-namespace sandbox is allowed, and
+// it chmods chrome-sandbox 4755 ONLY where unprivileged userns is unavailable
+// (0755 otherwise). `AppImage` is the distro-agnostic fallback and carries two
+// documented frictions (it needs libfuse2/libfuse2t64; on 24.04 it can hit
+// the unprivileged-userns rule). electron-builder's answer to the second is
+// SPLIT across two files, and only one half is unconditional: the generated
+// .desktop Exec is `AppRun --no-sandbox %U` (AppImageTarget.js — ONLY while
+// no `toolsets.appimage` pin is set; pinning a toolset silently drops the
+// default flag), while AppRun
+// itself adds --no-sandbox only when its `unshare -Ur true` probe FAILS
+// (appImageUtil.js) — so a hand-run `./AppRun` on a host where userns works
+// launches sandboxed. Recorded in docs/LINUX.md and the release notes. electron-updater's Linux feed (latest-linux.yml)
+// is emitted for the AppImage target; nhCanAutoUpdate stays false on Linux
+// exactly as on the shipped Mac and Windows apps (no update path nobody has
+// watched work).
+//
+// NOT signed, and the filename does NOT say so. "Signed" is not a property of
+// a .deb or an AppImage (apt REPOSITORIES are signed, packages are not), and a
+// -UNSIGNED tag would import a Gatekeeper/SmartScreen meaning that misleads
+// Linux users into thinking something is missing. Integrity travels as
+// SHA256SUMS-linux.txt on the release plus the site pointer's sha256, exactly
+// as for Windows (docs/LINUX.md §3 #6); the operator may still flip this to
+// `+ plan.artifactTag +` for filename-shape parity — one line.
+//
+// x64 only for v0.1.0. arm64 is cheap once x64 is proven (GitHub's
+// ubuntu-24.04-arm runner) and is an explicit optional phase of the plan; it is
+// not silently half-shipped by leaving arch unpinned.
+const linux = {
+  target: [
+    { target: "deb", arch: ["x64"] },
+    { target: "AppImage", arch: ["x64"] },
+  ],
+  // The brand master, byte-copied by packaging/derive-icons.mjs; electron-
+  // builder renders the hicolor size set from this one 512px PNG.
+  icon: "build/icon.png",
+  category: "Development",
+  // The launcher tooltip. electron-builder writes the .desktop `Comment` from
+  // linux.description (falling back to package.json's description — a
+  // developer sentence about "attaches to the local nh server"), and it does
+  // so AFTER merging desktop.entry, so a Comment set there is silently
+  // discarded (LinuxTargetHelper.js, measured 2026-08-18 by an independent
+  // reviewer). The tagline lives here, where it actually lands.
+  description: "Stop babysitting Claude",
+  synopsis: "no_human — the board for tasks Claude Code delivers with proof",
+  executableName: "no_human",
+  // The shipped .desktop file is named after package.json's `desktopName`
+  // ("no_human.desktop"), which is also what Electron uses as the app_id /
+  // WM_CLASS on Linux — so GNOME/KDE associate the running window with the
+  // launcher entry. Without both, electron-builder warns and the association
+  // is left to chance (measured 2026-08-18). The `homepage` the .deb requires
+  // lives beside it in package.json.
+  syncDesktopName: true,
+  // Debian requires a Maintainer. A ROLE address, never a person's: this
+  // string ships inside every .deb, and the repo's own scrub gate refuses a
+  // personal mailbox here (measured 2026-08-18). support@ must exist as a
+  // Cloudflare Email Routing rule before the first release (it exists since 2026-08-18).
+  maintainer: "no_human <support@getnohuman.com>",
+  artifactName: "${productName}-${version}-linux-${arch}.${ext}",
+  // No desktop.entry: electron-builder writes Name from productName, then
+  // OVERWRITES Comment (from linux.description) and Categories (from
+  // linux.category) after merging any entry — so those two would be dead
+  // config; and StartupWMClass is left to desktopName + syncDesktopName because
+  // that is the value Electron itself sets as the window's app_id (an entry
+  // value would win, and could then disagree with the running window).
 };
 
 // Ad-hoc re-seal when we are NOT signing for real.
@@ -243,6 +323,7 @@ module.exports = {
   },
   mac,
   win,
+  linux,
   // Darwin-only by construction: adhocSeal returns immediately unless
   // electronPlatformName is "darwin". Windows needs NO afterPack equivalent —
   // the macOS hook exists to repair a signature electron-builder INVALIDATES by

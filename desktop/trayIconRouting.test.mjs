@@ -102,6 +102,18 @@ test("darwin still gets the template mask, which is correct there", () => {
     + "its literal black pixels and it disappears in dark mode");
 });
 
+test("linux gets the real-colour glyph too — setTemplateImage is a no-op there as well", () => {
+  // The same reasoning as win32: only macOS honours a template image. Left on
+  // the mask, GNOME/KDE trays paint the mask's literal black pixels — the
+  // deliberately-deferred "unverified there" branch in main.mjs is now routed
+  // by !== "darwin" so Linux cannot inherit the wrong bitmap by omission.
+  const img = onPlatform("linux", () => trayIcon());
+  assert.ok(img.buffer.equals(WIN_GLYPH),
+    "Linux was handed the macOS TEMPLATE MASK; off macOS it renders as its own black RGB");
+  assert.equal(img.templated, false,
+    "setTemplateImage was called on the Linux icon — the fingerprint of the mask path");
+});
+
 test("the platform routing is read per call, not frozen at module load", () => {
   // The property that makes the two tests above trustworthy: if trayIcon()
   // cached the platform, whichever ran first would decide both answers.

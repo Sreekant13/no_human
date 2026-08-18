@@ -4,14 +4,16 @@
 
 # no_human
 
-**Give it a ticket. Get back a pull request, with the evidence that it works.**
+**From ticket to reviewed pull request.**<br>***Free and open-source, on your machine.***
+
+Give it a ticket. Get back a pull request, with the evidence that it works.
 
 [![python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [getnohuman.com](https://getnohuman.com) · [Quickstart](docs/quickstart.md) · [Docs](docs/README.md)
 
-**[▶ Watch it work a sprint](https://getnohuman.com/#demo)**
+**[▶ Watch it work a sprint](https://getnohuman.com/demo)**
 
 </div>
 

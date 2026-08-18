@@ -79,6 +79,29 @@ app.whenReady().then(async () => {
     out.errNotFound   = await errAt({ reason: "nh-not-found", packaged: "1" });
     out.errPackaged   = await errAt({ reason: "spawn-timeout", packaged: "1" });
     out.errDev        = await errAt({ reason: "spawn-timeout", packaged: "0" });
+
+    // The version the preload hands the board, measured through the SAME
+    // sandboxed preload the packaged app runs (Electron sandboxes a preload by
+    // default, and a sandboxed preload cannot require("./package.json") — so
+    // every shipped DMG/EXE/deb read "dev" until the version travelled through
+    // additionalArguments; seen live on the Linux Settings > Updates card,
+    // 2026-08-18). Two probes: with the argument main.mjs passes (must be the
+    // value), and without it (the negative control — proves the require path
+    // really is dead in a sandboxed preload, so the argument is load-bearing).
+    const preloadVersion = async (extraArgs) => {
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          contextIsolation: true, nodeIntegration: false,
+          preload: path.join(HERE, "preload.cjs"),
+          additionalArguments: extraArgs,
+        },
+      });
+      await w.loadFile(path.join(HERE, "token.html"));
+      return w.webContents.executeJavaScript("window.nhDesktop && window.nhDesktop.version");
+    };
+    out.versionWithArg = await preloadVersion(["--nh-app-version=9.9.9-probe"]);
+    out.versionWithoutArg = await preloadVersion([]);
     process.stdout.write("PROBE_JSON:" + JSON.stringify(out) + "\n");
     app.exit(0);
   } catch (err) {

@@ -16,16 +16,32 @@ contextBridge.exposeInMainWorld("nhSetup", {
 
 // `npm_package_version` is set by `npm run`, and NOTHING sets it in a packaged
 // app — this read was always the literal string "dev" in every shipped DMG.
-// That is load-bearing now: the update UI compares this against the released
-// version, and "dev" compares as "not newer" than everything, so a stale
-// install would never be told it was stale. electron-builder writes the real
-// version into the packaged package.json, so read that and keep the env var
-// only as the `npm run desktop` fallback.
+// electron-builder writes the real version into the packaged package.json, so
+// the next lines TRIED to read that and keep the env var as a dev fallback.
+// (The update CHECK is unaffected either way — main.mjs runs it on
+// app.getVersion(); this value is what the board DISPLAYS.)
+// …EXCEPT that this preload runs SANDBOXED (Electron's default for a preload
+// since 20), and a sandboxed preload's `require` cannot load "./package.json"
+// — the read below threw, silently, in every packaged app, and the fallback
+// "dev" is what the Settings > Updates card showed on a real Linux desktop
+// (2026-08-18: "no_human dev"). The value therefore travels the documented
+// way for sandboxed preloads: main.mjs passes `--nh-app-version=<app.getVersion()>`
+// through webPreferences.additionalArguments and it is read off process.argv.
+// The require stays only as a fallback (dead in every sandboxed run, dev
+// included — main always passes the argument), then npm_package_version, then
+// "dev" — and
+// desktop/uiPages.test.mjs measures the argument path in a real sandboxed
+// renderer, with a no-argument negative control.
 let appVersion = process.env.npm_package_version || "dev";
 try {
   appVersion = require("./package.json").version || appVersion;
 } catch {
-  /* keep the fallback — a missing package.json is already guarded elsewhere */
+  /* sandboxed preload: expected — the argument below is the real source */
+}
+const versionArg = (process.argv || []).find((a) => a.startsWith("--nh-app-version="));
+if (versionArg) {
+  const v = versionArg.slice("--nh-app-version=".length).trim();
+  if (v) appVersion = v;
 }
 
 contextBridge.exposeInMainWorld("nhDesktop", {

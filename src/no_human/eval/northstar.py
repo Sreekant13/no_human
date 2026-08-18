@@ -415,9 +415,26 @@ class BenchScore:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    out = subprocess.run(["git", *args], cwd=cwd, check=True,
-                         capture_output=True, text=True)
-    return out.stdout.strip()
+    """Run git in the sandbox, retrying ONLY lock contention.
+
+    Same policy as `GitRepo._run_with_lock_retry` (vcs/git.py): a stderr that
+    matches the lock-contention signatures is another process briefly holding a
+    lock (a parallel bench worker, an orphaned agent git subprocess) — re-run
+    after a short backoff; anything else raises on the first attempt. Two
+    main-6cec2140 specs were booked `crashed` on exactly this class.
+    """
+    from ..vcs.git import _GIT_RETRY_BACKOFFS_S, is_transient_git_failure
+    cmd = ["git", *args]
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    for backoff in _GIT_RETRY_BACKOFFS_S:
+        if proc.returncode == 0 or not is_transient_git_failure(proc.stderr):
+            break
+        time.sleep(backoff)
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
+    return proc.stdout.strip()
 
 
 def _sandbox_copy(src: Path, dst: Path) -> None:

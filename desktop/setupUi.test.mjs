@@ -2,8 +2,13 @@
 // board is live behind the credential screen.
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { dismissTarget, labels, parseCanReturn, restartFailedMessage, saveProgress } from "./setupUi.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 test("parseCanReturn: only the explicit flag counts", () => {
   assert.equal(parseCanReturn("?canReturn=1"), true);
@@ -39,6 +44,10 @@ test("labels: api_key mode states where the key lives and who it bills", () => {
   assert.equal(first.primary, "Save and start");
   assert.match(first.hint, /\.env/, "storage location is stated");
   assert.match(first.hint, /Anthropic account/i, "billing destination is stated");
+  // The same screen ships on macOS, Windows AND Linux (measured on a real
+  // Ubuntu 24.04 desktop 2026-08-18: it said "this Mac"). Platform-neutral
+  // copy, or the first thing a Linux/Windows user reads is wrong about them.
+  assert.doesNotMatch(first.hint, /\bMac\b/, "credential copy must not name macOS");
 
   const over = labels(true, "api_key");
   assert.match(over.hint, /interrupted/,
@@ -86,4 +95,10 @@ test("restartFailedMessage: names the action that actually helps, in both cases"
   assert.match(theirs, /another server/i);
   assert.doesNotMatch(theirs, /quit no_human/i,
     "quitting the app cannot free a port another process holds");
+});
+
+test("the first-run screen's copy is platform-neutral — it ships on macOS, Windows and Linux", () => {
+  const html = fs.readFileSync(path.join(here, "token.html"), "utf8");
+  assert.doesNotMatch(html, /this Mac\b/,
+    "token.html says 'this Mac' — a Linux/Windows user reads that on first run (seen on Ubuntu 24.04, 2026-08-18)");
 });

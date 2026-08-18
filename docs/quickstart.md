@@ -39,6 +39,46 @@ To uninstall: **Settings → Apps → no_human**. Your tasks and credential live
 `~/.no_human` and are deliberately left behind, so reinstalling picks up where
 you left off; delete that folder yourself if you want a clean slate.
 
+## Installed the Linux app? Start here instead
+
+> These steps are written from the build, not yet from a walked Ubuntu
+> desktop — `LINUX.md` §6/§7 record what has actually been observed on Linux.
+
+**If you installed `no_human-<version>-linux-amd64.deb` or ran the AppImage,
+sections 1–3 below are NOT for you.** The app carries its own Python, its own
+server and its own dependencies — nothing to clone, no `uv sync`. Doing any of
+it would set up a *second*, unrelated copy. As on the other platforms the
+bundle does **not** carry the Claude Code CLI, which the coding backend shells
+out to for every task, so install it first:
+`curl -fsSL https://claude.ai/install.sh | bash` (or `npm install -g
+@anthropic-ai/claude-code`), then `claude setup-token`.
+
+Two things specific to Linux, both expected:
+
+* The `.deb` is the recommended format: it installs from a double-click (or `sudo apt install ./no_human-<version>-linux-amd64.deb`), adds **no_human** to the application menu, and its installer sets up the sandbox permissions Ubuntu 24.04 needs.
+* The AppImage needs FUSE 2 on Ubuntu 22.04+ (`sudo apt install libfuse2t64` on 24.04) and may hit Ubuntu 24.04's user-namespace restriction; `LINUX.md §5` has the exact messages and the way round each. When in doubt, use the `.deb`.
+
+What you actually do:
+
+1. Open **no_human** from the application menu.
+2. It shows **Connect Claude** and asks for a credential — either a Claude subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key. Paste one and continue.
+3. The board opens. Create your first task there.
+
+Then confirm the install is actually working:
+
+```bash
+/opt/no_human/resources/nh-server/nh doctor
+```
+
+The same `nh doctor` as the Mac and Windows installs — only the path to the
+bundled binary differs. See
+[INSTALLER.md#verify-your-install-is-real](INSTALLER.md#verify-your-install-is-real),
+and `LINUX.md` for the Linux build, what has actually been verified on Linux,
+and its known limits.
+
+To uninstall: `sudo apt remove no-human-desktop`. Your tasks and credential
+live in `~/.no_human` and are deliberately left behind.
+
 ## Installed the Mac app? Start here instead
 
 **If you opened a `.dmg` and dragged no_human to Applications, sections 1–3

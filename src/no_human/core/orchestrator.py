@@ -1877,6 +1877,34 @@ class Orchestrator:
             await self.store.fill_memory_use_outcomes(task.id, label)
         except Exception as exc:  # noqa: BLE001
             log.warning("could not fill memory use outcomes: %s", exc)
+        # Fix-pair ledger (0013), resolution side: a task that reached the
+        # SUCCESS terminal demonstrably overcame every signature it hit along
+        # the way — fill its open friction rows so a FUTURE task hitting the
+        # same signature inherits the diagnosis instead of the dead end. Same
+        # never-load-bearing posture as the memory ledger above.
+        if label == self._MEMORY_OUTCOME_SUCCESS:
+            ctx = task.context or {}
+            note = (ctx.get("stuck_hypothesis") or "").strip()
+            logs = ctx.get("attempt_log") or []
+            # `attempt_log` keeps the last 3 entries only, so this count is a
+            # floor, not the attempt number — say so rather than reporting a
+            # silently saturated 3.
+            n = len(logs)
+            how_many = f"{n}+" if n >= 3 else str(n)
+            stem = f"overcome by task {task.id[:8]} after {how_many} failed attempt(s)"
+            plain = f"{stem} — see that task's diff"
+            # The diagnosis describes the LAST failure, so it rides only on the
+            # newest open row; older signatures get `plain`, which claims only
+            # what is true. See db.resolve_friction.
+            latest = (
+                f"{stem} — diagnosis that preceded the fix: {note}"
+                if note else None
+            )
+            try:
+                await self.store.resolve_friction(
+                    task.id, resolution=plain, latest_resolution=latest)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not resolve fix pairs: %s", exc)
 
     async def _run_task_body(self, task: Task) -> TaskOutcome:
         """Drive a task to a terminal/parked outcome.
@@ -2804,6 +2832,15 @@ class Orchestrator:
                 await self.store.update_task(task)
             except Exception as exc:  # noqa: BLE001
                 self._advisory(f"attempt log persistence failed: {exc}")
+
+            # Fix-pair ledger (0013): remember THIS failure's signature, and
+            # before the next attempt ask whether any PAST task overcame the
+            # same signature — the answer rides into the corrective preamble
+            # as history, never as an instruction. Best-effort like every
+            # ledger write here: a locked db must not turn a retryable
+            # failure into a crashed task.
+            await self._record_and_lookup_fix_pair(
+                task, outcome.detail or "unknown")
 
             # A3: an attempt that edits nothing leaves the repo byte-identical, so
             # a third try re-runs the same agent against the same state and gets
@@ -11783,6 +11820,15 @@ class Orchestrator:
                     if (ctx.get("stuck_hypothesis") or "").strip() else "\n"
                 )
             )
+            prior_fix = ctx.get("prior_fix") or {}
+            if prior_fix.get("resolution"):
+                debug_preamble += (
+                    "THIS EXACT ERROR SIGNATURE WAS OVERCOME BEFORE, in task "
+                    f"{str(prior_fix.get('task_id', ''))[:8]}: "
+                    f"{str(prior_fix['resolution'])[:400]}\n"
+                    "That is evidence from this machine's history, not a "
+                    "guaranteed fix — verify it applies here before using it.\n"
+                )
 
         distilled_block = ""
         if distilled:
@@ -12019,6 +12065,92 @@ class Orchestrator:
         kept, held = self._screen_memories_for_terms(list(mems or []))
         object.__setattr__(self, self._ACTIVE_MEMORIES_RAW, kept)
         object.__setattr__(self, "_memories_held_for_terms", held)
+
+    async def _record_and_lookup_fix_pair(self, task: Task, detail: str) -> None:
+        """Remember THIS failure's signature, then ask whether a PAST task
+        overcame the same one and, if so, put it in the task's context for the
+        next attempt's preamble.
+
+        A method rather than an inline block because an inline block cannot be
+        tested: the independent review of the first version deleted these 58
+        lines and the full 9,006-test suite stayed green — the store layer was
+        pinned, the seam that uses it was not, and so was the banned-term
+        screen that is the whole answer to the leak finding.
+
+        Best-effort like every ledger write on this path: a locked db must not
+        turn a retryable failure into a crashed task.
+        """
+        try:
+            from .bounds import error_signature
+            sig = error_signature(detail or "unknown")
+            await self.store.record_friction(
+                sig=sig, task_id=task.id,
+                error_excerpt=(detail or "unknown"),
+                repo_path=task.repo_path,
+            )
+            prior = await self.store.find_fix_pair(
+                sig, repo_path=task.repo_path, exclude_task_id=task.id)
+            # A fix pair crosses tasks AND repos — the ledger ranks the same
+            # repo first but deliberately falls back to another one, because a
+            # signature is normalised (paths, numbers, hashes stripped) and the
+            # machine's history is the point. That makes this a cross-repo text
+            # channel into the coder prompt, the same shape as an injected
+            # memory: a resolution written while working in a private repo can
+            # be handed to a task targeting a public one. Memories are screened
+            # for banned terms before injection
+            # (`_screen_memories_for_terms`); this route is held to the same
+            # standard rather than being the one unscreened way in. Same limits
+            # as that screen: plaintext terms on letter boundaries, nothing
+            # obfuscated, only as good as the term list — it narrows the
+            # channel, it does not close it.
+            if prior and prior.get("resolution"):
+                held = self._fix_pair_holds_terms(str(prior["resolution"]))
+                if held:
+                    # Name the row, the way the memory screen names what it
+                    # held: an event that says only "1 term" cannot be acted on.
+                    self.emit(
+                        "prior_fix_held",
+                        "a remembered fix from task "
+                        f"{str(prior.get('task_id', ''))[:8]} was held back: "
+                        f"its text carries {len(held)} screened term(s)",
+                    )
+                    prior = None
+            ctx = task.context or {}
+            if prior:
+                ctx["prior_fix"] = {
+                    "task_id": prior["task_id"],
+                    "resolution": prior["resolution"],
+                    "resolved_at": prior["resolved_at"],
+                }
+                self.emit(
+                    "prior_fix_found",
+                    f"signature seen before — overcome in task "
+                    f"{prior['task_id'][:8]}",
+                )
+            else:
+                # A stale hit from an EARLIER attempt's different failure must
+                # not ride into this retry's preamble.
+                ctx.pop("prior_fix", None)
+            task.context = ctx
+            await self.store.update_task(task)
+        except Exception as exc:  # noqa: BLE001
+            self._advisory(f"fix-pair ledger failed: {exc}")
+
+    def _fix_pair_holds_terms(self, text: str) -> list[str]:
+        """Banned terms in a remembered fix's resolution, if any.
+
+        Same matcher as `_screen_memories_for_terms`, same failure posture: a
+        screen that ERRORS must not silently drop evidence, so an exception
+        returns "no hits" and the pair rides. What it protects against is the
+        clean case — a resolution naming a private project reaching a task in
+        another repo — not a determined leak.
+        """
+        from ..eval.vendor_terms import find_banned_terms
+
+        try:
+            return list(find_banned_terms(text or ""))
+        except Exception:  # noqa: BLE001 — see the docstring
+            return []
 
     def _screen_memories_for_terms(self, mems: list[dict]) -> tuple[list[dict], list[str]]:
         """Hold back any memory carrying a banned vendor term.

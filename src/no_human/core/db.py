@@ -3232,6 +3232,107 @@ class Store:
         await self.db.commit()
         return cur.rowcount
 
+    @serialized_write
+    async def record_friction(
+        self, *, sig: str, task_id: str, error_excerpt: str,
+        repo_path: str | None = None,
+    ) -> str | None:
+        """Append one open `fix_pairs` friction row (see 0013_fix_pairs.sql).
+
+        Deduped per (sig, task): the SAME error failing the SAME task twice is
+        the StuckDetector's business, not new friction — one open row already
+        says "this task is stuck on this signature". Returns the row id, or
+        None when an open row for the pair already existed.
+        """
+        if await self._fetchone(
+            "SELECT id FROM fix_pairs WHERE sig = ? AND task_id = ? "
+            "AND resolution IS NULL", (sig, task_id),
+        ):
+            return None
+        row_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO fix_pairs (id, sig, repo_path, error_excerpt, task_id, "
+            "resolution, resolved_task_id, created_at, resolved_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL)",
+            (row_id, sig, repo_path, error_excerpt[:300], task_id, _now()),
+        )
+        await self.db.commit()
+        return row_id
+
+    @serialized_write
+    async def resolve_friction(
+        self, task_id: str, *, resolution: str,
+        latest_resolution: str | None = None,
+    ) -> int:
+        """Fill `resolution` on every still-open friction row of *task_id* —
+        the task reached a genuine SUCCESS terminal, so whatever it hit along
+        the way was, demonstrably, overcome. Called from the same terminal
+        finalizer that stamps `memory_uses.task_outcome`, with the same
+        never-load-bearing posture. Open rows only: a resumed task's earlier
+        resolved friction keeps its original resolution.
+
+        `latest_resolution` exists because the caller has exactly ONE
+        diagnosis (the last `stuck_hypothesis`) and a task can have hit
+        several distinct signatures. Writing that diagnosis onto all of them
+        pairs error A with the diagnosis of error B and then presents it to a
+        future task as "THIS EXACT ERROR SIGNATURE WAS OVERCOME BEFORE: <B>".
+        So the diagnosis lands on the NEWEST open row only — the failure the
+        fix actually followed — and every older row gets the plain
+        *resolution*, which claims only what is true: this task overcame it.
+        """
+        now = _now()
+        newest = None
+        if latest_resolution is not None:
+            row = await self._fetchone(
+                "SELECT id FROM fix_pairs WHERE task_id = ? AND resolution IS NULL "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (task_id,),
+            )
+            newest = row["id"] if row is not None else None
+        n = 0
+        if newest is not None:
+            cur = await self.db.execute(
+                "UPDATE fix_pairs SET resolution = ?, resolved_task_id = task_id, "
+                "resolved_at = ? WHERE id = ?",
+                (latest_resolution[:600], now, newest),
+            )
+            n += cur.rowcount
+        cur = await self.db.execute(
+            "UPDATE fix_pairs SET resolution = ?, resolved_task_id = task_id, "
+            "resolved_at = ? WHERE task_id = ? AND resolution IS NULL",
+            (resolution[:600], now, task_id),
+        )
+        n += cur.rowcount
+        await self.db.commit()
+        return n
+
+    async def find_fix_pair(
+        self, sig: str, *, repo_path: str | None = None,
+        exclude_task_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """The freshest RESOLVED fix pair for *sig* — same repo first.
+
+        `exclude_task_id` keeps a task from being handed its own history as if
+        it were independent evidence (the current task's own attempts are
+        already in its attempt_log).
+        """
+        rows_q = (
+            "SELECT sig, repo_path, error_excerpt, task_id, resolution, "
+            "resolved_at FROM fix_pairs "
+            "WHERE sig = ? AND resolution IS NOT NULL"
+        )
+        params: list[Any] = [sig]
+        if exclude_task_id:
+            rows_q += " AND task_id != ?"
+            params.append(exclude_task_id)
+        rows_q += (
+            " ORDER BY (CASE WHEN repo_path = ? THEN 0 ELSE 1 END), "
+            "resolved_at DESC LIMIT 1"
+        )
+        params.append(repo_path or "")
+        row = await self._fetchone(rows_q, tuple(params))
+        return dict(row) if row is not None else None
+
     async def memory_usage_report(self) -> list[dict[str, Any]]:
         """Per-memory usage stats for `nh learnings --usage` and the
         Learnings/Rules UI rows: use_count, last_used_at, and the outcome

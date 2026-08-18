@@ -90,6 +90,20 @@ def test_discovers_across_every_conventional_root(tmp_path):
     assert res["roots_missing"] == []
 
 
+def test_conventional_roots_match_case_variants_on_case_sensitive_filesystems(tmp_path):
+    """Linux keeps ~/code and ~/Code apart; APFS/NTFS fold them. Measured on a
+    real Ubuntu 24.04 desktop (2026-08-18): a user's ~/code/calc was invisible
+    to the scan because the list spells the root "Code". Every on-disk case
+    variant of a conventional name is a root; the canonical spelling is still
+    reported missing when no variant exists."""
+    _fake_repo(tmp_path / "code" / "calc")          # lowercase, the Linux convention
+    res = discover_repos(home=tmp_path)
+    assert "calc" in _by_name(res)
+    assert str(tmp_path / "code") in res["roots_scanned"]
+    # No double scan when the filesystem folds case (macOS): one entry per real dir.
+    assert len(set(res["roots_scanned"])) == len(res["roots_scanned"])
+
+
 def test_missing_roots_are_reported_not_errors(tmp_path):
     (tmp_path / "git").mkdir()
     res = discover_repos(home=tmp_path)

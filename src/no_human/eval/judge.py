@@ -23,6 +23,68 @@ from typing import Any
 
 _JUDGE_JSON = re.compile(r"JUDGE_JSON_START\s*(.*?)\s*JUDGE_JSON_END", re.DOTALL)
 
+#: A START marker whose END never arrived (truncation) — capture what follows so
+#: a COMPLETE JSON object that merely lost its END marker still scores. An
+#: incomplete object still fails closed.
+_JUDGE_JSON_OPEN = re.compile(r"JUDGE_JSON_START\s*(\{.*)", re.DOTALL)
+
+
+def _decode_first_object(text: str) -> dict[str, Any] | None:
+    """`raw_decode` the object at the head of ``text``; None if incomplete/invalid."""
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_verdict_json(text: str, verdict_key: str) -> tuple[dict[str, Any] | None, str]:
+    """Find the judge's verdict object in ``text``, most-explicit form first.
+
+    Returns ``(data, "")`` on success or ``(None, reason)`` with the exact
+    fail-closed reason strings the bench and the transient-retry logic key on.
+    Order (main-6cec2140 lost 6 of 50 specs to "no JUDGE_JSON block found" —
+    each shape below was chosen for an observed or structural loss mode):
+
+    1. The LAST complete ``JUDGE_JSON_START … JUDGE_JSON_END`` block — last,
+       not first, because the final block is the final answer.
+    2. A START marker whose END was truncated away but whose JSON object is
+       complete (quota-stress "Stream closed" mid-tail).
+    3. Bare-shape fallback: the LAST JSON object in the text that carries a
+       boolean ``verdict_key`` — the judge answered but dropped the markers.
+    Anything less than a complete object with a boolean verdict fails closed,
+    exactly as before.
+    """
+    blocks = _JUDGE_JSON.findall(text)
+    for raw in reversed(blocks):
+        data = _decode_first_object(raw)
+        if data is not None and isinstance(data.get(verdict_key), bool):
+            return data, ""
+    open_data = None
+    m = _JUDGE_JSON_OPEN.search(text)
+    if m:
+        open_data = _decode_first_object(m.group(1))
+        if open_data is not None and isinstance(open_data.get(verdict_key), bool):
+            return open_data, ""
+    # Bare-shape fallback: walk '{' candidates near the verdict key, last wins.
+    needle = f'"{verdict_key}"'
+    pos = text.rfind(needle)
+    while pos != -1:
+        start = text.rfind("{", 0, pos)
+        if start != -1:
+            data = _decode_first_object(text[start:])
+            if data is not None and isinstance(data.get(verdict_key), bool):
+                return data, ""
+        pos = text.rfind(needle, 0, pos)
+    if blocks or open_data is not None:
+        # A CLOSED marker block existed, or an open one held a complete object —
+        # either way the judge answered substantively and got the format wrong:
+        # not a transient, so it keeps the non-retried reason. An open START
+        # whose object never completed is the truncation signature and falls
+        # through to the transient (retried) reason instead.
+        return None, "malformed JUDGE_JSON"
+    return None, "no JUDGE_JSON block found"
+
 
 @dataclass
 class JudgeVerdict:
@@ -62,13 +124,9 @@ def parse_verdict(text: str) -> JudgeVerdict:
     """Parse the judge's output. Fail closed: no parseable block → not a match."""
     if not text:
         return JudgeVerdict(False, "judge produced no output", text)
-    m = _JUDGE_JSON.search(text)
-    if not m:
-        return JudgeVerdict(False, "no JUDGE_JSON block found", text)
-    try:
-        data = json.loads(m.group(1))
-    except (json.JSONDecodeError, ValueError):
-        return JudgeVerdict(False, "malformed JUDGE_JSON", text)
+    data, reason = _extract_verdict_json(text, "match")
+    if data is None:
+        return JudgeVerdict(False, reason, text)
     return JudgeVerdict(
         match=bool(data.get("match", False)),
         evidence=str(data.get("evidence", "")),
@@ -136,18 +194,88 @@ _RETRY_BACKOFF_S = 15.0
 _JUDGE_TIMEOUT_S = 600.0
 log = logging.getLogger("no_human.judge")
 
+#: Appended to the prompt on the single retry after a block-less reply. An
+#: identical re-issue tends to reproduce the same block-less shape (observed:
+#: main-6cec2140 lost 6 specs to "no JUDGE_JSON block found" THROUGH the
+#: existing identical-retry); the re-ask names the failure instead.
+_REASK_SUFFIX = (
+    "\n\nIMPORTANT: a previous reply to this exact prompt did not include a "
+    "parseable JUDGE_JSON block. Reply with ONLY the JUDGE_JSON block — no "
+    "prose before or after it."
+)
+
+
+async def _judged_run(backend: Any, prompt: str, parse: Any, *,
+                      cwd: str | None) -> Any:
+    """The shared judge loop: run → parse → recover → retry-once (re-asked).
+
+    Three loss modes this closes, each measured on main-6cec2140 (6/50 specs
+    scored ❌ solely as "no JUDGE_JSON block found"):
+    - ``final_text`` is only the LAST result event's text, so a verdict emitted
+      mid-run (the judge has max_turns=10 and repo read access) then followed
+      by a closing remark was invisible — a text-event collector now keeps the
+      whole reply and the parse falls back to it.
+    - The single retry re-issued the identical prompt and tended to reproduce
+      the identical block-less shape — the retry now names the failure
+      (``_REASK_SUFFIX``).
+    - Truncation/marker-drift shapes are rescued by ``_extract_verdict_json``.
+    Fail-closed semantics are unchanged: no complete boolean verdict → not
+    satisfied / not a match.
+    """
+    texts: list[str] = []
+
+    def _collect(event: Any) -> None:
+        if getattr(event, "kind", "") == "text" and getattr(event, "text", ""):
+            texts.append(event.text)
+
+    verdict = None
+    prompt_now = prompt
+    for attempt in range(2):
+        try:
+            # Injected test backends may not accept on_event; binding fails
+            # synchronously for an async def, so fall back before awaiting.
+            try:
+                coro = backend.run(prompt_now, cwd=cwd, max_turns=10,
+                                   effort="high", on_event=_collect)
+            except TypeError:
+                coro = backend.run(prompt_now, cwd=cwd, max_turns=10,
+                                   effort="high")
+            result = await asyncio.wait_for(coro, timeout=_JUDGE_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError):
+            # A hung SDK subprocess (Stream-closed) must not wedge the judge
+            # forever — surface a transient error-result so the retry-once-
+            # then-fail-closed path below handles it.
+            log.warning("judge backend.run timed out after %ss (attempt %d)",
+                        _JUDGE_TIMEOUT_S, attempt)
+            result = SimpleNamespace(final_text="", is_error=True)
+        final = getattr(result, "final_text", "") or ""
+        verdict = parse(final)
+        if verdict.evidence in _JUDGE_TRANSIENT and texts:
+            # The verdict may have been emitted mid-run and lost from the
+            # final result event — parse the accumulated reply, last block
+            # wins. Applied only to the transient (block-less) reasons: a
+            # malformed FINAL block is the judge's final answer and is not
+            # overridden by an earlier one.
+            recovered = parse("\n\n".join([*texts, final]))
+            if recovered.evidence not in _JUDGE_TRANSIENT:
+                verdict = recovered
+        transient = (getattr(result, "is_error", False)
+                     or verdict.evidence in _JUDGE_TRANSIENT)
+        if not transient:
+            return verdict
+        if attempt == 0:        # back off once, then retry with the re-ask
+            prompt_now = prompt + _REASK_SUFFIX
+            await asyncio.sleep(_RETRY_BACKOFF_S)
+    return verdict
+
 
 def parse_goal_verdict(text: str) -> GoalVerdict:
     """Fail closed: no parseable JUDGE_JSON block → not satisfied."""
     if not text:
         return GoalVerdict(False, "judge produced no output", text)
-    m = _JUDGE_JSON.search(text)
-    if not m:
-        return GoalVerdict(False, "no JUDGE_JSON block found", text)
-    try:
-        data = json.loads(m.group(1))
-    except (json.JSONDecodeError, ValueError):
-        return GoalVerdict(False, "malformed JUDGE_JSON", text)
+    data, reason = _extract_verdict_json(text, "satisfied")
+    if data is None:
+        return GoalVerdict(False, reason, text)
     return GoalVerdict(
         satisfied=bool(data.get("satisfied", False)),
         evidence=str(data.get("evidence", "")),
@@ -186,31 +314,9 @@ class GoalJudge:
         # its measurement (mirrors the CI infra-retry policy). A genuine
         # block-less reply persists and still fails closed after the retry; a
         # malformed-JSON reply is NOT retried — the judge answered substantively,
-        # so that's a format bug, not a transient.
-        verdict = None
-        for attempt in range(2):
-            try:
-                result = await asyncio.wait_for(
-                    backend.run(prompt, cwd=repo_path, max_turns=10,
-                                effort="high"),
-                    timeout=_JUDGE_TIMEOUT_S)
-            except (asyncio.TimeoutError, TimeoutError):
-                # A hung SDK subprocess (Stream-closed) must not wedge the judge
-                # forever — surface a transient error-result so the existing
-                # retry-once-then-fail-closed path below handles it.
-                log.warning("judge backend.run timed out after %ss (attempt %d)",
-                            _JUDGE_TIMEOUT_S, attempt)
-                result = SimpleNamespace(final_text="", is_error=True)
-            verdict = parse_goal_verdict(getattr(result, "final_text", "") or "")
-            # Transient = the backend flagged an error (the structured signal) OR
-            # the reply was empty / truncated before the JUDGE_JSON block.
-            transient = (getattr(result, "is_error", False)
-                         or verdict.evidence in _JUDGE_TRANSIENT)
-            if not transient:
-                return verdict
-            if attempt == 0:            # back off once, before the single retry
-                await asyncio.sleep(_RETRY_BACKOFF_S)
-        return verdict
+        # so that's a format bug, not a transient. Loop shared with IntentJudge.
+        return await _judged_run(backend, prompt, parse_goal_verdict,
+                                 cwd=repo_path)
 
 
 class IntentJudge:
@@ -237,25 +343,5 @@ class IntentJudge:
         backend = self._ensure_backend()
         # Same transient-retry as GoalJudge (review D3): a Stream-closed / empty
         # reply must not silently fail-close the intent-match eval either.
-        verdict = None
-        for attempt in range(2):
-            try:
-                result = await asyncio.wait_for(
-                    backend.run(prompt, cwd=repo_path, max_turns=10,
-                                effort="high"),
-                    timeout=_JUDGE_TIMEOUT_S)
-            except (asyncio.TimeoutError, TimeoutError):
-                # A hung SDK subprocess (Stream-closed) must not wedge the judge
-                # forever — surface a transient error-result so the existing
-                # retry-once-then-fail-closed path below handles it.
-                log.warning("judge backend.run timed out after %ss (attempt %d)",
-                            _JUDGE_TIMEOUT_S, attempt)
-                result = SimpleNamespace(final_text="", is_error=True)
-            verdict = parse_verdict(getattr(result, "final_text", "") or "")
-            transient = (getattr(result, "is_error", False)
-                         or verdict.evidence in _JUDGE_TRANSIENT)
-            if not transient:
-                return verdict
-            if attempt == 0:
-                await asyncio.sleep(_RETRY_BACKOFF_S)
-        return verdict
+        # Loop shared with GoalJudge.
+        return await _judged_run(backend, prompt, parse_verdict, cwd=repo_path)

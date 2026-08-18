@@ -461,18 +461,41 @@ def discover_repos(
     refused: list[str] = []
 
     candidate_roots: list[Path] = []
+    # Case-sensitive filesystems (Linux) keep ``~/code`` and ``~/Code`` apart;
+    # APFS and NTFS fold them, which is why the list above only ever needed one
+    # spelling. Measured on a real Ubuntu 24.04 desktop (2026-08-18): a user's
+    # ``~/code/calc`` was invisible to the scan. So every on-disk case variant
+    # of a conventional name is a root, and the canonical spelling stands in
+    # only when no variant exists (so ``roots_missing`` still names it).
+    # On a folding filesystem the variants collapse to one real directory, and
+    # ``seen`` keeps it from being scanned twice.
+    try:
+        by_fold: dict[str, list[Path]] = {}
+        for entry in home_path.iterdir():
+            try:
+                if entry.is_dir():
+                    by_fold.setdefault(entry.name.lower(), []).append(entry)
+            except OSError:
+                continue
+    except OSError:
+        by_fold = {}
+    seen: set[Path] = set()
     for name in CONVENTIONAL_ROOTS:
-        root = home_path / name
-        # The conventional roots were the ONE path built without this check,
-        # and `~/Code -> /Volumes/BigDisk/code` is an ordinary setup - so the
-        # walk left home through the front door while refusing every side
-        # entrance. Report the link, not just its target: "/Volumes/BigDisk"
-        # on its own does not tell the user which of their folders did it.
-        target = _resolved(root)
-        if target != root and not _is_within(target, home_path):
-            refused.append(f"{root} -> {target}")
-            continue
-        candidate_roots.append(root)
+        for root in sorted(by_fold.get(name.lower()) or [home_path / name]):
+            # The conventional roots were the ONE path built without this
+            # check, and `~/Code -> /Volumes/BigDisk/code` is an ordinary
+            # setup - so the walk left home through the front door while
+            # refusing every side entrance. Report the link, not just its
+            # target: "/Volumes/BigDisk" on its own does not tell the user
+            # which of their folders did it.
+            target = _resolved(root)
+            if target in seen:
+                continue
+            seen.add(target)
+            if target != root and not _is_within(target, home_path):
+                refused.append(f"{root} -> {target}")
+                continue
+            candidate_roots.append(root)
 
     for raw in extra_roots or []:
         if not str(raw).strip():

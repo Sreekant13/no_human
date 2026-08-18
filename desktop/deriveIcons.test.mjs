@@ -218,3 +218,63 @@ test("electron-builder config refuses when the derived ico is absent", () => {
   assert.match(r.stderr, /derive-icons\.mjs/,
     "the refusal must point at derive-icons.mjs as the fix");
 });
+
+// --- Linux: desktop/build/icon.png, the third derived icon --- //
+// electron-builder's Linux targets take ONE PNG >= 512x512 for linux.icon and
+// render the hicolor size set themselves. The master already IS a 512x512 RGBA
+// PNG, so the derivation is a byte-copy: never a re-encode, because every
+// re-encode of this mark rolls fresh 3-byte coincidences against the identity
+// scanner (the reason the icons stopped being committed at all).
+
+test("derives icon.png for Linux as a byte-identical copy of the master", () => {
+  const outDir = tmpDir("nh-icons-linux-");
+  const r = runDerive(["--out-dir", outDir]);
+  assert.equal(r.status, 0, r.stderr);
+  const png = path.join(outDir, "icon.png");
+  assert.ok(fs.existsSync(png), "icon.png (the Linux icon) was not derived");
+  const buf = fs.readFileSync(png);
+  assert.ok(buf.equals(fs.readFileSync(REAL_MASTER)),
+    "icon.png must be the master's bytes — a re-encode would roll new "
+    + "3-byte needle coincidences (the scanner-lottery class)");
+  // PNG magic + IHDR width/height 512: electron-builder needs >= 512.
+  assert.equal(buf.toString("hex", 0, 8), "89504e470d0a1a0a", "not a PNG");
+  assert.equal(buf.readUInt32BE(16), 512, "master is not 512 wide");
+  assert.equal(buf.readUInt32BE(20), 512, "master is not 512 high");
+  assert.match(r.stdout, /OK: wrote .*icon\.png/);
+});
+
+test("--verify fails when icon.png is missing, stale, or not the master's bytes", () => {
+  // Own copy of the master (NH_ICON_MASTER), like the ico staleness test above:
+  // "stale" means OLDER THAN THE MASTER, so the master's mtime is the thing to
+  // move — an absolute "one day ago" on the icon is not stale on a checkout
+  // whose master file is older than that (it was, on the primary checkout, and
+  // this test read green/red depending on when the master was last touched).
+  const outDir = tmpDir("nh-icons-linux-");
+  const masterPath = path.join(outDir, "master.png");
+  fs.copyFileSync(REAL_MASTER, masterPath);
+  const env = { NH_ICON_MASTER: masterPath };
+  const out = path.join(outDir, "out");
+  assert.equal(runDerive(["--out-dir", out], env).status, 0);
+  const png = path.join(out, "icon.png");
+
+  fs.unlinkSync(png);
+  const missing = runDerive(["--verify", "--out-dir", out], env);
+  assert.notEqual(missing.status, 0, "--verify passed with icon.png absent");
+  assert.match(missing.stderr, /icon\.png/);
+
+  assert.equal(runDerive(["--out-dir", out], env).status, 0);
+  // Only the png goes stale (older than the master by a second) so the
+  // refusal names icon.png — the ico is checked first and stays fresh.
+  const masterMtime = fs.statSync(masterPath).mtime;
+  const older = new Date(masterMtime.getTime() - 1000);
+  fs.utimesSync(png, older, older);
+  const stale = runDerive(["--verify", "--out-dir", out], env);
+  assert.notEqual(stale.status, 0, "--verify passed with a stale icon.png");
+  assert.match(stale.stderr, /icon\.png.*stale/);
+
+  assert.equal(runDerive(["--out-dir", out], env).status, 0);   // re-derive: fresh again
+  fs.writeFileSync(png, Buffer.concat([fs.readFileSync(png), Buffer.from([0])]));
+  const tampered = runDerive(["--verify", "--out-dir", out], env);
+  assert.notEqual(tampered.status, 0, "--verify passed with a modified icon.png");
+  assert.match(tampered.stderr, /icon\.png.*master/);
+});

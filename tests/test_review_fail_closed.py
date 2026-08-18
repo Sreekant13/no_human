@@ -941,10 +941,10 @@ async def test_an_angle_that_reaches_no_verdict_never_fails_the_gate(tmp_path):
     d = await AdversarialReviewer(backend=backend).review(
         task, repo_path=tmp_path, diff_override="+ x = 1\n")
 
-    assert backend.n == 4, "main + 3 angles"
+    assert backend.n == 5, "main + 4 angles"
     assert d.passed is True, "an angle that never reached a verdict failed the gate"
     notes = [i for i in d.checklist if "did not run" in i.label]
-    assert len(notes) == 3 and all(i.passed for i in notes)
+    assert len(notes) == 4 and all(i.passed for i in notes)
     assert not any("no parseable REVIEW_JSON" in i.evidence for i in d.checklist), (
         "the reviewer's own failure was appended as a finding against the diff")
 
@@ -1054,11 +1054,11 @@ async def test_a_skipped_angle_still_bills_its_tokens_to_the_attempt(tmp_path):
         task, repo_path=tmp_path, diff_override="+ x = 1\n")
 
     assert d.passed is True
-    assert d.tokens_used == 1_000 + 3 * spend["tokens_used"], (
-        "three skipped angles were billed and reported nothing")
-    assert d.cache_read_tokens == 3 * spend["cache_read_tokens"]
-    assert d.cache_creation_tokens == 3 * spend["cache_creation_tokens"]
-    assert d.output_tokens == 100 + 3 * spend["output_tokens"]
+    assert d.tokens_used == 1_000 + 4 * spend["tokens_used"], (
+        "four skipped angles were billed and reported nothing")
+    assert d.cache_read_tokens == 4 * spend["cache_read_tokens"]
+    assert d.cache_creation_tokens == 4 * spend["cache_creation_tokens"]
+    assert d.output_tokens == 100 + 4 * spend["output_tokens"]
 
 
 async def test_the_escalating_single_turn_gate_carries_its_burn(tmp_path):
