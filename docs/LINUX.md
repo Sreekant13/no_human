@@ -15,11 +15,13 @@ departs from it.
 > **[verified]** — a command was run on real Linux (or, where stated, on the
 > macOS host for a platform-neutral fact) and its output is quoted.
 > **[unverified]** — reasoned from source, not executed. Nothing is marked
-> verified on the strength of a code reading alone. Sections 6 and 7 are
-> tables to be FILLED by runs; while they are empty, the Linux app is not
-> OFFERED FOR DOWNLOAD anywhere — no release asset, no site button routed to
-> a build, no README download line. (The install docs land with the code, as
-> WINDOWS.md's did, and say what has and has not been verified.)
+> verified on the strength of a code reading alone. Sections 6 and 7 were
+> tables to be FILLED by runs, and the rule while they were empty was that the
+> Linux app is not OFFERED FOR DOWNLOAD anywhere. **That condition was met on
+> 2026-08-19**: §6 carries a green CI run and §7 a real Ubuntu 24.04 desktop
+> walk, and the app is now a release asset (`v0.1.0`), a pointer object each
+> for the .deb and the AppImage, and a site button routed to the signed-in
+> download.
 
 ---
 
@@ -222,12 +224,17 @@ quiet: the workflow-level `concurrency` group (`cancel-in-progress: true`)
 cancels an in-flight run on any push to `main`, and the same dispatch also
 runs the python job's `slow or nightly` guards, which bill in the same run.
 
-**Not yet run.** The first run is the spike that answers whether PyInstaller
-freezes against the uv-managed Python on the runner (the named first-run
-risk); if it
-does not, the job gains `actions/setup-python@v5` 3.12 and
-`uv sync --python "$(which python3.12)"`, and this line records which path
-worked. **[unverified]**
+**Run, and green.** The first release run was the public repo's own CI on
+2026-08-19 (run 32191761089, commit `671b26ae`, `linux_release=true`): all six
+jobs green, including this one. It answered the named first-run risk in the
+affirmative — **PyInstaller froze against the uv-managed Python on the runner
+with no `setup-python` step and no `--python` override**, so the fallback that
+line contemplated was never needed. The run produced
+`no_human-0.1.0-linux-amd64.deb` (122,048,572 B) and
+`no_human-0.1.0-linux-x86_64.AppImage` (151,011,154 B), installed the .deb,
+drove the installed app first-run → board → quit under Xvfb, did the same for
+the extracted AppImage, and proved `apt-get remove` keeps `~/.no_human`.
+`BUILD_STAMP`: `commit=671b26ae…`, `dirty=no`. **[verified]**
 
 ---
 
@@ -335,6 +342,17 @@ the OBSERVATION. Rig honesty: XFCE, not GNOME, so App-Center/GNOME-Shell
 behaviours (row 2's double-click, GNOME's app grid) are only partly
 reproducible; the artefacts came from the on-box build (§6), not a release,
 because the CI job could not run (org billing).
+
+> **Update 2026-08-19 — what closed afterwards, and what did not.** The public
+> repo's own CI (free minutes) then built and published the release, so row 1's
+> "no release/pointer exists" no longer holds: `v0.1.0` carries the .deb, the
+> AppImage and `SHA256SUMS-linux.txt`, the release bucket carries a pointer per
+> format whose sha256 equals the CI run's own checksum line, and the site's
+> Linux button routes to the signed-in download (checked live). What this does
+> NOT retroactively claim: the desktop walk below was performed against the
+> ON-BOX build, and the download-from-the-site hop in row 1 has still never
+> been walked end to end by a human — signing in requires the operator's own
+> credential. Rows 7–8 (a real task to a real PR) likewise remain open.
 
 | # | Step | Pass condition | Observed |
 | --- | --- | --- | --- |

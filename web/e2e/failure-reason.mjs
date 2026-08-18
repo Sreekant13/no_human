@@ -65,7 +65,12 @@ async function openFailedDrawer(task) {
   const drawer = page.locator(".slideover");
   check("[A] the failed task drawer opened", await drawer.isVisible().catch(() => false));
   const banner = page.locator(".so-failure");
-  check("[A] the why-it-failed banner is shown", await banner.isVisible().catch(() => false));
+  // waitFor, not isVisible(): the banner mounts only after the drawer's async
+  // detail fetch resolves, and isVisible does not auto-wait — this check raced
+  // the fetch and failed on a mounted-a-beat-later banner while the innerText
+  // check below (which DOES auto-wait) passed. Same 5s bound the drawer uses.
+  check("[A] the why-it-failed banner is shown",
+    await banner.waitFor({ state: "visible", timeout: 5000 }).then(() => true).catch(() => false));
   check("[A] the failure reason is rendered VERBATIM",
     (await banner.innerText().catch(() => "")).includes(REASON), "");
   // Computed style: it must actually read as an alert (undefined tokens would

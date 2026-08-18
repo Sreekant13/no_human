@@ -41,8 +41,10 @@ you left off; delete that folder yourself if you want a clean slate.
 
 ## Installed the Linux app? Start here instead
 
-> These steps are written from the build, not yet from a walked Ubuntu
-> desktop — `LINUX.md` §6/§7 record what has actually been observed on Linux.
+> Walked on a real Ubuntu 24.04 desktop on 2026-08-18 (install → first run →
+> board → task detail → settings → quit → uninstall); `LINUX.md` §6/§7 record
+> what was observed, including the two frictions worth knowing before you
+> start.
 
 **If you installed `no_human-<version>-linux-amd64.deb` or ran the AppImage,
 sections 1–3 below are NOT for you.** The app carries its own Python, its own
