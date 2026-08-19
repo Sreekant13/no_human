@@ -20,7 +20,13 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
+# hatch_build.py is BUILD CONFIGURATION, not a script: pyproject declares it as a
+# custom hatchling hook, and hatchling resolves the hook before it resolves
+# dependencies — so a tree without it fails `uv sync` with
+# "Build script does not exist: hatch_build.py" before a single package is
+# fetched. It was missing here and nothing noticed, because nothing in CI ever
+# built this image; the MCP job added alongside this fix now builds both.
+COPY pyproject.toml uv.lock README.md hatch_build.py ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 COPY eval/ ./eval/

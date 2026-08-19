@@ -21,21 +21,19 @@
 # for a registry's sandbox. The ASGI app itself needs no credential — it is the
 # board's API — so introspection succeeds with nothing secret in the image.
 #
+# NO BOARD IN THIS IMAGE. `uv sync` builds an EDITABLE wheel, and `hatch_build.py`
+# only REQUIRES web/dist for a standard one — so the React board is not needed to
+# install, and nothing here could serve it anyway (no port is published, MCP is
+# stdio). The API logs "board not found ... serving the API only" and answers
+# /api/* exactly as the bridge needs. Building it would cost a node stage per CI
+# run for output nobody reads.
+#
 # WHAT THIS IMAGE IS NOT. It answers `tools/list`; it cannot run a task.
 # `task_add` files work that a real no_human — with your repos, your git host
 # and your Claude credential — then executes. Nothing here is a way to run the
 # product without one, and no credential is baked in or required to build it.
 
-# ── Stage 1: the board, because a standard wheel refuses to build without it ──
-FROM node:22-slim AS web
-WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm ci --no-audit --no-fund
-COPY web/ ./
-RUN npm run build
-
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim
 
 # git is a hard dependency of the product's VCS layer; curl is the healthcheck.
 RUN apt-get update \
@@ -45,17 +43,21 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
+# hatch_build.py is BUILD CONFIGURATION: pyproject declares it as a custom
+# hatchling hook and hatchling resolves the hook before dependencies, so a
+# tree without it fails `uv sync` with "Build script does not exist".
+COPY pyproject.toml uv.lock README.md hatch_build.py ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
-COPY --from=web /web/dist ./web/dist
 
 RUN uv sync --frozen --no-dev
 
-# The bridge talks to 127.0.0.1:8420 and nothing else (BASE_URL in
-# `intake/mcp_bridge.py` is not configurable), so the API is bound to loopback
-# INSIDE the container and no port is published. MCP itself is stdio.
-ENV NH_MCP_API_PORT=8420
+# The bridge talks to 127.0.0.1:8420 and nothing else — BASE_URL in
+# `intake/mcp_bridge.py` is a module constant with no environment override — so
+# the entrypoint binds that exact port on loopback INSIDE the container. No port
+# is published and none is configurable here on purpose: a knob whose only
+# possible effect is to bind the API somewhere the bridge will not look is a
+# trap, not a feature. MCP itself is stdio.
 
 COPY packaging/mcp-entrypoint.sh /usr/local/bin/mcp-entrypoint.sh
 RUN chmod +x /usr/local/bin/mcp-entrypoint.sh

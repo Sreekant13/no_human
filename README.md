@@ -160,6 +160,34 @@ video with every step):
 
 <p align="center">▶️&nbsp;&nbsp;<strong><a href="https://getnohuman.com/assets/demo-jira.mp4">Play the full demo</a></strong> — 1:33, from Jira board to review-passed PR</p>
 
+## MCP server — hand it work from the agent you are already in
+
+no_human ships an **MCP (Model Context Protocol) server**: a stdio bridge, built
+on the official Python MCP SDK, that lets Claude Code, Cursor or any MCP client
+file work with your local no_human and check on it.
+
+```bash
+nh mcp-serve        # the MCP server, over stdio
+```
+
+Two tools, and no more:
+
+| Tool | What it does |
+|---|---|
+| `task_add(title, description, repo_path)` | Files a task. no_human then plans it, writes the change, runs your tests, has a second model review it, and opens the pull request. |
+| `task_status(task_id_or_external_id)` | Returns that task's current state — status, attempts, the PR link once there is one. |
+
+It talks to your own no_human at `http://127.0.0.1:8420` and nothing else: no
+auth, because that address is localhost, and no service of ours in between. For
+Claude Code, the same server ships as a plugin — point it at
+[`plugins/no-human/`](plugins/no-human/) and the two tools appear in your
+session.
+
+```jsonc
+// .mcp.json
+{ "mcpServers": { "no_human": { "command": "nh", "args": ["mcp-serve"] } } }
+```
+
 ## Docs
 
 | | |

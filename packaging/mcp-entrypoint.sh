@@ -7,14 +7,27 @@
 # stream a client is reading, and (c) `exec` the bridge so signals and the exit
 # status belong to it rather than to a shell wrapper. Every diagnostic here goes
 # to stderr for exactly that reason.
+#
+# WHY `--no-dev` ON EVERY `uv run`. The image is built with
+# `uv sync --frozen --no-dev`, so the dev group is absent from both the venv and
+# the image's uv cache. `uv run` re-syncs before executing, and its default group
+# set INCLUDES dev — so a bare `uv run` here would try to fetch pytest,
+# pyinstaller and eleven more wheels from PyPI at container start. An MCP
+# registry probing an untrusted image with no egress would get a container that
+# never serves: exactly the "unhealthy" verdict this image exists to avoid.
+# Measured: 14 packages, none of them in the image.
+#
+# The port is a literal, not a variable, because `BASE_URL` in
+# `intake/mcp_bridge.py` is a module constant — a configurable port here could
+# only ever bind the API somewhere the bridge will not look.
 set -eu
 
-PORT="${NH_MCP_API_PORT:-8420}"
+PORT=8420
 
 # uvicorn on the ASGI app, not `nh start`: the CLI asserts a usable coding
 # backend (credential + `claude` CLI) before serving, which a registry sandbox
 # cannot satisfy and does not need in order to answer `tools/list`.
-uv run --frozen uvicorn no_human.api.app:app \
+uv run --frozen --no-dev uvicorn no_human.api.app:app \
     --host 127.0.0.1 --port "$PORT" --log-level warning >&2 2>&1 &
 API_PID=$!
 
@@ -37,4 +50,4 @@ until curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/tasks" 2>/dev/null; d
 done
 
 echo "mcp-entrypoint: API up on 127.0.0.1:${PORT}; starting the MCP bridge" >&2
-exec uv run --frozen nh mcp-serve
+exec uv run --frozen --no-dev nh mcp-serve
