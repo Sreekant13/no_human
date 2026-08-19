@@ -12,6 +12,7 @@ import { connectionBanner } from "./connectionBanner.js";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const appJsx = readFileSync(here + "App.jsx", "utf8");
 const stylesCss = readFileSync(here + "styles.css", "utf8");
+const bannerJs = readFileSync(here + "connectionBanner.js", "utf8");
 
 test("the banner renders while disconnected and is absent once live", () => {
   const disconnected = connectionBanner("disconnected");
@@ -75,4 +76,32 @@ test("styles.css defines .nh-stale-banner and every var(--…) it reads is defin
     assert.ok(definedInCss.has(v), `${v} is read by .nh-stale-banner but never defined`);
     assert.ok(lightBlock.includes(`${v}:`), `${v} is read by .nh-stale-banner but not overridden for the light theme`);
   }
+});
+
+test("the banner is a status strip, not a control surface — it never eats clicks", () => {
+  // The behavioural gate for this lives in web/e2e (form-order.mjs goes red
+  // without the rule, because a static-server e2e run has no websocket and so
+  // renders the banner permanently). CI runs the node suite only — it sets
+  // PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD and never invokes web/e2e — so without
+  // this assertion the regression is caught only by a human running e2e
+  // locally. Cheap here, and it fails for the right reason.
+  const raw = stylesCss.replace(/\/\*[\s\S]*?\*\//g, "");
+  const base = raw.match(/\.nh-stale-banner\s*\{([^}]*)\}/);
+  assert.ok(base, ".nh-stale-banner base rule must exist");
+  assert.match(
+    base[1],
+    /pointer-events\s*:\s*none/,
+    ".nh-stale-banner must set pointer-events:none — it is position:fixed over "
+      + "the top bar, so without it the strip intercepts every click aimed at "
+      + "the controls beneath",
+  );
+  // The rule is only safe while the banner has nothing to click. If a control
+  // is ever added, pointer-events must be restored on it — assert the premise
+  // rather than trusting it to stay true.
+  assert.doesNotMatch(
+    bannerJs,
+    /onClick|<button|role:\s*"button"/,
+    "the banner gained an interactive element: pointer-events:none now kills "
+      + "it, so restore pointer-events:auto on that child",
+  );
 });

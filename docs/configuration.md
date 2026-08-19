@@ -223,6 +223,14 @@ blockers:                         # Part 22
   max_park_duration: "48h"        # parked past this => escalate (never abandon)
   wake_poll_interval: "10m"
   escalate_on_low_confidence_below: 0.6   # unsure what's wrong => ask, don't thrash
+  challenge: true                 # ONE supervisor-checked challenge per task, for the
+                                  # judgment-call blocker categories only (AMBIGUITY,
+                                  # NOVEL_UNKNOWN, IMPOSSIBLE). A "resolvable" verdict
+                                  # costs that attempt and re-enters the bounded loop
+                                  # under a recorded reversible assumption; every
+                                  # external category, every second blocker and every
+                                  # check failure park exactly as before. Set false to
+                                  # park on the first blocker, unchallenged.
 
 usage_ledger:
   retention_days: 90              # unattributed_usage rows older than this are rolled

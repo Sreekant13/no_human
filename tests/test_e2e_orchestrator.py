@@ -88,6 +88,12 @@ def _config(tmp_path):
     # deliberate and must be stated. The gate's own behaviour is covered by
     # tests/test_review_fail_closed.py.
     cfg.data.setdefault("reviewer", {})["allow_advisory"] = True
+    # The escalation-quality gate (blockers.challenge) is ON in production; OFF
+    # here so every blocker test pins the park semantics it was written for
+    # WITHOUT a live supervisor call (same deliberate-and-stated pattern as
+    # allow_advisory above). The gate's own behavior is covered by
+    # tests/test_blocker_challenge.py with the advisory seam patched.
+    cfg.data.setdefault("blockers", {})["challenge"] = False
     return cfg
 
 
@@ -1513,9 +1519,11 @@ async def test_agent_max_turns_escalates_not_crashes(bare_repo, tmp_path, store)
 
     assert outcome.status is TaskStatus.ESCALATED
     # The bounded loop ran every attempt, then escalated honestly.
-    assert backend.calls == cfg.data["bounds"]["max_attempts"]
+    # W4 (failed-restoration fingerprint): every attempt hits max_turns with
+    # the same empty diff — the second identical outcome stops the loop.
+    assert backend.calls == 2
     attempts = await store.list_attempts(t.id)
-    assert len(attempts) == cfg.data["bounds"]["max_attempts"]
+    assert len(attempts) == 2
     assert all(a["status"] == "failed" for a in attempts)
     assert all("max_turns" in (a.get("failure_reason") or "") for a in attempts)
     # No half-finished work was committed/pushed as an approvable PR. (A local
@@ -3404,7 +3412,10 @@ async def test_doom_loop_reason_persists_into_attempt_log(bare_repo, tmp_path, s
 
     assert outcome.status is TaskStatus.ESCALATED
     attempts = await store.list_attempts(t.id)
-    assert len(attempts) == cfg.data["bounds"]["max_attempts"]
+    # W4 (failed-restoration fingerprint): both attempts end in a
+    # byte-equivalent state, so the SECOND identical failure stops the loop —
+    # the third attempt would re-prove the same wall at the 20×-cost tier.
+    assert len(attempts) == 2
     assert all("doom-loop" in (a.get("failure_reason") or "") for a in attempts)
     assert t.context.get("attempt_log")
     assert any("doom-loop" in entry for entry in t.context["attempt_log"])

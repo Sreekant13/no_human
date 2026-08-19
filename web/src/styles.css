@@ -287,6 +287,12 @@ html, body, #root {
   left: 0;
   right: 0;
   z-index: 60;
+  /* A status strip, not a control surface (connectionBanner.js renders text
+     only, role="status"): it must never eat clicks aimed at the top bar
+     beneath it. Found by the 2026-08-18 QA pass — while disconnected, the
+     strip intercepted every click in the top ~30px (and blocked five e2e
+     suites the same way). */
+  pointer-events: none;
   padding: 6px 12px;
   text-align: center;
   font-size: 12px;

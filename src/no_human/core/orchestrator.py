@@ -107,7 +107,7 @@ from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
 from ..vcs.task_pr import resolve_task_pr
 from . import plan_gate
-from .bounds import Bounds, QuotaExhausted, StuckDetector
+from .bounds import Bounds, QuotaExhausted, StuckDetector, error_signature
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
 from .infra_breaker import infra_breaker
@@ -486,6 +486,26 @@ _REPORT_KINDS = ("investigation", "design_doc")
 #: file. `_drive` matches on it to break the retry loop, so it lives here rather
 #: than being spelled out at each site.
 _NO_CHANGES_DETAIL = "agent produced no file changes"
+
+
+def _fingerprint_detail(detail: str | None) -> str:
+    """The failure detail as the failed-restoration fingerprint sees it.
+
+    Durations ("in 0.42s") vary between byte-identical runs and
+    `error_signature` does not strip them, so without this the fingerprint of
+    two identical outcomes never matches and the whole check is dead code. A
+    named function rather than an inline `re.sub` because an inline one cannot
+    be tested: the review that found this deleted the normalization and every
+    suite stayed green.
+
+    WHAT IT DOES NOT DO, so the fingerprint's claim is not read wider than it
+    is: `error_signature` also collapses paths and numbers, so "the same diff"
+    means the same diff MODULO paths and line numbers — the identical wrong
+    body written into two DIFFERENT files fingerprints equal. The failure mode
+    is one honest escalation too early, never a fake done, and the failure
+    detail has to match as well.
+    """
+    return re.sub(r"\b\d+(?:\.\d+)?s\b", "<dur>", detail or "")
 # Prefix of the coder-turn wall-clock timeout detail (B20). The streak wiring
 # below matches on it, so the handler builds its detail from this constant —
 # a reworded message can't silently unhook the escalation.
@@ -2772,6 +2792,21 @@ class Orchestrator:
         # file warns about for zero_diff_reason: "a conditional write would let
         # a talkative attempt 1 put words in a silent attempt 2's mouth".
         streak_had_report = False
+        # The failed-restoration fingerprint compares THIS loop's attempts to
+        # each other. `task.context` survives escalate -> `nh reply` -> fresh
+        # loop (the paragraph above says so for `inadequate_report_text`, and
+        # `zero_diff_last` is written every attempt for the same reason), so a
+        # fingerprint carried in from a previous loop made the resumed loop
+        # escalate after ONE attempt: the human's new direction never got the
+        # corrective-preamble retry the bounded loop promises. Cleared at loop
+        # ENTRY, which is the only place that means "this loop, from scratch".
+        try:
+            _ctx = task.context or {}
+            if _ctx.pop("attempt_fingerprint", None) is not None:
+                task.context = _ctx
+                await self.store.update_task(task)
+        except Exception as exc:  # noqa: BLE001 — never block a loop on this
+            self._advisory(f"could not clear the attempt fingerprint: {exc}")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
             # Honour a cancellation before spending another attempt's tokens.
             # This is the cheap boundary: no session is open, the tree is clean.
@@ -3031,6 +3066,73 @@ class Orchestrator:
                             task, blocker, repo=repo, branch=base_branch,
                             escalate_now=True,
                         )
+
+            # Failed-restoration fingerprint (P2, Paperclip via the 2026-08-18
+            # gap plan): D6 above needs BOTH attempts to have reached review;
+            # most burn-then-quit attempts die earlier (tests, tamper, build).
+            # Hash the durable outcome — normalized failure detail + the
+            # worktree's diff against base. "Byte-equivalent" is the shape
+            # `error_signature` sees, which is modulo paths and numbers (see
+            # `_fingerprint_detail`), so this can fire one attempt early on
+            # identical content written to different files — never late, and
+            # never a fake done. If a retry lands there, the corrective
+            # preamble demonstrably changed nothing: the next attempt would be the 20×-cost class
+            # re-proving it. Escalate honestly NOW instead. Guarded to real-
+            # work failures only (`unproductive_streak == 0`) — zero-diff /
+            # timeout / inadequate-report streaks keep their own, more specific
+            # escalations above — and NOT to CI-round failures: the CI-fix
+            # rung has its own operator-configured bound
+            # (`blockers.max_ci_fix_rounds`) and a more specific escalation,
+            # and a generic check must not pre-empt an explicit knob. Best-
+            # effort: a diff failure skips the check, never the retry.
+            _is_ci_shaped = (outcome.detail or "").startswith(
+                ("CI failed", "push for CI failed"))
+            if unproductive_streak == 0 and not _is_ci_shaped:
+                try:
+                    diff_now = repo.diff(base_branch) if base_branch else repo.diff()
+                    # Durations ("in 0.42s") vary between byte-identical runs
+                    # and error_signature does not strip them — normalize here
+                    # so a repeat differs only when something REAL differs.
+                    fp = error_signature(
+                        _fingerprint_detail(outcome.detail) + "\n\x00\n" + diff_now)
+                    ctx = task.context or {}
+                    prev_fp = ctx.get("attempt_fingerprint")
+                    ctx["attempt_fingerprint"] = fp
+                    task.context = ctx
+                    await self.store.update_task(task)
+                    if prev_fp is not None and prev_fp == fp:
+                        self.emit(
+                            "failed_restoration",
+                            "retry ended in a byte-equivalent state (same "
+                            "failure signature, same diff) — escalating "
+                            "instead of burning another attempt",
+                        )
+                        blocker = Blocker(
+                            category=BlockerCategory.STAGNATION,
+                            transient=False, confidence=0.9, goal=task.title,
+                            tried=list(ctx.get("attempt_log") or []),
+                            root_cause_hypothesis=(
+                                "Two consecutive attempts ended in the SAME "
+                                "state — identical failure signature and an "
+                                "identical diff against base — so the retry "
+                                "(with its corrective preamble) changed "
+                                "nothing observable. A third attempt would "
+                                "re-prove it at the highest cost tier."
+                            ),
+                            question=(
+                                "The approach reaches the same failing state "
+                                "every time. Is there a missing constraint or "
+                                "piece of context the spec should name, or "
+                                "should a different approach be directed?"
+                            ),
+                            evidence=(outcome.detail or "")[:500],
+                        )
+                        return await self._raise_blocker(
+                            task, blocker, repo=repo, branch=base_branch,
+                            escalate_now=True,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self._advisory(f"restoration fingerprint failed: {exc}")
 
         # Bounds exhausted -> escalate with a diagnosis built from the attempts
         # (never fake done). 22.3: ≤2 distinct alternatives, then escalate.
@@ -3952,6 +4054,70 @@ class Orchestrator:
         emitted = parse_blocker(result.final_text or "")
         if emitted is not None:
             emitted.goal = emitted.goal or task.title
+            # Escalation-quality gate (gap-close W3): the judgment-call
+            # categories get ONE bounded challenge per task before parking —
+            # a "resolvable" verdict costs this attempt and re-enters the
+            # bounded loop under a documented reversible assumption; every
+            # external category, every second blocker, and every check
+            # failure honors the park exactly as before.
+            challenge = await self._challenge_blocker(task, emitted)
+            if challenge is not None:
+                # Checkpoint FIRST, and RECORD the sha. The next attempt
+                # begins with `reset_agent_workspace`, which hard-resets the
+                # tree, so returning here without a checkpoint destroys exactly
+                # the work this gate exists to save — measured before this
+                # existed: "workspace reset discarded 1 uncommitted
+                # leftover(s)". Committing alone is not enough: a sha nothing
+                # records is invisible to `_resume_branch_point`, which reads
+                # only `resume_from.sha` and `handoff.wip_sha`, so the bought
+                # attempt would branch from base and redo the work anyway —
+                # the commit would survive in the object store for a human and
+                # for nobody else. `_record_wip_checkpoint` is the same seam
+                # the abort paths use, and it merges rather than overwrites.
+                # [WIP-PARTIAL], NOT [WIP-BLOCKED], and the label is the
+                # whole point: `_is_wip_partial` recognises only the PARTIAL
+                # prefix, and `_is_own_partial` uses it to decide whether work
+                # already ahead of base belongs to THIS loop. A [WIP-BLOCKED]
+                # sha in `handoff.wip_sha` reads as "a human gated this", so
+                # the zero-diff honesty gate disarms and an attempt that edits
+                # nothing after a challenge is credited with attempt 1's
+                # commits — measured: AWAITING_APPROVAL with a PR opened on
+                # abandoned half-work, where the same probe with this label
+                # escalates. Semantically it IS the loop's own abandoned
+                # partial: no human gated it, the supervisor did.
+                _wip = ""
+                if repo.has_changes():
+                    try:
+                        _c = repo.commit_all(
+                            f"[WIP-PARTIAL] {self._commit_message(task)}")
+                        _wip = _c.sha
+                        self.emit("checkpoint", f"WIP-PARTIAL {_wip[:8]} "
+                                  f"({_c.files_changed} files preserved)")
+                    except Exception as _exc:  # noqa: BLE001 — never block routing
+                        log.warning("WIP checkpoint on a challenged blocker "
+                                    "failed: %s", _exc)
+                if _wip:
+                    await self._record_wip_checkpoint(
+                        task, _wip, repo,
+                        stopped_because=(
+                            "the supervisor judged this blocker resolvable — "
+                            "continue from this checkpoint under the recorded "
+                            "assumption"),
+                    )
+                await self.store.update_attempt(
+                    attempt_id, status="failed",
+                    failure_reason=(
+                        f"blocker challenged: {emitted.category.value} judged "
+                        f"resolvable by the supervisor"),
+                )
+                return TaskOutcome(
+                    task, status=TaskStatus.FAILED,
+                    detail=(
+                        "blocker challenged as resolvable — proceed under this "
+                        f"documented reversible assumption: {challenge.assumption[:220]} "
+                        f"(supervisor reasoning: {challenge.reasoning[:180]})"
+                    ),
+                )
             await self.store.update_attempt(
                 attempt_id, status="failed",
                 failure_reason=f"agent blocker: {emitted.category.value}",
@@ -6414,6 +6580,76 @@ class Orchestrator:
             task, status=TaskStatus.FAILED,
             detail=f"answer reused: {original_answer[:200]}", off_ramp=False,
         )
+
+    async def _challenge_blocker(self, task: Task, blocker: Blocker) -> Any:
+        """The escalation-quality gate (gap-close W3; `blockers/challenge.py`
+        holds the policy and the honest-escalation invariant).
+
+        Returns a `ChallengeVerdict` ONLY on a well-formed "resolvable"
+        verdict with a stated assumption — the caller then fails the attempt
+        into the bounded loop instead of parking. Returns None in every other
+        case (external category, second blocker on this task, gate disabled,
+        supervisor failure/timeout/parse-miss) and the blocker is honored
+        exactly as before. Advisory infrastructure: no branch of this may
+        raise into the pipeline.
+        """
+        from ..agent.advisory import advisory_backend
+        from ..blockers.challenge import (CHALLENGEABLE, build_challenge_prompt,
+                                          parse_challenge)
+        try:
+            if not (self.config.get("blockers") or {}).get("challenge", True):
+                return None
+            if blocker.category not in CHALLENGEABLE:
+                return None
+            ctx = task.context or {}
+            if ctx.get("blocker_challenged"):
+                return None
+            model = self.config.get("llm", {}).get(
+                "supervisor_model", "claude-sonnet-5")
+            backend = advisory_backend(model, role="supervisor")
+            prompt = build_challenge_prompt(
+                task.title, task.acceptance_criteria or [], blocker)
+            result = await asyncio.wait_for(
+                backend.run(prompt, cwd=None, max_turns=1, effort="low"),
+                timeout=120.0)
+            self._note_supervisor_usage(result)
+            verdict = parse_challenge(getattr(result, "final_text", "") or "")
+            # One challenge per task, spent whenever the check RAN and parsed —
+            # external verdicts confirm honesty and must not be re-litigated
+            # on the next blocker either.
+            if verdict is not None:
+                ctx["blocker_challenged"] = True
+                ctx["challenged_blocker"] = blocker.to_dict()
+                written = {
+                    "blocker_challenged": True,
+                    "challenged_blocker": blocker.to_dict(),
+                }
+                if verdict.verdict == "resolvable":
+                    assumptions = list(ctx.get("assumptions") or [])
+                    assumptions.append(
+                        f"{verdict.assumption} (assumed to resolve a "
+                        f"{blocker.category.value} blocker; supervisor-checked)")
+                    written["assumptions"] = assumptions
+                # merge_context, not update_task: `update_task` rewrites the
+                # whole context blob from THIS in-memory copy, so it deletes
+                # keys another writer added meanwhile — and the CLI writes
+                # `resume_from` from a different PROCESS while the attempt is
+                # running. `_record_wip_checkpoint`'s docstring records that as
+                # a live data loss; this write happens on the same path and had
+                # the same exposure.
+                task.context = await self.store.merge_context(task.id, written)
+                self.emit(
+                    "blocker_challenge",
+                    f"{blocker.category.value} blocker judged "
+                    f"{verdict.verdict} by the supervisor",
+                    verdict=verdict.verdict,
+                )
+                if verdict.verdict == "resolvable":
+                    return verdict
+            return None
+        except Exception as exc:  # noqa: BLE001 — fail open toward honesty
+            self._advisory(f"blocker challenge skipped: {exc}")
+            return None
 
     async def _raise_blocker(
         self, task: Task, blocker: Blocker, *, repo: GitRepo | None = None,

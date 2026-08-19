@@ -5975,6 +5975,39 @@ def _bench_cost_cell(cost_ratio: float | None, basis: str) -> str:
     return f"cost×{cost_ratio:.2f} ({basis})" if cost_ratio else "cost n/a"
 
 
+@bench.command("harvest")
+@click.option("--out", "out_dir", default=None, type=click.Path(path_type=Path),
+              help="Candidate output dir (default: ~/.no_human/harvest — "
+                   "OUTSIDE the corpus; candidates are runnable:false until "
+                   "the operator curates them in).")
+def bench_harvest(out_dir):
+    """Turn escalated/parked/failed tasks into bench-spec CANDIDATES.
+
+    Every terminal non-success is a replayable scenario for exactly the
+    failure modes the bench measures. Candidates are written runnable:false
+    with a harvest: provenance block; nothing enters the scored corpus until
+    the operator pins the repo state, sets the subset, and judges
+    expect_escalation (the corpus feeds a published trust number — nothing
+    enters it un-reviewed).
+    """
+    config = load_config()
+
+    async def _run():
+        from ..eval.harvest import harvest
+        async with Store(config.db_path) as store:
+            return await harvest(store, out_dir=out_dir)
+
+    written = asyncio.run(_run())
+    if written:
+        console.print(f"[green]{len(written)} candidate(s) written[/] → "
+                      f"{escape(str(written[0].parent))}")
+        console.print("[dim]curate: pin repo.pin, set subset, judge "
+                      "expect_escalation, then move into eval/northstar_tasks/[/]")
+    else:
+        console.print("[dim]no new candidates (existing files are never "
+                      "overwritten)[/]")
+
+
 @bench.command("run")
 @click.option("--full", is_flag=True,
               help="Run the FULL corpus (default: subset core only).")

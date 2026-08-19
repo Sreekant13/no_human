@@ -1387,6 +1387,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_park_duration": "48h",
         "wake_poll_interval": "10m",
         "escalate_on_low_confidence_below": 0.6,
+        # Escalation-quality gate (blockers/challenge.py): the judgment-call
+        # categories (AMBIGUITY / NOVEL_UNKNOWN / IMPOSSIBLE) get ONE
+        # supervisor-checked challenge per task before parking a deliverable
+        # task; external categories and every second blocker are honored
+        # untouched. Never converts a park into "done" — a resolvable verdict
+        # costs the attempt and re-enters the bounded loop under a documented
+        # reversible assumption.
+        "challenge": True,
         # PR comments from these authors never trigger a revision ("[bot]"
         # logins are always ignored on top). A CI service account that posts a
         # test-results table on every build is the shape this exists for:
