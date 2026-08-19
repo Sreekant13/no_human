@@ -388,6 +388,32 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # The MCP server, proven the way a registry proves it. Glama and the
+  # directories that follow it run the server in a container and ask it to
+  # answer `initialize` and `tools/list`; `nh mcp-serve` cannot do that alone,
+  # because it refuses to start without no_human's local API — deliberately, so
+  # that a bridge whose server is missing fails at launch instead of failing
+  # every tool call. `Dockerfile.mcp` starts the API first, so this job builds
+  # that image and drives a REAL MCP handshake over stdin/stdout inside it.
+  # Without this, the first evidence of a broken image would be a third party's
+  # "unhealthy" badge.
+  #
+  # `docker run -i` with no `-t`, and every diagnostic goes to stderr: stdout is
+  # the JSON-RPC stream. No credential is used or needed — the container answers
+  # introspection; it cannot run a task.
+  mcp:
+    name: MCP server answers a handshake
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the MCP image
+        run: docker build -f Dockerfile.mcp -t no-human-mcp:ci .
+
+      - name: initialize + tools/list, inside the container
+        run: python3 packaging/mcp_handshake_probe.py no-human-mcp:ci
+
   desktop:
     name: Desktop shell
     # Same billing philosophy as the windows job below: ~20 Linux minutes a

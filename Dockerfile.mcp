@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+
+# The MCP server, in a container that can answer an introspection request.
+#
+# WHY A SECOND DOCKERFILE. The root `Dockerfile` runs the product: the board and
+# the API, with your credential mounted at runtime. This one exists for MCP
+# registries (Glama and the directories that follow it), whose check is "start
+# the server and answer `initialize` / `tools/list`". `nh mcp-serve` cannot do
+# that alone: the bridge is a thin client over no_human's local HTTP API and
+# `_ensure_api_reachable()` makes it REFUSE to start when that API is not
+# listening — deliberately, because a bridge that starts without its server
+# would fail every tool call instead of failing at launch. In a bare container
+# there is no API, so the bridge exits before the MCP handshake and the check
+# records "unhealthy".
+#
+# So the entrypoint starts the API first and then execs the bridge. The API is
+# started with uvicorn against `no_human.api.app:app` rather than with
+# `nh start`, and that difference is the whole point: `nh start` asserts a
+# usable coding backend (a Claude credential and the `claude` CLI) before it
+# will serve, which is right for a person running the product and impossible
+# for a registry's sandbox. The ASGI app itself needs no credential — it is the
+# board's API — so introspection succeeds with nothing secret in the image.
+#
+# WHAT THIS IMAGE IS NOT. It answers `tools/list`; it cannot run a task.
+# `task_add` files work that a real no_human — with your repos, your git host
+# and your Claude credential — then executes. Nothing here is a way to run the
+# product without one, and no credential is baked in or required to build it.
+
+# ── Stage 1: the board, because a standard wheel refuses to build without it ──
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+# git is a hard dependency of the product's VCS layer; curl is the healthcheck.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ ./src/
+COPY migrations/ ./migrations/
+COPY --from=web /web/dist ./web/dist
+
+RUN uv sync --frozen --no-dev
+
+# The bridge talks to 127.0.0.1:8420 and nothing else (BASE_URL in
+# `intake/mcp_bridge.py` is not configurable), so the API is bound to loopback
+# INSIDE the container and no port is published. MCP itself is stdio.
+ENV NH_MCP_API_PORT=8420
+
+COPY packaging/mcp-entrypoint.sh /usr/local/bin/mcp-entrypoint.sh
+RUN chmod +x /usr/local/bin/mcp-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/mcp-entrypoint.sh"]
