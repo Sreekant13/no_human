@@ -376,6 +376,35 @@ the exact contract.
 orchestrator runs after review. If unset, a sensible default is detected
 (`pytest`, etc.). Held-out tests go in `tests/held_out/` and are run separately.
 
+## Lint command
+
+`lint.command` (optional) overrides lint detection the same way. It decides
+whether the lint gate exists at all: with no explicit command and no proven
+`lint_cmd` on the repo profile, the gate is SKIPPED — no lint, no gate — which
+is deliberate, because linting a repo with a command nobody confirmed produces
+noise the agent then "fixes". Neither this key nor `tests.command` appears in
+the defaults file; both are read straight from your config, so setting either
+one is how you turn the behaviour on.
+
+## Intake grill
+
+`intake.grill` (default **true**) decides whether the clarifying-questions
+stage runs before planning. It is the most expensive pre-plan stage — two LLM
+sessions on every task — so setting it `false` is the way to turn that cost
+off; a small prose-only change skips it automatically regardless. Like
+`lint.command` and `tests.command`, the `intake` section is not written into
+the defaults file: set it yourself to change the behaviour.
+
+## Timeouts read straight from your config
+
+Two wall-clock ceilings are read the same way and default generously so a
+legitimately long run is never cut off:
+
+- `bounds.attempt_timeout_s` (default 3600) — one coder attempt. It was the
+  single unbounded call before it existed.
+- `bounds.shadow_timeout_s` (default 1800) — one shadow/bench run in the
+  throwaway sandbox.
+
 ## Per-task config snapshot
 
 Each task stores the `config` it ran under (`tasks.config`), so a task's

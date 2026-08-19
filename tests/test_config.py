@@ -1,6 +1,7 @@
 """Auth scrub + subscription-mode assertion — the load-bearing safety boundary."""
 
 import os
+import re
 
 import pytest
 
@@ -442,3 +443,278 @@ def test_the_config_floor_never_inverts_the_retry_window():
     assert REVIEW_TIMEOUT_FLOOR_S >= _REVIEW_MIN_RETRY_TIMEOUT, (
         f"a configured window between {_REVIEW_MIN_RETRY_TIMEOUT} and "
         f"{REVIEW_TIMEOUT_FLOOR_S} would grow on retry instead of shrinking")
+
+
+# --------------------------------------------------------------------------- #
+# A default-ON knob shipped undocumented (blockers.challenge, 2026-08-19). The
+# suite was green because nothing asks whether a config key a user can set is
+# described anywhere. This is that gate — differential, because a strict
+# "document everything" would have failed on 62 pre-existing keys, and a gate
+# that is red on arrival gets disabled rather than obeyed.
+# --------------------------------------------------------------------------- #
+
+#: The 72 keys undocumented when this gate was written — the honest
+#: number under an ancestry-aware matcher. The first version of this gate
+#: counted 62, because 18 keys were passing on a leaf name that belonged to
+#: an unrelated section (`enabled:` under integrations.jira documenting
+#: `telemetry.enabled`). It may only SHRINK: adding a
+#: key here to make the gate pass is the failure mode it exists to prevent —
+#: document the key instead. The size assert below catches simple GROWTH; what
+#: it cannot catch is a SWAP (document one key, add another), so the rule is
+#: stated here and in the failure message, and the list is short enough
+#: to read in a review.
+#: A HIGH-WATER MARK, not a ratchet, and the difference matters: it fails a
+#: set that grows past 72, but it is never lowered when a key leaves, so
+#: documenting one key and adding a different undocumented one keeps the size
+#: at 72 and passes. Demonstrated in review. What it genuinely buys is a loud
+#: diff — `-72 / +73` is unmissable where one more line inside a sorted
+#: 72-entry frozenset is not. Real enforcement would derive the number from
+#: history, outside the file the author is editing.
+_BASELINE_SIZE_AT_WRITING = 72
+
+_UNDOCUMENTED_AT_BASELINE = frozenset({
+    "approve_merge.enabled",
+    "approve_merge.test_timeout_seconds",
+    "blockers.ignore_comment_authors",
+    "blockers.max_ci_fix_rounds",
+    "blockers.max_ci_gate_fix_rounds",
+    "blockers.pr_ci_policy",
+    "blockers.stuck_active_minutes",
+    "bounds.attempt_tokens",
+    "bounds.complex_multiplier",
+    "bounds.lifetime_tokens",
+    "bounds_investigation.max_attempts",
+    "bounds_investigation.max_correction_rounds",
+    "bounds_investigation.max_turns_per_attempt",
+    "ci.base_url",
+    "ci.cookie_auto_refresh",
+    "ci.crumb_path",
+    "ci.job",
+    "ci.storage_state_path",
+    "ci.wake_hint",
+    "concurrency.poll_interval",
+    "concurrency.worktree_root",
+    "context.attempt_state_distill_enabled",
+    "context.repo_map_enabled",
+    "decomposition.enabled",
+    "docs.auto_refresh",
+    "docs.max_turns",
+    "docs.refresh_interval_seconds",
+    "eval.nightly_budget_tokens",
+    "filter_user_skills",
+    "git.approve_identity.email",
+    "git.approve_identity.name",
+    "git.github_hosts",
+    "isolation.enabled",
+    "isolation.worktree_root",
+    "learning.auto_confirm_recurring",
+    "llm.auth_profile",
+    "llm.codex_cli_path",
+    "llm.codex_model",
+    "llm.codex_reasoning_effort",
+    "llm.moa_planning.criteria_threshold",
+    "llm.moa_planning.description_threshold",
+    "llm.moa_planning.enabled",
+    "llm.moa_planning.min_signals",
+    "llm.moa_planning.proposers",
+    "llm.planner_model",
+    "llm.supervisor_model",
+    "llm.utility_model",
+    "onboarding.completed",
+    "pipeline.trivial_tier.enabled",
+    "planning.enabled",
+    "planning.max_turns",
+    "profile.auto_confirm_proven",
+    "profile.auto_onboard",
+    "repro_gate.mode",
+    "reviewer.allow_advisory",
+    "reviewer.feedback_rounds",
+    "reviewer.passes",
+    "supervisor.check_every",
+    "supervisor.enabled",
+    "supervisor.preflight",
+    "tamper_adjudication.enabled",
+    "team_brain.control_plane_url",
+    "team_brain.enabled",
+    "team_brain.max_stale_days",
+    "telemetry.enabled",
+    "telemetry.endpoint",
+    "telemetry.instance_id",
+    "telemetry.posthog_host",
+    "telemetry.posthog_publishable",
+    "updates.enabled",
+    "updates.interval_seconds",
+    "worker.backend",
+})
+
+
+def _leaf_config_keys(node, prefix=""):
+    """Every settable key as a dotted path.
+
+    An EMPTY dict is a leaf: `ci.variables` defaults to `{}` and is settable,
+    and recursing into it yields nothing — so a future `{}`-defaulted knob
+    (including a whole user-keyed mapping section) would be invisible to this
+    gate. Found by review, mutation (f).
+    """
+    for key, value in (node or {}).items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            yield from _leaf_config_keys(value, path)
+        else:
+            yield path
+
+
+#: `config.get("SECTION", {}).get("KEY")` and the defensive
+#: `(config.get("SECTION") or {}).get("KEY")` — a key read straight from the user's
+#: config with an inline default and no DEFAULT_CONFIG entry. Fully settable
+#: (`_deep_merge` carries it through) and invisible to a defaults-only walk, so
+#: the gate's universe has to include these or it is checking "keys we declare"
+#: while claiming "keys a user can set". Found by review: `lint.command`
+#: decides whether the lint gate exists at all and was documented nowhere.
+_INLINE_READ = re.compile(
+    r"""(?<![\w.])(?:self\.)?config(?:\.data)?\.get\(\s*["'](\w+)["']\s*"""
+    r"""(?:,\s*\{\}\s*\)|\)\s*or\s*\{\}\s*\))\s*\.get\(\s*["'](\w+)["']""")
+
+
+def _keys_read_without_a_default(src_root, declared_sections):
+    """Settable keys the source reads but DEFAULT_CONFIG never declares.
+
+    A section that IS declared (`llm.moa_planning`) is skipped: reading a
+    subsection this way is ordinary, and its leaves are already walked.
+    """
+    found = set()
+    for path in sorted(src_root.rglob("*.py")):
+        for m in _INLINE_READ.finditer(path.read_text()):
+            dotted = f"{m.group(1)}.{m.group(2)}"
+            if dotted not in declared_sections:
+                found.add(dotted)
+    return found
+
+
+def _documented_paths(docs: str):
+    """Dotted paths the doc actually documents, by its own YAML nesting.
+
+    Matching a LEAF name anywhere in the file is what the first version did,
+    and it is blind to the class it was written for: `enabled` is the leaf of
+    19 of the 166 keys, so a brand-new default-ON section passed because
+    `enabled:` appears under `integrations.jira`. Review mutation (e) added
+    four knobs including a default-ON boolean and the gate stayed green.
+
+    So: rebuild each YAML key line's ancestry from its indentation, and let a
+    doc line document a config path only when its ancestry is a SUFFIX of that
+    path. `enabled:` nested under `concurrency:` documents
+    `concurrency.enabled` and nothing else.
+    """
+    stack: list[tuple[int, str]] = []
+    paths = set()
+    for line in docs.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", line)
+        if not m:
+            continue
+        indent = len(m.group(1).expandtabs(2))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, m.group(2)))
+        paths.add(".".join(name for _, name in stack))
+    return paths
+
+
+def _is_documented(path: str, doc_paths: set, docs: str) -> bool:
+    """Documented iff the doc's own nesting names this EXACT path, or the
+    dotted path is written out literally (the "Settings at a glance" table
+    documents keys that way).
+
+    Exact, not suffix. A suffix match leaves the prefix unchecked, so a future
+    `defaults.git.branch_prefix` or `overrides.ci.enabled` — documented
+    nowhere — rode the `git.branch_prefix` / `ci.enabled` lines; the re-review
+    demonstrated it, and anchoring on the CONFIG's own top-level names did not
+    help, because the offending section is itself in the config. Measured
+    before tightening: of the 99 documented keys, 84 match the full path and
+    15 the literal table entry — **none** needed a suffix. So exact costs
+    nothing and closes the hole.
+
+    The literal hatch requires a dot: for a single-segment key the "dotted
+    path" is one bare word, and any prose occurrence of `enabled` or
+    `hostname` documented it.
+    """
+    if path in doc_paths:
+        return True
+    return "." in path and bool(
+        re.search(rf"(?<![\w.]){re.escape(path)}(?![\w.])", docs))
+
+
+def test_every_new_config_key_is_documented(tmp_path):
+    """A key a user can set must be documented under a matching path.
+
+    The matcher is ancestry-aware on purpose (see `_documented_paths`): the
+    first version matched a bare leaf name anywhere in the file, which let a
+    whole new default-ON section ride on an unrelated `enabled:`. It also
+    accepts a literal dotted mention, because the summary table documents keys
+    that way.
+
+    Where it is still loose, stated in BOTH directions because the first
+    version of this docstring named only the safe one:
+
+    * false FAILURE — a key documented in another file (`worker.backend` is
+      described in docs/BACKENDS.md) counts as undocumented here and sits in
+      the baseline; so do keys whose doc line is inside a list item or an
+      inconsistently-indented block, because the ancestry parser produces a
+      longer path for those.
+    * false PASS, four channels, none of them hypothetical:
+      1. the parser cannot tell a fenced YAML block from a wrapped prose line
+         that happens to start `word:`. Two such lines exist
+         (docs/configuration.md's `size:` and `statement:` sentences), so a
+         top-level key named `size` or `statement` would pass documented by an
+         English sentence. No collision today — checked, the one-segment doc
+         ancestries share no name with any leaf — which is luck, not design;
+         fencing-aware parsing is the fix when it bites.
+      2. the doc contains a fenced block for a DIFFERENT file's schema
+         (`<repo>/.no_human.yml`), and its keys enter the ancestry set, so a
+         global key named `test_commands`, `playbook_hints` or
+         `forbidden_paths_extra` would pass on that block.
+      3. the literal-path hatch accepts a dotted name anywhere in the file,
+         including a "removed in vX" note. Every literal-only pass today is a
+         real table row or a descriptive sentence — checked one by one — but
+         the matcher cannot tell the difference.
+      4. the UNIVERSE is regex-swept, so a settable key read in a shape
+         `_INLINE_READ` does not match is invisible. Two forms are known and
+         live: a section pulled into a local first
+         (`sec = config.data.get("reanalysis", {})` then `sec.get("enabled")`
+         in api/app.py — `reanalysis.enabled`, `interval_seconds`, `days`,
+         `max_proposals`, `onboarding.extra_scan_roots`) and a single-segment
+         top-level read (`config.get("max_thinking_tokens", 10_000)`). Those
+         five-plus keys are settable, undocumented, and this gate does not see
+         them. An AST walk of `config` reads is the fix; a wider regex is not,
+         because the value flows through a variable.
+    """
+    from pathlib import Path
+
+    from no_human.config import load_config
+
+    cfg = load_config(tmp_path / "config.yaml")
+    docs = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md").read_text()
+    doc_paths = _documented_paths(docs)
+    declared = set(_leaf_config_keys(cfg.data))
+    sections = {p.rsplit(".", 1)[0] for p in declared} | declared
+    settable = declared | _keys_read_without_a_default(
+        Path(__file__).resolve().parents[1] / "src", sections)
+    undocumented = {
+        path for path in settable
+        if not _is_documented(path, doc_paths, docs)
+    }
+    # "May only shrink" was a comment and a failure message; a future author
+    # could satisfy this gate by ADDING their key to the baseline, and nothing
+    # objected (the re-review demonstrated it). Now something does.
+    assert len(_UNDOCUMENTED_AT_BASELINE) <= _BASELINE_SIZE_AT_WRITING, (
+        f"the baseline grew to {len(_UNDOCUMENTED_AT_BASELINE)}; it may only "
+        f"shrink from {_BASELINE_SIZE_AT_WRITING}. Document the key instead.")
+
+    new = undocumented - _UNDOCUMENTED_AT_BASELINE
+    assert not new, (
+        "config key(s) a user can set, documented nowhere in "
+        f"docs/configuration.md: {sorted(new)}. Document them; do NOT add them "
+        "to the baseline set, which may only shrink."
+    )
+    stale = _UNDOCUMENTED_AT_BASELINE - undocumented
+    assert not stale, (
+        f"these keys are documented now — drop them from the baseline: {sorted(stale)}")
