@@ -9,8 +9,10 @@ be rejected even if the tests pass:
 
 - The agent never merges. It opens a PR and stops; merging is always a human
   action, and there is no auto-merge anywhere.
-- The stack stays lean: SQLite only, a single Claude backend through the Agent
-  SDK, no vector database.
+- The stack stays lean: SQLite only, no vector database. The coder runs on the
+  Claude Agent SDK by default, with OpenAI Codex as the one sanctioned second
+  backend (`worker.backend`); the reviewer, planner, supervisor and utility
+  tiers stay on Claude regardless.
 - Review is evidence-based — an independent fresh-context reviewer producing a
   pass/fail checklist with cited evidence. Never a numeric self-score.
 - Only verifiable signals are trusted: a net reduction in test count or
@@ -295,9 +297,10 @@ npm run e2e       # the live-flows suite needs a server on :8420
 
 - Python 3.12, standard library first. The dependency list in `pyproject.toml`
   is short on purpose.
-- Do not add to the stack. SQLite only. One Claude backend through the Agent
-  SDK. No vector database. This is a standing project constraint and it is not
-  negotiable in a PR.
+- Do not add to the stack. SQLite only. No vector database. Coding backends
+  are the Claude Agent SDK and OpenAI Codex — a new one is a design decision,
+  not a PR; the reviewer, planner, supervisor and utility tiers stay on Claude.
+  This is a standing project constraint and it is not negotiable in a PR.
 - Tests ship with the module they cover. A PR that adds behaviour and no test
   will be sent back.
 - A test must observe an artifact, not recompute the expected value from the

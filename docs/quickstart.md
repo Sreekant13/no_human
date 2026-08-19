@@ -142,7 +142,7 @@ npm install -g @anthropic-ai/claude-code
 ## 2. Clone and install no_human
 
 ```bash
-git clone <repo_url> no_human && cd no_human
+git clone https://github.com/no-human-ai/no_human.git no_human && cd no_human
 uv sync
 cd web && npm install && npm run build && cd ..
 ```
@@ -291,7 +291,7 @@ When a task produces a PR:
 ```bash
 uv run nh review <task-id>   # evidence-backed review checklist
 uv run nh diff <task-id>     # the git diff
-uv run nh approve <task-id>  # record your approval — YOU merge the PR
+uv run nh approve <task-id>  # your approval squash-lands the PR (as git.approve_identity)
 ```
 
 If you want changes:

@@ -853,8 +853,8 @@ def task() -> None:
 @click.option("--grill/--no-grill", default=True,
               help="Ask a few questions to refine the spec (default: on; --no-grill to skip).")
 @click.option("--backend", default=None, type=click.Choice(["claude"]),
-              help="Override the worker backend for this task (default: from config; "
-                   "single in-process Claude Agent SDK backend).")
+              help="Label this task's backend (recorded on the task; the coder backend "
+                   "itself is chosen by `worker.backend` in config: claude or codex).")
 @click.option("--approve-plan", is_flag=True, default=False,
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")

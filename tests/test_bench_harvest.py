@@ -102,8 +102,13 @@ def test_the_default_output_dir_is_outside_the_scored_corpus():
     # `Path(h.__file__).parent / "northstar_tasks"` named a directory that does
     # not exist, so the assertion below could never fire: with `_DEFAULT_OUT`
     # set to the literal scored corpus it still passed. Import the constant.
+    # The corpus directory itself is not asserted to exist HERE: it is
+    # `drop`-classified (EXPORT_CLASSIFICATION.txt `drop 54 eval/northstar_tasks/`),
+    # so in the public export this test would fail on the tree, not on harvest —
+    # which is exactly what the public CI did. The non-vacuity guard ("the
+    # constant still names a real directory") lives with the other corpus-
+    # dependent assertions in tests/test_northstar_corpus.py (private-only).
     corpus = Path(NORTHSTAR_DIR).resolve()
-    assert corpus.exists(), f"the corpus constant no longer names a real dir: {corpus}"
     assert corpus not in default.parents and default != corpus, (
         f"harvest would write candidates into the scored corpus: {default}")
     # and it is under the operator's own state dir, not the repo

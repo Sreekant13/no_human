@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/nh-mark.png" alt="" width="160" height="160">
+<img src="docs/assets/nh-mark.png" alt="" width="140" height="140">
 
 # no_human
 
@@ -8,16 +8,17 @@
 
 Give it a ticket. Get back a pull request, with the evidence that it works.
 
-[![python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
-[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![latest release](https://img.shields.io/github/v/release/no-human-ai/no_human?label=release&color=4C9AFF)](https://github.com/no-human-ai/no_human/releases/latest) [![python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/) [![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[getnohuman.com](https://getnohuman.com) · [Quickstart](docs/quickstart.md) · [Docs](docs/README.md)
+[getnohuman.com](https://getnohuman.com) · [Quickstart](docs/quickstart.md) · [Docs](docs/README.md) · [Watch it work a sprint](https://getnohuman.com/demo)
 
-**[▶ Watch it work a sprint](https://getnohuman.com/demo)**
+[![Download for macOS](https://img.shields.io/badge/Download%20for-macOS-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest) [![Download for Windows](https://img.shields.io/badge/Download%20for-Windows-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest) [![Download for Linux](https://img.shields.io/badge/Download%20for-Linux-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest)
+
+<a href="https://getnohuman.com/"><img src="docs/assets/hero-loop-poster.jpg" alt="The no_human board: one task waiting on a question in Needs answer, four tasks working in parallel, one pull request ready for review." width="880"></a>
+
+<sub>▶ <a href="https://getnohuman.com/">Watch the loop</a> — a ticket in, a reviewed pull request out; the whole loop in 57 seconds.</sub>
 
 </div>
-
-![The board and the shell at the end of a sprint: five pull requests waiting for review, and the shell showing what was checked on the one in focus — tamper guard, lint, tests, the commit, the PR.](docs/assets/demo-sprint-still.png)
 
 Hand it a ticket and walk away. It plans, writes the change, has the work
 reviewed by a second model that never saw it being written, runs your tests,
@@ -34,23 +35,46 @@ switch off, and what you cannot:
 
 ## Install
 
+Whichever way you install, you need a **Claude credential**: an OAuth token
+from `claude setup-token` (personal subscription or enterprise), so install the
+Claude Code CLI first — `npm install -g @anthropic-ai/claude-code`, or
+`curl -fsSL https://claude.ai/install.sh | bash`. The desktop app also calls
+that CLI for every task. To pay Anthropic directly instead, set
+`llm.auth_mode: "api_key"` and put your `ANTHROPIC_API_KEY` in
+`~/.no_human/.env`.
+
+### Desktop app
+
+Download the build for your platform from the
+[latest release](https://github.com/no-human-ai/no_human/releases/latest), open
+it, and paste your credential on the **Connect Claude** screen. The app bundles
+its own Python, the server and the board — nothing to clone, no `uv sync`.
+
+- **macOS** (Apple silicon) — `no_human-<version>.dmg`, signed and notarized.
+  Drag to Applications.
+- **Windows** (x64) — `no_human-<version>-UNSIGNED.exe`. Not code-signed yet, so
+  SmartScreen warns: choose *More info → Run anyway*. Installs per user, no
+  administrator prompt.
+- **Linux** (x64) — `no_human-<version>-linux-amd64.deb` (recommended; `sudo apt
+  install ./no_human-<version>-linux-amd64.deb`) or the `.AppImage`.
+
+Each release ships a SHA-256 alongside the artifact. Platform notes and the
+first-run walk-through: [docs/quickstart.md](docs/quickstart.md).
+
+### From source
+
 ```bash
-git clone <your-clone-url>/no_human.git && cd no_human
+git clone https://github.com/no-human-ai/no_human.git && cd no_human
 uv sync                 # installs the `nh` entry point into .venv
 (cd web && npm install && npm run build)   # builds the board (cold first install can take minutes)
 uv run nh init          # token, config, first repo (about 2 minutes)
 uv run nh doctor        # verify the install is real before relying on it
 ```
 
-The `web` build is not optional if you want the board pictured above: a source
-checkout ships no `web/dist`, so without it `nh start` serves the API only and
-renders no UI.
-
-Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, Node and npm
-(for the board build above, and for the `claude` CLI), and a Claude
-credential — an OAuth token from `claude setup-token` (personal subscription or
-enterprise). To pay Anthropic directly instead, set `llm.auth_mode: "api_key"`
-and put your `ANTHROPIC_API_KEY` in `~/.no_human/.env`.
+The `web` build is not optional if you want the board: a source checkout ships
+no `web/dist`, so without it `nh start` serves the API only and renders no UI.
+Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and Node with
+npm for the board build.
 
 ## Run one task
 
@@ -64,7 +88,7 @@ nh task add https://github.com/org/repo/issues/42 --repo ~/git/repo
 nh status                            # needs-you / working / waiting / done
 nh review <id>                       # the reviewer's evidence checklist
 nh diff <id>                         # the diff it wants to ship
-nh approve <id>                      # records approval — you merge the PR
+nh approve <id>                      # your approval squash-lands the PR (git.approve_identity)
 nh reject <id> --reason "..."        # send it back with feedback
 ```
 
@@ -83,18 +107,19 @@ nh reject <id> --reason "..."        # send it back with feedback
 - **An honest stop.** When it cannot finish, it parks with one specific question
   instead of inventing a plausible diff.
 
-## It waits for you to approve the PR
+## The agent never merges
 
-`gh pr merge`, `glab mr merge` and the REST equivalents are denied before they
-execute. Pushes to `main`/`master`/`release/*` are refused at the git layer, and
-no code path merges your PR on approval. Git is driven by no_human's own code
-under a distinct commit identity, not by the model; during review the backend is
+Merging is yours. `gh pr merge`, `glab mr merge` and the REST equivalents are
+denied to the agent's sessions before they execute, and pushes to
+`main`/`master`/`release/*` are refused at the git layer. `nh approve` is
+**your** command: it squash-lands the pull request as the operator identity you
+configure in `git.approve_identity`; nothing merges without a human running it. Git is driven by no_human's own code under a
+distinct commit identity, not by the model; during review the backend is
 read-only. Credentials live in `~/.no_human/.env` (`chmod 600`), never in the
 repo. Detail: [docs/security.md](docs/security.md).
 
 Every task carries an enforced spend cap. `nh logs <id>` shows real spend
 against it, per task.
-
 
 ## Integrations
 
@@ -109,8 +134,13 @@ the pool.
 | **Linear** | Polled via the GraphQL API | `integrations.linear.team_key` + `state_types` + `label` |
 | **monday.com** | Polled via GraphQL v2 | `integrations.monday.board_id` + `status_column` + `todo_labels` |
 
-Jira ticket state round-trips: when a task ships, the ticket moves — the
-label-based round-trip is pinned by its own test. Setup for each tracker:
+With write-back on (`write_back`, off by default), the ticket moves with the
+task — matched by status category, type, or the label you name, never a
+hard-coded transition id — and gets the PR link; a task that needs a human is commented on, never
+transitioned. GitHub and
+GitLab issues import as tasks by URL, and PRs or MRs open on your own host;
+Slack and Teams get a message when a task needs you; Jenkins and CircleCI can
+run your test layers and gate the loop. Setup for each:
 [docs/adapters.md](docs/adapters.md).
 
 **Watch the Jira flow end to end** — tickets synced from a Jira board, scoped,
@@ -121,12 +151,11 @@ video with every step):
 
 <p align="center">▶️&nbsp;&nbsp;<strong><a href="https://getnohuman.com/assets/demo-jira.mp4">Play the full demo</a></strong> — 1:33, from Jira board to review-passed PR</p>
 
-
 ## Docs
 
 | | |
 |---|---|
-| [quickstart.md](docs/quickstart.md) | Zero to first task |
+| [quickstart.md](docs/quickstart.md) | Zero to first task, per platform |
 | [configuration.md](docs/configuration.md) | Every setting and default |
 | [verification.md](docs/verification.md) | The gates, the bounded loop, the limits |
 | [security.md](docs/security.md) | Auth boundary, the never-merge rule, guards |

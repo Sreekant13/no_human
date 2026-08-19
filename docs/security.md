@@ -33,10 +33,12 @@ may live in config; the key never does.
 ## 2. The agent never merges
 
 The orchestrator opens a PR/MR and **stops** at `awaiting_approval`. There is no
-auto-merge anywhere; merge is always a human action. The board's **Approve**
-button records approval and tells you to merge in your git host — it does not
-merge. `approval.auto_merge_on_approval` defaults to `false` and nothing in the
-code reads it, so approval never triggers a merge.
+auto-merge anywhere; merge is always a human action. The board's **Approve and
+merge** button and `nh approve` are that action: they squash-land the PR as a
+local commit under the operator identity and push it (§7, `vcs/approve_merge.py`)
+— a human runs them, never the agent. `approval.auto_merge_on_approval` defaults
+to `false` and nothing in the code reads it: no state change, webhook or timer
+merges anything; only that human command does.
 
 ## 3. Deterministic VCS under a distinct identity
 
