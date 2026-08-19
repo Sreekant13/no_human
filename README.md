@@ -8,7 +8,7 @@
 
 Give it a ticket. Get back a pull request, with the evidence that it works.
 
-[![latest release](https://img.shields.io/github/v/release/no-human-ai/no_human?label=release&color=4C9AFF)](https://github.com/no-human-ai/no_human/releases/latest) [![python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/) [![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![latest release](https://img.shields.io/github/v/release/no-human-ai/no_human?label=release&color=4C9AFF)](https://github.com/no-human-ai/no_human/releases/latest) [![CI](https://img.shields.io/github/actions/workflow/status/no-human-ai/no_human/ci.yml?branch=main&label=CI)](https://github.com/no-human-ai/no_human/actions/workflows/ci.yml) [![python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/) [![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [getnohuman.com](https://getnohuman.com) · [Quickstart](docs/quickstart.md) · [Docs](docs/README.md) · [Watch it work a sprint](https://getnohuman.com/demo)
 
@@ -162,6 +162,7 @@ video with every step):
 | [blockers.md](docs/blockers.md) | Escalation, wake watcher, `nh reply` |
 | [adapters.md](docs/adapters.md) | Intake, context, VCS and CI backends |
 | [eval.md](docs/eval.md) | Golden set, replay scoring, shadow mode |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, per release |
 
 ## Development
 

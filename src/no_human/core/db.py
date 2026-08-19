@@ -95,6 +95,13 @@ _SETTLED_OUTCOMES_SQL = "({})".format(
 AUX_USAGE_TIERS: tuple[str, ...] = tuple(
     t for t in USAGE_ROLES if t not in ("", "review_"))
 
+# Sites whose rows ARE recorded against a task: `_flush_orphaned_aux_usage`
+# (orchestrator.py:2097) writes `site=f"orphaned_{tier}usage"` for every tier
+# in AUX_USAGE_TIERS, always with the task's id. `unattributed_usage_totals`
+# uses this prefix (not `task_id`) to split the ledger — see that method's
+# docstring for why.
+ORPHANED_SITE_PREFIX = "orphaned_"
+
 
 def usage_columns_for(tier: str) -> tuple[str, ...]:
     """The three ADDEND token columns for one role prefix.
@@ -2266,13 +2273,26 @@ class Store:
         return row_id
 
     async def unattributed_usage_totals(
-        self, task_id: str | None = None
+        self, task_id: str | None = None, *, attributed: bool | None = None
     ) -> dict[str, int]:
         """Totals over the unattributed ledger: ``{calls, tokens_used,
         cache_read_tokens, cache_creation_tokens, total}``.
 
         ``task_id=None`` totals the WHOLE ledger (the default question — "how
         much intake spend does no task own"); pass an id to scope it.
+
+        ``attributed`` splits that ledger into the two classes ``nh status``
+        distinguishes: ``None`` (default) keeps today's whole-ledger
+        behaviour byte-identical for existing callers; ``True``/``False``
+        add a ``site`` filter. The split uses the ``site`` PREFIX
+        (``orphaned_%``, see ``ORPHANED_SITE_PREFIX``), not the presence of
+        ``task_id``, for two reasons: (a) ``compact_unattributed_usage``
+        drops ``task_id`` when it rolls a group up (a group can span tasks)
+        but preserves ``site``, so a ``task_id`` test would silently
+        reclassify aged spend as ownerless; (b) the prefix is generated from
+        ``AUX_USAGE_TIERS`` by ``_flush_orphaned_aux_usage``, so a newly
+        registered aux role lands in the attributed class automatically —
+        no hardcoded site list to fall outside of.
 
         ``calls`` is not a plain ``COUNT(*)``: retention compaction
         (``compact_unattributed_usage``) collapses aged rows into one
@@ -2281,7 +2301,10 @@ class Store:
         count as the calls it replaced, or "how many LLM calls landed here"
         would silently shrink the moment a row ages past the retention
         window — so this sums ``rolled_up`` where set, and 1 per ordinary
-        (non-rolled-up) row.
+        (non-rolled-up) row. The ``attributed`` split preserves this: each
+        class sums ``rolled_up`` within its own filtered rows, so a rolled-up
+        group still counts as the calls it replaced inside whichever class
+        its ``site`` belongs to.
         """
         sql = ("SELECT COALESCE(SUM(CASE WHEN rolled_up > 0 THEN rolled_up "
                "ELSE 1 END), 0) AS calls, "
@@ -2289,11 +2312,20 @@ class Store:
                "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
                "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens "
                "FROM unattributed_usage")
-        args: tuple[Any, ...] = ()
+        predicates: list[str] = []
+        args: list[Any] = []
         if task_id is not None:
-            sql += " WHERE task_id = ?"
-            args = (task_id,)
-        row = await self._fetchone(sql, args)
+            predicates.append("task_id = ?")
+            args.append(task_id)
+        if attributed is True:
+            predicates.append("site LIKE ?")
+            args.append(f"{ORPHANED_SITE_PREFIX}%")
+        elif attributed is False:
+            predicates.append("(site NOT LIKE ? OR site IS NULL)")
+            args.append(f"{ORPHANED_SITE_PREFIX}%")
+        if predicates:
+            sql += " WHERE " + " AND ".join(predicates)
+        row = await self._fetchone(sql, tuple(args))
         out = {k: int(row[k] if row else 0) for k in (
             "calls", "tokens_used", "cache_read_tokens", "cache_creation_tokens")}
         out["total"] = (out["tokens_used"] + out["cache_read_tokens"]

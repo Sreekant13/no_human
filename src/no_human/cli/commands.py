@@ -3567,12 +3567,33 @@ def status(as_json):
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {buckets['failed']}  "
                 f"[green]done[/] {buckets['done']}")
-            # Printed only when there IS a residual, so the line appears
-            # exactly when it has something to say.
+            # Printed only when there IS a residual (whole-ledger total, same
+            # gate as before), so the line appears exactly when it has
+            # something to say. Within it, "no task owns it" is scoped to the
+            # genuinely ownerless half only — the attributed half (site
+            # prefix `orphaned_*`) is recorded against a task, just not yet
+            # folded into that task's attempt rows, so it gets its own
+            # clause instead of being called ownerless.
             if resid["total"]:
-                console.print(
-                    f"[dim]unattributed intake spend: {resid['total']:,} tokens "
-                    f"over {resid['calls']} call(s) — no task owns it[/]")
+                owned = await store.unattributed_usage_totals(attributed=True)
+                # Derived by subtraction from the single whole-ledger query
+                # above, rather than a second `attributed=False` query, so
+                # the two halves are guaranteed to sum to `resid` instead of
+                # being able to disagree if the ledger changes between calls.
+                ownerless_total = resid["total"] - owned["total"]
+                ownerless_calls = resid["calls"] - owned["calls"]
+                parts = []
+                if ownerless_total:
+                    parts.append(
+                        f"unattributed intake spend: {ownerless_total:,} tokens "
+                        f"over {ownerless_calls} call(s) — no task owns it")
+                if owned["total"]:
+                    clause = (
+                        f"{owned['total']:,} tokens over {owned['calls']} "
+                        f"call(s) recorded to tasks but not in their attempt "
+                        f"rows")
+                    parts.append(f"plus {clause}" if parts else clause)
+                console.print(f"[dim]{'; '.join(parts)}[/]")
 
     asyncio.run(_go())
 

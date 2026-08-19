@@ -1238,6 +1238,141 @@ def test_status_json_empty(tmp_path, monkeypatch):
     }
 
 
+# --------------------------------------------------------------------------- #
+# nh status — unattributed-vs-attributed intake-spend split                   #
+# --------------------------------------------------------------------------- #
+
+def _seed_unattributed(db_path: Path, *, site: str, tokens_used: int = 100,
+                        task_id: str | None = None) -> str:
+    async def _go():
+        async with Store(db_path) as s:
+            return await s.record_unattributed_usage(
+                site=site, tokens_used=tokens_used, task_id=task_id)
+    return asyncio.run(_go())
+
+
+def test_status_splits_owned_and_ownerless_intake_spend(tmp_path, monkeypatch):
+    """AC1/AC2: the printed line separates the genuinely ownerless spend
+    (`cli.*`/`api.*`, no task_id) from spend already recorded against a task
+    (`orphaned_*`) — "no task owns it" attaches only to the former, and the
+    latter is named as recorded-but-not-yet-in-attempt-rows, not as lost."""
+    db = tmp_path / "test.db"
+    _seed_unattributed(db, site="cli.task_add.grill", tokens_used=1000)
+    task_id = _seed_task(db, TaskStatus.DONE)
+    _seed_unattributed(db, site="orphaned_plan_usage", tokens_used=5000,
+                        task_id=task_id)
+    runner = _make_runner(db, monkeypatch)
+
+    out = runner.invoke(cli, ["status"]).output
+
+    assert "1,000 tokens over 1 call(s) — no task owns it" in out, out
+    assert "5,000 tokens over 1 call(s) recorded to tasks but not in " \
+           "their attempt rows" in out, out
+
+
+def test_status_does_not_say_no_task_owns_it_when_every_row_is_attributed(
+        tmp_path, monkeypatch):
+    """Negative control for AC1: with only `orphaned_*` rows, the residual
+    line still prints (there is something to say) but never claims no task
+    owns the spend."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE)
+    _seed_unattributed(db, site="orphaned_plan_usage", tokens_used=5000,
+                        task_id=task_id)
+    runner = _make_runner(db, monkeypatch)
+
+    out = runner.invoke(cli, ["status"]).output
+
+    assert "recorded to tasks but not in their attempt rows" in out, out
+    assert "no task owns it" not in out, out
+
+
+def test_a_new_orphaned_site_classifies_as_attributed(tmp_path, monkeypatch):
+    """AC3: the split is derived from the `orphaned_` site PREFIX, not a
+    hardcoded list of the four known aux tiers — a brand-new aux role's site
+    (never referenced anywhere in source) must still land in the attributed
+    half automatically."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE)
+    _seed_unattributed(db, site="orphaned_reviewer_usage", tokens_used=777,
+                        task_id=task_id)
+    runner = _make_runner(db, monkeypatch)
+
+    out = runner.invoke(cli, ["status"]).output
+
+    assert "no task owns it" not in out, out
+    assert "777 tokens over 1 call(s) recorded to tasks but not in their " \
+           "attempt rows" in out, out
+
+
+def test_status_json_keys_unchanged_with_both_classes_present(tmp_path, monkeypatch):
+    """AC4: `--json`'s `unattributed_usage` keeps its five keys and its
+    whole-ledger `total`, unaffected by the new split logic used only on the
+    human-readable line."""
+    db = tmp_path / "test.db"
+    _seed_unattributed(db, site="cli.task_add.grill", tokens_used=1000)
+    task_id = _seed_task(db, TaskStatus.DONE)
+    _seed_unattributed(db, site="orphaned_plan_usage", tokens_used=5000,
+                        task_id=task_id)
+    runner = _make_runner(db, monkeypatch)
+
+    out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+
+    assert set(out["unattributed_usage"]) == {
+        "calls", "tokens_used", "cache_read_tokens", "cache_creation_tokens",
+        "total"}
+    assert out["unattributed_usage"]["total"] == 6000
+    assert out["unattributed_usage"]["calls"] == 2
+
+
+def test_status_split_counts_a_rolled_up_row_as_its_original_calls(
+        tmp_path, monkeypatch):
+    """AC5: retention compaction must not shrink the attributed clause's call
+    count — a roll-up row still counts as the calls it replaced.
+
+    Seed, backdate and compact all inside ONE Store connection: `connect()`
+    itself runs a best-effort `compact_unattributed_usage()` (db.py:518), so
+    opening a fresh connection between the backdate UPDATE and the explicit
+    compact call below would let that implicit, default-retention pass
+    collapse the rows first and mask what this test means to exercise."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE)
+
+    async def _seed_backdate_compact():
+        async with Store(db) as s:
+            ids = []
+            for _ in range(4):
+                ids.append(await s.record_unattributed_usage(
+                    site="orphaned_plan_usage", tokens_used=100,
+                    task_id=task_id))
+            placeholders = ",".join("?" for _ in ids)
+            await s.db.execute(
+                f"UPDATE unattributed_usage SET ts = ? WHERE id IN "
+                f"({placeholders})",
+                ("2020-01-01T00:00:00+00:00", *ids))
+            await s.db.commit()
+            return await s.compact_unattributed_usage(retention_days=1)
+    collapsed = asyncio.run(_seed_backdate_compact())
+    assert collapsed == 4
+    runner = _make_runner(db, monkeypatch)
+
+    out = runner.invoke(cli, ["status"]).output
+
+    assert "400 tokens over 4 call(s) recorded to tasks but not in their " \
+           "attempt rows" in out, out
+
+
+def test_status_prints_no_residual_line_on_an_empty_ledger(tmp_path, monkeypatch):
+    """AC6: with nothing in the unattributed ledger, the residual line is
+    absent entirely — today's "prints only when it has something to say"."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+
+    out = runner.invoke(cli, ["status"]).output
+
+    assert "unattributed intake spend" not in out, out
+
+
 def test_approve_with_a_stale_claim_and_a_real_pr_does_not_auto_done(tmp_path, monkeypatch):
     """PR #101 round-2 MEDIUM: after a claim is sent back and a later attempt
     ships a REAL PR, the stale already_satisfied_report must not hijack the

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "no_human": {
+      "command": "nh",
+      "args": ["mcp-serve"]
+    }
+  }
+}
