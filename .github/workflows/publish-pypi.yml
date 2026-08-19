@@ -25,6 +25,18 @@
 # upload step with "invalid-publisher", and nothing else in the repository is
 # affected.
 #
+# THE DEFAULT CHOICE IS `testpypi`, so a rehearsal cannot publish to the real
+# index by accident — and test.pypi.org is a SEPARATE registry with its own
+# accounts and its own trusted publishers. Rehearsing needs the same pending
+# publisher created there (environment `testpypi`); with only the pypi.org one
+# configured, a default-choice run fails at upload exactly as an unconfigured
+# real run would. Configure whichever index you actually intend to use.
+#
+# `environment:` here buys the OIDC audience claim, not an approval gate:
+# GitHub creates a missing environment on first use with no protection rules.
+# Add required reviewers on the `pypi` environment if a publish should need a
+# second pair of eyes.
+#
 # THE BOARD IS PART OF THE ARTEFACT. `hatch_build.py` refuses to build a
 # standard wheel without `web/dist`, so the board is built here exactly as the
 # `wheel` job builds it. A wheel published without it would install an `nh`
