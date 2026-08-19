@@ -405,6 +405,42 @@ legitimately long run is never cut off:
 - `bounds.shadow_timeout_s` (default 1800) — one shadow/bench run in the
   throwaway sandbox.
 
+## Keys the doc gate cannot see
+
+`tests/test_config.py` sweeps the source for settable keys, but it only sees a
+two-level chain read directly off the config (`config.get("a", {}).get("b")`).
+A section pulled into a local variable first, and a single top-level key, are
+both invisible to it — so these are documented by hand. If you add a key of
+either shape, add it here too: nothing will remind you.
+
+- `reanalysis.enabled` (default **true**), `reanalysis.interval_seconds`
+  (86400, floored at 60), `reanalysis.days` (30), `reanalysis.max_proposals`
+  (20) — the periodic job that mines **IDE conversation transcripts** from the
+  last N days and proposes learnings from them. It is not reading this
+  product's task history: it asks the running IDE language servers for their
+  transcripts, and with no IDE running it finds nothing and proposes nothing.
+  `max_proposals` does not cap anything — the proposals are already committed
+  when the count is checked, so exceeding it logs a warning and leaves them
+  for you to triage. Turning `enabled` off stops this unattended pass;
+  `nh history --analyze` ignores the flag and still works. (`nh serve` starts
+  the job, so it does honour it.) The `reanalysis` section is not written into
+  the defaults file.
+- `onboarding.extra_scan_roots` — extra directories the repo-discovery scan
+  looks in, beyond the conventional clone roots. A single string is accepted
+  as well as a list, and a leading `~` means the home the scan is bound to.
+  **It cannot reach outside your home directory**: a root that resolves
+  elsewhere is refused, by design. For repos on another volume use the
+  onboarding UI's "Search another folder", which takes any path.
+- `max_thinking_tokens` (default 10000) — a TOP-LEVEL key, not nested under
+  `llm`. It caps extended thinking on models that support it, and applies only
+  when the task's computed complexity tier turns thinking on; there is no way
+  to request it per task.
+
+`ci.workflow` and `ci.repo` are two more keys of this shape. Both are already
+shown in the `ci:` block above, as commented-out lines the gate's matcher
+cannot parse (it skips `#`-led lines, by design — a commented example is not a
+declaration).
+
 ## Per-task config snapshot
 
 Each task stores the `config` it ran under (`tasks.config`), so a task's
