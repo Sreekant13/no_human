@@ -65,7 +65,7 @@ by a tautology, or a behaviour-faking `autouse` fixture appearing in a
 `conftest.py`. No model judgement is involved. It covers Python, JS/TS, Java and
 the `e2e/` tree.
 
-## A reproduction gate that proves the fix fixes something
+## A reproduction gate that proves the fix fixed the bug
 
 [`src/no_human/testing/repro_gate.py`](../src/no_human/testing/repro_gate.py)
 takes the tests the coder says demonstrate its change, copies them into a

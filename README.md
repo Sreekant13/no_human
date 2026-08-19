@@ -20,17 +20,26 @@ Give it a ticket. Get back a pull request, with the evidence that it works.
 
 </div>
 
-Hand it a ticket and walk away. It plans, writes the change, has the work
-reviewed by a second model that never saw it being written, runs your tests,
-opens the pull request — and stops. You review and merge.
+You know the loop. You ask for the change. It comes back confident and wrong in
+a way that takes longer to disprove than to write. You correct it. It apologises
+and does it again. And the whole time you are the one checking it ran the tests,
+followed the conventions, and did not invent an API that does not exist. That is
+not delegation. That is supervision, with extra steps.
 
-It runs on your machine, against your checkout, on your own Claude credential.
-It is not, however, an offline tool: it sends your code to Anthropic as prompts,
-and it finishes a task by **pushing your branch to your git host and opening a
-pull request** — that is the deliverable, and there is no setting that turns it
-off. The coder session also runs with an unrestricted tool set, so it can reach
-the network on its own. The full list of what talks to the outside, what you can
-switch off, and what you cannot:
+no_human closes the loop instead. Hand it a ticket and walk away: it plans,
+writes the change, runs your tests, and hands the work to a second model that
+never saw it being written — one told to refute "done" and to cite file and line
+for every finding. What lands in your inbox is a pull request that has already
+been torn apart. You review and merge.
+
+Turn the pool on and tasks run in parallel, while your engineers stay on the
+work that needs them.
+Every task carries a spend cap, set before it starts. Nothing to deploy: it runs
+on the developer's machine, on SQLite and your existing git host.
+
+It runs on your own Claude credential, and it is not an offline tool — your code
+goes to Anthropic as prompts, and the branch and pull request go to your git
+host. Exactly what leaves your machine, and what you can switch off:
 [docs/security.md](docs/security.md#7-what-leaves-your-machine).
 
 ## Install
