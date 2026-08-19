@@ -696,16 +696,28 @@ jobs:
             web/package-lock.json
             desktop/package-lock.json
 
+      # A `uses:` step has no shell to wrap in a retry loop, and setup-uv
+      # already handles its own cache/download retries internally — a bound
+      # is the only meaningful control here.
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+        timeout-minutes: 3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       # Creates .venv/bin/pyinstaller, which build-installer.sh requires by that
       # exact path. pyinstaller is in the `dev` dependency-group.
+      # uv sync is idempotent (it converges the venv to uv.lock), so a bounded
+      # retry is safe.
       - name: Install dependencies
-        run: uv sync --frozen
+        timeout-minutes: 5
+        run: |
+          n=1
+          until uv sync --frozen; do
+            if [ "$n" -ge 2 ]; then echo "uv sync --frozen failed on both attempts"; exit 1; fi
+            n=$((n + 1)); sleep 15
+          done
 
       - name: Install the board's dependencies
         working-directory: web
@@ -755,10 +767,25 @@ jobs:
       # libnotify4, libnss3, …) are fetched from apt, and xvfb-run must exist
       # for the installed-app run. Fetching them here fails loudly, before a
       # 404 mid-install reads as "the package is broken".
+      # apt-get update is idempotent — it only refreshes lists — so a bounded
+      # retry is safe. apt-get install is NOT retried: a missing package or a
+      # broken dependency must fail the step the first time, not be retried
+      # until it looks like a network blip.
       - name: apt lists + Xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
+        timeout-minutes: 3
+        run: |
+          n=1
+          until sudo apt-get update; do
+            if [ "$n" -ge 2 ]; then echo "apt-get update failed on both attempts"; exit 1; fi
+            n=$((n + 1)); sleep 15
+          done
+          sudo apt-get install -y xvfb
 
+      # This is the product gate: dpkg/apt can leave a package half-configured,
+      # so a retry is not state-neutral, and a failure here is a finding about
+      # the package we just built, not a network blip to paper over. Not retried.
       - name: Install the .deb the way a user would
+        timeout-minutes: 5
         run: sudo apt-get install -y ./desktop/dist/no_human-*-linux-amd64.deb
 
       # Outside the repo, with no toolchain: the frozen binary runs on its own.
@@ -773,8 +800,18 @@ jobs:
       # a stub would prove the refusal is bypassable, not that the documented
       # install path works. No token is ever validated in this job — the dummy
       # credential only satisfies the presence check; no task is started.
+      # npm install -g is idempotent — reinstalling the same global package
+      # converges — so a bounded retry is safe. The presence/version checks
+      # are NOT retried: a genuinely broken install must still fail the step.
       - name: Install the Claude Code CLI the way a user would
-        run: npm install -g @anthropic-ai/claude-code && command -v claude && claude --version
+        timeout-minutes: 5
+        run: |
+          n=1
+          until npm install -g @anthropic-ai/claude-code; do
+            if [ "$n" -ge 2 ]; then echo "npm install -g claude-code failed on both attempts"; exit 1; fi
+            n=$((n + 1)); sleep 15
+          done
+          command -v claude && claude --version
 
       # ONE throwaway HOME for the install/acceptance/uninstall steps below:
       # each `run:` is its own shell, so it rides in $GITHUB_ENV. The uninstall
@@ -818,7 +855,11 @@ jobs:
 
       # Uninstall must not delete the operator's config and task history —
       # the same row as docs/WINDOWS.md §5.4.
+      # A pure assertion step (test -f on the throwaway HOME, apt-get remove,
+      # post-conditions). Retrying an assertion is retrying a verdict — bound
+      # only, not retried.
       - name: Uninstall keeps the user's data
+        timeout-minutes: 5
         run: |
           test -f "$NH_ACCEPT_HOME/.no_human/.env"      # written by the acceptance run above
           test -f "$NH_ACCEPT_HOME/.no_human/no_human.db"
