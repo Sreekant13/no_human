@@ -1105,6 +1105,33 @@ async def _unsettled_paths(repo_path: str, want_tree: str, ours: str,
     match its own name in the frozenset. The trailing ``--`` keeps a tree OID
     from ever being read as a pathspec.
     """
+    tree_conflicts = await merge_tree_conflicts(repo_path, ours, theirs)
+    if tree_conflicts is None:
+        return None
+    merged, conflicted = tree_conflicts
+    rc, names = await _git_rc(repo_path, "diff", "--name-only", "--no-renames",
+                              "-z", want_tree, merged, "--")
+    if rc != 0:
+        return None
+    return conflicted | {n for n in names.split("\0") if n}
+
+
+async def merge_tree_conflicts(repo_path: str, ours: str,
+                               theirs: str) -> tuple[str, set[str]] | None:
+    """(merged tree OID, conflicted paths) for merging ``theirs`` into
+    ``ours``, or ``None`` when the question could not be asked (rc not in
+    (0, 1), empty tree field, or an output shape this parser does not
+    recognise).
+
+    Extracted from ``_unsettled_paths`` (see its docstring for the full
+    rationale on ``-z`` parsing, why rc 1 is accepted, and why an unrecognised
+    field shape must return ``None`` rather than guess). This half of that
+    function — the ``merge-tree --write-tree -z`` call and its conflicted-path
+    parse — is also what a derived-artefact-only conflict needs to enumerate
+    the paths a mechanical regenerate could resolve, a different question from
+    ``_unsettled_paths``'s "is there unlanded content", so it is shared rather
+    than duplicated.
+    """
     rc, out = await _git_rc(repo_path, "merge-tree", "--write-tree", "-z",
                             ours, theirs)
     if rc not in (0, 1):
@@ -1121,11 +1148,7 @@ async def _unsettled_paths(repo_path: str, want_tree: str, ours: str,
         if not tab or not path or len(meta.split()) != 3:
             return None  # unrecognised shape — refuse to answer, never assume
         conflicted.add(path)
-    rc, names = await _git_rc(repo_path, "diff", "--name-only", "--no-renames",
-                              "-z", want_tree, merged, "--")
-    if rc != 0:
-        return None
-    return conflicted | {n for n in names.split("\0") if n}
+    return merged, conflicted
 
 
 async def _contained_at(repo_path: str, commit: str, branch: str) -> bool:
