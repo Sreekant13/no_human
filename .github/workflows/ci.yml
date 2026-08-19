@@ -401,10 +401,17 @@ jobs:
   # `docker run -i` with no `-t`, and every diagnostic goes to stderr: stdout is
   # the JSON-RPC stream. No credential is used or needed — the container answers
   # introspection; it cannot run a task.
-  mcp:
-    name: MCP server answers a handshake
+  #
+  # IT ALSO BUILDS THE ROOT IMAGE, which nothing did before. `Dockerfile` sat
+  # broken for its whole life — it never copied `hatch_build.py`, so `uv sync`
+  # could not resolve a single dependency — and no job noticed, because no job
+  # built it. Fixing the omission without adding the build would leave the same
+  # hole open for the next one. It is only built here, never run: the product's
+  # own container needs a credential mounted, which CI does not have.
+  images:
+    name: Container images build; the MCP one answers a handshake
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -413,6 +420,11 @@ jobs:
 
       - name: initialize + tools/list, inside the container
         run: python3 packaging/mcp_handshake_probe.py no-human-mcp:ci
+
+      # Last, because it is the slow one (a node stage builds the board) and a
+      # failure here is about the product image, not about MCP.
+      - name: Build the product image
+        run: docker build -t no-human:ci .
 
   desktop:
     name: Desktop shell

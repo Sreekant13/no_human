@@ -25,7 +25,7 @@ WORKDIR /app
 # dependencies — so a tree without it fails `uv sync` with
 # "Build script does not exist: hatch_build.py" before a single package is
 # fetched. It was missing here and nothing noticed, because nothing in CI ever
-# built this image; the MCP job added alongside this fix now builds both.
+# built this image; the `images` job added alongside this fix builds it.
 COPY pyproject.toml uv.lock README.md hatch_build.py ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
