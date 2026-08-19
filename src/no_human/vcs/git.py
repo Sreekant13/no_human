@@ -312,8 +312,22 @@ class GitRepo:
         because tests run against the WORKTREE (which still holds the file),
         not the committed tree. Returns the leftover source paths (empty when
         the commit captured everything), so the caller can fail the attempt
-        instead of opening a broken PR."""
+        instead of opening a broken PR.
+
+        A guard must not share BOTH predicates with the code path it guards.
+        `commit_paths` decides what to stage using `_CODE_EXTS` and the
+        edit-hook-populated `coder_touched` set; a guard built on only those
+        same two predicates is blind in exactly the region where the commit
+        is blind — which is why a Bash-created, non-code file (a harness's
+        own generated report, written beside the harness it came from) was
+        silently dropped 20 times across 15 tasks and flagged by this guard
+        zero of those times. The third predicate below
+        (`_dirs_newly_added_by_head`) is derived from the COMMIT ITSELF —
+        which directories HEAD just brought into existence — an input
+        `commit_paths` never consults when deciding what to stage, so it can
+        catch the class the other two predicates cannot."""
         out = self._run("status", "--porcelain", check=False).strip()
+        newly_added_dirs = self._dirs_newly_added_by_head()
         leftovers: list[str] = []
         for line in out.splitlines():
             rel = line[3:].strip() if len(line) > 3 else ""
@@ -325,14 +339,55 @@ class GitRepo:
                 continue
             if Path(rel).suffix.lower() in self._CODE_EXTS:
                 leftovers.append(rel)
-            elif coder_touched and rel in coder_touched:
+            elif (coder_touched and rel in coder_touched) or (
+                str(Path(rel).parent) in newly_added_dirs
+            ):
                 # B2 #7: a non-code leftover the coder ITSELF touched
                 # (Dockerfile, yaml, requirements, proto) is intentional work
                 # missing from the commit — the favicon incident class in its
-                # non-code shape. Untouched non-code leftovers stay ignored:
-                # they are test side-effects, exactly why _CODE_EXTS exists.
+                # non-code shape. A leftover sitting in a directory HEAD just
+                # created is the same incident class again, caught without
+                # relying on the edit hook at all (see docstring above).
+                # Untouched non-code leftovers in PRE-EXISTING directories
+                # stay ignored: they are test side-effects, exactly why
+                # _CODE_EXTS exists (see its comment).
                 leftovers.append(rel)
         return leftovers
+
+    def _dir_absent_from_tree(self, rel_dir: str, treeish: str) -> bool:
+        """True if *rel_dir* has no entries in *treeish* — i.e. *treeish*
+        does not (yet) know this directory exists.
+
+        The repo root (`""`/`"."`) always exists, so it is never "absent".
+        An unresolvable *treeish* (unborn repo, root commit with no parent)
+        gives no evidence either way, so this degrades to False — the
+        conservative, exclude-leaning answer used everywhere else in this
+        class — rather than raising or guessing "new"."""
+        if not rel_dir or rel_dir == ".":
+            return False
+        if not self._run("rev-parse", "--verify", treeish, check=False).strip():
+            return False
+        out = self._run("ls-tree", treeish, "--", rel_dir + "/", check=False).strip()
+        return out == ""
+
+    def _dirs_newly_added_by_head(self) -> set[str]:
+        """Directories that HEAD's commit brought into existence — present
+        among the files HEAD touched, absent from HEAD^'s tree.
+
+        Root commit (no HEAD^ to diff against): every directory among HEAD's
+        files counts as newly added — there is no prior tree it could have
+        existed in. Unborn repo (no HEAD at all): returns the empty set, the
+        same conservative degrade as `_dir_absent_from_tree`."""
+        names = self._run(
+            "show", "--pretty=format:", "--name-only", "HEAD", check=False
+        )
+        dirs = {str(Path(n).parent) for n in names.splitlines() if n.strip()}
+        dirs.discard(".")
+        if not dirs:
+            return dirs
+        if not self._run("rev-parse", "--verify", "HEAD^", check=False).strip():
+            return dirs  # root commit: no HEAD^, so all of HEAD's dirs are new
+        return {d for d in dirs if self._dir_absent_from_tree(d, "HEAD^")}
 
     def commit_all(self, message: str) -> CommitResult:
         branch = self.current_branch()
@@ -427,12 +482,40 @@ class GitRepo:
         untracked = self._run(
             "ls-files", "--others", "--exclude-standard", check=False
         ).strip().splitlines()
+        rejected_non_code: list[str] = []
         for u in untracked:
             u = u.strip()
             if not u:
                 continue
             ext = Path(u).suffix.lower()
             if ext in self._CODE_EXTS:
+                rel_paths.append(u)
+            else:
+                rejected_non_code.append(u)
+        # Stage non-code untracked files too, but only when they are almost
+        # certainly a DELIVERABLE rather than a test side-effect. A file is a
+        # deliverable when the same commit is (a) newly creating the
+        # directory it sits in — this repo had no such directory before —
+        # AND (b) already staging another file into that same directory: the
+        # coder built a new directory for its work and filled it (the
+        # measured case: a new eval directory holding a harness module plus
+        # the markdown report that running it produces — dropped silently 20
+        # times across 15 tasks, because a generated report carries no code
+        # extension). A test side-effect
+        # instead lands in a PRE-EXISTING directory (`teams/test/alert-
+        # state.json`) or in a directory holding nothing else the commit is
+        # staging (`data/state.json`) — running the suite does not also
+        # author source next to its own state file. Both halves are
+        # load-bearing: dropping (b) would commit `data/state.json`, which
+        # `test_commit_paths_excludes_untracked_json_side_effects` pins as
+        # excluded. This is suffix-agnostic, so it covers extensionless
+        # deliverables (Dockerfile, Makefile) for free.
+        staged_dirs = {str(Path(r).parent) for r in rel_paths}
+        for u in rejected_non_code:
+            if self._is_ephemeral_path(u):
+                continue
+            d = str(Path(u).parent)
+            if d in staged_dirs and self._dir_absent_from_tree(d, "HEAD"):
                 rel_paths.append(u)
         # Dedupe and drop ephemeral artifacts. We MUST filter in Python rather
         # than pass :(exclude) pathspecs to `git add` alongside the literal

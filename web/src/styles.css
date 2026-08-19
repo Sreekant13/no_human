@@ -5371,7 +5371,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* repo list */
 .ob-repolist { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow: auto; margin: 8px 0 16px; }
 .ob-repo {
-  display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+  display: flex; align-items: center; flex-wrap: wrap; row-gap: 3px; gap: 10px; padding: 11px 14px;
   background: var(--surface-1); border: 1px solid var(--border);
   border-radius: var(--r-md); cursor: pointer; transition: border-color var(--dur-fast), background var(--dur-fast);
 }
@@ -5379,6 +5379,11 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-repo.sel { border-color: var(--accent-700); background: color-mix(in oklab, var(--accent-500) 8%, var(--surface-1)); }
 .ob-repo input { accent-color: var(--accent-500); }
 .ob-repo-name { font-family: var(--font-ui); font-weight: 500; color: var(--text-hi); }
+/* Shown only on rows whose basename collides with another discovered repo:
+   without it two checkouts of the same repo are indistinguishable. Full-width
+   so it reads as a second line under the name and badges, matching the task
+   composer's discovered-repo list. */
+.ob-repo-path { flex-basis: 100%; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
 .ob-tag { font-family: var(--font-mono); font-size: 10px; color: var(--accent-300); border: 1px solid var(--border-hi); border-radius: var(--r-pill); padding: 1px 9px; }
 /* A discovered repo that is mid-edit, on a detached HEAD, or not a git repo at
    all. Same pill, attention colour: pointing a task at one is a decision the

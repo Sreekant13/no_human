@@ -5,7 +5,7 @@ import {
   generateDocs, fetchIntegrationSetup, saveIntegrationSetup,
   proveRepoSSE, confirmRepoProfile, fetchReadiness,
 } from "./api.js";
-import { repoBadges, discoveryMessage, fromDetectedRepo } from "./discoveredRepos.js";
+import { repoBadges, discoveryMessage, fromDetectedRepo, ambiguousNames, rowName } from "./discoveredRepos.js";
 import { LegionLogo } from "./Logo.jsx";
 import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
@@ -172,6 +172,10 @@ export default function Onboarding({ onComplete }) {
   // then "Projects 0" the first external tester saw. Named on the card, counted
   // honestly here, and refused by finish().
   const unbound = unboundProjects(projectDefs);
+  // Two checkouts of the same repo render as two identical rows with no path
+  // anywhere - basenames that collide get their full path shown so the user
+  // can tell which checkout they are selecting.
+  const ambiguousRepoNames = ambiguousNames(detected);
   const next = () => setI((n) => Math.min(n + 1, STEPS.length - 1));
   const back = () => setI((n) => Math.max(n - 1, 0));
   // Everything the nav predicates in onboardingNav.js need. Kept as one object so
@@ -650,6 +654,9 @@ export default function Onboarding({ onComplete }) {
                           {b.text}
                         </span>
                       ))}
+                      {ambiguousRepoNames.has(rowName(r)) && (
+                        <span className="ob-repo-path">{r.path}</span>
+                      )}
                       {st === "busy" && <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>}
                       {st && st !== "busy" && (
                         <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
@@ -832,8 +839,8 @@ export default function Onboarding({ onComplete }) {
             <Stagger>
               <h2 className="ob-h2">Learn from your AI history</h2>
               <p className="ob-sub">
-                no_human reads your past <strong>Claude Code</strong> and ide-agent/agent-a
-                conversations, catalogs your <strong>skills</strong>, and distills the
+                no_human reads your past <strong>Claude Code</strong> conversations,
+                catalogs your <strong>skills</strong>, and distills the
                 corrections you keep repeating — so the Supervisor enforces them for you.
               </p>
               <p className="ob-sub" style={{ opacity: 0.75, fontSize: "0.9em" }}>
@@ -858,7 +865,7 @@ export default function Onboarding({ onComplete }) {
                     <div className="va-build-title">Claude is building your validator agent…</div>
                     <div className="va-build-sub">
                       {scanPhase === "extracting"
-                        ? "Booting up — reading your Claude Code & ide-agent conversations…"
+                        ? "Booting up — reading your Claude Code conversations…"
                         : <>Generalizing the lessons from <strong>{(history?.messages || 0).toLocaleString()}</strong> messages
                            across <strong>{history?.transcripts || 0}</strong> conversations. This can take up to a minute.</>}
                     </div>

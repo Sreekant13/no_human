@@ -693,6 +693,7 @@ async def grill_spec(
     usage_sink: UsageSink | None = None,
     outcome_sink: OutcomeSink | None = None,
     questions_outcome_sink: OutcomeSink | None = None,
+    probe: bool = True,
 ) -> list[GrillQA] | None:
     """The full unattended grill: generate questions, answer the answerable
     ones FROM THE REPO (the answering session's cwd is the task's repo — the
@@ -706,6 +707,14 @@ async def grill_spec(
     error path). A pass that never runs (no questions, or every question
     carved out) reports nothing — an absent pass is not a failed one, and
     folding the two together would poison the denominator.
+
+    ``probe=False`` skips the exploring session entirely and asks for the
+    tool-less emit as the PRIMARY (and only) pass — the caller has judged the
+    task's questions answerable without reading the repo (the proportionality
+    rung for prose-only tasks: the 2026-08-19 funnel forensics measured the
+    exploring pass at ~3-4x the whole utility lane's 08-10 baseline, and a
+    docs task's questions rarely need filesystem probes). Answers still carry
+    ``source: "assumption"`` and the same never-fabricate instruction.
 
     ``questions_outcome_sink`` is the same for the QUESTIONS pass, and is
     forwarded rather than merged: the two passes fail for different reasons at
@@ -755,9 +764,30 @@ async def grill_spec(
             )
             fallback_used = False
             outcome = "parsed_first_try"
-            # The expensive one: max_turns=8, and it explores a real repo.
-            result = await _bounded_run(be, prompt, max_turns=8, effort="low",
-                                        cwd=cwd, usage_sink=usage_sink)
+            if probe:
+                # The expensive one: it explores a real repo. The turn budget
+                # scales with the question count — one answerable question has
+                # never needed eight turns of probing, and the v11 failure mode
+                # (exhaust ALL turns exploring, return an error result) burns
+                # every turn it is given. Ceiling unchanged at 8.
+                probe_turns = min(8, 2 + 2 * len(answerable))
+                result = await _bounded_run(be, prompt, max_turns=probe_turns,
+                                            effort="low",
+                                            cwd=cwd, usage_sink=usage_sink)
+            else:
+                # Proportionality rung: the tool-less emit AS the primary.
+                # Same never-fabricate contract as the fallback below —
+                # general-knowledge answers marked source "assumption", no
+                # invented file citations.
+                result = await _bounded_run(
+                    be,
+                    prompt + "\n\nDo NOT use tools. Emit the GRILL_ANSWERS "
+                    "block IMMEDIATELY in your first reply, as STRICT JSON "
+                    "with no commentary inside the block; answers from "
+                    "general knowledge with source \"assumption\" are fine. "
+                    "Do NOT cite file paths or line numbers you have not "
+                    "read; plain-language assumptions only.",
+                    max_turns=2, effort="low", cwd=cwd, usage_sink=usage_sink)
             timed_out = bool(getattr(result, "timed_out", False))
             data, why = _parse_answers_block(result.final_text or "")
             if data is None:

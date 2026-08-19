@@ -1334,3 +1334,13 @@ def test_bench_git_helper_shares_the_lock_retry(tmp_path, monkeypatch):
     ns._git(work, "init", "-b", "main")
     assert len(calls) == 2
     assert (work / ".git").exists()
+
+
+def test_shipped_git_retry_backoffs_are_two_positive_delays():
+    """Every retry test above zeroes _GIT_RETRY_BACKOFFS_S for speed, so
+    nothing else pins the value that actually ships: setting it to () would
+    silently disable lock retrying entirely and the rest of the suite would
+    stay green."""
+    from no_human.vcs.git import _GIT_RETRY_BACKOFFS_S
+    assert len(_GIT_RETRY_BACKOFFS_S) == 2
+    assert all(backoff > 0 for backoff in _GIT_RETRY_BACKOFFS_S)

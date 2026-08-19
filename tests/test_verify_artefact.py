@@ -137,6 +137,17 @@ def make_repo(tmp_path: Path, name: str = "src", commits: int = 1) -> tuple[Path
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
+@pytest.fixture(scope="module")
+def _default_repo(tmp_path_factory):
+    """The plain `make_repo(tmp_path)` shape, built ONCE per module.
+
+    Safe to share: `verify_artefact.py` only ever reads `--repo` (rev-parse,
+    cat-file -e) — it never writes to it — so every test that just needs *a*
+    correct, unmutated repo can use the same one instead of paying `git init`
+    + `git commit` again."""
+    return make_repo(tmp_path_factory.mktemp("verify-artefact-default-repo"))
+
+
 def make_bundle(tmp_path: Path, commit: str, *, files: dict[str, bytes] | None = None,
                 stamp: dict[str, str] | None = None, name: str = "mnt") -> Path:
     """An artefact directory shaped like a mounted DMG: app/Resources/nh-server."""
@@ -167,8 +178,8 @@ def run(args: list[str], capsys) -> tuple[int, str, str]:
 # the control: a correct artefact passes
 # --------------------------------------------------------------------------- #
 
-def test_a_correct_artefact_passes(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_correct_artefact_passes(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 0, err
@@ -177,8 +188,8 @@ def test_a_correct_artefact_passes(tmp_path, capsys):
     assert "3 board file(s)" in out
 
 
-def test_the_stale_artefact_it_exists_for_is_caught(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_the_stale_artefact_it_exists_for_is_caught(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     stale = {**BOARD, "index.html": b"THIS IS THE WRONG BOARD - 44 commits stale"}
     bundle = make_bundle(tmp_path, "c12a5f0f9256" + "0" * 28, files=stale)
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
@@ -191,9 +202,9 @@ def test_the_stale_artefact_it_exists_for_is_caught(tmp_path, capsys):
 # DEFECT 1 — an absent or empty board_sha256 must not mean "nothing to check"
 # --------------------------------------------------------------------------- #
 
-def test_empty_board_sha256_fails_even_when_the_board_is_wrong(tmp_path, capsys):
+def test_empty_board_sha256_fails_even_when_the_board_is_wrong(tmp_path, capsys, _default_repo):
     """The reviewer's exact reproduction. rc used to be 0 with an OK line."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     wrong = {**BOARD, "index.html": b"THIS IS THE WRONG BOARD - 44 commits stale"}
     bundle = make_bundle(tmp_path, sha, files=wrong, stamp={"board_sha256": ""})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
@@ -202,16 +213,16 @@ def test_empty_board_sha256_fails_even_when_the_board_is_wrong(tmp_path, capsys)
     assert "verify-artefact: OK" not in out
 
 
-def test_missing_board_sha256_field_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_missing_board_sha256_field_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"board_sha256": None})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
     assert "no 'board_sha256' field" in err
 
 
-def test_a_board_modified_after_the_build_still_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_board_modified_after_the_build_still_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     board = next(bundle.rglob("index.html"))
     board.write_bytes(b"tampered after the build")
@@ -220,7 +231,7 @@ def test_a_board_modified_after_the_build_still_fails(tmp_path, capsys):
     assert "does not match its own stamp" in err
 
 
-def test_swapping_two_board_files_paths_is_caught(tmp_path, capsys):
+def test_swapping_two_board_files_paths_is_caught(tmp_path, capsys, _default_repo):
     """The digest was PATH-BLIND: both halves hashed a multiset of content
     hashes with the names stripped (`awk '{print $1}'`, `blobs.values()`).
 
@@ -229,7 +240,7 @@ def test_swapping_two_board_files_paths_is_caught(tmp_path, capsys):
     `OK — 2 board file(s) matching the stamped digest`, rc=0. Every rename, move
     and swap inside dist/ was invisible.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     files = {"index.html": b"THE CURRENT BOARD",
              "assets/app.js": b"THIS IS THE WRONG BOARD - 44 commits stale"}
     bundle = make_bundle(tmp_path, sha, files=files)
@@ -247,8 +258,8 @@ def test_swapping_two_board_files_paths_is_caught(tmp_path, capsys):
     assert "does not match its own stamp" in err
 
 
-def test_the_digest_distinguishes_a_rename(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_the_digest_distinguishes_a_rename(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     board = next(bundle.rglob("index.html")).parent
     (board / "assets" / "app.js").rename(board / "assets" / "app.legacy.js")
@@ -257,8 +268,8 @@ def test_the_digest_distinguishes_a_rename(tmp_path, capsys):
     assert "does not match its own stamp" in err
 
 
-def test_a_malformed_digest_is_not_silently_accepted(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_malformed_digest_is_not_silently_accepted(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"board_sha256": "not-a-digest"})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
@@ -269,26 +280,26 @@ def test_a_malformed_digest_is_not_silently_accepted(tmp_path, capsys):
 # DEFECT 2 — an empty commit, and an empty expectation
 # --------------------------------------------------------------------------- #
 
-def test_empty_commit_in_the_stamp_fails(tmp_path, capsys):
+def test_empty_commit_in_the_stamp_fails(tmp_path, capsys, _default_repo):
     """`"anything".startswith("")` is True, so an empty commit matched anything."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"commit": ""})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1, f"an empty commit passed: {out}"
     assert "'commit' is EMPTY" in err
 
 
-def test_missing_commit_field_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_missing_commit_field_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"commit": None})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
     assert "no 'commit' field" in err
 
 
-def test_empty_expect_commit_is_a_usage_error_not_a_skip(tmp_path, capsys):
+def test_empty_expect_commit_is_a_usage_error_not_a_skip(tmp_path, capsys, _default_repo):
     """`--expect-commit "$(git rev-parse HEAD)"` with a failed substitution."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, "b" * 40)  # deliberately NOT the repo's sha
     rc, out, err = run([str(bundle), "--repo", str(repo), "--expect-commit", ""],
                        capsys)
@@ -298,8 +309,8 @@ def test_empty_expect_commit_is_a_usage_error_not_a_skip(tmp_path, capsys):
     assert "verify-artefact: OK" not in out
 
 
-def test_a_junk_expect_commit_is_a_usage_error(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_junk_expect_commit_is_a_usage_error(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo),
                         "--expect-commit", "HEAD"], capsys)
@@ -307,8 +318,8 @@ def test_a_junk_expect_commit_is_a_usage_error(tmp_path, capsys):
     assert "usage error" in err
 
 
-def test_expect_commit_accepts_an_abbreviation_and_still_compares(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_expect_commit_accepts_an_abbreviation_and_still_compares(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo),
                         "--expect-commit", sha[:12]], capsys)
@@ -319,8 +330,8 @@ def test_expect_commit_accepts_an_abbreviation_and_still_compares(tmp_path, caps
     assert "stale-artefact failure" in err
 
 
-def test_a_malformed_commit_in_the_stamp_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_malformed_commit_in_the_stamp_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"commit": "main"})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
@@ -331,8 +342,8 @@ def test_a_malformed_commit_in_the_stamp_fails(tmp_path, capsys):
 # the stamp as a whole
 # --------------------------------------------------------------------------- #
 
-def test_no_stamp_at_all_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_no_stamp_at_all_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     next(bundle.rglob("BUILD_STAMP")).unlink()
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
@@ -340,15 +351,15 @@ def test_no_stamp_at_all_fails(tmp_path, capsys):
     assert "no BUILD_STAMP" in err
 
 
-def test_dirty_is_refused_unless_allowed(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_dirty_is_refused_unless_allowed(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"dirty": "yes"})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
     assert "DIRTY tree" in err
 
 
-def test_allow_dirty_is_not_an_unqualified_ok(tmp_path, capsys):
+def test_allow_dirty_is_not_an_unqualified_ok(tmp_path, capsys, _default_repo):
     """`make-dmg.sh` passes --allow-dirty for EVERY unsigned build.
 
     A stale board plus dirty=yes plus a self-consistent digest used to print a
@@ -357,7 +368,7 @@ def test_allow_dirty_is_not_an_unqualified_ok(tmp_path, capsys):
     just as stale". `dirty=yes` means the stamped commit does not describe these
     bytes, so it is a DOWNGRADE, not a waiver: rc=3, and the OK line says so.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"dirty": "yes"})
     rc, out, err = run([str(bundle), "--repo", str(repo), "--allow-dirty"], capsys)
     assert rc == 3, f"a dirty build was indistinguishable from a verified one: {out}"
@@ -366,8 +377,8 @@ def test_allow_dirty_is_not_an_unqualified_ok(tmp_path, capsys):
     assert "DIRTY tree" in err
 
 
-def test_a_nonsense_dirty_value_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_nonsense_dirty_value_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha, stamp={"dirty": "maybe"})
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 1
@@ -403,9 +414,9 @@ def test_the_writer_does_not_put_a_branch_name_in_the_artefact(tmp_path):
     assert sorted(_fields(stamp)) == ["board_sha256", "commit", "dirty"]
 
 
-def test_an_unrecognised_stamp_field_fails(tmp_path, capsys):
+def test_an_unrecognised_stamp_field_fails(tmp_path, capsys, _default_repo):
     """The closed field set is what stops the next convenience field leaking."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(
         tmp_path, sha,
         stamp={"branch": "fix/a-customer-and-their-ticket-number"})
@@ -415,8 +426,8 @@ def test_an_unrecognised_stamp_field_fails(tmp_path, capsys):
     assert "branch" in err
 
 
-def test_the_ok_line_does_not_echo_stamp_free_text(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_the_ok_line_does_not_echo_stamp_free_text(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == 0, err
@@ -444,14 +455,14 @@ def test_a_commit_absent_from_the_repo_is_not_reported_as_staleness(tmp_path, ca
     assert "--allow-unknown-commit" in err
 
 
-def test_allow_unknown_commit_passes_but_says_so_loudly(tmp_path, capsys):
+def test_allow_unknown_commit_passes_but_says_so_loudly(tmp_path, capsys, _default_repo):
     """rc=3, not 0: a caller reading only `$?` must be able to tell it apart.
 
     Against a board reading "THIS IS THE WRONG BOARD - 44 commits stale" this
     returned 0 with every caveat in stderr prose. `if verify_artefact.py …; then
     ship; fi` shipped it. Prose is not a signal a pipeline can act on.
     """
-    export, _ = make_repo(tmp_path)
+    export, _ = _default_repo
     stale = {**BOARD, "index.html": b"THIS IS THE WRONG BOARD - 44 commits stale"}
     bundle = make_bundle(tmp_path, "a" * 40, files=stale)
     rc, out, err = run([str(bundle), "--repo", str(export),
@@ -462,9 +473,9 @@ def test_allow_unknown_commit_passes_but_says_so_loudly(tmp_path, capsys):
     assert "provenance NOT verified" in out
 
 
-def test_allow_unknown_commit_does_not_disable_the_content_check(tmp_path, capsys):
+def test_allow_unknown_commit_does_not_disable_the_content_check(tmp_path, capsys, _default_repo):
     """The opt-out must weaken exactly one check, not become a bypass."""
-    export, _ = make_repo(tmp_path)
+    export, _ = _default_repo
     bundle = make_bundle(tmp_path, "a" * 40)
     next(bundle.rglob("index.html")).write_bytes(b"tampered")
     rc, out, err = run([str(bundle), "--repo", str(export),
@@ -523,8 +534,8 @@ needs_nonroot = pytest.mark.skipif(
 
 
 @needs_nonroot
-def test_an_unreadable_board_file_fails_cleanly(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_an_unreadable_board_file_fails_cleanly(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     victim = next(bundle.rglob("app.js"))
     victim.chmod(0o000)
@@ -537,8 +548,8 @@ def test_an_unreadable_board_file_fails_cleanly(tmp_path, capsys):
 
 
 @needs_nonroot
-def test_an_unreadable_stamp_fails_cleanly(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_an_unreadable_stamp_fails_cleanly(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     stamp = next(bundle.rglob("BUILD_STAMP"))
     stamp.chmod(0o000)
@@ -550,8 +561,8 @@ def test_an_unreadable_stamp_fails_cleanly(tmp_path, capsys):
     assert "cannot be read" in err
 
 
-def test_a_stamp_that_is_a_directory_fails_cleanly(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_stamp_that_is_a_directory_fails_cleanly(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     stamp = next(bundle.rglob("BUILD_STAMP"))
     stamp.unlink()
@@ -561,8 +572,8 @@ def test_a_stamp_that_is_a_directory_fails_cleanly(tmp_path, capsys):
     assert "not a regular file" in err
 
 
-def test_a_stamp_line_that_is_not_key_value_fails(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_a_stamp_line_that_is_not_key_value_fails(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     stamp = next(bundle.rglob("BUILD_STAMP"))
     stamp.write_text(stamp.read_text() + "this is not a field\n")
@@ -581,9 +592,9 @@ def test_a_missing_bundle_directory_fails_cleanly(tmp_path, capsys):
 # DEFECT 8 — first-dist-wins, and the symlink divergence
 # --------------------------------------------------------------------------- #
 
-def test_a_decoy_dist_is_ambiguous_not_a_coin_toss(tmp_path, capsys):
+def test_a_decoy_dist_is_ambiguous_not_a_coin_toss(tmp_path, capsys, _default_repo):
     """rglob walks in directory order, so `AAA/dist` used to win outright."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     decoy = bundle / "AAA" / "dist"
     decoy.mkdir(parents=True)
@@ -594,9 +605,9 @@ def test_a_decoy_dist_is_ambiguous_not_a_coin_toss(tmp_path, capsys):
     assert "AAA/dist" in err
 
 
-def test_a_symlink_in_the_board_is_reported_not_silently_hashed(tmp_path, capsys):
+def test_a_symlink_in_the_board_is_reported_not_silently_hashed(tmp_path, capsys, _default_repo):
     """`find -type f` skips symlinks; `is_file()` follows them. They diverged."""
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     board = next(bundle.rglob("index.html")).parent
     (board / "alias.html").symlink_to("index.html")
@@ -606,8 +617,8 @@ def test_a_symlink_in_the_board_is_reported_not_silently_hashed(tmp_path, capsys
     assert "UNVERIFIED" in err
 
 
-def test_two_stamps_are_ambiguous(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_two_stamps_are_ambiguous(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     original = next(bundle.rglob("BUILD_STAMP"))
     (bundle / "BUILD_STAMP").write_text(original.read_text())
@@ -620,8 +631,8 @@ def test_two_stamps_are_ambiguous(tmp_path, capsys):
 # require / forbid
 # --------------------------------------------------------------------------- #
 
-def test_require_and_forbid_read_the_bundled_bytes(tmp_path, capsys):
-    repo, sha = make_repo(tmp_path)
+def test_require_and_forbid_read_the_bundled_bytes(tmp_path, capsys, _default_repo):
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo),
                         "--require", "a feature shipped this week",
@@ -633,7 +644,7 @@ def test_require_and_forbid_read_the_bundled_bytes(tmp_path, capsys):
     assert "MISSING required string" in err
 
 
-def test_a_forbidden_string_that_IS_present_fails_the_artefact(tmp_path, capsys):
+def test_a_forbidden_string_that_IS_present_fails_the_artefact(tmp_path, capsys, _default_repo):
     """The seventh review's F3: `--forbid` had no positive case at all.
 
     The test above exercises only the ABSENT half, so the check could not fail
@@ -647,7 +658,7 @@ def test_a_forbidden_string_that_IS_present_fails_the_artefact(tmp_path, capsys)
     A check that reports having run while doing nothing is worse than no check,
     because the sentence an operator reads is the same either way.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     stale = {**BOARD,
              "index.html": b"<!doctype html>THIS IS THE WRONG BOARD - 44 commits stale"}
     bundle = make_bundle(tmp_path, sha, files=stale)
@@ -661,13 +672,13 @@ def test_a_forbidden_string_that_IS_present_fails_the_artefact(tmp_path, capsys)
 
 
 def test_a_forbidden_string_is_found_ACROSS_the_whole_board_not_just_index(
-        tmp_path, capsys):
+        tmp_path, capsys, _default_repo):
     """The needle is sought in every board file, joined, not only in index.html.
 
     Without this, narrowing the search to a single file would leave the case
     above green — index.html is where the incident's marker happened to live.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     files = {**BOARD, "assets/app.css": b":root{--bg:#111}/* leaked-secret */"}
     bundle = make_bundle(tmp_path, sha, files=files)
 
@@ -682,7 +693,7 @@ def test_a_forbidden_string_is_found_ACROSS_the_whole_board_not_just_index(
 # --------------------------------------------------------------------------- #
 
 def test_the_stamp_digest_covers_ONLY_the_board_not_the_rest_of_the_bundle(
-        tmp_path, capsys):
+        tmp_path, capsys, _default_repo):
     """`make-dmg.sh`, `verify_artefact.py` and `docs/INSTALLER.md` all said the
     self-referential comparison proves "the DMG was not edited between being
     built and being packaged". It proves that of the BOARD, and this is the case
@@ -695,7 +706,7 @@ def test_the_stamp_digest_covers_ONLY_the_board_not_the_rest_of_the_bundle(
     the "widening is out of scope" paragraph beside them — are what need
     rewriting, not this test.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     srv = bundle / "no_human.app" / "Contents" / "Resources" / "nh-server"
     planted = ["_internal/evil.so", "_internal/base_library.zip",
@@ -1283,14 +1294,14 @@ def test_a_signed_build_never_accepts_an_unverified_verdict(tmp_path):
 # self-referential comparison can never yield "verified".
 # --------------------------------------------------------------------------- #
 
-def test_the_checkout_that_built_it_cannot_verify_it(tmp_path, capsys):
+def test_the_checkout_that_built_it_cannot_verify_it(tmp_path, capsys, _default_repo):
     """A repo compared against itself proves the DMG was not edited. Nothing more.
 
     `--repo-built-this-artefact` is the caller saying "this repo IS the build
     checkout", which makes `stamp.commit == HEAD` a tautology: a clone 45 commits
     behind main satisfies it exactly as well as the tip does.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo),
                         "--repo-built-this-artefact"], capsys)
@@ -1301,13 +1312,13 @@ def test_the_checkout_that_built_it_cannot_verify_it(tmp_path, capsys):
     assert "which source" in err.lower()
 
 
-def test_without_that_flag_the_same_comparison_is_a_real_check(tmp_path, capsys):
+def test_without_that_flag_the_same_comparison_is_a_real_check(tmp_path, capsys, _default_repo):
     """The control. A CONSUMER holding their own clone is doing a real check.
 
     Without this, the test above would pass if the flag did nothing and the
     default path had simply been broken to always return 3.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo)], capsys)
     assert rc == va.RC_OK, err
@@ -1315,12 +1326,12 @@ def test_without_that_flag_the_same_comparison_is_a_real_check(tmp_path, capsys)
 
 
 def test_declaring_the_repo_built_it_alongside_an_expectation_is_a_usage_error(
-        tmp_path, capsys):
+        tmp_path, capsys, _default_repo):
     """The two are contradictory: one says self-referential, one names a source.
 
     Ambiguous input is a FAILURE, never a quiet choice of one of them.
     """
-    repo, sha = make_repo(tmp_path)
+    repo, sha = _default_repo
     bundle = make_bundle(tmp_path, sha)
     rc, out, err = run([str(bundle), "--repo", str(repo), "--expect-commit", sha,
                         "--repo-built-this-artefact"], capsys)

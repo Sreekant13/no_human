@@ -110,3 +110,30 @@ export function filterRepos(repos, query) {
       (r.path || "").toLowerCase().includes(q),
   );
 }
+
+// The name a row is grouped by for collision detection. A row that arrives
+// without `name` (should not happen, but the shape is not enforced) still
+// participates instead of silently reading as unique.
+export function rowName(r) {
+  const n = (r?.name || "").trim();
+  if (n) return n;
+  const segs = (r?.path || "").split("/").filter(Boolean);
+  return segs.length ? segs[segs.length - 1] : "";
+}
+
+// Two checkouts of the same repository (say ~/git/svc and ~/work/svc) render as
+// two identical rows. Callers show the full path on exactly those rows: a path
+// on every row is noise, and a path on none of them is unusable (measured on a
+// real machine, 2026-08-18). Name-collision only, so unique rows are untouched.
+// Comparison is exact-string, case-sensitive: `Svc` and `svc` are different
+// directories on a case-sensitive filesystem.
+export function ambiguousNames(repos) {
+  const list = Array.isArray(repos) ? repos : [];
+  const seen = new Map();
+  for (const r of list) {
+    const n = rowName(r);
+    if (!n) continue;
+    seen.set(n, (seen.get(n) || 0) + 1);
+  }
+  return new Set([...seen].filter(([, c]) => c > 1).map(([n]) => n));
+}

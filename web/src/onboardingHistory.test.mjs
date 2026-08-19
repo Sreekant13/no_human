@@ -83,3 +83,16 @@ test("the empty-history headline names the missing history, not a missing IDE", 
   // The server's own detail still rides along — it names the sources it looked in.
   assert.match(callout, /\{history\.detail\}/);
 });
+
+// ── the AI-history step names no product but Claude Code ───────────────────
+//
+// The two placeholders checked below were publication-shape scrub leftovers
+// from a redaction pass — not real products, and meaningless to a user.
+test("the AI-history step names no product but Claude Code", () => {
+  assert.doesNotMatch(onboarding, /\bide-agent\b/,
+    "the scrub placeholder must never be shown to a user");
+  assert.doesNotMatch(onboarding, /\bagent-a\b/,
+    "the scrub placeholder must never be shown to a user");
+  assert.match(onboarding, /reads your past <strong>Claude Code<\/strong> conversations/);
+  assert.match(onboarding, /Booting up — reading your Claude Code conversations…/);
+});

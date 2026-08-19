@@ -48,7 +48,7 @@ async def test_grill_runs_for_every_task_and_persists_qa(
     async def _fake_grill(title, description, criteria, repo_path, *,
                           backend=None, model=None, questions=None,
                           usage_sink=None, outcome_sink=None,
-                          questions_outcome_sink=None):
+                          questions_outcome_sink=None, probe=True):
         seen["repo_path"] = repo_path
         return _qa()
     monkeypatch.setattr(ev, "grill_spec", _fake_grill)

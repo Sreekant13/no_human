@@ -1053,7 +1053,7 @@ async def test_bench_grill_runs_in_the_sandbox_not_the_source(tmp_path, monkeypa
     async def _fake_grill(title, description, criteria, repo_path, *,
                           backend=None, model=None, questions=None,
                           usage_sink=None, outcome_sink=None,
-                          questions_outcome_sink=None):
+                          questions_outcome_sink=None, probe=True):
         seen["repo_path"] = str(repo_path)
         return None
     monkeypatch.setattr(ev, "grill_spec", _fake_grill)

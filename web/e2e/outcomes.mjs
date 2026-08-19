@@ -207,7 +207,10 @@ for (const theme of ["dark", "light"]) {
   if (theme === "dark") await page.screenshot({ path: `${OUT}/outcomes-done-dark.png` });
 
   // Back to the board.
-  await page.getByRole("button", { name: /^Board/ }).click();
+  // The sidenav redesign renamed the board-return row: it is the "In
+  // progress" NavRow (a real <button>), not "Board" (2026-08-19 fix —
+  // the suite predated the rename and timed out here).
+  await page.getByRole("button", { name: /^In progress/ }).click();
   await page.waitForTimeout(400);
   check(`[${theme}] back to the board, still 3 lanes`, (await page.locator(".lane-title").count()) === 3);
   if (theme === "dark") await page.screenshot({ path: `${OUT}/board-3lane-dark.png` });

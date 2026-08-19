@@ -7,6 +7,7 @@ import {
   filterRepos,
   DIRTY_TEXT,
   fromDetectedRepo,
+  ambiguousNames,
 } from "./discoveredRepos.js";
 
 const repo = (over = {}) => ({
@@ -227,4 +228,60 @@ test("a manually scanned repo does not claim a branch or a clean tree it never m
 test("an unmeasured repo is not mistaken for a non-git directory", () => {
   const b = repoBadges(fromDetectedRepo({ path: "/p", name: "p" }));
   assert.ok(!b.some((x) => x.key === "nogit"));
+});
+
+// --------------------------------------------------------------------------
+// Ambiguous names
+// --------------------------------------------------------------------------
+
+test("two checkouts of the same repo mark that name ambiguous", () => {
+  const rs = [
+    repo({ name: "svc", path: "/Users/x/git/svc" }),
+    repo({ name: "svc", path: "/Users/x/work/svc" }),
+  ];
+  assert.ok(ambiguousNames(rs).has("svc"));
+});
+
+test("a unique basename is never marked ambiguous", () => {
+  const rs = [
+    repo({ name: "svc", path: "/Users/x/git/svc" }),
+    repo({ name: "svc", path: "/Users/x/work/svc" }),
+    repo({ name: "billing", path: "/Users/x/git/billing" }),
+  ];
+  assert.deepEqual(ambiguousNames(rs), new Set(["svc"]));
+  assert.ok(!ambiguousNames(rs).has("billing"));
+});
+
+test("a single repo list marks nothing ambiguous", () => {
+  assert.equal(ambiguousNames([repo()]).size, 0);
+  assert.equal(ambiguousNames([]).size, 0);
+});
+
+test("a missing or ragged list does not throw", () => {
+  assert.equal(ambiguousNames(null).size, 0);
+  assert.equal(ambiguousNames(undefined).size, 0);
+  assert.equal(ambiguousNames([null, {}]).size, 0);
+});
+
+test("collision detection falls back to the path's last segment when name is absent", () => {
+  const rs = [{ path: "/a/svc" }, { path: "/b/svc" }];
+  assert.ok(ambiguousNames(rs).has("svc"));
+});
+
+test("names differing only in case are distinct directories, not a collision", () => {
+  const rs = [
+    repo({ name: "svc", path: "/Users/x/git/svc" }),
+    repo({ name: "Svc", path: "/Users/x/work/Svc" }),
+  ];
+  assert.equal(ambiguousNames(rs).size, 0);
+});
+
+test("marking a name ambiguous does not change its badges", () => {
+  const rs = [
+    repo({ name: "svc", path: "/Users/x/git/svc" }),
+    repo({ name: "svc", path: "/Users/x/work/svc", dirty: true }),
+  ];
+  assert.ok(ambiguousNames(rs).has("svc"));
+  assert.deepEqual(keys(rs[0]), ["branch"]);
+  assert.deepEqual(keys(rs[1]), ["branch", "dirty"]);
 });

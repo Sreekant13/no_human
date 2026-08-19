@@ -3017,50 +3017,67 @@ class Orchestrator:
                             return 0.0
                         return len(t1 & t2) / len(t1 | t2)
 
-                    def _recurring_finding(labels1: set[str], labels2: set[str]) -> bool:
-                        """True when a MAJORITY of the smaller attempt's
-                        failing labels have a close word-overlap match in the
-                        other attempt — i.e. the overall set of complaints is
-                        substantially the same. A single pair of otherwise-
-                        different findings that happen to share a few words
-                        (e.g. two distinct comment-pagination bugs both
-                        mentioning "pr comment", "delete-repost") isn't
-                        enough on its own — verified against a real run
-                        where that exact case scored 0.385, comfortably below
-                        the 0.4 per-pair threshold."""
+                    def _recurring_finding(labels1: set[str], labels2: set[str]) -> list[str]:
+                        """Matched labels from the smaller attempt's set when a
+                        MAJORITY of the smaller attempt's failing labels have a
+                        close word-overlap match in the other attempt — i.e.
+                        the overall set of complaints is substantially the
+                        same. A single pair of otherwise-different findings
+                        that happen to share a few words (e.g. two distinct
+                        comment-pagination bugs both mentioning "pr comment",
+                        "delete-repost") isn't enough on its own — verified
+                        against a real run where that exact case scored 0.385,
+                        comfortably below the 0.4 per-pair threshold.
+                        Returns the matched labels from the smaller attempt's
+                        set (sorted, so the escalation text is deterministic),
+                        or [] when the majority rule is not met. Empty is
+                        falsy, so the caller's condition is unchanged."""
                         if not labels1 or not labels2:
-                            return False
+                            return []
                         smaller, other = (
                             (labels1, labels2) if len(labels1) <= len(labels2)
                             else (labels2, labels1)
                         )
-                        matches = sum(
-                            1 for l in smaller
+                        matched = sorted(
+                            l for l in smaller
                             if any(_label_similarity(l, o) >= 0.4 for o in other)
                         )
-                        return matches / len(smaller) >= 0.5
+                        if len(matched) / len(smaller) < 0.5:
+                            return []
+                        return matched
 
                     r1 = _pass_rate(attempts[-1])
                     r2 = _pass_rate(attempts[-2])
-                    if (r1 is not None and r2 is not None and r1 == r2 and r1 < 1.0
-                            and _recurring_finding(_failing_labels(attempts[-1]),
-                                                    _failing_labels(attempts[-2]))):
+                    recurring = (
+                        _recurring_finding(_failing_labels(attempts[-1]),
+                                           _failing_labels(attempts[-2]))
+                        if (r1 is not None and r2 is not None and r1 == r2 and r1 < 1.0)
+                        else []
+                    )
+                    if recurring:
                         ctx = task.context or {}
                         ctx["stagnation_detected"] = True
                         task.context = ctx
                         await self.store.update_task(task)
+                        _labels_txt = ", ".join(recurring)
                         blocker = Blocker(
                             category=BlockerCategory.STAGNATION,
                             transient=False, confidence=0.9, goal=task.title,
+                            tried=list(ctx.get("attempt_log") or []),
                             root_cause_hypothesis=(
                                 f"Review pass rate stuck at {r1:.0%} for 2 consecutive "
                                 f"attempts, with at least one recurring specific "
                                 f"finding — the agent is not making progress."
                             ),
                             question=(
-                                "The agent appears stuck. Should the task be revised, "
-                                "decomposed, or manually investigated?"
+                                f"The agent is stuck on {_labels_txt}. Should the task "
+                                f"be revised, decomposed, or manually investigated?"
                             ),
+                            evidence=(
+                                f"Failing review findings that recurred across the "
+                                f"last two attempts (pass rate {r1:.0%} both times): "
+                                f"{_labels_txt}"
+                            )[:500],
                         )
                         return await self._raise_blocker(
                             task, blocker, repo=repo, branch=base_branch,
@@ -9355,6 +9372,20 @@ class Orchestrator:
                     error=fields.get("error"),
                 )
 
+            # Proportionality rung between trivial (grill skipped above) and
+            # the full probing grill: a task whose named files are ALL
+            # non-executed prose missed the trivial fast path only on criteria
+            # count / description length — its scoping questions rarely need
+            # filesystem probes, and the exploring session is the utility
+            # lane's cost center (2026-08-19 funnel forensics: ~3-4x the
+            # 08-10 baseline). Tool-less answers, marked "assumption",
+            # surfaced in the PR body exactly like every other grill answer.
+            from .complexity import named_paths, trivial_paths
+            prose_only = trivial_paths(named_paths(task))
+            if prose_only:
+                self.emit("intake_grill",
+                          "prose-only task: answering without filesystem "
+                          "probes (proportionality rung)")
             qa = await _ev.grill_spec(
                 task.title, task.description or "",
                 task.acceptance_criteria or [], task.repo_path,
@@ -9362,6 +9393,7 @@ class Orchestrator:
                 usage_sink=self._note_utility_usage,
                 outcome_sink=_grill_outcome,
                 questions_outcome_sink=_grill_questions_outcome,
+                probe=not prose_only,
             )
             if not qa:
                 return

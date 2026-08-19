@@ -44,15 +44,21 @@ await page.waitForTimeout(400);
 
 const cont = () => page.getByRole("button", { name: /^Continue$/ }).click();
 
-// welcome -> team -> repos -> projects (3 Continues).
-await cont(); await page.waitForTimeout(150);
-await cont(); await page.waitForTimeout(150);
-await cont(); await page.waitForTimeout(300);
+// Walk Continues until the Projects step's heading renders (bounded): the
+// suite used to hardcode 3 Continues for a welcome->team->repos->projects
+// order, and the step list has changed shape once already (the team step is
+// gone) — counting steps is exactly what went stale (2026-08-19 fix).
+for (let hop = 0; hop < 6; hop++) {
+  if (await page.getByRole("heading", { name: /Group repos into projects/i })
+      .isVisible().catch(() => false)) break;
+  await cont(); await page.waitForTimeout(250);
+}
 
 // Projects step: add a project, then the remove-project ✕ appears.
 const NAME = "metrics-core";
 const projInput = page.getByPlaceholder(/Project name/i);
-check("reached the Projects step", await projInput.isVisible().catch(() => false));
+check("reached the Projects step",
+  await projInput.waitFor({ state: "visible", timeout: 5000 }).then(() => true).catch(() => false));
 await projInput.fill(NAME);
 await projInput.press("Enter");
 await page.waitForTimeout(300);

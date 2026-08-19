@@ -60,6 +60,14 @@ class CodebaseSource:
     )
     _SEARCH_TIMEOUT = 20  # must be < ContextGatherer.per_source_timeout (30s)
 
+    # Content bounds — a property of the gatherer's contract, NOT of ripgrep's
+    # flag set. Enforced in _search's shared parse loop so every backend
+    # (rg, grep, any future third one) is bound by them. grep has no
+    # --max-filesize equivalent, so a flag-for-flag port is not available.
+    _MAX_FILESIZE_BYTES = 256 * 1024   # files larger than this contribute nothing
+    _MAX_MATCHES_PER_FILE = 5          # at most N matched lines per file
+    _MAX_LINE_CHARS = 200              # each surviving line truncated to N chars
+
     def _search(self, repo: Path, terms: list[str]) -> dict[Path, list[str]]:
         """Return {file: matched lines} ranked by hit count, using rg or grep."""
         if not terms:
@@ -67,8 +75,11 @@ class CodebaseSource:
         pattern = "|".join(t.replace("+", r"\+") for t in terms)
         hits: dict[Path, list[str]] = {}
         if shutil.which("rg"):
-            cmd = ["rg", "-n", "--no-heading", "-i", "--max-columns", "200",
-                   "--max-count", "5", "--max-filesize", "256K", "-e", pattern]
+            cmd = ["rg", "-n", "--no-heading", "-i",
+                   "--max-columns", str(self._MAX_LINE_CHARS),
+                   "--max-count", str(self._MAX_MATCHES_PER_FILE),
+                   "--max-filesize", str(self._MAX_FILESIZE_BYTES),
+                   "-e", pattern]
             for d in self._EXCLUDE_DIRS:
                 cmd += ["--glob", f"!**/{d}/**"]
             for g in self._EXCLUDE_GLOBS:
@@ -88,12 +99,26 @@ class CodebaseSource:
             # Return partial results from whatever stdout was captured.
             proc_stdout = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             proc = type("R", (), {"stdout": proc_stdout, "returncode": -1})()
+        oversize: dict[Path, bool] = {}   # stat() cache — one stat per file, not per line
         for line in proc.stdout.splitlines():
             parts = line.split(":", 2)
             if len(parts) < 3:
                 continue
             fp = Path(parts[0])
-            hits.setdefault(fp, []).append(f"{parts[1]}: {parts[2].strip()[:200]}")
+            existing = hits.setdefault(fp, [])
+            if len(existing) >= self._MAX_MATCHES_PER_FILE:
+                continue                      # per-file match cap (both branches)
+            if fp not in oversize:
+                try:
+                    oversize[fp] = fp.stat().st_size > self._MAX_FILESIZE_BYTES
+                except OSError:
+                    oversize[fp] = False      # unknown size is NOT a reason to drop a
+                                              # real positive; only a measured
+                                              # over-cap size excludes.
+            if oversize[fp]:
+                continue                      # size cap (both branches)
+            existing.append(f"{parts[1]}: {parts[2].strip()[:self._MAX_LINE_CHARS]}")
+        hits = {p: ls for p, ls in hits.items() if ls}   # drop keys left empty by the caps
         # rank files by number of matches (most relevant first)
         return dict(sorted(hits.items(), key=lambda kv: len(kv[1]), reverse=True))
 

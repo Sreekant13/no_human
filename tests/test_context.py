@@ -1,5 +1,7 @@
 """Context gathering: keywords, codebase search, completeness, parallel gather."""
 
+import inspect
+import shutil
 import subprocess
 
 import pytest
@@ -74,6 +76,85 @@ async def test_codebase_source_excludes_suffixed_venv_dirs(code_repo):
     t = Task.new("update AnalyticsExporter retention", repo_path=str(code_repo))
     chunks = await CodebaseSource().gather(t)
     assert not any(".venv312" in c.ref for c in chunks)
+
+
+@pytest.fixture
+def bounded_repo(code_repo):
+    """One over-cap file and one small file, both matching the search terms."""
+    small = code_repo / "small_hit.py"
+    small.write_text("# AnalyticsExporter retention note\n")
+    big = code_repo / "generated_big.json"
+    filler = '{"AnalyticsExporter retention": "x"}\n'
+    big.write_text(filler * (400 * 1024 // len(filler)))   # ~400K > 256K
+    assert big.stat().st_size > CodebaseSource._MAX_FILESIZE_BYTES
+    return code_repo
+
+
+@pytest.mark.parametrize("branch", ["grep", "rg"])
+def test_search_size_cap_holds_on_both_branches(bounded_repo, monkeypatch, branch):
+    if branch == "grep":
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+    else:
+        rg_path = shutil.which("rg")
+        if rg_path is None:
+            pytest.skip("ripgrep not installed")
+        monkeypatch.setattr(shutil, "which", lambda name: rg_path if name == "rg" else None)
+
+    result = CodebaseSource()._search(bounded_repo, ["AnalyticsExporter", "retention"])
+
+    assert any(p.name == "small_hit.py" for p in result)
+    assert not any(p.name == "generated_big.json" for p in result)
+    assert all(lines for lines in result.values())
+
+
+def test_search_match_cap_on_grep_branch(code_repo, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    many_hits = code_repo / "many_hits.py"
+    many_hits.write_text("\n".join(f"# retention line {i}" for i in range(12)) + "\n")
+
+    result = CodebaseSource()._search(code_repo, ["retention"])
+
+    path = next(p for p in result if p.name == "many_hits.py")
+    assert len(result[path]) == CodebaseSource._MAX_MATCHES_PER_FILE
+
+
+def test_search_line_length_cap_on_grep_branch(code_repo, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    long_line = code_repo / "long_line.py"
+    long_line.write_text("retention" + "z" * 5000 + "\n")
+
+    result = CodebaseSource()._search(code_repo, ["retention"])
+
+    path = next(p for p in result if p.name == "long_line.py")
+    for line in result[path]:
+        _, _, text = line.partition(": ")
+        assert len(text) <= CodebaseSource._MAX_LINE_CHARS
+
+
+def test_bounds_are_class_constants_not_branch_literals():
+    assert CodebaseSource._MAX_FILESIZE_BYTES == 256 * 1024
+    assert CodebaseSource._MAX_MATCHES_PER_FILE == 5
+    assert CodebaseSource._MAX_LINE_CHARS == 200
+
+    source = inspect.getsource(CodebaseSource._search)
+    rg_branch = source.split('if shutil.which("rg"):', 1)[1].split("else:", 1)[0]
+    assert "_MAX_FILESIZE_BYTES" in rg_branch
+    assert "256K" not in rg_branch
+
+
+def test_exclusions_unchanged_on_grep_branch(code_repo, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    cache_dir = code_repo / ".pytest_cache" / "v" / "cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "nodeids").write_text("retention\n")
+    venv_dir = code_repo / ".venv312" / "lib" / "site-packages" / "pytest"
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "__init__.py").write_text("retention\n")
+
+    result = CodebaseSource()._search(code_repo, ["retention"])
+
+    assert not any(".pytest_cache" in str(p) for p in result)
+    assert not any(".venv312" in str(p) for p in result)
 
 
 def test_completeness_binary():
