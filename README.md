@@ -20,27 +20,18 @@ Give it a ticket. Get back a pull request, with the evidence that it works.
 
 </div>
 
-You know the loop. You ask for the change. It comes back confident and wrong in
-a way that takes longer to disprove than to write. You correct it. It apologises
-and does it again. And the whole time you are the one checking it ran the tests,
-followed the conventions, and did not invent an API that does not exist. That is
-not delegation. That is supervision, with extra steps.
-
-no_human closes the loop instead. Hand it a ticket and walk away: it plans,
-writes the change, runs your tests, and hands the work to a second model that
-never saw it being written — one told to refute "done" and to cite file and line
-for every finding. What lands in your inbox is a pull request that has already
-been torn apart. You review and merge.
-
-Turn the pool on and tasks run in parallel, while your engineers stay on the
-work that needs them.
-Every task carries a spend cap, set before it starts. Nothing to deploy: it runs
-on the developer's machine, on SQLite and your existing git host.
-
-It runs on your own Claude credential, and it is not an offline tool — your code
-goes to Anthropic as prompts, and the branch and pull request go to your git
-host. Exactly what leaves your machine, and what you can switch off:
-[docs/security.md](docs/security.md#7-what-leaves-your-machine).
+- **A plan before any code**, from the ticket plus what it finds in your repo.
+- **An adversarial review.** A different model, fresh context, read-only tools,
+  told to refute "done". You get a pass/fail checklist citing file and line —
+  never a numeric self-score.
+- **A tamper guard.** Deleted tests, new skips, an assertion turned into a
+  tautology — blocked before a reviewer token is spent.
+- **Proof the fix fixed the bug.** For a bug fix, the tests offered as evidence
+  must fail at the merge base and pass on the new tree — the reproduction gate
+  enforces that, and you can require it for every change.
+- **Your tests run**, locally and optionally through your CI.
+- **An honest stop.** When it cannot finish, it parks with one specific question
+  instead of inventing a plausible diff.
 
 ## Install
 
@@ -100,35 +91,6 @@ nh diff <id>                         # the diff it wants to ship
 nh approve <id>                      # your approval squash-lands the PR (git.approve_identity)
 nh reject <id> --reason "..."        # send it back with feedback
 ```
-
-## What you get
-
-- **A plan before any code**, from the ticket plus what it finds in your repo.
-- **An adversarial review.** A different model, fresh context, read-only tools,
-  told to refute "done". You get a pass/fail checklist citing file and line —
-  never a numeric self-score.
-- **A tamper guard.** Deleted tests, new skips, an assertion turned into a
-  tautology — blocked before a reviewer token is spent.
-- **Proof the fix fixed the bug.** For a bug fix, the tests offered as evidence
-  must fail at the merge base and pass on the new tree — the reproduction gate
-  enforces that, and you can require it for every change.
-- **Your tests run**, locally and optionally through your CI.
-- **An honest stop.** When it cannot finish, it parks with one specific question
-  instead of inventing a plausible diff.
-
-## The agent never merges
-
-Merging is yours. `gh pr merge`, `glab mr merge` and the REST equivalents are
-denied to the agent's sessions before they execute, and pushes to
-`main`/`master`/`release/*` are refused at the git layer. `nh approve` is
-**your** command: it squash-lands the pull request as the operator identity you
-configure in `git.approve_identity`; nothing merges without a human running it. Git is driven by no_human's own code under a
-distinct commit identity, not by the model; during review the backend is
-read-only. Credentials live in `~/.no_human/.env` (`chmod 600`), never in the
-repo. Detail: [docs/security.md](docs/security.md).
-
-Every task carries an enforced spend cap. `nh logs <id>` shows real spend
-against it, per task.
 
 ## Integrations
 

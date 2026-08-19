@@ -1670,3 +1670,107 @@ def test_shipped_git_retry_backoffs_are_two_positive_delays():
     from no_human.vcs.git import _GIT_RETRY_BACKOFFS_S
     assert len(_GIT_RETRY_BACKOFFS_S) == 2
     assert all(backoff > 0 for backoff in _GIT_RETRY_BACKOFFS_S)
+
+
+# --------------------------------------------------------------------------
+# RETRY BASE STALENESS: a retry that reuses its branch meets whatever base it
+# was cut from, forever, unless something measures the gap and rebases past a
+# threshold. Reproduces `db9da7f7` (5 behind, attempt 2 burned 6.9M tokens
+# re-fixing a test main had already deleted) and `e6719bd8` (140 behind, 6
+# attempts, 37.9M tokens).
+# --------------------------------------------------------------------------
+
+def _stale_branch(work, n=5):
+    """Branch off `main`, commit on the branch, then advance `main` `n`
+    times — the branch's own commit is still there, but it now trails `main`
+    by exactly `n` commits it never saw."""
+    repo = GitRepo(work, identity_name="no_human", identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (work / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    _git(work, "checkout", "main")
+    for i in range(n):
+        (work / f"main-advance-{i}.py").write_text(f"m = {i}\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", f"main advances {i}")
+    _git(work, "checkout", "no-human/t1")
+    return repo
+
+
+def test_commits_behind_measures_the_gap(repo_with_bare_remote):
+    repo = _stale_branch(repo_with_bare_remote, n=5)
+    assert repo.commits_behind("main") == 5
+
+
+def test_commits_behind_is_zero_at_base(repo_with_bare_remote):
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (repo_with_bare_remote / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    assert repo.commits_behind("main") == 0
+
+
+def test_rebase_onto_replays_the_branch_and_returns_true(repo_with_bare_remote):
+    repo = _stale_branch(repo_with_bare_remote, n=5)
+    before = repo.head_sha()
+    assert repo.rebase_onto("main") is True
+    assert repo.head_sha() != before
+    assert repo.commits_behind("main") == 0
+    assert (repo_with_bare_remote / "feature.py").exists()
+    assert (repo_with_bare_remote / "main-advance-4.py").exists()
+
+
+def test_rebase_onto_a_branch_already_at_base_is_a_no_op(repo_with_bare_remote):
+    """Negative control: nothing to rebase means no rebase happens, and HEAD
+    does not move."""
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (repo_with_bare_remote / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    before = repo.head_sha()
+    assert repo.rebase_onto("main") is False
+    assert repo.head_sha() == before
+
+
+def test_rebase_onto_a_conflict_aborts_and_leaves_the_branch_usable(repo_with_bare_remote):
+    """A CONFLICTING rebase must not fail the attempt: abort, report False,
+    and leave a clean, committable tree — no rebase left in progress."""
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (repo_with_bare_remote / "shared.py").write_text("branch = 1\n")
+    repo.commit_all("branch edits shared.py")
+    before = repo.head_sha()
+
+    _git(repo_with_bare_remote, "checkout", "main")
+    (repo_with_bare_remote / "shared.py").write_text("main = 1\n")
+    _git(repo_with_bare_remote, "add", "-A")
+    _git(repo_with_bare_remote, "commit", "-m", "main edits shared.py too")
+    _git(repo_with_bare_remote, "checkout", "no-human/t1")
+
+    assert repo.rebase_onto("main") is False
+    assert repo.head_sha() == before, "a conflicting rebase must not move HEAD"
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1"], cwd=repo_with_bare_remote,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status == "", f"a conflict/rebase must not be left in progress: {status!r}"
+    # Proceeding un-rebased must still be possible — the tree is usable.
+    (repo_with_bare_remote / "unrelated.py").write_text("z = 1\n")
+    repo.commit_all("more work after the aborted rebase")
+
+
+def test_a_rebased_branch_reads_diverged_not_behind_against_its_own_remote(
+        repo_with_bare_remote):
+    """The mechanism the whole fix leans on: after rebasing an already-PUSHED
+    branch onto a moved base, `remote_branch_relation` reports "diverged"
+    (never "behind") against its own prior remote tip — the classification
+    that routes delivery to --force-with-lease instead of raising
+    PushBehindRemote."""
+    repo = _stale_branch(repo_with_bare_remote, n=5)
+    repo.push("no-human/t1")
+    assert repo.remote_branch_relation("no-human/t1") == "up_to_date"
+    assert repo.rebase_onto("main") is True
+    assert repo.remote_branch_relation("no-human/t1") == "diverged"

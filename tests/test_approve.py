@@ -280,6 +280,100 @@ def test_escalated_and_failed_and_done_paths_are_unchanged(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# ESCALATED/FAILED tail now reads the canonical PR predicate                  #
+# (task_has_pr_evidence), not ctx["pr_watch"] directly                        #
+# --------------------------------------------------------------------------- #
+
+def test_escalated_task_with_a_pr_only_in_the_event_log_is_restored(tmp_path):
+    """The worker died between the review passing and the PR being written
+    back to task context: no `pr_watch`, no attempt `pr_url`, only a
+    `pr_open` event on record. `task_has_pr_evidence` resolves this; a
+    direct `ctx["pr_watch"]` read does not.
+
+    Mutation to state in the PR body: revert the gate to
+    `if not (t.context or {}).get("pr_watch")` -> this test fails with
+    exit_code == 1 and output containing "task has no open PR".
+    """
+    db = tmp_path / "nh.db"
+
+    async def _setup():
+        async with Store(db) as store:
+            t = Task.new("escalated, PR only in the event log", repo_path="/tmp/x")
+            t.context = {}
+            await store.create_task(t)
+            await store.save_events(t.id, [{
+                "source": "test", "kind": "pr_open",
+                "text": "https://example.invalid/pr/480", "ts": 0.0}])
+            await store.set_status(t, TaskStatus.ESCALATED, validate=False,
+                                   human_override=True)
+            return t.id
+    tid = asyncio.run(_setup())
+
+    result = _invoke(task_restore_approval, db, [tid, "--reason", "probe"])
+
+    assert result.exit_code == 0, result.output
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.AWAITING_APPROVAL
+    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    assert len(repaired) == 1, events
+    assert (t.context or {}).get("pr_closed_repaired_url") == \
+        "https://example.invalid/pr/480"
+
+
+def test_escalated_task_with_no_pr_anywhere_is_still_refused(tmp_path):
+    db = tmp_path / "nh.db"
+
+    async def _setup():
+        async with Store(db) as store:
+            t = Task.new("escalated, no PR anywhere", repo_path="/tmp/x")
+            t.context = {}
+            await store.create_task(t)
+            await store.set_status(t, TaskStatus.ESCALATED, validate=False,
+                                   human_override=True)
+            return t.id
+    tid = asyncio.run(_setup())
+
+    result = _invoke(task_restore_approval, db, [tid, "--reason", "probe"])
+
+    assert result.exit_code == 1, result.output
+    assert "has no open PR" in result.output
+    normalized = " ".join(result.output.split())
+    assert "restore-approval only repairs parked-PR tasks" in normalized
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.ESCALATED
+    assert not any(e.get("kind") == "state_repaired" for e in events), events
+
+
+def test_escalated_task_whose_only_pr_is_abandoned_is_refused(tmp_path):
+    """The abandonment subtraction lives inside `task_has_pr_evidence` — the
+    event is a `pr_open` (so the separate `pr_open`-event gate at :1724
+    would otherwise pass), meaning this refusal can only come from
+    `task_has_pr_evidence` itself excluding the abandoned URL."""
+    db = tmp_path / "nh.db"
+    url = "https://example.invalid/pr/253"
+
+    async def _setup():
+        async with Store(db) as store:
+            t = Task.new("escalated, only PR is abandoned", repo_path="/tmp/x")
+            t.context = {"pr_draft_created": url, "abandoned_pr_urls": [url]}
+            await store.create_task(t)
+            await store.save_events(t.id, [{
+                "source": "test", "kind": "pr_open", "text": url, "ts": 0.0}])
+            await store.set_status(t, TaskStatus.ESCALATED, validate=False,
+                                   human_override=True)
+            return t.id
+    tid = asyncio.run(_setup())
+
+    result = _invoke(task_restore_approval, db, [tid, "--reason", "probe"])
+
+    assert result.exit_code == 1, result.output
+    assert "has no open PR" in result.output
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.ESCALATED
+    assert not any(e.get("kind") == "state_repaired" for e in events), events
+
+
+# --------------------------------------------------------------------------- #
 # no path requires `failed`, and containment still runs                       #
 # --------------------------------------------------------------------------- #
 

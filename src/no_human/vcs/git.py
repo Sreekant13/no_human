@@ -588,6 +588,59 @@ class GitRepo:
         except ValueError:
             return 0
 
+    def commits_behind(self, base: str) -> int:
+        """How many commits *base* carries that this branch does not.
+
+        A retry that reuses its branch meets whatever base it was cut from,
+        forever, unless something measures the gap. Resolved through
+        `resolve_commitish` (local `<base>`, else the already-fetched
+        `origin/<base>`) so a single-branch clone with no local `main` still
+        measures correctly. An unmeasurable base is 0, never an exception —
+        same convention as `commits_ahead` and `is_ancestor`: "cannot prove
+        it" is not a reason to raise out of a staleness check.
+        """
+        ref = (self.resolve_commitish(base) if base else None) or base
+        if not ref:
+            return 0
+        out = self._run("rev-list", "--count", f"HEAD..{ref}", check=False).strip()
+        try:
+            return int(out)
+        except ValueError:
+            return 0
+
+    def rebase_onto(self, base: str) -> bool:
+        """Replay this branch's commits onto *base*. True iff the branch moved.
+
+        A CONFLICT aborts and returns False — losing a retry to a rebase
+        conflict is worse than the staleness it would have cured; the caller
+        reports the staleness and proceeds un-rebased.
+
+        Non-fast-forwardness after a successful rebase is a CONSEQUENCE, not
+        extra code here: rewriting an already-pushed branch makes the local
+        head and the remote tip mutually unreachable, so
+        `remote_branch_relation` reports `"diverged"` (never `"behind"`),
+        `push`'s pre-check does not raise `PushBehindRemote`, and the
+        existing `_is_non_fast_forward` route reaches `--force-with-lease`.
+        """
+        ref = (self.resolve_commitish(base) if base else None) or base
+        if not ref:
+            return False
+        before = self.head_sha()
+        try:
+            # Literal "rebase" as the first argument, so the egress analyser
+            # resolves the channel to `exec:git rebase`, not `exec:git
+            # <dynamic>` (see `_run`'s inline-argv comment above).
+            self._run("rebase", ref)
+        except GitError:
+            # Unconditional and `check=False`: a failure that never started a
+            # rebase (e.g. "cannot rebase: you have unstaged changes") must
+            # not raise a second exception here. The tree is expected to be
+            # clean already (`reset_agent_workspace` runs before this is
+            # reached), so this is belt-and-braces, not the safety property.
+            self._run("rebase", "--abort", check=False)
+            return False
+        return self.head_sha() != before
+
     def head_commit(self, base: str) -> CommitResult:
         """Describe HEAD as a commit against *base* — for work already committed.
 

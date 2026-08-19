@@ -591,7 +591,7 @@ ALEX = dict(
         "good and send back what is not. I am the gate; I need to be able to do "
         "my job in fifteen minutes."
     ),
-    knows="docs/quickstart.md §7 and the README's 'What you get'.",
+    knows="docs/quickstart.md §7 and the README's opening list of what you get.",
 )
 
 

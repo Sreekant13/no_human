@@ -29,7 +29,7 @@ from no_human.blockers.wake import WakeWatcher
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 from no_human.vcs.pr_watcher import default_branch_shipped
-from no_human.vcs.task_pr import resolve_task_pr
+from no_human.vcs.task_pr import resolve_task_pr, task_has_pr_evidence
 
 
 def _git(repo_path, *args):
@@ -291,3 +291,44 @@ async def test_null_and_empty_pr_urls_are_both_absent(tmp_path, store):
     fresh = await store.get_task(t.id)
     resolved = await resolve_task_pr(store, fresh)
     assert (resolved.url, resolved.branch, resolved.source) == ("", "", "none")
+
+
+# ------------------------- task_has_pr_evidence ------------------------- #
+
+async def test_evidence_falls_back_to_a_pr_open_event_when_nothing_else_has_it(
+    tmp_path, store,
+):
+    """`resolve_task_pr` is empty (no pr_watch, no attempt url, no draft) —
+    the only trace is a persisted `pr_open` event, whose URL lives in
+    `text`. This is the belt-and-braces rung restore-approval must now see."""
+    t = Task.new("t")
+    await store.create_task(t)
+    await store.save_events(t.id, [{
+        "source": "test", "kind": "pr_open",
+        "text": "https://example.invalid/pr/480", "ts": 0.0}])
+
+    fresh = await store.get_task(t.id)
+    assert await task_has_pr_evidence(store, fresh) == "https://example.invalid/pr/480"
+
+
+async def test_evidence_is_empty_when_nothing_resolves_anywhere(tmp_path, store):
+    t = Task.new("t")
+    await store.create_task(t)
+
+    fresh = await store.get_task(t.id)
+    assert await task_has_pr_evidence(store, fresh) == ""
+
+
+async def test_evidence_excludes_a_url_listed_as_abandoned(tmp_path, store):
+    """A URL present only via the event-scan rung is still subtracted if it
+    is also listed in `abandoned_pr_urls`."""
+    url = "https://example.invalid/pr/253"
+    t = Task.new("t")
+    t.context = {"abandoned_pr_urls": [url]}
+    await store.create_task(t)
+    await store.save_events(t.id, [{
+        "source": "test", "kind": "pr_draft", "text": "", "pr_url": url,
+        "ts": 0.0}])
+
+    fresh = await store.get_task(t.id)
+    assert await task_has_pr_evidence(store, fresh) == ""

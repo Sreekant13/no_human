@@ -565,6 +565,16 @@ _MAX_REVIEW_INFRA_PARKS = 3
 #: unbounded loop wearing a cap's clothes.
 _REVIEW_INFRA_PARKS_KEY = "review_infra_parks"
 
+#: A retry that reuses its branch meets whatever base it was cut from, forever
+#: — measured, not guessed: incident `db9da7f7` was 5 commits behind main and
+#: burned a whole attempt (6.9M tokens, failed by the tamper guard) re-fixing
+#: a test main had already deleted. 5 is the smallest gap that has actually
+#: cost an attempt; 1 would rebase on nearly every retry (most gaps are noise
+#: — an unrelated commit landing on main mid-attempt), and 10 was tried and
+#: rejected because it excludes `db9da7f7` itself. Below the threshold the
+#: staleness is still measured and reported — only the rebase is gated.
+BASE_STALENESS_REBASE_THRESHOLD = 5
+
 
 #: One claim line: "CRITERION: <text> — MET — evidence: <nonempty>". The
 #: verdict must sit in its own dash-delimited slot — a criterion whose TEXT
@@ -2177,6 +2187,65 @@ class Orchestrator:
                 protected.append(branch)
         self.backend.never_push_to = protected
 
+    async def _refresh_stale_base(
+        self, task: Task, repo: GitRepo, branch: str, base: str | None,
+    ) -> None:
+        """Measure this retry's branch against the current base; rebase past
+        `BASE_STALENESS_REBASE_THRESHOLD`.
+
+        A retry that reuses its branch (`ctx['pr_branch']`) or resumes from a
+        checkpoint meets whatever base it was cut from, forever, unless
+        something measures the gap. `db9da7f7` was 5 commits behind and burned
+        attempt 2 (6.9M tokens) re-fixing a test main had already deleted;
+        `e6719bd8` was 140 commits behind across 6 attempts and 37.9M tokens.
+        Called once per attempt, after `branch` is checked out and `base` is
+        resolved — true for both the reused-branch path and the fresh/resumed
+        path, so this one call site covers both.
+
+        Never fails the attempt: a measurement or rebase failure degrades to
+        an advisory and the attempt proceeds with whatever could be measured
+        (possibly nothing).
+        """
+        if not base:
+            return
+        try:
+            behind = repo.commits_behind(base)
+        except Exception as exc:
+            self._advisory(f"base staleness check failed: {exc}")
+            return
+        rebased = False
+        if behind >= BASE_STALENESS_REBASE_THRESHOLD:
+            try:
+                rebased = repo.rebase_onto(base)
+            except Exception as exc:
+                self._advisory(f"base rebase failed: {exc}")
+                rebased = False
+        # `commits_behind` is CURRENT staleness (0 once rebased — the rebase
+        # replayed every local commit on top of `base`, so nothing remains
+        # behind it). `was_behind` is the measurement that justified acting,
+        # preserved so the coder preamble can say how stale the branch WAS
+        # instead of losing that number to the post-rebase 0 it would
+        # otherwise read — the exact defect a prior attempt's review caught.
+        ctx = task.context or {}
+        ctx["base_staleness"] = {
+            "commits_behind": 0 if rebased else behind,
+            "was_behind": behind,
+            "rebased": rebased,
+        }
+        task.context = ctx
+        await self.store.update_task(task)
+        self.emit(
+            "base_staleness",
+            f"branch {branch} is {behind} commit(s) behind {base}"
+            + (" — rebased onto it" if rebased
+               else " — rebase skipped (conflict)" if behind >= BASE_STALENESS_REBASE_THRESHOLD
+               else ""),
+            branch=branch,
+            base=base,
+            commits_behind=behind,
+            rebased=rebased,
+        )
+
     def _agent_git_identity(self) -> dict[str, str]:
         """Env that forces the agent's own `git commit` to use no_human's name.
 
@@ -3502,6 +3571,7 @@ class Orchestrator:
         # its [WIP-BLOCKED] checkpoint landed on.
         self._active_branch = branch
         self._protect_base_branch(task, base)
+        await self._refresh_stale_base(task, repo, branch, base)
 
         # PR-F Gate 2: create matching branches in linked repos so changes
         # there land on their own deterministic branch (never_push_to honoured).
@@ -12126,6 +12196,37 @@ class Orchestrator:
                     "guaranteed fix — verify it applies here before using it.\n"
                 )
 
+        # A retry that reuses its branch, or resumes from a checkpoint, may
+        # predate a fix that landed on the base branch since the branch was
+        # cut — the exact way `db9da7f7` and `e6719bd8` lost whole attempts to
+        # a defect main had already fixed. `_refresh_stale_base` measures and,
+        # past the threshold, rebases; this narrates what it found. The
+        # rebased case reports `was_behind` (the PRE-rebase measurement that
+        # justified acting), not `commits_behind` (which is 0 immediately
+        # after a successful rebase) — losing that number here would tell the
+        # agent nothing happened.
+        staleness_preamble = ""
+        stale = ctx.get("base_staleness") or {}
+        if stale.get("rebased"):
+            staleness_preamble = (
+                "YOUR BRANCH WAS STALE AND HAS BEEN REBASED onto the current "
+                f"base (it was {stale.get('was_behind', stale.get('commits_behind'))} "
+                "commit(s) behind). A fix that landed on the base branch since "
+                "your branch was cut is now in your tree — do not re-diagnose "
+                "or re-fix something the base already resolved; check current "
+                "behavior before assuming a symptom is still present.\n\n"
+            )
+        elif stale.get("commits_behind", 0) >= BASE_STALENESS_REBASE_THRESHOLD:
+            staleness_preamble = (
+                f"YOUR BRANCH IS {stale['commits_behind']} COMMIT(S) BEHIND the "
+                "current base and a rebase was attempted but did not complete "
+                "(likely a conflict) — you are working from a stale tree. A fix "
+                "that landed on the base branch since your branch was cut may "
+                "not be present; verify current behavior on the base before "
+                "assuming a symptom is still present, and consider merging or "
+                "rebasing yourself if that is the source of a failure.\n\n"
+            )
+
         distilled_block = ""
         if distilled:
             distilled_block = (
@@ -12187,6 +12288,7 @@ class Orchestrator:
             # ── volatile task-specific content ──
             + f"{zero_diff_preamble}"
             + f"{debug_preamble}"
+            + f"{staleness_preamble}"
             + f"{multi_block}"
             f"Task: {task.title}\n"
             f"{('Description: ' + task.description) if task.description else ''}\n\n"

@@ -334,6 +334,16 @@ GIT_SUBCOMMANDS: dict[str, tuple[str, str]] = {
     # ever gains a remote-naming call site here, this row is wrong.
     "merge": (LOCAL, "merges a local ref into the worktree; contacts a "
                      "remote only via `pull`, which stays EXTERNAL"),
+    # LOCAL because the only call sites in this tree are `rebase <local base>`
+    # and `rebase --abort` (vcs/git.py's `rebase_onto`) — `<local base>` is
+    # resolved by `resolve_commitish` before the call, to either a local
+    # branch or an already-fetched `origin/<base>` tracking ref, never a bare
+    # remote name; no round-trip happens here, only in whatever fetched that
+    # tracking ref (`fetch`, which stays EXTERNAL below). If `rebase` ever
+    # gains a call site that names a remote directly, this row is wrong.
+    "rebase": (LOCAL, "replays local commits onto an already-resolved local "
+                      "or tracking ref; contacts a remote only via `fetch`, "
+                      "which stays EXTERNAL"),
     "grep": (LOCAL, "searches local tracked files / a local ref's tree; "
                     "reads the object store, never a remote"),
     "add": (LOCAL, "writes the index"),

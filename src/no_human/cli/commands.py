@@ -1716,8 +1716,9 @@ def task_restore_approval(task_id, reason):
                 console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                               f"(repair recorded)")
                 return
-            if not (t.context or {}).get("pr_watch"):
-                console.print("[yellow]task has no open PR (pr_watch) — "
+            pr_url = await task_has_pr_evidence(store, t)
+            if not pr_url:
+                console.print("[yellow]task has no open PR (no PR evidence) — "
                               "restore-approval only repairs parked-PR tasks[/]")
                 sys.exit(1)
             events = await store.list_events(t.id)
@@ -1756,7 +1757,6 @@ def task_restore_approval(task_id, reason):
             # this event's text and timestamp (2026-08-12 repair-defeating
             # loop: ESCALATED is not terminal, so an unguarded rung re-fired
             # within one poll interval of this exact repair).
-            pr_url = (t.context or {}).get("pr_watch")
             if pr_url:
                 t.context = await store.merge_context(
                     t.id, {"pr_closed_repaired_url": pr_url})
