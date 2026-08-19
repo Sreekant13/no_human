@@ -1543,6 +1543,14 @@ def task_restore_approval(task_id, reason):
     completion is never second-guessed), and `task_has_pr_evidence` resolves
     to a real PR (there is genuine outstanding work to restore to). Passing
     all three is exactly the false-done shape; failing any one refuses.
+
+    Also accepts BLOCKED (2026-08-19, the stranded-post-PASS incident): a
+    task PAUSED on a blocker after review already PASSED and a PR is open
+    (any blocker category qualifies — the precondition is the evidence, not
+    what parked it) restores the same way. Refuses when either precondition
+    is missing: no PR evidence, or the latest recorded review verdict is not
+    a PASS. This is the only route that avoids writing a false `failed`
+    state on the way back to awaiting_approval.
     """
     config, _ = _bootstrap(require_auth=False)
 
@@ -1552,9 +1560,10 @@ def task_restore_approval(task_id, reason):
             if not t:
                 print_no_task_matching(task_id)
                 sys.exit(1)
-            if t.status not in (TaskStatus.ESCALATED, TaskStatus.FAILED, TaskStatus.DONE):
+            if t.status not in (TaskStatus.BLOCKED, TaskStatus.ESCALATED,
+                                TaskStatus.FAILED, TaskStatus.DONE):
                 console.print(f"[yellow]task is {t.status.value!r}, not "
-                              "escalated, failed, or done — nothing to restore[/]")
+                              "blocked, escalated, failed, or done — nothing to restore[/]")
                 sys.exit(1)
             if (t.context or {}).get("cancel_reason"):
                 # A CANCELLED task is FAILED by a human's explicit decision —
@@ -1606,6 +1615,106 @@ def task_restore_approval(task_id, reason):
                 }])
                 console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                               f"(false-done repair recorded)")
+                return
+            if t.status is TaskStatus.BLOCKED:
+                # The stranded-post-PASS incident (2026-08-19): a task
+                # AWAITING_APPROVAL gets resumed to IMPLEMENTING by a
+                # pr_conflict round, is paused there (USER_PAUSED) before the
+                # burn finishes, and lands `blocked` with its earlier PASS
+                # and open PR both still on record. The precondition is that
+                # EVIDENCE, not the blocker category — any `blocked` task
+                # qualifies once it has a PR and a passing review verdict.
+                pr_url = await task_has_pr_evidence(store, t)
+                if not pr_url:
+                    console.print("[yellow]blocked task has no PR evidence — "
+                                  "restore-approval needs a PR to restore "
+                                  "to[/]")
+                    sys.exit(1)
+                verdict = await store.latest_review_verdict(t.id)
+                if verdict is None:
+                    console.print("[yellow]no review verdict on record — "
+                                  "restore-approval needs a PASSED "
+                                  "independent review[/]")
+                    sys.exit(1)
+                if not verdict:
+                    console.print("[yellow]the latest review verdict is a "
+                                  "FAIL — refusing[/]")
+                    sys.exit(1)
+                evidence = "review PASS (verdict on record)"
+                # Best-effort tip match: if review_history names which commit
+                # passed, prefer evidence naming the branch head — but never
+                # fail OPEN into a merge and never fail CLOSED on an
+                # unresolvable local repo. `nh approve` re-runs the strict
+                # `_review_pass_evidence` head check before it will ever
+                # merge (see `approve`, below); this verb only has to put the
+                # task back where that gate can run.
+                if (t.context or {}).get("review_history"):
+                    tip_note = "review tip check: not resolvable"
+                    try:
+                        from ..vcs.git import GitError, GitRepo
+                        from ..vcs.task_pr import resolve_task_pr
+                        git_cfg = config.get("git") or {}
+                        repo = GitRepo(
+                            Path(t.repo_path),
+                            identity_name=git_cfg.get(
+                                "agent_identity_name", "no_human"),
+                            identity_email=git_cfg.get(
+                                "agent_identity_email", "no-human@acme.com"),
+                            never_push_to=git_cfg.get("never_push_to")
+                            or ["main", "master", "release/*"],
+                        )
+                        repo.fetch()
+                        resolved = await resolve_task_pr(store, t)
+                        branch = resolved.branch
+                        ref = repo.resolve_commitish(branch) if branch else ""
+                        head_sha = repo._run("rev-parse", ref) if ref else ""
+                        if head_sha:
+                            tip_passed, tip_evidence = _review_pass_evidence(
+                                t.context or {}, head_sha, repo)
+                            if not tip_passed:
+                                console.print(
+                                    "[yellow]blocked task's review does not "
+                                    f"match its branch tip — {tip_evidence}"
+                                    "[/]")
+                                sys.exit(1)
+                            tip_note = tip_evidence
+                    except (GitError, OSError):
+                        pass
+                    evidence = f"{evidence}; {tip_note}"
+                # Transition FIRST, record after — same ordering the
+                # ESCALATED/FAILED repair below uses, for the same reason: a
+                # silently-refused CAS must never leave an event describing a
+                # state change that never happened.
+                prior = t.status.value
+                displaced = str(t.blocker)[:400]
+                moved = await store.set_status(
+                    t, TaskStatus.AWAITING_APPROVAL, validate=False,
+                    human_override=True)
+                if moved is None:
+                    console.print("[red]the transition was refused by the "
+                                  "store (concurrent change?) — nothing was "
+                                  "recorded; re-run after checking "
+                                  "`nh task show`[/]")
+                    sys.exit(1)
+                disarmed_condition = (t.blocker or {}).get("wake_condition")
+                disarmed_wake_check_at = t.wake_check_at
+                t.blocker = None
+                t.wake_check_at = None
+                await store.update_task(t)
+                if pr_url:
+                    t.context = await store.merge_context(
+                        t.id, {"pr_closed_repaired_url": pr_url})
+                await store.save_events(t.id, [{
+                    "source": "human", "kind": "state_repaired",
+                    "text": f"{prior} → awaiting_approval: {reason}; "
+                            f"evidence: {evidence}; PR: {pr_url}; "
+                            f"displaced blocker: {displaced}; "
+                            f"disarmed wake_condition={disarmed_condition!r} "
+                            f"wake_check_at={disarmed_wake_check_at!r}",
+                    "ts": time.time(),
+                }])
+                console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
+                              f"(repair recorded)")
                 return
             if not (t.context or {}).get("pr_watch"):
                 console.print("[yellow]task has no open PR (pr_watch) — "

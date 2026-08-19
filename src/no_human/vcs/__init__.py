@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import github, gitlab
 from .approve_merge import LandResult, land_task
-from .git import CommitResult, GitError, GitRepo, ProtectedBranch
+from .git import CommitResult, GitError, GitRepo, ProtectedBranch, PushBehindRemote
 from .manifest_repair import commit_with_manifest_repair, parse_manifest_refusal
 from .outbound_scrub import scrub_outbound
 
@@ -15,6 +15,7 @@ __all__ = [
     "GitRepo",
     "GitError",
     "ProtectedBranch",
+    "PushBehindRemote",
     "CommitResult",
     "PrResult",
     "open_pr",
@@ -55,6 +56,14 @@ def open_pr(
     exactly one caller — the delivery retry after a non-fast-forward rejection.
     See ``GitRepo.push`` for why a rebased agent branch cannot be delivered any
     other way, and why the protected-branch refusal is unaffected.
+
+    A non-fast-forward rejection caused by the local branch being BEHIND its
+    own remote tip (not diverged from it) raises ``PushBehindRemote`` out of
+    ``GitRepo.push`` instead of being retried with force — forcing there would
+    destroy an earlier attempt's already-published commits. This propagates
+    out of ``open_pr`` unhandled: no PR is opened for a branch that could not
+    be published, and the caller decides and reports rather than this
+    function silently choosing a remedy.
 
     ``github_hosts`` lists extra GitHub Enterprise hosts (from ``git.github_hosts``)
     so a GHE remote like code.example.com is recognized as GitHub.

@@ -563,6 +563,12 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
                                  "PR; `never_push_to` chooses where, not whether"),
         "exec:git fetch": Allowed("your git remote — refs only",
                                   _ON + "PR/CI status polling while a task waits"),
+        "exec:git ls-remote": Allowed(
+            "your git remote — refs only; reads the branch's own remote tip, "
+            "writes no ref",
+            _ON + "classifying a non-fast-forward push rejection as BEHIND vs "
+            "DIVERGED (remote_branch_relation) before choosing whether to "
+            "force"),
     },
     # Its own module ON PURPOSE: the `<dynamic>` bucket is per-file, and
     # parking it on vcs/git.py would blind this gate to any future dynamic

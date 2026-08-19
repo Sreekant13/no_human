@@ -37,14 +37,19 @@ on:
   # `github.event_name != 'schedule'` guard of their own.
   #
   # `linux_release`: a dispatch is ALSO the nightly lane's handle (above), so
-  # the linux job's package upload — the one place this workflow lets an
-  # installable app leave the runner — keys on this explicit input, never on
-  # the bare event. Default false: a dispatch fired for the guards produces no
-  # downloadable app and (below) does not run the linux job at all.
+  # the linux job's package upload — one of the two places this workflow lets
+  # an installable leave the runner; `wheel_release` below is the other — keys
+  # on this explicit input, never on the bare event. Default false: a dispatch
+  # fired for the guards produces no downloadable app and (below) does not run
+  # the linux job at all.
   workflow_dispatch:
     inputs:
       linux_release:
         description: "Linux: build the release packages and keep them as a 7-day run artefact"
+        type: boolean
+        default: false
+      wheel_release:
+        description: "Wheel: keep the board-carrying wheel as a 90-day run artefact"
         type: boolean
         default: false
 
@@ -270,6 +275,118 @@ jobs:
       - run: npm run build
 
       - run: npm test
+
+  # The CLI's distributable form. `hatch_build.py` makes the board REQUIRED for a
+  # standard wheel — a wheel without web/dist installs an `nh` whose main command
+  # renders nothing, and that shipped once — so this job builds the board the way
+  # the Web job does, builds the wheel, and then proves things ABOUT THE ARTEFACT
+  # rather than about the tree: the board, the migrations and the `nh` entry point
+  # are inside it; `uv tool install <wheel>` in an isolated tool dir yields an `nh`
+  # that resolves its board from site-packages and finds the Agent SDK's bundled
+  # `claude`, so the install needs neither Node nor a separately installed CLI.
+  # No term scan runs here: the wheel carries nothing the tree and web/dist do
+  # not already carry, the tree is gated by the export, and the built board's
+  # term scan is the private identity-scrub guard (live on a checkout with a
+  # built board; it skips in the bare-tree scrub job) — this public job does
+  # not claim that coverage.
+  #
+  # The install step resolves the wheel's dependencies UNLOCKED from PyPI, on
+  # purpose: that is what a user's `uv tool install` does, so an upstream
+  # release that breaks the import turns this job red before it turns a user's
+  # install red. `--python 3.12` pins the interpreter the tool env is built on
+  # (tool installs do not read .python-version).
+  #
+  # Like the Linux and Windows bundles, the wheel is NOT uploaded from
+  # arbitrary runs — an installable must not ride as a downloadable artefact of
+  # every PR. A release build (workflow_dispatch with wheel_release) keeps it as
+  # a 90-day run artefact to attach to the release. The public one-line
+  # installer (getnohuman.com/install.sh) runs
+  # `uv tool install git+https://github.com/no-human-ai/no_human` today and fails
+  # on exactly the board rule above, because a clone has no web/dist; this wheel,
+  # attached to a release, is what it should install instead.
+  wheel:
+    name: Wheel carries the board
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the board
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build the wheel
+        run: uv build --wheel --out-dir dist
+
+      # Assertions over the zip, not the source tree. The migrations count is not
+      # pinned (it grows); "at least one" is the property a boardless-CLI-style
+      # omission would break.
+      - name: The wheel carries the board, the migrations and the nh entry point
+        run: |
+          uv run --no-project python - <<'EOF'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+          problems = []
+          if "no_human/web_dist/index.html" not in names:
+              problems.append("no board: no_human/web_dist/index.html is missing")
+          if not any(n.startswith("no_human/web_dist/assets/") for n in names):
+              problems.append("no board assets under no_human/web_dist/assets/")
+          if not any("/migrations/" in n and n.endswith(".sql") for n in names):
+              problems.append("no migrations/*.sql inside the package")
+          ep = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+          text = zipfile.ZipFile(wheels[0]).read(ep[0]).decode() if ep else ""
+          if "nh = no_human.cli.commands:main" not in text:
+              problems.append("entry_points.txt does not declare nh = no_human.cli.commands:main")
+          print(wheels[0], len(names), "files; board files:",
+                sum(1 for n in names if n.startswith("no_human/web_dist/")))
+          if problems:
+              print("\n".join("FAIL: " + p for p in problems)); sys.exit(1)
+          EOF
+
+      # The user-side proof, isolated from the runner's own tools. The same
+      # command the one-line installer should run, pointed at the artefact.
+      - name: Install the wheel the way a user would, and run it
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/uv-bin
+        run: |
+          uv tool install --force --python 3.12 dist/*.whl
+          "$UV_TOOL_BIN_DIR/nh" --version
+          "$UV_TOOL_BIN_DIR/nh" --help >/dev/null
+          "$UV_TOOL_DIR/no-human/bin/python" - <<'EOF'
+          from pathlib import Path
+          from no_human.api.app import _resolve_web_dist
+          from no_human.agent.backend_check import find_claude_cli
+          board = _resolve_web_dist()
+          assert (board / "index.html").is_file(), f"installed nh cannot find its board: {board}"
+          assert "site-packages" in str(board), f"board resolved outside the package: {board}"
+          cli = find_claude_cli()
+          assert cli, "installed nh finds no claude CLI (the Agent SDK should bundle one)"
+          print("board:", board); print("claude:", cli)
+          EOF
+
+      - name: Upload the wheel (release build only — workflow_dispatch with wheel_release)
+        if: github.event_name == 'workflow_dispatch' && inputs.wheel_release
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 90
 
   desktop:
     name: Desktop shell

@@ -100,6 +100,7 @@ from ..vcs import (
     GitError,
     GitRepo,
     ProtectedBranch,
+    PushBehindRemote,
     commit_with_manifest_repair,
     open_pr,
 )
@@ -202,7 +203,18 @@ def _is_non_fast_forward(exc: BaseException) -> bool:
 
     Both spellings are git's: `! [rejected] ... (non-fast-forward)` from a plain
     push, and `(fetch first)` when the remote has commits the local ref lacks.
+
+    A `PushBehindRemote` carries this exact vocabulary too (BEHIND and
+    DIVERGED are indistinguishable by string alone — see
+    `GitRepo.remote_branch_relation`), but is the OPPOSITE remedy: the local
+    branch is an ancestor of its own pushed tip, so forcing would destroy an
+    earlier attempt's already-published commits. This short-circuit is
+    belt-and-braces against the text rules below ever matching it by
+    accident; the real guarantee is that `GitRepo.push` never raises a plain
+    `GitError` for this case in the first place.
     """
+    if isinstance(exc, PushBehindRemote):
+        return False
     text = str(exc).lower()
     if "rejected" not in text:
         return False
@@ -4664,8 +4676,11 @@ class Orchestrator:
         # denial + never_push_to are unaffected. What the drafts left behind should DO is
         # an open operator decision — do not claim here that a human sees them, because
         # the board does not render pr_draft.
-        draft_pr = await self._open_draft_pr_for_review(
-            task, repo, branch, base, attempt_id, commit=commit, result=result)
+        try:
+            draft_pr = await self._open_draft_pr_for_review(
+                task, repo, branch, base, attempt_id, commit=commit, result=result)
+        except PushBehindRemote as exc:
+            return await self._escalate(task, str(exc), repo=repo, branch=branch)
 
         try:
             decision = await self._run_review(
@@ -5324,6 +5339,11 @@ class Orchestrator:
                          # pre-review body, and the evidence sections only exist now.
                          update_existing_body=may_refresh_body)
         except ProtectedBranch as exc:
+            return await self._escalate(task, str(exc), repo=repo, branch=branch)
+        except PushBehindRemote as exc:
+            # BEHIND, not diverged: the remote holds commits this tree does
+            # not (an earlier attempt's push). No retry, no force — that
+            # would destroy them. Decide and report; see git.py's docstring.
             return await self._escalate(task, str(exc), repo=repo, branch=branch)
         except Exception as exc:  # noqa: BLE001
             # Usually transient forge/network trouble — the live incident was
@@ -8275,6 +8295,14 @@ class Orchestrator:
             self._advisory(f"draft PR before review refused: {exc}")
             self._draft_pr_absent = "open failed"
             return ""
+        except PushBehindRemote:
+            # NOT caught-and-swallowed like the generic branch below: a BEHIND
+            # branch cannot be delivered by ANY retry (force would destroy an
+            # earlier attempt's published commits), so degrading to "no draft,
+            # gate runs anyway" would keep this attempt reviewing an
+            # unpublishable tree — the exact swallow that cost 4.9M tokens on
+            # task e6719bd8. Propagate; the call site escalates.
+            raise
         except Exception as exc:  # noqa: BLE001
             # 🔴 EMIT THE ESTABLISHED SIGNAL, do not invent a quieter one. My first
             # version logged an advisory and swallowed this, which silently downgraded

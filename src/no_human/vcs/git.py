@@ -69,6 +69,45 @@ class ProtectedBranch(GitError):
     """Raised on any attempt to operate directly on a never_push_to branch."""
 
 
+class PushBehindRemote(GitError):
+    """The local branch is an ANCESTOR of its own pushed tip — behind, not diverged.
+
+    Same git error string as the rebase case (`(non-fast-forward)` /
+    `(fetch first)`), opposite remedy: forcing here destroys an earlier
+    attempt's reviewed, already-published commits (the remote holds commits
+    this tree does not). Distinct type so the delivery retry can never route
+    it into `--force-with-lease`.
+    """
+
+
+#: `git push` rejection vocabulary that means "not a fast-forward" — a
+#: rebased branch OR a branch behind its own remote tip both say this; the
+#: two are distinguished by ancestry, not by this string (see
+#: `GitRepo.remote_branch_relation`). Mirrors the orchestrator's
+#: `_is_non_fast_forward`, deliberately narrow: it only gates the extra
+#: `ls-remote` classification call, never a force decision on its own.
+def _looks_like_non_fast_forward(text: str) -> bool:
+    low = (text or "").lower()
+    if "rejected" not in low:
+        return False
+    return "non-fast-forward" in low or "fetch first" in low
+
+
+def _behind_message(branch: str, remote: str, sha: str) -> str:
+    """Shared text for `PushBehindRemote`, raised from both the pre-push
+    classification (force requested up front) and the post-push failure
+    path (plain push rejected non-fast-forward). Same wording either way —
+    other tests assert on "behind" and the branch name in this string."""
+    return (
+        f"refusing to force-push {branch!r}: local is BEHIND its "
+        f"own tip on {remote!r} (local {sha[:8]} is an ancestor "
+        f"of the remote tip) — the remote holds commits this "
+        f"tree does not, most likely from an earlier attempt's "
+        f"push. Forcing would destroy them. This attempt cannot "
+        f"publish {sha[:8]} onto {branch!r} without human sync."
+    )
+
+
 @dataclass
 class CommitResult:
     branch: str
@@ -591,6 +630,66 @@ class GitRepo:
         )
         return proc.returncode == 0
 
+    def remote_branch_relation(self, branch: str, *, remote: str = "origin",
+                                timeout: int = 30) -> str:
+        """How local ``branch`` relates to its own tip on ``remote``.
+
+        Returns ``"behind"`` (local is an ancestor of the remote tip — the
+        remote holds commits this tree does not, e.g. an earlier attempt's
+        push), ``"diverged"`` (neither is an ancestor of the other, e.g. a
+        local rebase of an already-pushed branch), ``"up_to_date"``, or
+        ``"unknown"`` when the relation cannot be determined (branch never
+        pushed, remote unreachable, or its object isn't available locally —
+        fail-open to today's behaviour: nothing here BLOCKS a force, only a
+        *proven* ancestry does).
+
+        Deliberately does NOT touch ``refs/remotes/<remote>/<branch>`` — that
+        is the ref `push`'s ``--force-with-lease`` is judged against, and
+        refreshing it here would make the lease vacuous (see `push`'s
+        docstring). The remote tip is read with `ls-remote` (no ref written),
+        and if its object is missing locally it is fetched into a private
+        namespace (`refs/no_human/push-check/<branch>`), never the tracking
+        ref — this requires ``--refmap=`` on that fetch: git applies the
+        remote's *configured* fetch refspec (`+refs/heads/*:refs/remotes/
+        <remote>/*`) to update tracking refs IN ADDITION to an explicit
+        refspec argument, so a plain ``git fetch <remote> <explicit-dest>``
+        silently updates the tracking ref anyway (confirmed empirically);
+        only an empty ``--refmap=`` disables that and writes exclusively to
+        the private destination.
+        """
+        local = self._run("rev-parse", branch, check=False)
+        if not local:
+            return "unknown"
+        ls = subprocess.run(
+            ["git", "ls-remote", remote, f"refs/heads/{branch}"],
+            cwd=self.path, capture_output=True, text=True, timeout=timeout,
+        )
+        if ls.returncode != 0 or not ls.stdout.strip():
+            return "unknown"
+        remote_sha = ls.stdout.split()[0]
+        if remote_sha == local:
+            return "up_to_date"
+        have_obj = subprocess.run(
+            ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
+            cwd=self.path, capture_output=True, text=True,
+        )
+        if have_obj.returncode != 0:
+            private_ref = f"refs/no_human/push-check/{branch}"
+            fetched = subprocess.run(
+                ["git", "fetch", "--refmap=", remote,
+                 f"+refs/heads/{branch}:{private_ref}"],
+                cwd=self.path, capture_output=True, text=True, timeout=timeout,
+            )
+            if fetched.returncode != 0:
+                return "unknown"
+            have_obj = subprocess.run(
+                ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
+                cwd=self.path, capture_output=True, text=True,
+            )
+            if have_obj.returncode != 0:
+                return "unknown"
+        return "behind" if self.is_ancestor(local, remote_sha) else "diverged"
+
     def diff(self, ref: str = "HEAD~1") -> str:
         return self._run("diff", ref, "HEAD", check=False)
 
@@ -665,6 +764,21 @@ class GitRepo:
           protect. Proven both ways by tests: the benign own-rebase delivers,
           the unseen third-party commit is refused, and a missing tracking
           ref refuses rather than guesses.
+
+        A THIRD safety property, ahead of the lease itself: ``--force-with-
+        lease`` does NOT protect a branch that is merely BEHIND its remote.
+        The lease only checks that the remote-tracking ref still matches the
+        actual remote — and a behind branch's tracking ref is perfectly
+        current (nothing has touched it), so the lease is satisfied and the
+        force proceeds anyway, destroying the remote's commits. The flag's
+        name suggests otherwise; only ancestry (`remote_branch_relation`)
+        tells a behind branch apart from a legitimately rebased one. Because
+        a force is requested up front here, no `GitError` will ever be
+        raised for git to reject — the failure-path classification below
+        never runs — so this ancestry check has to happen BEFORE the push,
+        not after. It is gated on `force_with_lease` so an ordinary,
+        non-forcing push keeps its current cost: no extra `ls-remote`
+        round-trip.
         """
         branch = branch or self.current_branch()
         if _branch_protected(branch, self.never_push_to):
@@ -672,13 +786,30 @@ class GitRepo:
         sha = self._run("rev-parse", branch)
         args = ["push"]
         if force_with_lease:
+            try:
+                relation = self.remote_branch_relation(branch, remote=remote)
+            except Exception:
+                # Fail OPEN: an unreachable remote, an unpushed branch, or an
+                # auth failure must never silently disable delivery — only a
+                # *proven* "behind" blocks (same contract as "unknown" below).
+                relation = "unknown"
+            if relation == "behind":
+                raise PushBehindRemote(_behind_message(branch, remote, sha))
+            # "unknown" / "diverged" / "up_to_date" all fall through and
+            # force, exactly as today.
             # NO fetch here — see the docstring: refreshing the tracking ref
             # is what would make the lease vacuous.
             args += ["--force-with-lease"]
         if set_upstream:
             args += ["-u"]
         args += [remote, branch]
-        self._run(*args)
+        try:
+            self._run(*args)
+        except GitError as exc:
+            if _looks_like_non_fast_forward(str(exc)) and \
+                    self.remote_branch_relation(branch, remote=remote) == "behind":
+                raise PushBehindRemote(_behind_message(branch, remote, sha)) from exc
+            raise
         return sha
 
     # ----------------------------- worktrees ------------------------------- #

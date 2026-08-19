@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from no_human import vcs
-from no_human.vcs import GitRepo, ProtectedBranch
+from no_human.vcs import GitRepo, ProtectedBranch, PushBehindRemote
 
 
 def _git(cwd, *args):
@@ -730,6 +730,332 @@ def test_the_lease_without_a_tracking_ref_refuses_rather_than_guesses(
     with pytest.raises(Exception):
         repo.push("no-human/t1", force_with_lease=True)
     assert _remote_tip(tmp_path / "remote.git") == before
+
+
+# --------------------------------------------------------------------------
+# DELIVERY: a BEHIND branch must never be forced — the opposite incident.
+#
+# `_rebased_pushed_branch` above reproduces DIVERGED (a rebase of our OWN
+# already-pushed branch): force-with-lease is the correct remedy. This block
+# reproduces the OTHER shape that produces the identical git error string: the
+# local branch is an ANCESTOR of its own remote tip because someone else (an
+# earlier attempt) already pushed further commits. The two are indistinguishable
+# by error text alone; only ancestry tells them apart (task e6719bd8: a retry
+# force-pushed a BEHIND branch, the lease correctly refused, and the attempt
+# then swallowed the failure and burned 4.9M tokens reviewing an unpublishable
+# tree).
+# --------------------------------------------------------------------------
+
+def _behind_pushed_branch(work, tmp_path):
+    """Push a branch, then have a second, independent worktree push one more
+    commit onto the SAME remote branch — leaving `work`'s local ref a strict
+    ancestor of the remote tip. This is task e6719bd8's shape: one attempt
+    delivered, and a later attempt ran from an older tree and tried to push
+    the same branch again."""
+    repo = GitRepo(work, identity_name="no_human", identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (work / "feature.py").write_text("y = 1\n")
+    repo.commit_all("first attempt's work")
+    repo.push("no-human/t1")                      # delivered, remote holds this
+
+    bare = tmp_path / "remote.git"
+    other = tmp_path / "other-attempt"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other)],
+                   check=True, capture_output=True)
+    _git(other, "checkout", "no-human/t1")
+    _git(other, "config", "user.email", "o@example.com")
+    _git(other, "config", "user.name", "o")
+    (other / "more.py").write_text("z = 1\n")      # a later attempt pushes further
+    _git(other, "add", "-A")
+    _git(other, "commit", "-m", "second attempt pushed more")
+    _git(other, "push", "origin", "no-human/t1")
+    return repo                                    # `work`'s ref never learned of this
+
+
+def test_remote_branch_relation_is_behind_when_local_is_an_ancestor_of_remote(
+        repo_with_bare_remote, tmp_path):
+    repo = _behind_pushed_branch(repo_with_bare_remote, tmp_path)
+    assert repo.remote_branch_relation("no-human/t1") == "behind"
+
+
+def test_remote_branch_relation_is_diverged_when_neither_is_an_ancestor(
+        repo_with_bare_remote):
+    """Negative control on the classifier itself: the rebase shape above must
+    classify as diverged, not behind."""
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    assert repo.remote_branch_relation("no-human/t1") == "diverged"
+
+
+def test_remote_branch_relation_is_up_to_date_right_after_a_clean_push(
+        repo_with_bare_remote):
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (repo_with_bare_remote / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    repo.push("no-human/t1")
+    assert repo.remote_branch_relation("no-human/t1") == "up_to_date"
+
+
+def test_remote_branch_relation_is_unknown_for_an_unpushed_branch(repo_with_bare_remote):
+    """Fail-open: a branch with no remote tip at all has no PROVEN ancestry, so
+    it must not be classified as behind (that would newly block a push that
+    works today)."""
+    repo = GitRepo(repo_with_bare_remote)
+    repo.create_branch("no-human/never-pushed")
+    assert repo.remote_branch_relation("no-human/never-pushed") == "unknown"
+
+
+def test_a_behind_branch_never_reaches_a_force_push(
+        repo_with_bare_remote, tmp_path, monkeypatch):
+    """The real guarantee, asserted on the push ARGUMENTS rather than the
+    outcome: a plain push of a BEHIND branch raises PushBehindRemote, and no
+    subprocess call this triggers ever carries --force-with-lease."""
+    from no_human.core.orchestrator import _is_non_fast_forward
+
+    repo = _behind_pushed_branch(repo_with_bare_remote, tmp_path)
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    with pytest.raises(PushBehindRemote) as exc:
+        repo.push("no-human/t1")
+
+    assert calls, "expected at least the rejected push attempt to be recorded"
+    assert not any("--force-with-lease" in c for c in calls), calls
+    assert _is_non_fast_forward(exc.value) is False
+
+
+def test_a_diverged_branch_still_forces_with_lease(repo_with_bare_remote):
+    """Negative control: DIVERGED must keep TODAY's exact behaviour — this is
+    the already-working rebase-recovery path and the fix must not touch it."""
+    from no_human.core.orchestrator import _is_non_fast_forward
+
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    assert repo.remote_branch_relation("no-human/t1") == "diverged"
+    assert _is_non_fast_forward(RuntimeError(
+        "! [rejected] no-human/t1 -> no-human/t1 (non-fast-forward)")) is True
+
+    local = repo._run("rev-parse", "no-human/t1")
+    pushed = repo.push("no-human/t1", force_with_lease=True)
+    assert pushed == local
+    remote = subprocess.run(
+        ["git", "ls-remote", "origin", "refs/heads/no-human/t1"],
+        cwd=repo_with_bare_remote, capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+    assert remote == local, "the remote did not end at the branch we pushed"
+
+
+def test_behind_classification_never_precedes_the_protection_check(
+        repo_with_bare_remote, monkeypatch):
+    """The protected-branch refusal in `push` runs FIRST, untouched — before
+    any ancestry classification, regardless of what the branch's relation to
+    its remote tip is. No ls-remote/fetch/push subprocess call should ever
+    happen for a protected branch."""
+    repo = GitRepo(repo_with_bare_remote, never_push_to=["main"])
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    with pytest.raises(ProtectedBranch):
+        repo.push("main")
+    with pytest.raises(ProtectedBranch):
+        repo.push("main", force_with_lease=True)
+
+    assert calls == [], (
+        "the protection check must refuse before any git subprocess runs "
+        f"(saw: {calls})")
+
+
+def test_behind_error_names_the_behind_condition(repo_with_bare_remote, tmp_path):
+    """BEHIND must be reported in human-actionable terms — naming the branch
+    and the word "behind" — not swallowed into a generic advisory that lets
+    the attempt keep reviewing an unpublishable tree (the 4.9M-token incident)."""
+    repo = _behind_pushed_branch(repo_with_bare_remote, tmp_path)
+    with pytest.raises(PushBehindRemote) as exc:
+        repo.push("no-human/t1")
+    msg = str(exc.value).lower()
+    assert "behind" in msg
+    assert "no-human/t1" in msg
+
+
+def test_is_non_fast_forward_refuses_to_force_a_behind_error():
+    from no_human.core.orchestrator import _is_non_fast_forward
+    assert _is_non_fast_forward(PushBehindRemote("refusing: behind")) is False
+
+
+def test_classification_does_not_refresh_the_remote_tracking_ref(
+        repo_with_bare_remote, tmp_path):
+    """`remote_branch_relation` must never write `refs/remotes/<remote>/<branch>`
+    — that is the ref `--force-with-lease` is judged against; refreshing it
+    here would make a later lease check vacuous."""
+    repo = _behind_pushed_branch(repo_with_bare_remote, tmp_path)
+    tracking_ref = "refs/remotes/origin/no-human/t1"
+    before = repo._run("rev-parse", "--verify", "--quiet", tracking_ref, check=False)
+
+    relation = repo.remote_branch_relation("no-human/t1")
+
+    assert relation == "behind"
+    after = repo._run("rev-parse", "--verify", "--quiet", tracking_ref, check=False)
+    assert after == before
+
+
+# --------------------------------------------------------------------------
+# THE HOLE: force_with_lease=True requested UP FRONT never produces a
+# GitError, so the failure-path classification above never runs. A caller
+# that asks for the force from the start could destroy a behind branch's
+# remote commits before the retry-path check above ever gets a chance to
+# object. The pre-push classification below closes it.
+# --------------------------------------------------------------------------
+
+def test_force_with_lease_on_a_behind_branch_refuses_before_pushing(
+        repo_with_bare_remote, tmp_path, monkeypatch):
+    """The hole this ticket closes: a force requested UP FRONT (not only one
+    earned by a prior rejection) must still be classified before the push
+    ever runs. A behind branch must never be forced -- the remote's commits
+    (an earlier attempt's already-published work) must survive untouched,
+    and no push subprocess call may happen at all.
+
+    The tracking ref is refreshed with a real `fetch` first (as would
+    naturally happen between attempts, e.g. before deriving a base branch) so
+    the lease's own compare-and-swap is SATISFIED -- exactly the "perfectly
+    current tracking ref" shape the ticket describes, where
+    `--force-with-lease` alone does not protect a behind branch and only
+    ancestry classification does."""
+    repo = _behind_pushed_branch(repo_with_bare_remote, tmp_path)
+    repo.fetch("origin", prune=False)
+    bare = tmp_path / "remote.git"
+    theirs = _remote_tip(bare)
+
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    with pytest.raises(PushBehindRemote):
+        repo.push("no-human/t1", force_with_lease=True)
+
+    assert _remote_tip(bare) == theirs, (
+        "the remote's commits were destroyed by a force requested up front")
+    assert not any("push" in c for c in calls), (
+        f"the push must never run once the branch is classified behind: saw {calls}")
+
+
+def test_force_with_lease_still_forces_when_the_relation_is_unknown(
+        repo_with_bare_remote, tmp_path):
+    """Negative control: UNKNOWN must keep forcing exactly as today -- an
+    unpushed branch has no PROVEN ancestry, so it must not newly block a
+    force that works today."""
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/never-pushed")
+    (repo_with_bare_remote / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    assert repo.remote_branch_relation("no-human/never-pushed") == "unknown"
+
+    local = repo._run("rev-parse", "no-human/never-pushed")
+    pushed = repo.push("no-human/never-pushed", force_with_lease=True)
+    assert pushed == local
+    assert _remote_tip(tmp_path / "remote.git", branch="no-human/never-pushed") == local
+
+
+def test_force_with_lease_still_forces_when_classification_raises(
+        repo_with_bare_remote, monkeypatch):
+    """Fail-open pinned directly on the pre-push check: if
+    `remote_branch_relation` itself raises (network error, auth failure,
+    anything), the force must proceed rather than propagate the exception --
+    an unreachable remote must never silently disable delivery."""
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+
+    def _boom(self, branch, *, remote="origin", timeout=30):
+        raise RuntimeError("simulated network failure")
+
+    monkeypatch.setattr(GitRepo, "remote_branch_relation", _boom)
+
+    local = repo._run("rev-parse", "no-human/t1")
+    pushed = repo.push("no-human/t1", force_with_lease=True)
+    assert pushed == local
+
+
+def test_protection_refusal_precedes_classification_on_a_diverged_branch(
+        repo_with_bare_remote, tmp_path, monkeypatch):
+    """The protected-branch refusal must run before any ancestry
+    classification -- unconditionally, not merely when the relation happens
+    to be "behind". Even a genuinely diverged protected branch must be
+    refused with zero git subprocess calls (no ls-remote, no fetch, no
+    push)."""
+    bare = tmp_path / "remote.git"
+    intruder = tmp_path / "intruder-main"
+    subprocess.run(["git", "clone", "-q", str(bare), str(intruder)],
+                   check=True, capture_output=True)
+    _git(intruder, "config", "user.email", "h@example.com")
+    _git(intruder, "config", "user.name", "h")
+    (intruder / "remote_change.py").write_text("r = 1\n")
+    _git(intruder, "add", "-A")
+    _git(intruder, "commit", "-m", "remote-side change to main")
+    _git(intruder, "push", "origin", "main")
+
+    (repo_with_bare_remote / "local_change.py").write_text("l = 1\n")
+    _git(repo_with_bare_remote, "add", "-A")
+    _git(repo_with_bare_remote, "commit", "-m", "local-side change to main")
+
+    repo = GitRepo(repo_with_bare_remote, never_push_to=["main"])
+    assert repo.remote_branch_relation("main") == "diverged"
+
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    with pytest.raises(ProtectedBranch):
+        repo.push("main", force_with_lease=True)
+
+    assert calls == [], (
+        "no git subprocess call should happen before the protection check "
+        f"(saw: {calls})")
+
+
+def test_a_plain_push_does_not_classify_the_remote(repo_with_bare_remote, monkeypatch):
+    """No extra network round-trip on the ordinary path: classification is
+    gated on `force_with_lease`, so a plain, non-forcing push must never call
+    `ls-remote`."""
+    repo = GitRepo(repo_with_bare_remote, identity_name="no_human",
+                    identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (repo_with_bare_remote / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+
+    calls = []
+    real_run = subprocess.run
+
+    def _spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    repo.push("no-human/t1")
+
+    assert not any("ls-remote" in c for c in calls), (
+        f"a plain push must not classify the remote: saw {calls}")
 
 
 # ---- manifest-gate refusal repair (2026-08-11 task_crashed incident) -------- #
