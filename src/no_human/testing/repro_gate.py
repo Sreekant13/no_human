@@ -318,15 +318,15 @@ def run_repro_gate(
     checkpoint rather than from the task's true base. The caller is
     responsible for handing this function a ``base_ref`` that resolves to
     that TRUE pre-work base (never the checkpoint itself — see
-    ``Orchestrator._repro_base_ref``); this flag only changes the WORDING of
-    the fail reasons and stamps ``resume_shape`` on the result, so a resumed
-    task's send-back message reads as "this resumed attempt proved nothing"
-    rather than the misleading "the base code already does this". The
-    red-first contract is NOT relaxed: both directions (fail-on-base AND
-    pass-on-tip) are still required for ``pass``, exactly as the default
-    path requires. When ``resume_shape`` is ``False`` (the default) this
-    function's behaviour, reasons and return values are byte-identical to
-    before this parameter existed.
+    ``Orchestrator._repro_base_ref``); this flag stamps ``resume_shape`` on
+    the result and prefixes the fail reasons with ``resume-shape:`` — it does
+    not change the stated CAUSE, which is identical to the non-resume path
+    (the declared repro tests already pass at the named base ref, so they do
+    not demonstrate this change). The red-first contract is NOT relaxed: both
+    directions (fail-on-base AND pass-on-tip) are still required for
+    ``pass``, exactly as the default path requires. When ``resume_shape`` is
+    ``False`` (the default) this function's behaviour, reasons and return
+    values are byte-identical to before this parameter existed.
     """
     tests = read_manifest(repo_path)
     if not tests:
@@ -431,14 +431,16 @@ def run_repro_gate(
             return ReproResult("error", tests=tests, reasons=[
                 f"base-tree repro run could not execute:\n{out_before}"])
         if ok_before:
+            named = ", ".join(tests)
+            cause = (
+                "the declared repro tests already pass at base ref "
+                f"{base_ref} ({named}), so they do not demonstrate this change"
+            )
             if resume_shape:
                 return ReproResult("fail", tests=tests, resume_shape=True, reasons=[
-                    "resume-shape: fails-before failed — the declared repro "
-                    "tests already pass on the resumed base, so this attempt "
-                    "has no proof of change"])
+                    f"resume-shape: fails-before failed — {cause}"])
             return ReproResult("fail", tests=tests, reasons=[
-                "fails-before failed — the declared repro tests already pass "
-                "on the base code, so they do not demonstrate this change"])
+                f"fails-before failed — {cause}"])
         return ReproResult("pass", tests=tests, resume_shape=resume_shape)
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],

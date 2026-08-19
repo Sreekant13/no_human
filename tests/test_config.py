@@ -109,6 +109,14 @@ def test_load_config_has_integrations_defaults(tmp_path):
     assert cfg["ci"]["project"] == ""
 
 
+def test_approve_identity_ships_empty(tmp_path):
+    # No person's name/email may ship as the default merge identity — it is
+    # resolved from the repo's own git config at merge time instead (see
+    # vcs/approve_merge.py::_resolve_approve_identity).
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.data["git"]["approve_identity"] == {"name": "", "email": ""}
+
+
 def test_load_config_null_integrations_section_does_not_crash(tmp_path):
     # Deep-merge shadowing trap: `integrations:` set to null in the user file
     # replaces the whole default dict — loading must not crash, and the
@@ -502,8 +510,6 @@ _UNDOCUMENTED_AT_BASELINE = frozenset({
     "docs.refresh_interval_seconds",
     "eval.nightly_budget_tokens",
     "filter_user_skills",
-    "git.approve_identity.email",
-    "git.approve_identity.name",
     "git.github_hosts",
     "isolation.enabled",
     "isolation.worktree_root",

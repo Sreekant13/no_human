@@ -190,6 +190,19 @@ git:
   never_push_to: ["main", "master", "release/*"]
   agent_identity_name: "no_human"
   agent_identity_email: "no-human@acme.com"   # distinct from you
+  approve_identity:               # who a human merge is attributed to
+    name: ""                      # empty -> resolved from this repo's git
+    email: ""                     # config (user.name/user.email)
+
+`git.approve_identity.name`/`.email` is the identity the ONE commit `nh
+approve` lands when it squash-merges a PR is attributed to — the human merge
+action (constraint #2), never the agent's. Left empty (the shipped default),
+it resolves to git's own `user.name`/`user.email` for that repo (repo-local
+config overriding global), the same identity a plain `git commit` there
+would use; it is deliberately never `git.agent_identity_name`/`_email`. Set
+both fields to override per install. If neither the config nor git yields
+both `name` and `email`, `nh approve` refuses with an explicit message
+rather than guessing.
 
 safety:
   max_files_changed: null         # no size cap by default; set an int to escalate

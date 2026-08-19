@@ -631,7 +631,7 @@ def test_resume_shape_passing_on_both_fails_with_no_proof_reason(repo):
     r = run_repro_gate(repo, "HEAD", resume_shape=True)
     assert r.verdict == "fail"
     assert "resume-shape" in r.reasons[0]
-    assert "no proof of change" in r.reasons[0]
+    assert "do not demonstrate this change" in r.reasons[0]
 
 
 def test_resume_shape_failing_on_tip_is_a_fail_not_a_pass(repo):
@@ -651,10 +651,71 @@ def test_resume_shape_unresolvable_base_is_error_never_fail(repo):
     assert r.verdict == "error"
 
 
+def test_resume_shape_fails_before_message_does_not_blame_the_base(repo):
+    """The resume-shape fails-before message must name the real cause (the
+    declared repro tests don't discriminate) instead of implying the base
+    ref itself is stale or already carries the fix — that reading sent a
+    real task chasing base-resolution code that was already correct."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    r = run_repro_gate(repo, base, resume_shape=True)
+    assert r.verdict == "fail"
+    # Guard against a vacuous fixture: confirm the gate actually reached the
+    # ok_before branch before trusting any of the NOT-in assertions below.
+    assert r.reasons[0].startswith("resume-shape: fails-before failed")
+    assert "do not demonstrate this change" in r.reasons[0]
+    assert base in r.reasons[0]
+    assert "test_repro.py::test_add_fixed" in r.reasons[0]
+    for blame_phrase in ("resumed base", "stale", "already contains", "already carries"):
+        assert blame_phrase not in r.reasons[0]
+
+
+def test_normal_fails_before_message_names_base_ref_and_tests(repo):
+    """Sibling of the resume-shape test above: the non-resume fails-before
+    message states the same cause and also names the base ref and tests."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    r = run_repro_gate(repo, base)
+    assert r.verdict == "fail"
+    assert r.reasons[0].startswith("fails-before failed")
+    assert "do not demonstrate this change" in r.reasons[0]
+    assert base in r.reasons[0]
+    assert "test_repro.py::test_add_fixed" in r.reasons[0]
+
+
+def test_resume_shape_fails_before_verdict_and_flag_unchanged(repo):
+    """This ticket changes only what the failure SAYS — the verdict and the
+    resume_shape flag on the result object are pinned unchanged."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    r_resume = run_repro_gate(repo, "HEAD", resume_shape=True)
+    assert r_resume.verdict == "fail"
+    assert r_resume.resume_shape is True
+    assert r_resume.tests == ["test_repro.py::test_add_fixed"]
+    assert r_resume.to_json()["resume_shape"] is True
+
+    r_normal = run_repro_gate(repo, "HEAD")
+    assert r_normal.verdict == "fail"
+    assert r_normal.resume_shape is False
+    assert r_normal.to_json()["resume_shape"] is False
+
+
 def test_normal_gate_is_byte_identical_to_resume_off(repo):
     """Criterion 5: the non-resume path is untouched by this feature — same
-    verdict, same three reason strings, verbatim, plus the (default-False)
-    resume_shape key `to_json()` now always carries."""
+    verdict, same three reason strings, verbatim (the fails-before reason now
+    also carries the base ref and the declared test names), plus the
+    (default-False) resume_shape key `to_json()` now always carries."""
     r = run_repro_gate(repo, "HEAD")
     assert r.to_json() == {
         "verdict": "pass",
@@ -666,8 +727,9 @@ def test_normal_gate_is_byte_identical_to_resume_off(repo):
     (repo / "test_repro.py").write_text("def test_add_fixed():\n    assert True\n")
     r_fails_before = run_repro_gate(repo, "HEAD")
     assert r_fails_before.reasons[0] == (
-        "fails-before failed — the declared repro tests already pass "
-        "on the base code, so they do not demonstrate this change"
+        "fails-before failed — the declared repro tests already pass at "
+        "base ref HEAD (test_repro.py::test_add_fixed), so they do not "
+        "demonstrate this change"
     )
 
     (repo / "test_repro.py").write_text(

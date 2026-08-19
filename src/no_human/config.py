@@ -1176,16 +1176,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "github_hosts": ["github.com", "code.example.com"],
         "agent_identity_name": "no_human",
         "agent_identity_email": "no-human@acme.com",
-        # The OPERATOR's identity — used ONLY for the one commit `nh approve`
-        # makes when it squash-lands a PR (vcs/approve_merge.py). Distinct from
-        # agent_identity_* above on purpose: that commit is a human merge
-        # action (constraint #2), never the agent's, so it must never carry the
-        # agent's name/email. Defaults to this deployment's configured operator
-        # (operator directive 2026-08-12); override per install as needed.
-        "approve_identity": {
-            "name": "eyalgolan",
-            "email": "5146175+eyalgolan@users.noreply.github.com",
-        },
+        # The identity the ONE commit `nh approve` makes when it squash-lands a
+        # PR is attributed to (vcs/approve_merge.py). Distinct from
+        # agent_identity_* above on purpose: that commit is a human merge action
+        # (constraint #2), never the agent's, so it must never carry the agent's
+        # name/email. Left EMPTY on purpose: when unset, the identity is resolved
+        # from git's own configuration for that repo (repo-local overriding
+        # global) — the same identity a plain `git commit` there would use. Set
+        # these to override per install. If neither is set nor resolvable, `nh
+        # approve` refuses rather than inventing one.
+        "approve_identity": {"name": "", "email": ""},
     },
     "safety": {
         # No size cap by default. A line/file count is a proxy for "scope

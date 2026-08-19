@@ -6,7 +6,43 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
-## [0.1.1] — 2026-08-19
+## [0.1.1] — 2026-08-20
+
+Also in this release — reliability, honesty, and cost, measured not asserted
+(full suite 8,864/0; funnel 5/5 with every holdout green; reviewer recall
+17/19, up from 15/19):
+
+- The eval judge's verdict now survives mid-run emission, a truncated end
+  marker, and marker drift — six bench tasks per run were being scored as
+  failures because a verdict could not be parsed, not because work was wrong.
+- Git lock contention (another process briefly holding `index.lock`) is
+  retried with two short backoffs instead of crashing the task; every other
+  git failure still fails fast and loud.
+- Fix pairs: when a task fails on an error this machine has overcome before,
+  the retry is handed what worked — as evidence, never as an instruction.
+- A retry that ends byte-identical to its predecessor (same failure, same
+  diff) stops the loop and escalates honestly instead of buying the most
+  expensive third attempt.
+- Judgment-call blockers (ambiguity, novel-unknown, impossible) get exactly
+  one supervisor-checked challenge before parking; external blockers are
+  honored untouched, and a park is never converted into a fake "done".
+- The reviewer carries a maintainability-trajectory lens: does this change
+  make the NEXT change harder? Concrete findings only, capped below blocking
+  severity.
+- `nh bench harvest`: escalated, parked, and failed tasks become bench-spec
+  candidates for curation.
+- The intake grill's answering pass pays for what the task needs: probe
+  budget scales with the question count; prose-only tasks skip filesystem
+  probes (assumption-grade answers, clearly marked).
+- Onboarding: two checkouts of the same repository are tellable apart —
+  colliding names show their full path. (Authored end-to-end by no_human
+  from its own board, review PASS, 8,847/0.)
+- The stale-data banner no longer eats clicks while disconnected.
+- docs: an operator profile for reviewing untrusted external PRs in a
+  credential-isolated container.
+- This release restores auto-update for installed apps: it ships the ZIP and
+  `latest-mac.yml` that `electron-updater` requires (0.1.0's release lacked
+  both).
 
 ### Added
 - CI builds the board-carrying wheel on every run and proves it installs:

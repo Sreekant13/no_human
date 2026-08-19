@@ -442,6 +442,14 @@ def land_env(tmp_path, monkeypatch) -> LandEnv:
 
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    # Repo-local identity for the clone — this is what the default
+    # `approve_identity` resolution path (git.approve_identity.name/.email
+    # left unset in `config` below) resolves the squash-commit identity
+    # from. Distinct from the hermetic GLOBAL identity above ("Hermetic
+    # Test") so repo-local-overrides-global is actually exercised by every
+    # land test, not just the ones that test it explicitly.
+    _git(clone, "config", "user.name", "clone-user")
+    _git(clone, "config", "user.email", "clone@example.invalid")
 
     # `gh` stub on PATH.
     bin_dir = tmp_path / "bin"
@@ -462,10 +470,10 @@ def land_env(tmp_path, monkeypatch) -> LandEnv:
             "agent_identity_name": "no_human",
             "agent_identity_email": "no-human@acme.com",
             "never_push_to": ["main", "master", "release/*"],
-            "approve_identity": {
-                "name": "eyalgolan",
-                "email": "5146175+eyalgolan@users.noreply.github.com",
-            },
+            # No `approve_identity` here on purpose: the default path — resolved
+            # from the clone's own git config (repo-local `clone-user` /
+            # `clone@example.invalid`, set above) — is what every land test in
+            # this module exercises unless it opts into an explicit override.
         },
         "approve_merge": {"enabled": True, "test_timeout_seconds": 120},
     }
@@ -586,7 +594,145 @@ def test_manifest_reset_classification_preserved(land_env):
     assert classification == branch_classification
 
 
+def _commit_identity(land_env, sha) -> tuple[str, str]:
+    out = _git(land_env.origin, "show", "-s", "--format=%an%x09%ae", sha).stdout.strip()
+    name, _, email = out.partition("\t")
+    return name, email
+
+
+def _clear_repo_local_identity(clone) -> None:
+    _git(clone, "config", "--unset", "user.name")
+    _git(clone, "config", "--unset", "user.email")
+
+
+def test_identity_defaults_to_repo_git_config(land_env):
+    """AC: with no `git.approve_identity` in config (the fixture default),
+    the squash identity is resolved from the clone's own repo-local git
+    config, not from a hard-coded person."""
+    branch, head_sha = land_env.cut_branch("no-human/t-default-identity")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, result.stderr
+    name, email = _commit_identity(land_env, result.landed_sha)
+    assert name == "clone-user"
+    assert email == "clone@example.invalid"
+
+
+def test_repo_local_git_identity_wins_over_global(land_env, monkeypatch):
+    """AC: repo-local git config overrides global, matching plain `git
+    commit` precedence — `git config --get` already applies this, this test
+    pins it end to end through `land_task`."""
+    other_global = land_env.tmp_path / "other-global-gitconfig"
+    other_global.write_text(
+        "[user]\n\tname = Global Person\n\temail = global@example.invalid\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(other_global))
+    branch, head_sha = land_env.cut_branch("no-human/t-local-wins")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, result.stderr
+    name, email = _commit_identity(land_env, result.landed_sha)
+    assert name == "clone-user"
+    assert email == "clone@example.invalid"
+
+
+def test_explicit_approve_identity_overrides_git_config(land_env):
+    """AC: an explicit `git.approve_identity` in config still wins over the
+    resolved git-config default."""
+    land_env.config["git"]["approve_identity"] = {
+        "name": "Ada L.", "email": "ada@example.invalid",
+    }
+    branch, head_sha = land_env.cut_branch("no-human/t-explicit-wins")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, result.stderr
+    name, email = _commit_identity(land_env, result.landed_sha)
+    assert name == "Ada L."
+    assert email == "ada@example.invalid"
+
+
+def test_identity_is_never_the_agent_identity_when_git_config_empty(land_env, monkeypatch):
+    """CONSTRAINT #2: when git config yields no usable identity at all, land
+    refuses at `preconditions` — it must NEVER fall through to the agent
+    identity (`git.agent_identity_name`/`_email`), and nothing is landed."""
+    empty_global = land_env.tmp_path / "empty-global-gitconfig"
+    empty_global.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty_global))
+    _clear_repo_local_identity(land_env.clone)
+    tip_before = land_env.tip_sha()
+    branch, head_sha = land_env.cut_branch("no-human/t-no-identity")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok is False
+    assert result.step == "preconditions"
+    assert "no_human" not in result.stderr
+    assert "no-human@acme.com" not in result.stderr
+    # `origin/main`'s tip is unmoved: land_task never reached fetch/worktree/
+    # commit/push, so the branch it would have squashed never landed.
+    assert land_env.tip_sha() == tip_before
+    log = _git(land_env.origin, "log", "--format=%s", "main").stdout
+    assert "Add feature" not in log
+
+
+def test_refusal_message_names_the_fix(land_env, monkeypatch):
+    """Same setup as the constraint-#2 test: the refusal must be actionable,
+    naming both ways to fix it."""
+    empty_global = land_env.tmp_path / "empty-global-gitconfig"
+    empty_global.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty_global))
+    _clear_repo_local_identity(land_env.clone)
+    branch, head_sha = land_env.cut_branch("no-human/t-refusal-message")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok is False
+    assert "user.email" in result.stderr
+    assert "git.approve_identity" in result.stderr
+
+
+def test_partial_git_identity_refuses(land_env, monkeypatch):
+    """AC: only one of user.name/user.email set is not a usable identity —
+    same refusal shape as the fully-empty case."""
+    empty_global = land_env.tmp_path / "empty-global-gitconfig-partial"
+    empty_global.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty_global))
+    _git(land_env.clone, "config", "--unset", "user.email")
+    branch, head_sha = land_env.cut_branch("no-human/t-partial-identity")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok is False
+    assert result.step == "preconditions"
+    assert "no_human" not in result.stderr
+    assert "no-human@acme.com" not in result.stderr
+    assert "user.email" in result.stderr
+    assert "git.approve_identity" in result.stderr
+
+
 def test_commit_uses_operator_identity(land_env):
+    """REGRESSION CONTROL: this deployment's own config does not set
+    `git.approve_identity`, and its git identity resolves to exactly the
+    values the old hard-coded literal used — proving byte-identical
+    behaviour for the current deployment now that the default is resolved
+    from git config instead of a literal."""
+    _git(land_env.clone, "config", "user.name", "eyalgolan")
+    _git(land_env.clone, "config", "user.email",
+         "5146175+eyalgolan@users.noreply.github.com")
     branch, head_sha = land_env.cut_branch("no-human/t-ident")
     result = land_task(
         repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
@@ -594,9 +740,7 @@ def test_commit_uses_operator_identity(land_env):
         config=land_env.config,
     )
     assert result.ok, result.stderr
-    out = _git(land_env.origin, "show", "-s", "--format=%an%x09%ae",
-               result.landed_sha).stdout.strip()
-    name, _, email = out.partition("\t")
+    name, email = _commit_identity(land_env, result.landed_sha)
     assert name == "eyalgolan"
     assert email == "5146175+eyalgolan@users.noreply.github.com"
 

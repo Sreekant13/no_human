@@ -25,9 +25,13 @@ The eight-step procedure, proven by hand before this module existed:
                         it), then `export_guard.py approve` the branch's
                         changed ship-classified files so the manifest is
                         re-derived from tip + those pins, and stage it.
-  5. commit           — one commit, `-c user.name=<operator> -c
-                        user.email=<operator>`, message = task title + task
-                        id + review-evidence line.
+  5. commit           — one commit, `-c user.name=<identity> -c
+                        user.email=<identity>`, message = task title + task
+                        id + review-evidence line. The identity is
+                        `git.approve_identity` if set, else git's own
+                        resolved `user.name`/`user.email` for the repo
+                        (repo-local overriding global); if neither resolves,
+                        the run refuses at the `preconditions` step.
   6. verify + tests   — `export_guard.py verify`, then the task's
                         change-scoped tests, both run IN the worktree.
   7. push             — re-check the tip has not moved, then push the landed
@@ -76,10 +80,6 @@ _APPROVE_TIMEOUT_S = 120
 _VERIFY_TIMEOUT_S = 120
 _GH_TIMEOUT_S = 30
 
-_DEFAULT_OPERATOR_NAME = "eyalgolan"
-_DEFAULT_OPERATOR_EMAIL = "5146175+eyalgolan@users.noreply.github.com"
-
-
 @dataclass(frozen=True)
 class LandResult:
     """The outcome of one `land_task` run.
@@ -114,6 +114,46 @@ def _sh(args: list[str], *, cwd: Path | str, timeout: float | None = None,
         args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
         env=env,
     )
+
+
+def _git_config_value(repo_path: Path | str, key: str) -> str:
+    """Best-effort `git config --get <key>` for *repo_path* — repo-local
+    overriding global overriding system, exactly as `git config --get`
+    already resolves it. Returns "" on any failure (key unset, empty value,
+    unparseable config, multivar, or a timeout) — never raises."""
+    try:
+        proc = _sh(["git", "config", "--get", key], cwd=repo_path,
+                    timeout=_APPROVE_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+
+
+def _resolve_approve_identity(git_cfg: dict, repo_path: Path | str) -> tuple[str, str, str]:
+    """Return ``(name, email, error)`` for the identity `nh approve`'s squash
+    commit is attributed to. Explicit ``git.approve_identity`` config wins;
+    otherwise falls back to git's own resolved identity for *repo_path*
+    (`git config --get`, which already applies repo-local -> global ->
+    system precedence). NEVER falls back to the agent identity — this
+    function never reads `agent_identity_name`/`agent_identity_email`. If
+    either field is still empty after both sources, returns an explicit
+    error and no identity; the caller must refuse rather than guess."""
+    ident = git_cfg.get("approve_identity") or {}
+    name = (ident.get("name") or "").strip()
+    email = (ident.get("email") or "").strip()
+    if not name:
+        name = _git_config_value(repo_path, "user.name")
+    if not email:
+        email = _git_config_value(repo_path, "user.email")
+    if not name or not email:
+        return "", "", (
+            "cannot determine the identity to attribute this merge to: git "
+            f"user.name/user.email are unset for {repo_path}. Run `git config "
+            'user.email "you@example.com"` (and user.name), or set '
+            "git.approve_identity.name/.email in your config file. This "
+            "refuses rather than guessing, and will never land a human "
+            "merge under the agent identity.")
+    return name, email, ""
 
 
 def _step(on_step: Callable[[str], None] | None, name: str) -> None:
@@ -330,9 +370,10 @@ def land_task(
         return LandResult(ok=False, step="preconditions", branch=branch, pr_url=pr_url,
                            stderr=f"branch {branch!r} does not resolve to a commit")
 
-    ident = git_cfg.get("approve_identity") or {}
-    op_name = ident.get("name") or _DEFAULT_OPERATOR_NAME
-    op_email = ident.get("email") or _DEFAULT_OPERATOR_EMAIL
+    op_name, op_email, ident_err = _resolve_approve_identity(git_cfg, repo.path)
+    if ident_err:
+        return LandResult(ok=False, step="preconditions", branch=branch,
+                           pr_url=pr_url, stderr=_cap(ident_err))
     test_timeout = approve_cfg.get("test_timeout_seconds", _DEFAULT_TEST_TIMEOUT_S)
 
     # -- step 2: fetch + resolve the CURRENT default-branch tip ------------ #
