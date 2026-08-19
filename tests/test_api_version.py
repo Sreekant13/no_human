@@ -112,3 +112,16 @@ def test_the_declared_version_and_the_installed_metadata_agree():
         f"{no_human.__version__!r} — bump both, or `nh --version` and the update "
         f"check will disagree with the wheel"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_openapi_document_reports_the_running_version(client):
+    """`/openapi.json` and `/docs` are a THIRD place a version is published, and
+    it used to be a hardcoded `0.1.0` in the `FastAPI(...)` call — it stayed
+    0.1.0 through a release that moved `__version__` and `pyproject.toml`, so
+    any tool reading the schema saw a version the build had left behind. The
+    app now reads the package's own version; this pins that it keeps doing so.
+    """
+    from no_human.api.app import app as _app
+
+    assert _app.openapi()["info"]["version"] == no_human.__version__

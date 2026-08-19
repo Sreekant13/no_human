@@ -43,6 +43,7 @@ from starlette.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .. import __version__
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
@@ -321,7 +322,12 @@ async def lifespan(app: FastAPI):
         await store.close()
 
 
-app = FastAPI(title="no_human board", version="0.1.0", lifespan=lifespan)
+# The OpenAPI document's version is READ from the package rather than written
+# here. It was a third hardcoded literal — `0.1.0` — and it stayed 0.1.0 through
+# a release that moved `__version__` and `pyproject.toml`, so `/openapi.json`
+# and `/docs` reported a version the build had left behind. A literal that only
+# a generated document shows is exactly the kind nobody notices is stale.
+app = FastAPI(title="no_human board", version=__version__, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
