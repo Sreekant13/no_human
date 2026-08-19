@@ -6,6 +6,8 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-19
+
 ### Added
 - CI builds the board-carrying wheel on every run and proves it installs:
   `uv tool install <wheel>` yields an `nh` that finds its board and the Agent
@@ -13,6 +15,12 @@ All notable changes to no_human. The format follows
   (`workflow_dispatch` with `wheel_release`) keeps the wheel as an artefact.
 - A Claude Code plugin at `plugins/no-human/` exposing the MCP bridge's two
   tools (`task_add`, `task_status`).
+- A `Publish to PyPI` workflow (`workflow_dispatch` only, typed confirmation)
+  that builds the board-carrying wheel and uploads it with PyPI Trusted
+  Publishing — no API token anywhere in the repository.
+- Version is 0.1.1 across `pyproject.toml`, `desktop/package.json` and
+  `web/package.json` (and those lockfiles' root entries), so a built wheel is
+  no longer labelled with the released 0.1.0's version.
 - `CHANGELOG.md` (this file) and `glama.json`.
 
 ### Changed
@@ -49,5 +57,6 @@ evidence it works. A human approves and merges.
   2026-08-18, built by the public repository's CI. `SHA256SUMS-linux.txt`
   ships alongside.
 
-[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/no-human-ai/no_human/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/no-human-ai/no_human/releases/tag/v0.1.0

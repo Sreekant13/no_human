@@ -1,0 +1,120 @@
+# Publish the board-carrying wheel to PyPI.
+#
+# WHY A SEPARATE WORKFLOW, AND WHY MANUAL. `ci.yml`'s `wheel` job already builds
+# this artefact and proves it installs on every run; this workflow does the one
+# thing that job deliberately does not — hand the artefact to an index that
+# anyone can install from. That is a publish, it is irreversible per version
+# (PyPI never lets a version be re-uploaded), and it must therefore be an act
+# somebody performs, not a side effect of a push. So: `workflow_dispatch` only,
+# with a typed confirmation, and no `release`/`push` trigger. Add one only when
+# somebody wants releases to publish themselves and says so.
+#
+# NO TOKEN LIVES HERE. Publication uses PyPI Trusted Publishing (OIDC): PyPI is
+# configured to trust exactly this repository + this workflow filename, and the
+# runner exchanges a short-lived identity token for the upload. There is no API
+# token in the repo, in the org secrets, or in anyone's shell history — which is
+# the only way this can be run by automation without a human handling a
+# credential.
+#
+# BEFORE THE FIRST RUN, one browser step nobody can do for you: on pypi.org,
+# Your projects → Publishing → add a *pending publisher* with
+#   owner: no-human-ai   repository: no_human
+#   workflow: publish-pypi.yml   environment: pypi
+# The project does not have to exist yet; the pending publisher is how a first
+# release of a brand-new name is allowed. Without it this workflow fails at the
+# upload step with "invalid-publisher", and nothing else in the repository is
+# affected.
+#
+# THE BOARD IS PART OF THE ARTEFACT. `hatch_build.py` refuses to build a
+# standard wheel without `web/dist`, so the board is built here exactly as the
+# `wheel` job builds it. A wheel published without it would install an `nh`
+# whose main command renders nothing — the failure that rule exists to prevent.
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish" to confirm — this cannot be undone for a version'
+        required: true
+        default: ''
+      repository:
+        description: "Which index"
+        type: choice
+        options: ["pypi", "testpypi"]
+        default: "testpypi"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build the wheel and publish it
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.repository }}
+    permissions:
+      contents: read
+      # The OIDC token Trusted Publishing exchanges for an upload. This is the
+      # only privilege the job holds, and it is scoped to this workflow file.
+      id-token: write
+    steps:
+      - name: Refuse unless the run was confirmed
+        if: inputs.confirm != 'publish'
+        run: |
+          echo "::error::type 'publish' in the confirm input to run this workflow"
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the board
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build the wheel and the sdist
+        run: uv build --out-dir dist
+
+      # The same artefact-level assertions the `wheel` job in ci.yml makes. A
+      # publish is the worst place to discover a boardless wheel, so they run
+      # again here rather than being trusted from another workflow's run.
+      - name: The wheel carries the board and the nh entry point
+        run: |
+          uv run --no-project python - <<'EOF'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+          problems = []
+          if "no_human/web_dist/index.html" not in names:
+              problems.append("no board: no_human/web_dist/index.html is missing")
+          if not any(n.startswith("no_human/web_dist/assets/") for n in names):
+              problems.append("no board assets under no_human/web_dist/assets/")
+          if not any("/migrations/" in n and n.endswith(".sql") for n in names):
+              problems.append("no migrations/*.sql inside the package")
+          ep = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+          text = zipfile.ZipFile(wheels[0]).read(ep[0]).decode() if ep else ""
+          if "nh = no_human.cli.commands:main" not in text:
+              problems.append("entry_points.txt does not declare nh = no_human.cli.commands:main")
+          print(wheels[0], len(names), "files; board files:",
+                sum(1 for n in names if n.startswith("no_human/web_dist/")))
+          if problems:
+              print("\n".join("FAIL: " + p for p in problems)); sys.exit(1)
+          EOF
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ inputs.repository == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          print-hash: true
