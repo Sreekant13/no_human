@@ -29,7 +29,8 @@ from typing import Awaitable, Callable
 
 from ..agent.worker_context import WorkerContext, set_worker_context
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
-from ..config import parallelism_enabled, worktree_isolation_enabled
+from ..config import (DEFAULT_CONFIG, parallelism_enabled,
+                      worktree_isolation_enabled)
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
@@ -54,6 +55,34 @@ log = logging.getLogger("no_human.scheduler")
 # was blocking an escalated task. WIP-first (across statuses) and FIFO
 # (within a status) are independent and both hold.
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
+
+#: Default for `concurrency.stop_grace_s`: how long a stopping server waits
+#: for in-flight attempts to checkpoint and unwind before exiting anyway.
+#: Read from the config template so the number lives in one place.
+DEFAULT_STOP_GRACE_S = float(DEFAULT_CONFIG["concurrency"]["stop_grace_s"])
+#: The API lifespan waits for the worker loop this much LONGER than the grace,
+#: so the scheduler's own bounded drain is what ends the wait, not uvicorn.
+LIFESPAN_DRAIN_MARGIN_S = 5.0
+#: `nh stop --timeout` defaults to the grace plus this, so SIGKILL lands only
+#: after the lifespan has had its turn. Three readers, one number.
+STOP_COMMAND_MARGIN_S = 15.0
+
+
+def stop_grace_s(config: dict | None) -> float:
+    """`concurrency.stop_grace_s` as a non-negative float, default 60.
+
+    The single source for the three waits that stack at shutdown — the
+    scheduler's drain, the lifespan's wait on the worker loop, and `nh stop`'s
+    SIGKILL timer. Each used to carry its own literal (30 s in two places),
+    which is how the outer kill landed before the inner drain had a chance.
+    An unparseable value reads as the default, a negative one as zero.
+    """
+    raw = ((config or {}).get("concurrency") or {}).get("stop_grace_s",
+                                                       DEFAULT_STOP_GRACE_S)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_STOP_GRACE_S
 
 
 def pool_width_ceiling(cpu_count: int | None = None) -> int:
@@ -317,6 +346,19 @@ class Scheduler:
         self.wiki_refresh = wiki_refresh_job
         self.retirement = retirement_job
         self._config = config or {}
+        # Orchestrators whose `run_task` is being awaited right now, so a
+        # shutdown can ask each one to checkpoint and requeue
+        # (`request_stop_checkpoints` → `Orchestrator.request_server_stop`).
+        # Distinct from `_inflight` (ids reserved synchronously at dispatch):
+        # this holds the OBJECT, and only for the span of the await.
+        self._running: dict[str, object] = {}
+        # How long `drain()` waits after a stop before the process exits with
+        # attempts still running. A stop asks every session to unwind at its
+        # next tool boundary, so the drain normally returns in seconds; the
+        # grace covers a session inside ONE long tool call (a full test suite).
+        # Past it, that attempt is killed as before and closed by the next
+        # `create_attempt` as interrupted.
+        self._stop_grace_s = stop_grace_s(self._config)
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
         self._MAX_EVENTS = 200
@@ -1067,6 +1109,7 @@ class Scheduler:
         try:
             orch = self.factory(task)
             orch._sink = _sink
+            self._running[task.id] = orch
             outcome = await orch.run_task(task)
             # 7.4: a quota park pauses the whole pool until the reset time.
             if outcome is not None and outcome.status == TaskStatus.PAUSED_QUOTA:
@@ -1138,6 +1181,7 @@ class Scheduler:
                     f"{task.id[:8]}: could not record FAILED ({werr}); "
                     f"{self._consecutive_status_write_failures} in a row")
         finally:
+            self._running.pop(task.id, None)
             self._inflight.discard(task.id)
             self._live_status.pop(task.id, None)
             # Final notify so SSE clients see the task finished, then clean up.
@@ -1184,6 +1228,10 @@ class Scheduler:
                 await asyncio.wait_for(stop.wait(), timeout=poll_interval)
             except asyncio.TimeoutError:
                 pass
+        # A stop is a REQUEUE of whatever is running, not a wait for it to
+        # finish: `nh stop` SIGKILLs after its timeout, and an attempt
+        # mid-coder takes minutes. Ask first, then wait — bounded.
+        self.request_stop_checkpoints()
         await self.drain()
 
     async def queue_is_drained(self) -> bool:
@@ -1212,10 +1260,58 @@ class Scheduler:
                 out.append(tid)
         return out
 
-    async def drain(self) -> None:
-        """Wait for all in-flight tasks to finish (best-effort, bounded poll)."""
+    def request_stop_checkpoints(self) -> int:
+        """Ask every running orchestrator to checkpoint and requeue its
+        attempt (`Orchestrator.request_server_stop`). Returns how many were
+        asked.
+
+        Never raises: a factory that returned an object without the hook (a
+        test double, a foreign runner) is skipped, and `drain()` still bounds
+        the wait. Nothing is written to the DB — the signal lives in process
+        memory on purpose, so a SIGKILL during the grace cannot leave a stop
+        behind to re-fire on the next server's first cheap boundary.
+        """
+        asked = 0
+        for task_id, orch in list(self._running.items()):
+            hook = getattr(orch, "request_server_stop", None)
+            if hook is None:
+                continue
+            try:
+                hook()
+                asked += 1
+            except Exception as exc:  # noqa: BLE001 — one task must not block the stop
+                log.warning("stop checkpoint request failed for %s: %s",
+                            task_id[:8], exc)
+        if asked:
+            self._on_event("server_stop",
+                           f"asked {asked} running task(s) to checkpoint and requeue")
+        return asked
+
+    async def drain(self, *, grace_s: float | None = None) -> bool:
+        """Wait for in-flight tasks to finish — bounded by ``grace_s``
+        (default `concurrency.stop_grace_s`, 60 s). Returns True when every
+        in-flight task finished, False when the grace ran out first.
+
+        Used to be unbounded, and `nh stop`'s docstring promised "a task is
+        an Agent SDK session finishing a turn — seconds at best" — false: it
+        waited for whole ATTEMPTS, so the 30 s SIGKILL landed on the coder
+        mid-work every time. `request_stop_checkpoints` is what makes the
+        seconds true; the bound is what keeps a wedged tool call from
+        holding the process open forever.
+        """
+        limit = self._stop_grace_s if grace_s is None else float(grace_s)
+        deadline = time.monotonic() + limit
         while self._inflight:
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "drain: %d task(s) still running after %.0fs grace — "
+                    "exiting anyway; their attempts resume from their last "
+                    "commit on the next start. The store closes behind them, "
+                    "so their teardown may log a closed-database error: that "
+                    "is this path, not a new defect", len(self._inflight), limit)
+                return False
             await asyncio.sleep(0.05)
+        return True
 
 
 # --------------------------------------------------------------------------- #

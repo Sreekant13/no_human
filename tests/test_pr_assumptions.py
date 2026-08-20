@@ -131,11 +131,16 @@ def test_pr_body_surfaces_single_run_aggregate(store, tmp_path):
     assert "8 passed, 2 failed, 1 errors" in body
 
 
-def test_pr_body_no_evidence_when_tests_did_not_run(store, tmp_path):
+def test_pr_body_discloses_when_tests_did_not_run(store, tmp_path):
+    """Used to pin the OPPOSITE — no "Test evidence" section at all for
+    `ran=False` — which is how a PR from a repo with no test command
+    carried no test line. The section now exists and says NOT RUN; only an
+    absent evidence object (None) leaves it out."""
     orch = _orch(store, tmp_path)
     t = Task.new("t", repo_path="/r")
     body = orch._pr_body(t, _Commit(), _Result(), test_evidence={"ran": False})
-    assert "Test evidence" not in body
+    assert "NOT RUN — no test command detected" in body
+    assert "Test evidence" not in orch._pr_body(t, _Commit(), _Result(), test_evidence=None)
 
 
 def test_section_includes_intake_qa(store, tmp_path):

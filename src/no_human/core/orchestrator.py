@@ -45,6 +45,8 @@ from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
 from ..agent.verification_receipts import KINDS
 from ..blockers import (
+    MACHINE_REQUEUE_PROVENANCE,
+    SERVER_STOP_REASON,
     Blocker,
     BlockerCategory,
     BlockerOption,
@@ -1633,6 +1635,18 @@ class Orchestrator:
         # one Orchestrator — the same reason `_active_repo_root` is per-attempt.
         if self._cancel_reason and self._cancel_reason[0] == self._active_task_id:
             raise CancelRequested(self._cancel_reason[1])
+        # A server stop is read from the flag itself, not only from the primed
+        # reason: `_active_task_id` is assigned after `create_attempt`, so a
+        # stop landing in that window primes nothing, and a session that
+        # starts after the stop would otherwise run its whole attempt, the
+        # review and the PR into a drain that is about to exit. Gated on an
+        # ACTIVE attempt on purpose: `_run_code_review`'s read-only diff-fetch
+        # fallback also streams through this sink under the coder role, sets
+        # no `_active_task_id`, and has no `CancelRequested` handler — raising
+        # there would crash a code_review task to FAILED (review round 2).
+        # That session finishes under the drain grace instead.
+        if self._server_stopping and self._active_task_id:
+            raise CancelRequested(SERVER_STOP_REASON)
         # Mid-attempt budget watch (ARCH_REVIEW B2 #2). The backend yields one
         # "usage" event per DISTINCT assistant message_id (the stream repeats
         # each response 2-3x under one id, which this running sum used to count
@@ -2146,13 +2160,169 @@ class Orchestrator:
         Read straight from the DB rather than the watcher's cache: the phases
         between agent sessions can outlive a poll interval, and a cancellation
         must not wait for the next tick to be seen.
+
+        A server stop (`request_server_stop`) is reported here too, so a stop
+        that lands BETWEEN sessions requeues the task instead of letting the
+        next attempt start into a drain that will SIGKILL it. A human's pending
+        cancel outranks it: theirs is the richer record (a reason, a park they
+        will resume themselves), and the stop loses nothing by it — a parked
+        task needs no checkpoint from us.
         """
-        return await self.store.get_cancel_request(task.id)
+        pending = await self.store.get_cancel_request(task.id)
+        if pending:
+            return pending
+        if self._server_stopping:
+            return SERVER_STOP_REASON
+        return None
+
+    # Set by the scheduler at shutdown (`Scheduler.request_stop_checkpoints`).
+    # In-process on purpose: a flag in `tasks.cancel_requested` would outlive
+    # a SIGKILL and re-fire on the next server's first cheap boundary
+    # (`_pending_cancel`), requeueing a task that had just been claimed.
+    # Process memory dies with the stop, which is exactly the lifetime wanted.
+    _server_stopping: bool = False
+
+    def request_server_stop(self) -> None:
+        """Ask THIS orchestrator's running attempt to checkpoint and requeue.
+
+        Same unwinding as `nh task pause`: `CancelRequested` is raised out of
+        the event sink at the implementer's next tool boundary, so the SDK
+        session ends with the working tree intact. Honoured as a REQUEUE, not
+        a park — see `_honor_server_stop`. Idempotent; safe with no session
+        open (the cheap-boundary check in `_pending_cancel` then carries it).
+        """
+        self._server_stopping = True
+        if self._active_task_id:
+            self._cancel_reason = (self._active_task_id, SERVER_STOP_REASON)
+
+    async def _honor_server_stop(
+        self, task: Task, repo: GitRepo | None, branch: str | None,
+        attempt_id: str | None,
+    ) -> TaskOutcome:
+        """The server is shutting down: keep the work, close the row, stay
+        claimable.
+
+        Measured 2026-08-20: `Scheduler.drain()` waited for whole attempts
+        while `nh stop` SIGKILLed after 30 s; the coder's uncommitted edits
+        sat in a worktree the task's next run reaped, `_ORPHANABLE` never
+        stamped IMPLEMENTING, and the next run started from base — 342
+        ``interrupted`` rows, 25 of them with 20+ turns and no commit.
+
+        Two shapes, told apart by ``attempt_id``:
+
+        * **Mid-session** (``attempt_id`` set): the coder was unwound at a tool
+          boundary. Uncommitted work is committed as [WIP-PARTIAL] (the
+          stuck-abort branch's shape), ``resume_from`` is stamped with machine
+          provenance ``server_stop`` and `_record_wip_checkpoint` fills the
+          handoff — unless a HUMAN gated the branch point, in which case the
+          human's stamp is executed, not decided over (`_inherited_checkpoint`'s
+          rule): the WIP is still committed and named on the attempt row, so
+          it is findable, but the next run branches from the human's sha.
+          The row is closed ``interrupted`` with its TRUE spend and
+          ``infra_failure=1``: a shutdown is not the coder's failure and does
+          not consume a lifetime attempt (the quota wall's rule); the tokens
+          still count toward the lifetime token ledger.
+        * **Cheap boundary** (``attempt_id`` None — `_drive` entry, loop top):
+          no session is open and nothing is in flight. NOTHING is stamped.
+          The checkout sits at base, or at a review-REJECTED tip at the loop
+          top, and stamping either would move the next run's branch point
+          for no gain; the prior record stands and every open row of this
+          task is closed with the stop's reason (`close_open_attempts`).
+
+        The status is left claimable: IMPLEMENTING stays; PLANNING (the first
+        loop-top boundary, reached before any attempt) is flipped to
+        IMPLEMENTING exactly as the orphan sweep would, so the next server
+        claims it without recording a crash. No blocker, no wake condition,
+        nobody asked.
+
+        Provenance ``server_stop`` is in `MACHINE_REQUEUE_PROVENANCE`, so the
+        zero-diff honesty gate treats the resumed run like an orphan
+        recovery: a claim on top of this unreviewed WIP goes to a full review.
+        """
+        from ..blockers import resume_provenance
+        wip_sha = ""
+        committed_now = False
+        if repo is not None and attempt_id:
+            try:
+                if repo.has_changes():
+                    commit = repo.commit_all(
+                        f"[WIP-PARTIAL] {self._commit_message(task)}")
+                    wip_sha = commit.sha
+                    committed_now = True
+                    self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
+                              f"({commit.files_changed} files preserved)")
+                else:
+                    wip_sha = repo.head_sha()
+            except Exception as exc:  # noqa: BLE001 — a failed checkpoint is a cold start, not a crash
+                log.warning("WIP checkpoint on server stop failed for %s: %s",
+                            task.id[:8], exc)
+                wip_sha = ""
+        ctx = task.context or {}
+        prior = ctx.get("resume_from") or {}
+        # Identical to `Scheduler._inherited_checkpoint`: a human's gate is
+        # executed, never decided over; a stamp-less legacy resume is a human's.
+        human_gated = bool(prior.get("sha")) and (
+            prior.get("by") == "human"
+            or (not prior.get("by")
+                and ctx.get("resume_reason") != "wake_condition_satisfied"))
+        stamped = ""
+        if wip_sha and not human_gated:
+            task.context = await self.store.merge_context(
+                task.id, {"resume_from": resume_provenance(
+                    {"sha": wip_sha, "branch": branch or ""}, "server_stop")})
+            stamped = wip_sha
+            await self._record_wip_checkpoint(
+                task, wip_sha, repo, stopped_because="server stop")
+        if stamped:
+            what = f"checkpointed {stamped[:8]}"
+        elif wip_sha and human_gated:
+            what = (f"{'committed' if committed_now else 'left'} {wip_sha[:8]} "
+                    "behind a human-gated resume_from, not resumed onto")
+        elif attempt_id:
+            what = "nothing to checkpoint (no measurable tree)"
+        else:
+            what = "nothing to checkpoint (no session was open)"
+        reason = f"interrupted: server stopping — {what}"
+        if attempt_id:
+            u = getattr(self, "_attempt_usage", None) or {}
+            await self.store.update_attempt(
+                attempt_id, status="interrupted", failure_reason=reason,
+                infra_failure=1, commit_sha=wip_sha or None,
+                tokens_used=u.get("tokens_used", 0),
+                output_tokens=u.get("output_tokens"),
+                cache_read_tokens=u.get("cache_read_tokens", 0),
+                cache_creation_tokens=u.get("cache_creation_tokens", 0),
+                **self._pop_aux_usage(),
+            )
+        else:
+            await self.store.close_open_attempts(task.id, reason=reason)
+        if task.status == TaskStatus.PLANNING:
+            # Mirrors `Scheduler._recover_orphans`: PLANNING is worker-only
+            # and not claimable. The plan (if any) is already in context. A
+            # `None` return means a human finished or cancelled the task
+            # meanwhile (the CAS terminal guard) — the sweep stops there too.
+            moved = await self.store.set_status(
+                task, TaskStatus.IMPLEMENTING, validate=False)
+            if moved is None:
+                task = await self.store.get_task(task.id) or task
+        # Nothing of ours is in the DB flag, but a stop honoured mid-session
+        # must not re-fire from the cached reason on the next tool event of a
+        # pooled orchestrator.
+        self._cancel_reason = None
+        self.emit("server_stop", reason, status=task.status.value)
+        return TaskOutcome(task, status=task.status, detail=reason)
 
     async def _honor_cancel(
-        self, task: Task, repo: GitRepo | None, branch: str | None, reason: str
+        self, task: Task, repo: GitRepo | None, branch: str | None, reason: str,
+        *, attempt_id: str | None = None,
     ) -> TaskOutcome:
-        """Stop where we are, keeping the work: checkpoint, park, clear the flag."""
+        """Stop where we are, keeping the work: checkpoint, park, clear the flag.
+
+        A SERVER stop is not a pause — it is routed to `_honor_server_stop`
+        (checkpoint, close the row, stay claimable) before anything here runs.
+        """
+        if reason == SERVER_STOP_REASON:
+            return await self._honor_server_stop(task, repo, branch, attempt_id)
         before = ""
         if repo is not None:
             try:
@@ -4097,7 +4267,8 @@ class Orchestrator:
                 task, budget_blocker, repo=repo, branch=branch
             )
         if cancelled:
-            return await self._honor_cancel(task, repo, branch, cancelled)
+            return await self._honor_cancel(task, repo, branch, cancelled,
+                                            attempt_id=attempt_id)
 
         # B2 #5/#6: planning + utility burn land on the attempt the plan fed,
         # popped ONCE (review #3: the same pop runs on the abort paths above,
@@ -4456,7 +4627,7 @@ class Orchestrator:
                             task, result, repo=repo, attempt_id=attempt_id)
                     except CancelRequested as exc:
                         return await self._honor_cancel(
-                            task, repo, branch, str(exc))
+                            task, repo, branch, str(exc), attempt_id=attempt_id)
                     except (BudgetAbort, StuckAbort) as exc:
                         return await self._abort_during_nudge(
                             task, repo, attempt_id, exc, result=result,
@@ -4986,11 +5157,19 @@ class Orchestrator:
             if not test_result.ok:
                 fail_tail = (getattr(test_result, "output", "") or "")[-1200:]
             failing_tests = getattr(test_result, "failing_tests", []) or []
+            # A run that found no command says so in the event too: the board
+            # reads this line, and "no test command detected" with ok=True is
+            # the shape a human should be able to spot without opening the PR.
+            not_run = ("NOT RUN — " if not test_result.ran
+                       and not getattr(test_result, "invocation_error", False)
+                       else "")
             self.emit(
                 "tests",
-                test_result.summary + (" (reused the reviewer's run)" if was_cached else "")
+                not_run + test_result.summary
+                + (" (reused the reviewer's run)" if was_cached else "")
                 + (f"\n{fail_tail}" if fail_tail else ""),
                 ok=test_result.ok, cached=was_cached, failing_tests=failing_tests,
+                ran=test_result.ran,
             )
             await self.store.update_attempt(
                 attempt_id,
@@ -7526,7 +7705,13 @@ class Orchestrator:
         `_ORPHANABLE` is CONTEXT/PLANNING/REVIEWING/TESTING — IMPLEMENTING is not
         in it), so this stamp exists only when one of THOSE phases was killed and
         requeued: a genuinely interrupted review (or context/planning/testing) —
-        exactly this incident's shape. A `wake` resume (CI-fix, quota, timer) or a
+        exactly this incident's shape. `_honor_server_stop` writes the
+        IMPLEMENTING twin, ``by == "server_stop"``: a graceful stop mid-coder
+        leaves a [WIP-PARTIAL] diff no review has judged, so a zero-diff claim
+        on top of it is the same laundering shape. Both values live in
+        `blockers.MACHINE_REQUEUE_PROVENANCE`, which is what this gate reads —
+        a third machine writer must join that set, not this docstring. A
+        `wake` resume (CI-fix, quota, timer) or a
         human-gated `nh reply` never had a review in flight to interrupt, and its
         already-reviewed escape (D15, `test_the_already_satisfied_escape_fires_
         for_that_same_wake_resume`) must not be re-litigated by this gate.
@@ -7545,7 +7730,7 @@ class Orchestrator:
         an unstamped round -> ineligible, i.e. a full review runs.
         """
         resume_by = ((task.context or {}).get("resume_from") or {}).get("by")
-        if resume_by != "orphan_recovery":
+        if resume_by not in MACHINE_REQUEUE_PROVENANCE:
             return True, ""
         try:
             head = repo.head_sha()
@@ -15788,8 +15973,10 @@ SIX of them read a checkpoint and TWO do not — but do
 
         Uses the per-layer summaries collected during the layered test run
         (blocking + advisory + wake-gated layers), or the single-command
-        aggregate when no layered plan ran. Returns "" when nothing ran so the
-        default path is byte-for-byte unchanged.
+        aggregate when no layered plan ran. Returns "" only when there is no
+        evidence object at all (the pre-review draft body); a run that found
+        NO test command renders a NOT RUN line — an empty section read as
+        "nothing to say" in a body whose every other line is evidence.
         """
         if not isinstance(test_evidence, dict):
             return ""
@@ -15828,10 +16015,20 @@ SIX of them read a checkpoint and TWO do not — but do
                 "- this change carries NO test evidence — do not read the "
                 "absence of failures as a pass",
             ]
+        elif test_evidence.get("ran") is False:
+            # The runner found NO command (`testing/runner.py`: `ran=False,
+            # ok=True`, no counts). `ok=True` is the routing predicate — a repo
+            # with no tests is structural absence, not a failed gate — but the
+            # body used to print nothing for it, and nothing is what a reader
+            # takes for "fine". The disclosure is the ledger entry.
+            lines = [
+                "- tests: **NOT RUN — no test command detected** — this change "
+                "carries NO test evidence; do not read the absence of failures "
+                "as a pass",
+            ]
         # `ran` alone is the right condition and `or counted` would be dead code:
-        # the runner only ever builds `ran=False` for "no test command detected",
-        # which carries no counts, and the layered writer always sets `layers`
-        # (first branch). A mutation run proved no test could tell the two apart.
+        # `ran=False` is handled above, and the layered writer always sets
+        # `layers` (first branch).
         elif test_evidence.get("ran"):
             if test_evidence.get("ok"):
                 lines = [f"- tests: PASS — {test_evidence.get('passed', 0)} passed, "

@@ -1599,6 +1599,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "max_workers": 2,
         "poll_interval": "10s",   # how often `nh serve` checks for new pending tasks
+        # Seconds a stopping server waits for running attempts to checkpoint
+        # ([WIP-PARTIAL] + resume_from) and unwind before exiting anyway.
+        # `nh stop --timeout` defaults to this plus 15.
+        "stop_grace_s": 60,
         "worktree_root": None,    # pre-split alias for isolation.worktree_root
     },
     "decomposition": {

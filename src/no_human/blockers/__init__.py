@@ -24,6 +24,8 @@ from .actions import (
     is_terminal_action,
 )
 from .taxonomy import (
+    MACHINE_REQUEUE_PROVENANCE,
+    SERVER_STOP_REASON,
     Blocker,
     BlockerCategory,
     BlockerOption,
@@ -37,6 +39,8 @@ from .taxonomy import (
 from .wake import WakeWatcher, parse_duration
 
 __all__ = [
+    "MACHINE_REQUEUE_PROVENANCE",
+    "SERVER_STOP_REASON",
     "ActionError",
     "apply_action",
     "is_plan_approval_action",

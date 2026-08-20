@@ -1958,9 +1958,17 @@ def test_serve_until_empty_exit_code_is_the_drains_verdict(tmp_path, monkeypatch
 
 def test_stop_waits_long_enough_for_a_real_drain():
     """3s was shorter than one Agent SDK turn, so `nh stop` SIGKILLed the very
-    drain SIGTERM had just asked for. The default must stay generous."""
-    default = {p.name: p for p in cli.commands["stop"].params}["timeout"].default
+    drain SIGTERM had just asked for. The default is now DERIVED — the
+    server's `concurrency.stop_grace_s` plus a margin — so it cannot fall
+    below the drain it waits for, whatever the grace is set to."""
+    from no_human.cli.commands import _default_stop_timeout
+    from no_human.core.scheduler import stop_grace_s
+    click_default = {p.name: p for p in cli.commands["stop"].params}["timeout"].default
+    assert click_default is None, "a literal default can disagree with the server's grace"
+    default = _default_stop_timeout(None)
     assert default >= 30.0, f"nh stop --timeout default fell back to {default}s"
+    assert default > stop_grace_s(None)
+    assert _default_stop_timeout({"concurrency": {"stop_grace_s": 600}}) > 600
 
 def _write_pidfile(home: Path, pid: int) -> Path:
     home.mkdir(parents=True, exist_ok=True)

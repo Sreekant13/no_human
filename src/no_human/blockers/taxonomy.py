@@ -250,6 +250,22 @@ def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, A
             "by": by}
 
 
+#: The cooperative-stop reason a SERVER SHUTDOWN hands a running attempt.
+#: Never written to ``tasks.cancel_requested`` — it is signalled in-process
+#: (`Orchestrator.request_server_stop`) so a SIGKILL cannot leave it behind
+#: to re-fire on the next server's first cheap boundary. `_honor_cancel`
+#: routes it to a REQUEUE (checkpoint, close the row, stay IMPLEMENTING)
+#: instead of a USER_PAUSED park.
+SERVER_STOP_REASON = "__server_stop__"
+
+#: ``resume_from.by`` values the MACHINE writes after an interrupted run — a
+#: killed process (``orphan_recovery``, the scheduler's startup sweep) or a
+#: graceful stop (``server_stop``, `Orchestrator._honor_server_stop`). The
+#: already-satisfied gate reads this set: a zero-diff claim over a diff no
+#: completed review judged must route to a full review on either path.
+MACHINE_REQUEUE_PROVENANCE = frozenset({"orphan_recovery", "server_stop"})
+
+
 @dataclass
 class Blocker:
     """Structured blocker report (PLAN.md 22.1). Never prose — a human acts on

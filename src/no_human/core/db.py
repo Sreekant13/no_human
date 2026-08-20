@@ -1865,9 +1865,18 @@ class Store:
         }
 
     @serialized_write
-    async def close_open_attempts(self, task_id: str) -> None:
+    async def close_open_attempts(
+        self, task_id: str, *, reason: str | None = None,
+    ) -> None:
         """Retire every ``in_progress`` row of *task_id* — the caller has just
         declared the run that owned them over.
+
+        ``reason`` is the ``failure_reason`` written onto rows that have none.
+        The default names the checkpoint-clearing case described below; a
+        graceful server stop (`Orchestrator._honor_server_stop`) passes its
+        own, because a row closed by a shutdown is NOT a row whose checkpoint
+        was cleared — the next run resumes from it, and the reason column is
+        the only place that says so.
 
         Called by the CHECKPOINT-CLEARING paths (`POST /tasks/{id}/retry`,
         `nh task retry`, and both "send back" twins), all of which promise "a
@@ -1898,14 +1907,14 @@ class Store:
         Safe to call when nothing is running (every clear path runs on a task
         whose worker is already gone) and idempotent.
         """
+        default = ("interrupted: its checkpoint was cleared for a fresh run "
+                   "from base — the worker process had already died without "
+                   "closing this row")
         await self.db.execute(
             "UPDATE attempts SET status = 'interrupted', "
-            "failure_reason = COALESCE(NULLIF(TRIM(failure_reason), ''), "
-            "'interrupted: its checkpoint was cleared for a fresh run from "
-            "base — the worker process had already died without closing this "
-            "row') "
+            "failure_reason = COALESCE(NULLIF(TRIM(failure_reason), ''), ?) "
             "WHERE task_id = ? AND status = 'in_progress'",
-            (task_id,),
+            (reason or default, task_id),
         )
         await self.db.commit()
 
@@ -2189,12 +2198,18 @@ class Store:
         # 'interrupted'` and not merely "zero priced work" on its own.
         #
         # This stays outside the coder's influence: the excluded shape
-        # requires `status = 'interrupted'`, which only `db.py` writes —
-        # never the agent, and never `update_attempt(status='failed')` from
-        # the attempt loop — AND zero recorded spend, which an agent cannot
-        # fake downward because any session it runs meters tokens. There is
-        # no way for a coder to convert its own failing attempts into free
-        # ones.
+        # requires `status = 'interrupted'` — written by `db.py` (dead rows
+        # closed at `create_attempt` / `close_open_attempts`) and by ONE
+        # orchestrator path, `Orchestrator._honor_server_stop`, which only a
+        # server shutdown reaches (never the agent, never
+        # `update_attempt(status='failed')` from the attempt loop) — AND
+        # zero recorded spend, which an agent cannot fake downward because
+        # any session it runs meters tokens. The server-stop row ALSO
+        # carries `infra_failure=1` (its work is checkpointed, not lost, and
+        # a coder cannot trigger a shutdown), so it is excluded by the
+        # infra branch whatever it spent; its tokens still sum below. There
+        # is no way for a coder to convert its own failing attempts into
+        # free ones.
         #
         # The token SUMs above are UNCHANGED (a dead row contributes 0
         # anyway), and the row is never deleted or skipped — it is the

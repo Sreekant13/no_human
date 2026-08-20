@@ -226,6 +226,36 @@ def test_a_real_failure_names_the_failing_tests():
     assert "tests/test_b.py::test_two" in section
 
 
+def test_no_test_command_is_disclosed_not_silent():
+    """`runner.py` returns `ran=False, ok=True` when it finds no command, and
+    this section returned "" for it — the one evidence line a reviewer could
+    not tell apart from "nothing to say". A repo with no tests is structural
+    absence (the routing predicate `ok=True` stays), but the PR body must
+    say so."""
+    section = Orchestrator._test_evidence_section(
+        {"ran": False, "ok": True, "passed": 0, "failed": 0, "errors": 0})
+    assert "NOT RUN — no test command detected" in section
+    assert "NO test evidence" in section
+    assert "0 failed" not in section
+
+
+def test_no_test_command_is_not_confused_with_an_invocation_error():
+    """Negative control for the new branch: an invocation error keeps its own
+    wording and its base-tree verdict, whatever `ran` says."""
+    section = Orchestrator._test_evidence_section(
+        {"ran": False, "ok": False, "passed": 0, "failed": 0, "errors": 0,
+         "invocation_error": True, "reproduces_on_base": False})
+    assert "test invocation failed" in section
+    assert "no test command detected" not in section
+    assert "reproduces on base: no" in section
+
+
+def test_a_missing_evidence_dict_still_renders_nothing():
+    """`None` means the caller had no evidence object at all (the draft-PR
+    body before any test ran) — that is not the no-command case."""
+    assert Orchestrator._test_evidence_section(None) == ""
+
+
 def test_a_pass_still_reads_as_pass():
     section = Orchestrator._test_evidence_section(
         {"ran": True, "ok": True, "passed": 9, "failed": 0, "errors": 0})
@@ -248,8 +278,11 @@ def test_the_tamper_flag_is_rendered_on_a_layered_run_too():
     assert "tamper guard fired" in section
 
 
-def test_nothing_ran_and_nothing_is_known_stays_silent():
-    assert Orchestrator._test_evidence_section({"ran": False}) == ""
+def test_nothing_known_stays_silent_but_nothing_ran_is_said():
+    """Used to pin `{"ran": False}` → "" — the silence that let a PR with no
+    test command carry no test line at all. Only the ABSENT evidence object
+    (the pre-review draft body) is silent now."""
+    assert "NOT RUN — no test command detected" in Orchestrator._test_evidence_section({"ran": False})
     assert Orchestrator._test_evidence_section(None) == ""
 
 

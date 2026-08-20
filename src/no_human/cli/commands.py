@@ -5952,10 +5952,18 @@ def _stop_server(timeout: float) -> int:
     return 1
 
 
+def _default_stop_timeout(config_data: dict | None) -> float:
+    """`nh stop --timeout` when none is given: the server's stop grace plus
+    a margin, read from the same config the server reads, so SIGKILL lands
+    only after the lifespan's own wait (grace + its smaller margin) has ended."""
+    from ..core.scheduler import STOP_COMMAND_MARGIN_S, stop_grace_s
+    return stop_grace_s(config_data) + STOP_COMMAND_MARGIN_S
+
+
 @cli.command("stop")
-@click.option("--timeout", default=30.0, type=float,
+@click.option("--timeout", default=None, type=float,
               help="Seconds to wait after SIGTERM before escalating to SIGKILL "
-                   "(default 30).")
+                   "(default: concurrency.stop_grace_s + 15, i.e. 75).")
 def stop(timeout):
     """Stop the running `nh start`/`nh serve` server.
 
@@ -5964,14 +5972,30 @@ def stop(timeout):
     Pairs with `nh start` — this is the command referenced by the
     auth-switch restart hint.
 
-    The default was 3s, which is not a graceful stop of this server: SIGTERM
-    sets the scheduler's stop event and `run_forever` then DRAINS in-flight
-    tasks, and a task is an Agent SDK session finishing a turn — seconds at
-    best. A 3s bound SIGKILLed the drain it was supposed to wait for. 30s is
-    a wait long enough for a turn to land, still short enough that a genuinely
-    wedged process is force-killed while somebody is watching; pass --timeout
-    to choose your own.
+    What SIGTERM does: the scheduler asks every running attempt to checkpoint
+    — the coder session unwinds at its next tool boundary, uncommitted work is
+    committed as [WIP-PARTIAL], `resume_from` is stamped, the attempt row is
+    closed as interrupted (its tokens count, it does not consume a lifetime
+    attempt) and the task stays claimable — then drains for
+    `concurrency.stop_grace_s` (60 s). The next `nh start` resumes those
+    tasks from their checkpoint. What the grace cannot reach: a coder session
+    inside ONE long tool call (a full test suite), and the planner / reviewer
+    sessions, which are not interruptible — past the grace the process exits
+    as before and that task resumes from its last commit, not its edits.
+
+    The default timeout is therefore derived, not a literal: grace + 15 s,
+    so the kill cannot land before the drain it is waiting for. Pass
+    --timeout to choose your own; anything below the grace defeats the
+    checkpoint.
     """
+    if timeout is None:
+        try:
+            from ..config import load_config
+            # A read, not a bootstrap: a stop must not create a config file.
+            timeout = _default_stop_timeout(
+                load_config(create_if_missing=False).data)
+        except Exception:  # noqa: BLE001 — an unreadable/absent config must not block a stop
+            timeout = _default_stop_timeout(None)
     sys.exit(_stop_server(timeout))
 
 

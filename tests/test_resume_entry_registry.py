@@ -71,6 +71,14 @@ REGISTRY: dict[tuple[str, str], str] = {
     # attempt that actually died (the one still `in_progress`), never one a
     # CLEARS path above deliberately removed.
     ("core/scheduler.py", "Scheduler._recover_orphans"): INHERITS_ELSE_STAMPS,
+    # A graceful server stop mid-session: the same rule as the orphan sweep,
+    # one restart earlier. A HUMAN's gated sha is inherited untouched (the
+    # WIP commit is still named on the attempt row, so it is findable);
+    # otherwise the coder's [WIP-PARTIAL] is stamped `by: "server_stop"` —
+    # machine provenance in MACHINE_REQUEUE_PROVENANCE, so the zero-diff
+    # gate stays armed. At a cheap boundary (no session open) it stamps
+    # nothing at all: there is no in-flight work to preserve.
+    ("core/orchestrator.py", "Orchestrator._honor_server_stop"): INHERITS_ELSE_STAMPS,
     # --- internal, within a run the loop already entered ---
     ("core/orchestrator.py", "Orchestrator._run_attempt"): INTERNAL,
 }
@@ -293,6 +301,11 @@ STOP_REGISTRY: dict[tuple[str, str], str] = {
     ("cli/commands.py", "task_retry._go"): WITHDRAWS,
     ("blockers/wake.py", "WakeWatcher._resume"): KEEPS,
     ("core/scheduler.py", "Scheduler._recover_orphans"): KEEPS,
+    # A graceful server stop is a machine requeue: it executes no human
+    # decision, so a human's pending pause survives it and `_drive` parks on
+    # turn zero at the next start. (`_pending_cancel` already lets a human
+    # cancel outrank the stop while the process lives.)
+    ("core/orchestrator.py", "Orchestrator._honor_server_stop"): KEEPS,
     ("core/orchestrator.py", "Orchestrator._run_attempt"): STOP_INTERNAL,
 }
 

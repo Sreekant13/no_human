@@ -8,8 +8,12 @@ leaves this file when the defect is fixed, not when it stops being convenient.
 
 ## KI-1 — concurrent tasks can crash a `Store` commit
 
-**Status:** open. Deselected in CI (`.github/workflows/ci.yml`), so the badge
-is honest rather than red on a third of pushes.
+**Status:** mitigated in code — every `Store` write now goes through the
+`serialized_write` lock (`src/no_human/core/db.py`, landed 2026-07-30), so two
+orchestrators can no longer interleave statements on one connection. The test
+below stays deselected in CI (`.github/workflows/ci.yml`) because its failure
+rate has not been re-measured since the lock landed; the numbers in this entry
+are from BEFORE it. Re-measure, then re-enable or close.
 
 **Symptom**
 

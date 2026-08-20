@@ -311,10 +311,16 @@ async def lifespan(app: FastAPI):
 
     if worker_task and stop_event:
         stop_event.set()
+        # `run_forever` asks every running attempt to checkpoint, then drains
+        # for `concurrency.stop_grace_s`. Wait a margin LONGER than that, so
+        # the scheduler's bounded drain (which logs what it abandoned) is what
+        # ends this wait — not a second, shorter literal here.
+        from ..core.scheduler import LIFESPAN_DRAIN_MARGIN_S, stop_grace_s
+        budget = stop_grace_s(config.data) + LIFESPAN_DRAIN_MARGIN_S
         try:
-            await asyncio.wait_for(worker_task, timeout=30)
+            await asyncio.wait_for(worker_task, timeout=budget)
         except asyncio.TimeoutError:
-            log.warning("worker drain timed out after 30s")
+            log.warning("worker drain timed out after %.0fs", budget)
     # An externally-supplied store is owned by whoever connected it (`nh
     # start`'s `_go()`) — it closes it, not us, or `start()`'s own use of the
     # connection after `server.serve()` returns would hit a closed store.
