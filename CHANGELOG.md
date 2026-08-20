@@ -6,6 +6,23 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-20
+
+Registry release: the package now carries what the official MCP Registry
+needs, plus the loop fixes that had accumulated since 0.1.2.
+
+- `server.json` at the repository root describes the MCP bridge (`nh
+  mcp-serve`, two tools, stdio) as the PyPI package `no-human`, and the README
+  carries the registry's `mcp-name: io.github.no-human-ai/no_human` ownership
+  marker. A manual `publish-mcp-registry.yml` workflow publishes it with OIDC
+  — no token in the repository — and refuses unless pyproject, server.json and
+  PyPI agree on the version.
+- A second console script, `no-human`, is the same entry point as `nh`, so
+  `uvx no-human mcp-serve` runs the bridge the way registry clients invoke it.
+- The wheel-build refusal when the board is absent now also says the short
+  way out: `uv tool install no-human` installs the published wheel, board
+  included (public issue #4).
+
 - The wake watcher's PR-conflict rung no longer falls through to an
   expensive coder round when it can't tell what's conflicting: a failed
   conflicting-path enumeration — whether `conflicting_paths()` raises, or
@@ -131,7 +148,8 @@ evidence it works. A human approves and merges.
   2026-08-18, built by the public repository's CI. `SHA256SUMS-linux.txt`
   ships alongside.
 
-[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/no-human-ai/no_human/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/no-human-ai/no_human/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/no-human-ai/no_human/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/no-human-ai/no_human/releases/tag/v0.1.0

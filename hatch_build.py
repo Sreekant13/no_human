@@ -152,6 +152,9 @@ def board_missing_error(index: Path, target_name: str) -> str:
         f"  Build the board first:\n"
         f"      {_build_it()}\n"
         f"\n"
+        f"  Or skip the build: `uv tool install no-human` installs the published\n"
+        f"  wheel from PyPI, board included.\n"
+        f"\n"
         f"  A dev install does NOT need it: `uv sync` and `pip install -e .`\n"
         f"  warn and continue.\n"
     )

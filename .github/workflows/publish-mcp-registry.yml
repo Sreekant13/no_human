@@ -1,0 +1,76 @@
+# Publish server.json to the official MCP Registry (registry.modelcontextprotocol.io).
+#
+# WHY MANUAL, LIKE publish-pypi.yml. A registry entry points at a PyPI version,
+# and the registry verifies that the PyPI package's README carries
+# `mcp-name: io.github.no-human-ai/no_human`. So the order is fixed: the PyPI
+# publish for this version must already have happened, and this workflow is the
+# deliberate act that follows it. `workflow_dispatch` only, with a typed
+# confirmation — the same shape as the PyPI publish.
+#
+# NO TOKEN LIVES HERE. `mcp-publisher login github-oidc` exchanges the runner's
+# OIDC identity for a short-lived registry token; an OIDC identity from this
+# repository is allowed to publish under the `io.github.no-human-ai/*` namespace
+# and nothing else.
+#
+# THE THREE FILES MUST AGREE, and the job refuses before it authenticates if
+# they do not: pyproject.toml's version, server.json's version (top level AND
+# the PyPI package entry), and the version PyPI actually serves. Publishing an
+# entry for a version PyPI does not have would list a server nobody can run.
+name: Publish to MCP Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish" to confirm'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish server.json to the MCP Registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Refuse unless the run was confirmed
+        if: inputs.confirm != 'publish'
+        run: |
+          echo "::error::type 'publish' in the confirm input to run this workflow"
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: pyproject, server.json and PyPI agree on the version
+        run: |
+          set -euo pipefail
+          PROJECT=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          TOP=$(python3 -c 'import json;print(json.load(open("server.json"))["version"])')
+          PKG=$(python3 -c 'import json;print(json.load(open("server.json"))["packages"][0]["version"])')
+          NAME=$(python3 -c 'import json;print(json.load(open("server.json"))["name"])')
+          echo "pyproject=$PROJECT server.json=$TOP package=$PKG name=$NAME"
+          [ "$PROJECT" = "$TOP" ] && [ "$PROJECT" = "$PKG" ] || { echo "::error::version drift between pyproject.toml and server.json"; exit 1; }
+          grep -q -E "mcp-name: $NAME( |$|-->)" README.md || { echo "::error::README.md lacks the 'mcp-name: $NAME' ownership marker"; exit 1; }
+          curl -fsS "https://pypi.org/pypi/no-human/$PROJECT/json" >/dev/null \
+            || { echo "::error::PyPI does not serve no-human $PROJECT yet — run publish-pypi.yml first"; exit 1; }
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --version || true
+
+      # The registry's own validator, before any credential is minted: it
+      # caught a 119-char description (max 100) on review of this file.
+      - name: server.json validates against the live registry
+        run: ./mcp-publisher validate server.json
+
+      - name: Authenticate to the MCP Registry (OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

@@ -1,6 +1,6 @@
 [project]
 name = "no-human"
-version = "0.1.2"
+version = "0.1.3"
 description = "Autonomous AI software-delivery orchestrator driving the Claude Agent SDK on your own Claude credentials"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,6 +30,9 @@ dependencies = [
 
 [project.scripts]
 nh = "no_human.cli.commands:main"
+# The same entry point under the package's own name, so `uvx no-human mcp-serve`
+# resolves without `--from` — the shape the MCP Registry and its clients run.
+no-human = "no_human.cli.commands:main"
 
 # Redirects HOME to a temp dir before no_human.config can bind DB_PATH /
 # CONFIG_PATH to the operator's real ~/.no_human — see
