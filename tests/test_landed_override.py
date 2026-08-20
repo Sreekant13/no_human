@@ -14,6 +14,8 @@ never mocked.
 from __future__ import annotations
 
 import subprocess
+import time
+from datetime import datetime
 
 import pytest
 import pytest_asyncio
@@ -483,3 +485,46 @@ async def test_api_approve_landed_completes_failed_pre_pr(tmp_path, store, clien
         json={"sha": landed_sha, "justification": "replay"},
     )
     assert r.status_code == 409, r.text
+
+
+# --------------------------------------------------------------------------- #
+# ts must be the shared REAL clock, not an ISO string (SQLite orders TEXT     #
+# above REAL, so an ISO ts sorts above every real event forever)              #
+# --------------------------------------------------------------------------- #
+
+async def test_override_event_ts_is_real_and_orders_before_later_event(
+    tmp_path, store,
+):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, pr_branch="")
+
+    result = await approve_landed_override(
+        store, t, sha, "supervisor squash train 15 — verified by eyeball diff")
+
+    rows = await store.query(
+        "SELECT typeof(ts) AS t, ts FROM task_events "
+        "WHERE json_extract(data,'$.kind')=?",
+        (LANDED_OVERRIDE_KIND,),
+    )
+    assert len(rows) == 1
+    assert rows[0]["t"] == "real"
+
+    # a normal event emitted afterwards must sort AFTER the override, not
+    # before it — the bug made every override look newer than everything.
+    await store.save_events(
+        t.id, [{"kind": "note", "source": "test", "ts": time.time()}])
+
+    ordered = await store.query(
+        "SELECT json_extract(data,'$.kind') AS k FROM task_events "
+        "ORDER BY ts ASC, id ASC",
+    )
+    kinds = [r["k"] for r in ordered]
+    assert kinds.index(LANDED_OVERRIDE_KIND) < kinds.index("note")
+
+    fresh = await store.get_task(t.id)
+    approved_at = fresh.context["approved_at"]
+    # still ISO, still parseable — the drawer and web/e2e/drawer.mjs depend
+    # on this shape; only the event-level ts column changed type.
+    datetime.fromisoformat(approved_at)
+    assert result["sha"] == sha

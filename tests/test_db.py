@@ -1,5 +1,8 @@
 """SQLite store: create/get/list/transition/attempts."""
 
+import json
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from no_human.core.db import Store
@@ -566,3 +569,85 @@ async def test_historical_compound_parent_and_subtask_rows_still_load(store):
     subtasks = await store.list_subtasks(parent.id)
     assert [s.id for s in subtasks] == [sub.id]
     assert await store.count_subtasks(parent.id) == 1
+
+
+async def test_migration_normalizes_text_ts_to_epoch_float(tmp_path):
+    """migrations/0014: a TEXT ts (the approved_landed_override incident
+    shape — ISO written straight into the REAL column) is normalized to its
+    equivalent epoch float on the next connect, byte-preserving every other
+    column, with the instant itself round-tripping through datetime."""
+    db_path = tmp_path / "t.db"
+    original = datetime(2026, 8, 20, 12, 34, 56, 123000, tzinfo=timezone.utc)
+    iso = original.isoformat()
+    data = json.dumps({"kind": "approved_landed_override", "ts": iso})
+
+    s1 = await Store(db_path).connect()
+    t = Task.new("x", repo_path="/tmp/r")
+    await s1.create_task(t)
+    await s1.db.execute(
+        "INSERT INTO task_events (task_id, ts, data) VALUES (?, ?, ?)",
+        (t.id, iso, data),
+    )
+    await s1.db.commit()
+    before_count = (await s1.query_one(
+        "SELECT count(*) AS c FROM task_events"))["c"]
+    await s1.close()
+
+    # Reconnect: re-runs `_migrate`, which runs migrations/0014 again.
+    s2 = await Store(db_path).connect()
+    row = (await s2.query_one(
+        "SELECT typeof(ts) AS t, ts, task_id, data FROM task_events "
+        "WHERE task_id = ?", (t.id,)))
+    assert row["t"] == "real"
+    migrated = datetime.fromtimestamp(row["ts"], timezone.utc)
+    assert abs(migrated - original) < timedelta(milliseconds=10)
+    assert row["task_id"] == t.id
+    assert row["data"] == data
+
+    after_count = (await s2.query_one(
+        "SELECT count(*) AS c FROM task_events"))["c"]
+    assert after_count == before_count
+
+    non_real = (await s2.query_one(
+        "SELECT count(*) AS c FROM task_events WHERE typeof(ts) != 'real'"))["c"]
+    assert non_real == 0
+    await s2.close()
+
+
+async def test_migration_is_idempotent_on_repeated_connect(tmp_path):
+    """migrations/0014 re-runs on every connect (no schema-version gate in
+    this repo) — a second reconnect after the rows are already REAL must
+    leave the value and row count unchanged, never re-touch or drop rows."""
+    db_path = tmp_path / "t.db"
+    original = datetime(2026, 8, 20, 12, 34, 56, 123000, tzinfo=timezone.utc)
+    iso = original.isoformat()
+
+    s1 = await Store(db_path).connect()
+    t = Task.new("x", repo_path="/tmp/r")
+    await s1.create_task(t)
+    await s1.db.execute(
+        "INSERT INTO task_events (task_id, ts, data) VALUES (?, ?, ?)",
+        (t.id, iso, json.dumps({"kind": "approved_landed_override"})),
+    )
+    await s1.db.commit()
+    await s1.close()
+
+    s2 = await Store(db_path).connect()
+    row2 = (await s2.query_one(
+        "SELECT ts FROM task_events WHERE task_id = ?", (t.id,)))
+    count2 = (await s2.query_one("SELECT count(*) AS c FROM task_events"))["c"]
+    await s2.close()
+
+    # third connect (second reconnect after normalization) — pin idempotency
+    s3 = await Store(db_path).connect()
+    row3 = (await s3.query_one(
+        "SELECT typeof(ts) AS t, ts FROM task_events WHERE task_id = ?", (t.id,)))
+    count3 = (await s3.query_one("SELECT count(*) AS c FROM task_events"))["c"]
+    non_real = (await s3.query_one(
+        "SELECT count(*) AS c FROM task_events WHERE typeof(ts) != 'real'"))["c"]
+    await s3.close()
+
+    assert row3["t"] == "real"
+    assert row3["ts"] == row2["ts"]
+    assert count3 == count2
+    assert non_real == 0

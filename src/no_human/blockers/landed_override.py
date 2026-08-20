@@ -46,6 +46,7 @@ behind a completion.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -196,9 +197,9 @@ async def approve_landed_override(
         "asserted_with_residue"
     )
 
-    ts = _now_iso()
+    ts_iso = _now_iso()
     await store.merge_context(
-        task.id, {"landed_override_sha": sha, "approved_at": ts})
+        task.id, {"landed_override_sha": sha, "approved_at": ts_iso})
 
     sha12 = sha[:12]
     residue_text = ", ".join(residue) if residue else (
@@ -219,7 +220,10 @@ async def approve_landed_override(
         "residue": residue,
         "base": base,
         "branch": branch,
-        "ts": ts,
+        # unix float, same clock every other emitter uses for task_events.ts
+        # (a REAL column) — context["approved_at"] above stays ISO for the
+        # drawer; only this event-level clock must match the column's type.
+        "ts": time.time(),
         "text": text,
         "shape": shape,
         "equivalence": equivalence,
