@@ -1455,8 +1455,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         #              .py edit made through bash/sed/python -c is invisible to
         #              it, as is a resumed attempt that edits only JS while the
         #              shipped diff touches Python): a
-        #              "fail" OR a "waived" (no manifest) verdict fails that
-        #              attempt and sends it back. Non-Python and non-bugfix
+        #              "fail" (a manifest exists but doesn't reproduce the bug
+        #              on the unfixed code) fails that attempt and sends it
+        #              back immediately. "waived" (no manifest at all) is a
+        #              missing artefact, not failed code: it buys ONE bounded
+        #              corrective round on the SAME branch to write the
+        #              manifest (`Orchestrator._repro_corrective_round`)
+        #              before the attempt fails — only a second non-pass
+        #              verdict sends it back. Non-Python and non-bugfix
         #              changes stay report-only, so a JS/CSS bugfix is never
         #              asked for a pytest repro.
         #   required — enforces for every kind and every change.

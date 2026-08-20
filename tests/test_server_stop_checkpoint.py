@@ -397,6 +397,11 @@ def test_every_coder_sink_session_has_a_stated_stop_disposition():
         "_run_attempt": 1,
         # the zero-diff reformat nudge: same catch, same attempt_id
         "_reformat_nudge": 1,
+        # the repro-gate corrective round (PR #533): CancelRequested is
+        # re-raised out of the round, caught by _run_attempt's gate-step
+        # handler, and routed to _honor_cancel(attempt_id=) — mid-session
+        # shape, so the round's partial work is checkpointed [WIP-PARTIAL]
+        "_repro_corrective_round": 1,
         # the preflight plan, inside _run_attempt after _active_task_id is set:
         # its except swallows the raise and the coder session honours the stop
         "_maybe_preflight": 1,

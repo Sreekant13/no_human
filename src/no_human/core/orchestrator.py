@@ -225,7 +225,12 @@ def _is_non_fast_forward(exc: BaseException) -> bool:
 
 
 def repro_send_back_message(detail: str) -> str:
-    """What a coder reads AFTER the repro gate already cost it an attempt.
+    """The instruction for the ONE bounded corrective round a `waived`
+    verdict (manifest missing) buys, on the SAME branch, before the attempt
+    fails (`Orchestrator._repro_corrective_round`). A `fail` verdict (a
+    manifest exists but its tests do not fail on the unfixed code) gets no
+    such round — that is failed code, not a missing artefact — but reuses
+    this same message on its way to failing the attempt outright.
 
     Module-level so it is testable: this is the highest-stakes place the
     manifest path can drift — a wrong path here tells an already-blocked coder
@@ -869,6 +874,11 @@ def _infra_sdk_failure(result) -> str | None:
 # pr_conflict rebase round, each burning a lifetime attempt, until 9/9 killed
 # work that was already reviewed and about to land.
 _MECHANICAL_FEEDBACK_SOURCES = frozenset({"pr_conflict"})
+
+# One bounded round to write a MISSING artefact (the repro manifest) on the
+# SAME branch, when the gate WAIVED for lack of one — not a review round, so
+# it gets a small budget of its own rather than the attempt's full turn cap.
+_REPRO_CORRECTIVE_TURNS = 15
 
 
 def _classify_error(stop_reason: str | None, text: str,
@@ -4904,66 +4914,28 @@ class Orchestrator:
                 return lr_outcome
 
         # M2/W1.2: reproduction-test gate — deterministic, before any reviewer
-        # tokens. Advisory by default; for BUGFIX-classed tasks the gate is
-        # REQUIRED (Agentless evidence: repro-first repair is the quality-per-
-        # dollar core) — a bugfix without a reproduction test that failed on
-        # the unfixed code is unverifiable, so it goes back to the coder
-        # before burning reviewer tokens. Conservative by classification:
-        # only kind == "bugfix" is enforced; "off" skips everything.
-        repro_mode = self.config.get("repro_gate", {}).get("mode", "advisory")
-        if repro_mode != "off":
-            # Historically the gate only ran pytest, so it could only REQUIRE
-            # a repro when the change actually touched Python — forcing one on
-            # a JS/CSS-only bugfix made every web bugfix uncompletable
-            # (2026-07-11). SCRUM-65 taught the gate to route non-Python repos
-            # through the profile's own test_cmd, but this enforcement gate is
-            # left as-is (python-changed-only) to avoid widening what blocks a
-            # task; non-Python bugfixes still get an advisory repro verdict.
-            # Enforce for bugfix ONLY when python files changed; explicit
-            # mode=required still enforces unconditionally.
-            changed_py = any(
-                str(f).endswith(".py") for f in (self._agent_edited_files or ())
+        # tokens (`_repro_gate_step`). `waived` buys one bounded corrective
+        # round on THIS branch before it can fail the attempt; `fail` cannot.
+        try:
+            repro_outcome = await self._repro_gate_step(
+                task, repo, base=base, attempt_id=attempt_id,
+                attempt_n=attempt_n, branch=branch, tamper_before=tamper_before,
             )
-            enforced = repro_mode == "required" or (
-                task.kind == "bugfix" and repro_mode != "off" and changed_py)
-            resume_shape = self._is_resume_shape(task)
-            base_ref = await self._repro_base_ref(
-                repo.path, base, resume_shape=resume_shape)
-            prof = getattr(self, "_active_profile", None)
-            try:
-                repro = await asyncio.to_thread(
-                    run_repro_gate, repo.path, base_ref, prof,
-                    resume_shape=resume_shape)
-                self.emit(
-                    "repro_gate",
-                    f"{repro.verdict}"
-                    + (f" ({len(repro.tests)} test(s))" if repro.tests else "")
-                    + (f" — {repro.reasons[0][:200]}" if repro.reasons else "")
-                    + (" [required]" if enforced else " [advisory]")
-                    + (" [resume-shape]" if resume_shape else ""),
-                    verdict=repro.verdict,
-                    resume_shape=resume_shape,
-                )
-            except Exception as exc:  # noqa: BLE001 — a crashed gate is not a verdict
-                self._advisory(f"repro gate crashed: {exc}")
-                repro = None
-            if enforced and repro is not None and repro.verdict in ("fail", "waived"):
-                # A waived bugfix (no manifest) is as unverifiable as a failed
-                # one — "no repro test at all" is the zero-tests-reports-PASSED
-                # class the gate exists to kill.
-                detail = (f"repro gate {repro.verdict}: "
-                          + ("; ".join(repro.reasons[:3]) if repro.reasons
-                             else "no reproduction evidence"))
-                await self.store.append_context_list(
-                    task.id, "send_back_feedback", {
-                        "at": datetime.now(timezone.utc).isoformat(),
-                        "message": repro_send_back_message(detail),
-                        "author": "repro_gate", "source": "repro_gate",
-                    })
-                task.context = await self.store.merge_context(task.id, {})
-                await self.store.update_attempt(
-                    attempt_id, status="failed", failure_reason=detail)
-                return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+        except CancelRequested as exc:
+            # `attempt_id` MUST ride along: `_honor_cancel` routes a SERVER
+            # stop to `_honor_server_stop`, which tells "mid-session" (set:
+            # commit [WIP-PARTIAL], stamp resume_from, close the row
+            # interrupted/infra) from "cheap boundary" (None: stamp nothing)
+            # by exactly this argument. Omitting it here would make a stop
+            # during the corrective round discard the round's work and
+            # re-implement from base — the waste this path exists to avoid.
+            return await self._honor_cancel(
+                task, repo, branch, str(exc), attempt_id=attempt_id)
+        except (BudgetAbort, StuckAbort) as exc:
+            return await self._abort_during_repro_corrective(
+                task, repo, attempt_id, exc, branch=branch)
+        if repro_outcome is not None:
+            return repro_outcome
 
         # 🔴 0a / PR-021 — OPEN THE DRAFT PR BEFORE THE GATE RUNS.
         #
@@ -6486,6 +6458,295 @@ class Orchestrator:
             output_tokens=out_total,
             cache_read_tokens=_billed("cache_read_tokens"),
             cache_creation_tokens=_billed("cache_creation_tokens"),
+            **self._pop_aux_usage(),
+        )
+        self.emit("agent_error", detail,
+                  error_class="budget" if is_budget else "stuck")
+        if is_budget:
+            budget_blocker = await self._check_lifetime_budget(task)
+            if budget_blocker is not None:
+                return await self._raise_blocker(
+                    task, budget_blocker, repo=repo, branch=branch)
+        return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+    async def _repro_gate_step(
+        self, task: Task, repo: GitRepo, *, base: str | None, attempt_id: str,
+        attempt_n: int, branch: str | None, tamper_before: str,
+    ) -> "TaskOutcome | None":
+        """The M2/W1.2 reproduction-test gate — deterministic, before any
+        reviewer tokens. Advisory by default; REQUIRED for BUGFIX-classed
+        tasks that touched Python (Agentless evidence: repro-first repair is
+        the quality-per-dollar core) — a bugfix without a reproduction test
+        that failed on the unfixed code is unverifiable, so it goes back to
+        the coder before burning reviewer tokens.
+
+        The two failing verdicts are NOT the same kind of failure, and no
+        longer get the same response:
+
+        * ``fail`` — a manifest exists but its named test(s) do not fail on
+          the unfixed code. That is FAILED CODE (the coder's own claimed
+          evidence does not hold up) and fails the attempt immediately, with
+          no corrective round — exactly as before this method existed.
+        * ``waived`` — no manifest at all. That is a MISSING ARTEFACT, not
+          failed code: the diff already committed may be a correct,
+          tamper-clean fix, short only the required evidence for it. It
+          therefore buys ONE bounded corrective round on THIS SAME
+          branch/worktree (`_repro_corrective_round`) — instructed with
+          `repro_send_back_message` — before the attempt can fail. The gate
+          is then re-run; only a SECOND non-pass verdict fails the attempt,
+          reported with that second run's own detail (not the first run's),
+          so the failure reason describes what actually happened last.
+          Keyed on `attempt_id` (`_repro_corrected`) so a re-entered attempt
+          cannot buy a second round.
+
+        Returns None to let the pipeline continue to the draft PR / reviewer,
+        or the `TaskOutcome` that ends the attempt.
+        """
+        repro_mode = self.config.get("repro_gate", {}).get("mode", "advisory")
+        if repro_mode == "off":
+            return None
+        # Historically the gate only ran pytest, so it could only REQUIRE a
+        # repro when the change actually touched Python — forcing one on a
+        # JS/CSS-only bugfix made every web bugfix uncompletable
+        # (2026-07-11). SCRUM-65 taught the gate to route non-Python repos
+        # through the profile's own test_cmd, but this enforcement gate is
+        # left as-is (python-changed-only) to avoid widening what blocks a
+        # task; non-Python bugfixes still get an advisory repro verdict.
+        changed_py = any(
+            str(f).endswith(".py") for f in (self._agent_edited_files or ())
+        )
+        enforced = repro_mode == "required" or (
+            task.kind == "bugfix" and changed_py)
+        resume_shape = self._is_resume_shape(task)
+        base_ref = await self._repro_base_ref(
+            repo.path, base, resume_shape=resume_shape)
+        prof = getattr(self, "_active_profile", None)
+
+        async def _run_gate():
+            try:
+                repro = await asyncio.to_thread(
+                    run_repro_gate, repo.path, base_ref, prof,
+                    resume_shape=resume_shape)
+            except Exception as exc:  # noqa: BLE001 — a crashed gate is not a verdict
+                self._advisory(f"repro gate crashed: {exc}")
+                return None
+            self.emit(
+                "repro_gate",
+                f"{repro.verdict}"
+                + (f" ({len(repro.tests)} test(s))" if repro.tests else "")
+                + (f" — {repro.reasons[0][:200]}" if repro.reasons else "")
+                + (" [required]" if enforced else " [advisory]")
+                + (" [resume-shape]" if resume_shape else ""),
+                verdict=repro.verdict,
+                resume_shape=resume_shape,
+            )
+            return repro
+
+        async def _fail(bad_repro) -> TaskOutcome:
+            # A waived bugfix (no manifest) is as unverifiable as a failed
+            # one — "no repro test at all" is the zero-tests-reports-PASSED
+            # class the gate exists to kill.
+            fail_detail = (f"repro gate {bad_repro.verdict}: "
+                      + ("; ".join(bad_repro.reasons[:3]) if bad_repro.reasons
+                         else "no reproduction evidence"))
+            await self.store.append_context_list(
+                task.id, "send_back_feedback", {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "message": repro_send_back_message(fail_detail),
+                    "author": "repro_gate", "source": "repro_gate",
+                })
+            task.context = await self.store.merge_context(task.id, {})
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=fail_detail)
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=fail_detail)
+
+        repro = await _run_gate()
+        if not enforced or repro is None or repro.verdict not in ("fail", "waived"):
+            return None
+        if repro.verdict == "fail":
+            return await _fail(repro)
+
+        # verdict == "waived": one bounded corrective round, once per attempt.
+        corrected = self.__dict__.setdefault("_repro_corrected", set())
+        if attempt_id in corrected:
+            return await _fail(repro)
+        corrected.add(attempt_id)
+        round_detail = (f"repro gate {repro.verdict}: "
+                  + ("; ".join(repro.reasons[:3]) if repro.reasons
+                     else "no reproduction evidence"))
+        round_outcome = await self._repro_corrective_round(
+            task, repo, round_detail, attempt_id=attempt_id, branch=branch,
+            attempt_n=attempt_n, tamper_before=tamper_before,
+        )
+        if round_outcome is not None:
+            return round_outcome
+        repro2 = await _run_gate()
+        if repro2 is None or repro2.verdict not in ("fail", "waived"):
+            return None
+        return await _fail(repro2)
+
+    async def _repro_corrective_round(
+        self, task: Task, repo: GitRepo, detail: str, *, attempt_id: str,
+        branch: str | None, attempt_n: int, tamper_before: str,
+    ) -> "TaskOutcome | None":
+        """ONE bounded coder round to write the MISSING repro manifest, on
+        the SAME branch/worktree the attempt already committed to — not a
+        fresh attempt, because the diff under review may already be a
+        correct, tamper-clean fix; only the required evidence for it is
+        missing. `repro_send_back_message(detail)` is the instruction,
+        `_REPRO_CORRECTIVE_TURNS` (15) the turn budget — small on purpose:
+        this is "write one JSON manifest and the test(s) it names", not a
+        second implementation pass.
+
+        Returns None to let the caller re-run the gate, or the `TaskOutcome`
+        that ends the attempt (a commit refusal, or a tamper fire on the
+        round's own commit).
+
+        🔴 `CancelRequested`/`BudgetAbort`/`StuckAbort` are RE-RAISED, never
+        swallowed — matching `_reformat_nudge`'s own sibling pattern, for
+        exactly the reason stated there: each carries a reason, a routing
+        decision and a spend the ledger has not seen yet. A pause must still
+        park, a lifetime-budget cross must still reach BUDGET_EXHAUSTED, and
+        a stuck attempt must still retry with fresh context — swallowing any
+        of the three into an ordinary "gate did not pass" would silently lose
+        all three (review-verified on an earlier version of this exact
+        method: it swallowed them into a FAILED `repro gate waived` attempt).
+        The caller (`_repro_gate_step`'s call site in `_run_attempt`) catches
+        these around the call and persists/routes them exactly as the coder
+        turn's own handlers do, via `_abort_during_repro_corrective`.
+
+        Unlike the nudge, this round is EXPECTED to write real files (the
+        manifest, and possibly the test(s) it names, or even a code fix), so
+        there is no worktree snapshot/revert here — only the usage delta is
+        stashed on abort, for the caller to bill.
+        """
+        self.emit(
+            "repro_corrective_round",
+            "repro gate waived — one bounded round to write "
+            f"{REPRO_MANIFEST} before failing the attempt",
+        )
+        usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
+        bounds = self.config.get("bounds") or {}
+        timeout_s = min(float(bounds.get("attempt_timeout_s") or 3600), 900.0)
+
+        def _delta() -> dict[str, int]:
+            now = getattr(self, "_attempt_usage", None) or {}
+            return {
+                k: max(int(now.get(k) or 0) - int(usage_baseline.get(k) or 0), 0)
+                for k in ("tokens_used", "cache_read_tokens",
+                          "cache_creation_tokens", "output_tokens")
+            }
+
+        try:
+            result = await asyncio.wait_for(
+                self.backend.run(
+                    repro_send_back_message(detail), cwd=repo.path,
+                    max_turns=_REPRO_CORRECTIVE_TURNS, effort="high",
+                    on_event=self._agent_sink,
+                ),
+                timeout=timeout_s,
+            )
+        except (CancelRequested, BudgetAbort, StuckAbort):
+            # Single-use, popped by `_abort_during_repro_corrective`.
+            self._repro_partial_usage = _delta()
+            raise
+        except Exception as exc:  # noqa: BLE001 — best-effort corrective round
+            self._advisory(f"repro corrective round skipped: {exc}")
+            partial = _delta()
+            if any(partial.values()):
+                await self.store.add_attempt_usage(attempt_id, **partial)
+            return None
+
+        await self.store.add_attempt_usage(
+            attempt_id,
+            turns_used=getattr(result, "num_turns", None),
+            tokens_used=getattr(result, "tokens_used", None),
+            output_tokens=getattr(result, "output_tokens", None),
+            cache_read_tokens=getattr(result, "cache_read_tokens", None),
+            cache_creation_tokens=getattr(result, "cache_creation_tokens", None),
+        )
+
+        # A billing/auth wall or a dead SDK session INSIDE the corrective
+        # round is infra, not the coder's failure — classified with the SAME
+        # two predicates the coder turn uses (`_quota_signal`, prose; and
+        # `_infra_sdk_failure`, the prose-less shapes) and routed into the
+        # SAME park (`QuotaExhausted` -> `_park_quota`). Without this the
+        # round leaves the tree unchanged, the second gate run reads
+        # `waived` again, and the attempt fails "repro gate waived" with
+        # `infra_failure` NULL — a lifetime attempt consumed by a wall.
+        if getattr(result, "is_error", False):
+            text = getattr(result, "final_text", "") or ""
+            wall = _quota_reason(text) if _quota_signal(text) else None
+            infra = None if wall else _infra_sdk_failure(result)
+            if wall or infra:
+                reason = wall or infra
+                await self.store.update_attempt(
+                    attempt_id, status="failed",
+                    failure_reason=f"{'quota' if wall else 'infra'}: {reason}",
+                    infra_failure=1)
+                self.emit("agent_error", f"repro corrective round: {reason}",
+                          error_class="infra")
+                raise QuotaExhausted(reason)
+
+        if not repo.has_changes():
+            return None
+
+        commit_msg = self._commit_message(task)
+        edited = getattr(self, "_agent_edited_files", None)
+        try:
+            commit = await asyncio.to_thread(
+                commit_with_manifest_repair, repo,
+                list(edited) if edited else None, commit_msg,
+            )
+        except GitError as exc:
+            self._advisory(f"repro corrective round: commit failed: {exc}")
+            return None
+        await self.store.update_attempt(attempt_id, commit_sha=commit.sha)
+        self.emit("commit", f"repro corrective round: {commit.sha[:8]}",
+                  sha=commit.sha)
+
+        tamper = runner.tamper_check_between(repo.path, before_ref=tamper_before)
+        self.emit("tamper", f"[repro corrective round] {tamper.summary}",
+                  tampered=tamper.tampered)
+        return await self._handle_tamper_fire(
+            task, tamper, repo=repo, branch=branch, attempt_id=attempt_id,
+            attempt_n=attempt_n, diff_repo=repo.path, before_ref=tamper_before,
+            where="repro corrective round",
+        )
+
+    async def _abort_during_repro_corrective(
+        self, task: Task, repo: GitRepo, attempt_id: str,
+        exc: "BudgetAbort | StuckAbort", *, branch: str | None,
+    ) -> TaskOutcome:
+        """A budget or stuck abort raised out of the repro-gate corrective
+        round. Same obligations as `_abort_during_nudge`, in the same order,
+        adapted for a round that — unlike the nudge — bills additively
+        (`Store.add_attempt_usage`) rather than by re-summing an `AgentResult`
+        already on the row:
+
+        1. **Persist the TRUE spend before anything else.** The partial-usage
+           delta `_repro_corrective_round` stashed before re-raising — the
+           four keys it measured, `output_tokens` included — is added to the
+           attempt's existing usage columns. The coder turn's own numbers are
+           already on the row from earlier in this same attempt, so this is
+           additive, not a replacement.
+        2. **Route a budget cross on the LIFETIME ledger, not on this
+           attempt.** `_check_lifetime_budget` is consulted AFTER the usage
+           write above, so its decision sees this round's spend.
+        3. **Never checkpoint.** Unlike the coder turn's own abort handlers,
+           this leaves any uncommitted work exactly where the abort found it:
+           the corrective round runs on the SAME branch/worktree the attempt
+           already committed to, and that worktree is discarded (not reused)
+           once the attempt is marked failed — same as every other
+           mid-attempt abort that does not itself commit.
+        """
+        is_budget = isinstance(exc, BudgetAbort)
+        detail = f"{'budget' if is_budget else 'stuck'}-abort: {exc}"
+        partial = self.__dict__.pop("_repro_partial_usage", None) or {}
+        if any(partial.values()):
+            await self.store.add_attempt_usage(attempt_id, **partial)
+        await self.store.update_attempt(
+            attempt_id, status="failed", failure_reason=detail,
             **self._pop_aux_usage(),
         )
         self.emit("agent_error", detail,

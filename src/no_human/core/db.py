@@ -1768,6 +1768,41 @@ class Store:
         )
         await self.db.commit()
 
+    @serialized_write
+    async def add_attempt_usage(self, attempt_id: str, **fields: int | None) -> None:
+        """ADD to the five usage columns on one attempt row, instead of
+        `update_attempt`'s SET.
+
+        Exists for a round that bills onto a row a PRIOR write already
+        populated (the repro-gate corrective round: the coder turn's
+        authoritative numbers are on the row before the gate ever runs, and
+        this round's numbers are a second, later measurement of the SAME
+        attempt, not a replacement for the first). Whitelisted to the usage
+        columns only — this is not a general-purpose additive `update_attempt`.
+
+        `None` values are ignored, not coerced to 0: an unreported
+        `output_tokens` stays NULL (the "the split was never captured for this
+        write" state `update_attempt`'s own docs describe), rather than a 0
+        that would read as "this round captured a split of exactly zero".
+
+        Deliberately NOT idempotent — a retried call double-bills. Callers
+        invoke this exactly once per corrective round.
+        """
+        allowed = ("turns_used", "tokens_used", "output_tokens",
+                   "cache_read_tokens", "cache_creation_tokens")
+        clean = {k: v for k, v in fields.items()
+                 if k in allowed and v is not None}
+        if not clean:
+            return
+        assignments = ", ".join(
+            f"{k} = COALESCE({k}, 0) + :{k}" for k in clean
+        )
+        clean["id"] = attempt_id
+        await self.db.execute(
+            f"UPDATE attempts SET {assignments} WHERE id = :id", clean
+        )
+        await self.db.commit()
+
     async def list_attempts(self, task_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
             "SELECT * FROM attempts WHERE task_id = ? ORDER BY attempt_number",
