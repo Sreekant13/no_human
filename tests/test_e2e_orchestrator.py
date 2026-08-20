@@ -14,6 +14,7 @@ import pytest
 from types import SimpleNamespace as _SimpleNamespace
 
 from no_human.agent.claude_backend import AgentEvent, AgentResult
+from no_human.cli.commands import _review_pass_evidence
 from no_human.config import load_config
 from no_human.core.db import Store
 from no_human.core.orchestrator import (
@@ -21,7 +22,7 @@ from no_human.core.orchestrator import (
 )
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
-from no_human.vcs import PrResult
+from no_human.vcs import GitRepo, PrResult
 from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
 from no_human.review.selfcheck import ChecklistItem
 from no_human.testing.repro_gate import MANIFEST as REPRO_MANIFEST
@@ -3879,6 +3880,185 @@ async def test_already_satisfied_reviewer_crash_fails_the_attempt(
     assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
     attempts = await store.list_attempts(t.id)
     assert any("crashed" in (a.get("failure_reason") or "") for a in attempts)
+
+
+# --------------------------------------------------------------------------- #
+# f27f3b73: a review-only recovery round must stamp the sha it reviewed        #
+# --------------------------------------------------------------------------- #
+
+def _commit_real_work(work_dir):
+    """Simulate attempt 1: real, reviewable work already on the branch."""
+    (work_dir / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\n"
+        "def mul(a, b):\n    return a * b\n"
+    )
+    (work_dir / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n"
+    )
+
+
+_ALREADY_SATISFIED_CLAIM = (
+    "Verified every criterion against the existing code.\n"
+    "ALREADY-SATISFIED\n"
+    "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:4\n"
+)
+
+
+async def test_review_only_recovery_round_stamps_the_reviewed_sha(
+    bare_repo, tmp_path, store
+):
+    """f27f3b73: attempt 1 commits real work and its reviewer session dies
+    twice, unreviewed (TRANSIENT_INFRA park). On wake, a review-only recovery
+    round (`_gate_already_satisfied`'s PASS path — reached via a "wake"-type
+    resume, which `_already_satisfied_eligible` does not restrict the way it
+    restricts `orphan_recovery`) re-reviews the already-committed diff and
+    PASSES. That PASS must stamp the sha it reviewed into `review_history` —
+    the only place `nh approve`'s merge precondition (`_review_pass_evidence`
+    / `Orchestrator._rounds_for_head`) looks — or the task strands at an
+    unmergeable awaiting_approval, exactly as it did live."""
+    branch = "no-human/task-f27f3b73"
+    _git(bare_repo, "checkout", "-b", branch)
+    _commit_real_work(bare_repo)
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "add mul()")
+    _git(bare_repo, "push", "-u", "origin", branch)
+
+    repo = GitRepo(bare_repo)
+    reviewed_sha = repo.head_sha()
+
+    cfg = _config(tmp_path)
+    passing = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) returns product", True,
+                      "calc.py:4 defines mul returning a*b")])
+    reviewer = FakeReviewer(passing)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # The provenance a timed wake-resume writes — not a human, not an
+    # orphan-recovery mid-phase restart. This is the exact resume shape
+    # `_already_satisfied_eligible` does NOT restrict (only `orphan_recovery`
+    # is gated), which is how the live incident reached this code path.
+    t.context = {"eval_result": {"verdict": "accept"},
+                "resume_from": {"by": "wake"}}
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 2)
+
+    outcome = await orch._gate_already_satisfied(
+        t, repo, attempt_id, _ALREADY_SATISFIED_CLAIM, branch=branch,
+        attempt_n=2,
+    )
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    refreshed = await store.find_task(t.id)
+    history = (refreshed.context or {}).get("review_history") or []
+    assert history, "the PASS recorded nothing in review_history"
+    assert history[-1]["sha"] == reviewed_sha
+    assert history[-1]["passed"] is True
+
+    # The merge precondition itself — unchanged, and now satisfied.
+    head_sha = repo.head_sha()
+    passed, evidence = _review_pass_evidence(refreshed.context or {}, head_sha, repo)
+    assert passed, evidence
+
+
+async def test_review_only_recovery_stamp_does_not_cover_a_later_rewrite(
+    bare_repo, tmp_path, store
+):
+    """Control: after the review-only round stamps sha X, the branch is
+    REWRITTEN (amended, not merely advanced) so X is no longer an ancestor of
+    the new head. The merge precondition must still refuse — the stamp covers
+    the exact commit reviewed, not whatever the branch points to later."""
+    branch = "no-human/task-f27f3b73-moved"
+    _git(bare_repo, "checkout", "-b", branch)
+    _commit_real_work(bare_repo)
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "add mul()")
+
+    repo = GitRepo(bare_repo)
+
+    cfg = _config(tmp_path)
+    passing = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) returns product", True,
+                      "calc.py:4 defines mul returning a*b")])
+    reviewer = FakeReviewer(passing)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"},
+                "resume_from": {"by": "wake"}}
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 2)
+
+    await orch._gate_already_satisfied(
+        t, repo, attempt_id, _ALREADY_SATISFIED_CLAIM, branch=branch,
+        attempt_n=2,
+    )
+
+    # The branch is REWRITTEN, not advanced: the reviewed commit is no
+    # longer reachable from the new head at all.
+    _git(bare_repo, "commit", "--amend", "-m", "add mul() (reworded)")
+    new_head = repo.head_sha()
+
+    refreshed = await store.find_task(t.id)
+    passed, evidence = _review_pass_evidence(refreshed.context or {}, new_head, repo)
+    assert not passed, evidence
+    assert "no review round is stamped" in evidence
+
+
+async def test_review_only_recovery_round_fails_closed_on_unresolvable_head(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """If the review-only round cannot resolve the head it just judged, it
+    must NOT stamp anything — an unstamped PASS stays unmergeable rather than
+    lying about what it reviewed. Pins the fail-closed branch explicitly."""
+    branch = "no-human/task-f27f3b73-unresolvable"
+    _git(bare_repo, "checkout", "-b", branch)
+    _commit_real_work(bare_repo)
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "add mul()")
+
+    repo = GitRepo(bare_repo)
+    monkeypatch.setattr(
+        GitRepo, "head_sha",
+        lambda self: (_ for _ in ()).throw(RuntimeError("git rev-parse failed")),
+    )
+
+    cfg = _config(tmp_path)
+    passing = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) returns product", True,
+                      "calc.py:4 defines mul returning a*b")])
+    reviewer = FakeReviewer(passing)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"},
+                "resume_from": {"by": "wake"}}
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 2)
+
+    outcome = await orch._gate_already_satisfied(
+        t, repo, attempt_id, _ALREADY_SATISFIED_CLAIM, branch=branch,
+        attempt_n=2,
+    )
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    refreshed = await store.find_task(t.id)
+    history = (refreshed.context or {}).get("review_history") or []
+    assert history, "the round itself must still be recorded"
+    assert history[-1]["sha"] == "", (
+        "an unresolvable head must degrade to an empty stamp, never a "
+        "fabricated one"
+    )
+    monkeypatch.undo()
+    real_head = repo.head_sha()
+    passed, evidence = _review_pass_evidence(refreshed.context or {}, real_head, repo)
+    assert not passed, evidence
+    assert "no review round is stamped" in evidence
 
 
 # --------------------------------------------------------------------------- #

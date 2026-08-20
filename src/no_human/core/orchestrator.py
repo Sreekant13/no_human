@@ -6598,6 +6598,20 @@ class Orchestrator:
                 review_round=len(
                     (task.context or {}).get("review_history") or []) + 1)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+        # A PASS here is a review-only round (no new commit): the branch head
+        # this round actually judged, resolved at review start, exactly as
+        # `_run_review` stamps it (C4, :8571-8578). Without this, `nh approve`'s
+        # `_review_pass_evidence` finds zero rounds for the head — the diff
+        # reviewed here (already committed by an earlier attempt) was never
+        # stamped anywhere `_rounds_for_head` can find — and refuses to merge
+        # forever (f27f3b73). Fail closed: an unresolvable head stamps an empty
+        # sha, which `_rounds_for_head` already skips, so the round stays
+        # unmatched rather than lying about what it reviewed.
+        try:
+            reviewed_sha = repo.head_sha()
+        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
+            reviewed_sha = ""
+        await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         await self.store.update_attempt(
             attempt_id, review_checklist=decision.as_dict(), review_passed=1,
             status="succeeded",
