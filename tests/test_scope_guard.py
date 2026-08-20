@@ -190,6 +190,20 @@ def test_scratch_redirect_silent_inside_the_scratch_dir():
     assert scratch_redirect(f"/repo/{SCRATCH_DIR}/notes.md", "/repo") is None
 
 
+def test_scratch_redirect_silent_on_the_repro_manifest():
+    """The implement prompt tells the coder to write the repro manifest at
+    exactly this agent-owned path and the REQUIRED repro gate reads it from the
+    working tree — so the nudge must not tell the coder to move it. Task
+    89db42ea lost a 99-turn attempt to the contradiction."""
+    from no_human.agent import scope_guard
+    from no_human.testing.repro_gate import MANIFEST
+    assert MANIFEST in scope_guard.HARNESS_READ_FILES, "constants drifted apart"
+    assert scope_guard.scratch_redirect(MANIFEST) is None
+    assert scope_guard.scratch_redirect(f"/repo/{MANIFEST}", "/repo") is None
+    # and a sibling file in the same dir still gets the nudge
+    assert scope_guard.scratch_redirect(".no_human/notes.md") is not None
+
+
 def test_scratch_redirect_ignores_ordinary_paths():
     assert scratch_redirect("src/foo.py") is None
 
@@ -273,3 +287,28 @@ async def test_scope_guard_hook_no_plan():
         "id1", None,
     )
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_scope_guard_hook_hands_back_the_manifest_schema_on_a_bad_write(tmp_path):
+    """On a write to the repro manifest the hook runs the gate's own reader and
+    returns the schema problem immediately — not the scratch nudge (wrong
+    advice) and not silence (task 89db42ea learned of its wrong-shaped
+    manifest only from the gate, two minutes and one attempt later)."""
+    from no_human.testing.repro_gate import MANIFEST
+    (tmp_path / ".no_human").mkdir()
+    m = tmp_path / MANIFEST
+    plan = "## FILES TO CHANGE/CREATE\n- src/foo.py\n"
+    events = []
+    hook = ScopeGuardHook(plan, str(tmp_path), on_event=lambda k, t: events.append((k, t)))
+    call = {"tool_name": "Write", "tool_input": {"file_path": str(m)}}
+
+    m.write_text('{"repro_tests": ["tests/t.py::t"]}')
+    bad = await hook.hook(call, "id1", None)
+    ctx = bad["hookSpecificOutput"]["additionalContext"]
+    assert ctx.startswith("[REPRO]") and '"tests"' in ctx and SCRATCH_DIR not in ctx
+
+    m.write_text('{"tests": ["tests/t.py::t"]}')
+    good = await hook.hook(call, "id2", None)
+    assert good == {}
+    assert [k for k, _ in events] == ["repro_manifest_hint"]

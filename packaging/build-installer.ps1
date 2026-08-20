@@ -198,7 +198,10 @@ if ($LASTEXITCODE -ne 0 -or $boardSha -notmatch '^[0-9a-f]{64}$') {
   Fail "the board digest came out as '$boardSha', which is not a sha256. Refusing to write an unusable stamp."
 }
 $stampPath = Join-Path $Bundle 'BUILD_STAMP'
-@("commit=$commit", "dirty=$dirty", "board_sha256=$boardSha") | Set-Content -Encoding ascii $stampPath
+# LF, not Set-Content's CRLF: verify_artefact.py tolerates CRLF (splitlines +
+# strip), but the .sh twin writes LF and two stamps that differ in bytes for
+# the same fields are a diff nobody should have to explain twice.
+[IO.File]::WriteAllText($stampPath, "commit=$commit`ndirty=$dirty`nboard_sha256=$boardSha`n", [Text.Encoding]::ASCII)
 Write-Host "==> build stamp: commit=$commit dirty=$dirty board_sha256=$boardSha"
 
 # 4/5. Modules that must never ship. Searching the bundle for the NAME cannot do

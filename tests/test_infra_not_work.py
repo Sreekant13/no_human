@@ -443,3 +443,35 @@ def test_breaker_trips_on_three_distinct_tasks_and_not_on_one():
     healed.record_infra_failure("t3")
     assert healed.tripped() is None, (
         "record_healthy() must reset the consecutive streak")
+
+
+# --------------------------------------------------------------------------- #
+# A pending stop is honoured before _drive's route split                       #
+# --------------------------------------------------------------------------- #
+
+
+async def test_drive_honours_a_pending_stop_before_the_human_gated_route(
+        store, bare_repo, tmp_path, monkeypatch):
+    """A machine re-entry keeps a human's stale stop so the loop parks on turn
+    zero — but the human-gated-CI resume route went straight to `_finalize`
+    and OPENED THE PR, and the plan-correction route burned a planner round,
+    before any check. `_drive` now checks first."""
+    from no_human.core.orchestrator import Orchestrator
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.context = {**(task.context or {}),
+                    "human_gated_ci": {"branch": "main", "pr_url": "x"}}
+    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+    await store.request_cancel(task.id, "Paused from board")
+
+    async def _must_not_run(*a, **k):
+        raise AssertionError("the human-gated route ran despite a pending stop")
+    monkeypatch.setattr(Orchestrator, "_resume_human_gated", _must_not_run)
+
+    outcome = await orch._drive(task, repo)
+
+    assert outcome.status == TaskStatus.BLOCKED
+    fresh = await store.get_task(task.id)
+    assert fresh.blocker["category"] == "USER_PAUSED"
+    assert await store.get_cancel_request(task.id) is None, "honoured stops are cleared"

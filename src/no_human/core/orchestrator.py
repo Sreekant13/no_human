@@ -2534,6 +2534,20 @@ class Orchestrator:
         # straight to the PR — the gate is cleared and the change was already
         # verified before parking. Re-running the agent would only find nothing
         # to change and fail the attempt.
+        #
+        # But FIRST: a pending stop is honoured here, before the route split —
+        # not only at the top of the attempt loop. A machine re-entry (a wake
+        # timer, an orphan requeue) deliberately keeps a human's stale stop so
+        # the loop parks on turn zero instead of discarding the instruction;
+        # two of the three routes below never reached that check: this
+        # human-gated-CI resume went straight to `_finalize` and OPENED THE PR,
+        # and the plan-correction route burned a full planner round first.
+        # Found by the independent review of the re-entry registry's
+        # pending-stop invariant (2026-08-20).
+        pending = await self._pending_cancel(task)
+        if pending:
+            return await self._honor_cancel(task, repo, None, pending)
+
         hg = (task.context or {}).get("human_gated_ci")
         if hg and task.status != TaskStatus.PENDING:
             return await self._resume_human_gated(task, repo, hg)
@@ -12377,7 +12391,8 @@ class Orchestrator:
             f"For drafts, notes, and throwaway files, use `{SCRATCH_DIR}/`. It is "
             f"excluded from every git diff, so nothing there reaches the PR — and "
             f"nothing there counts against you. Never draft anywhere else under "
-            f"`.no_human/`.\n\n"
+            f"`.no_human/` — the one file the harness asks you to write there is "
+            f"`{REPRO_MANIFEST}`, and it reads that file from the working tree.\n\n"
             f"{profile_block}"
             f"{repo_hints_block}"
             f"{rules}\n"

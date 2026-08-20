@@ -106,6 +106,9 @@ llm:
   review_timeout_seconds: 1500    # wall-clock per review session; a round that
                                   # dies on this wall escalates UNREVIEWED
   code_review_timeout_seconds: 1800  # same, for `nh review` on a whole PR diff
+  local_model: null               # worker.backend: local — model id the local server serves
+  local_base_url: null            # e.g. http://localhost:8000 — required in local mode
+  local_cli_path: null            # null ⇒ the SDK-bundled CLI
 
 database:
   path: ~/.no_human/no_human.db   # SQLite (WAL). No Postgres/Redis.
@@ -194,6 +197,15 @@ git:
   approve_identity:               # who a human merge is attributed to
     name: ""                      # empty -> resolved from this repo's git
     email: ""                     # config (user.name/user.email)
+
+`approve_merge.enabled` (default **true**) is what makes `nh approve` LAND the
+pull request: squash the branch into one commit, push it to the default branch,
+and close the PR. Set it to `false` and `nh approve` still records your
+approval and still marks the task approved — it just does not merge, leaving
+the PR for you to merge in your git host. The same record-only path is taken
+when there is no PR or no `gh` on PATH; none of those is a failure.
+`approve_merge.test_timeout_seconds` (default **1800**) bounds the test run
+that gates that landing.
 
 `git.approve_identity.name`/`.email` is the identity the ONE commit `nh
 approve` lands when it squash-merges a PR is attributed to — the human merge
@@ -347,6 +359,21 @@ exception, for friends/commercial installs that pay Anthropic directly with
    still scrubbed from the process, so a run bills exactly one path.
 4. No OAuth token is exported into the process env in this mode.
 5. The run is attributed to the `api_key` profile for cost/audit tracking.
+
+### `llm.local_model` / `llm.local_base_url` / `llm.local_cli_path`
+
+Only read when `worker.backend: local`. `local_base_url` is **required** in
+that mode — an ambient `ANTHROPIC_BASE_URL` is scrubbed and never trusted as a
+fallback. It must be `http` or `https`, and the host must be `localhost` or a
+**literal** loopback/RFC1918 IP address: a DNS name is refused (it is
+re-resolved at connect time, which is a rebinding surface) and a
+public/routable IP is refused (local mode must not leave the machine). Port
+numbers and paths are not validated — `http://localhost:8000` and
+`http://127.0.0.1:1234/v1` are both fine. The URL must not embed userinfo
+(`http://user:pass@host`) or a key-looking query parameter — the mode lives in
+config, the key never does. If the local server enforces a key, it goes in
+`~/.no_human/.env` as `LOCAL_LLM_API_KEY`, never in `config.yaml`.
+`local_cli_path` is optional; `null` uses the SDK-bundled CLI.
 
 ## `learning:` — memory lifecycle
 

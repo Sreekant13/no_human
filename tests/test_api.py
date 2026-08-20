@@ -3018,3 +3018,21 @@ async def test_board_reply_send_back_and_cancel_withdraw_a_pending_pause(client,
     r = await client.post(f"/api/tasks/{t3.id}/cancel")
     assert r.status_code == 200, r.text
     assert await store.get_cancel_request(t3.id) is None
+
+
+@pytest.mark.asyncio
+async def test_send_back_withdraws_the_durable_human_stop_too(client, store):
+    """Board Pause stamps `blocker.human_stopped`; Send back is a human
+    re-entry and must drop that stamp along with the cancel flag, or the
+    fresh run reads 'stopped by you' on the card and the wake sweep skips it."""
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    t.blocker = {"category": "USER_PAUSED", "question": "Paused from board",
+                 "human_stopped": True}
+    await store.update_task_columns(t)
+    await store.request_cancel(t.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "redo"})
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.IMPLEMENTING
+    assert fresh.blocker is None
+    assert await store.get_cancel_request(t.id) is None

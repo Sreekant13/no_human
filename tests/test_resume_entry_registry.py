@@ -248,3 +248,157 @@ def test_the_registry_has_no_entries_for_paths_that_no_longer_exist():
     assert not stale, (
         "REGISTRY lists paths that no longer re-enter the loop; remove them:\n  "
         + "\n  ".join(f"{f}::{fn}" for f, fn in stale))
+
+
+# --------------------------------------------------------------------------- #
+# The pending-stop twin of the invariant above.                                #
+#                                                                              #
+# `cancel_requested` is the one signal a running orchestrator observes         #
+# (`_pending_cancel` at the top of `_drive` and of the attempt loop, the coder #
+# sink). A stop the worker never got to honour — killed, crashed, or the pause #
+# landed during review — survives in the column. Whether the NEXT re-entry     #
+# honours it or withdraws it is a decision, and like `resume_from` it has to   #
+# be stated per site, not assumed: a human acting again (answer, retry,        #
+# resume, unblock, reject, send back) supersedes their own earlier stop, so    #
+# those withdraw it; a machine re-entry (a wake timer, an orphan requeue)      #
+# executes no new human decision, so it KEEPS the stop and `_drive` parks on   #
+# turn zero — the user's last instruction, honoured late rather than           #
+# discarded. Board Pause → Cancel → Retry once re-parked the fresh run on       #
+# exactly this (PR #504); `unblock` and `reject` were the two human paths      #
+# still missing the withdrawal.                                                #
+#                                                                              #
+# The check is PLACEMENT, not presence: the clear must sit in the SAME         #
+# statement block as the claimable `set_status`, BEFORE it. A clear on a       #
+# sibling branch (`unblock --fail` parks a possibly-LIVE task, where the flag  #
+# is the pause its worker is about to honour) or after the transition is the  #
+# defect, and a presence test passed it green. Calls inside a nested def are   #
+# attributed to the enclosing registered function, so a KEEPS site cannot      #
+# withdraw through a helper.                                                   #
+# --------------------------------------------------------------------------- #
+
+WITHDRAWS = "human re-entry: withdraws a pending stop (clear_cancel_request in the same block, before set_status)"
+KEEPS = ("machine re-entry: keeps a pending stop — no new human decision; "
+         "_drive honours it on turn zero and parks")
+STOP_INTERNAL = "within-run transition: the stop is honoured by _drive/_honor_cancel, not here"
+
+STOP_REGISTRY: dict[tuple[str, str], str] = {
+    ("api/app.py", "send_back"): WITHDRAWS,
+    ("api/app.py", "resume_task"): WITHDRAWS,
+    ("api/app.py", "reply_task"): WITHDRAWS,
+    ("api/app.py", "retry_task"): WITHDRAWS,
+    ("cli/commands.py", "task_resume._go"): WITHDRAWS,
+    ("cli/commands.py", "reply._go"): WITHDRAWS,
+    ("cli/commands.py", "reject._go"): WITHDRAWS,
+    ("cli/commands.py", "unblock._go"): WITHDRAWS,
+    ("cli/commands.py", "task_retry._go"): WITHDRAWS,
+    ("blockers/wake.py", "WakeWatcher._resume"): KEEPS,
+    ("core/scheduler.py", "Scheduler._recover_orphans"): KEEPS,
+    ("core/orchestrator.py", "Orchestrator._run_attempt"): STOP_INTERNAL,
+}
+
+
+def _is_claimable_set_status(node: ast.AST) -> bool:
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_status"):
+        return False
+    target = node.args[1] if len(node.args) > 1 else None
+    text = ast.unparse(target) if target is not None else ""
+    return (any(text.endswith(f".{s}") for s in CLAIMABLE)
+            or (bool(target) and not isinstance(target, ast.Attribute)))
+
+
+def _calls_in(stmt: ast.AST, attr: str) -> bool:
+    return any(isinstance(n, ast.Call) and getattr(n.func, "attr", "") == attr
+               for n in ast.walk(stmt))
+
+
+def _stop_placement() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """(sites whose claimable set_status has a clear_cancel_request EARLIER IN
+    THE SAME BLOCK, sites that call clear_cancel_request ANYWHERE — nested
+    defs attributed to the enclosing registered function)."""
+    placed: set[tuple[str, str]] = set()
+    anywhere: set[tuple[str, str]] = set()
+    registered = set(STOP_REGISTRY)
+    for path in sorted(SRC.rglob("*.py")):
+        rel = str(path.relative_to(SRC))
+        tree = ast.parse(path.read_text())
+        stack: list[str] = []
+
+        def owner() -> tuple[str, str]:
+            # the innermost enclosing name that is registered, else the full path
+            for i in range(len(stack), 0, -1):
+                key = (rel, ".".join(stack[:i]))
+                if key in registered:
+                    return key
+            return (rel, ".".join(stack))
+
+        class V(ast.NodeVisitor):
+            def _scan_blocks(self, node):
+                for field_ in ("body", "orelse", "finalbody", "handlers"):
+                    block = getattr(node, field_, None)
+                    if not isinstance(block, list):
+                        continue
+                    for i, stmt in enumerate(block):
+                        if any(_is_claimable_set_status(n) for n in ast.walk(stmt)):
+                            if any(_calls_in(prev, "clear_cancel_request") for prev in block[:i]):
+                                placed.add(owner())
+            def visit_FunctionDef(self, node):
+                stack.append(node.name)
+                self._scan_blocks(node)
+                self.generic_visit(node)
+                stack.pop()
+            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_ClassDef(self, node):
+                stack.append(node.name); self.generic_visit(node); stack.pop()
+            def generic_visit(self, node):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                    self._scan_blocks(node)
+                if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "clear_cancel_request":
+                    anywhere.add(owner())
+                super().generic_visit(node)
+        V().visit(tree)
+    return placed, anywhere
+
+
+def test_stop_registry_covers_every_reentry():
+    sites = _reentry_sites()
+    assert len(sites) >= 10, "site walk returned implausibly few re-entries"
+    unregistered = sorted(sites - set(STOP_REGISTRY))
+    assert not unregistered, (
+        "re-entry path(s) with no stated pending-stop disposition — add each to "
+        "STOP_REGISTRY as WITHDRAWS (human) or KEEPS (machine):\n  "
+        + "\n  ".join(f"{f}: {fn}" for f, fn in unregistered))
+
+
+def test_stop_registry_has_no_stale_entries():
+    stale = sorted(set(STOP_REGISTRY) - _reentry_sites())
+    assert not stale, f"STOP_REGISTRY lists paths that no longer re-enter: {stale}"
+
+
+def test_every_human_reentry_withdraws_a_pending_stop_before_it_transitions():
+    """RED before the fix on `unblock._go` and `reject._go`; RED again if the
+    clear moves to a sibling branch or after `set_status`.
+
+    KNOWN LIMIT, stated so nobody reads more into a green: a clear at the JOIN
+    of an if/else, before a `set_status` whose target is a VARIABLE, satisfies
+    this check even when one arm of that variable is terminal — which is
+    exactly `unblock --fail` on a live task. That shape is behavioural, not
+    structural, and is pinned by
+    tests/test_cli_commands.py::test_unblock_fail_on_a_live_task_leaves_a_pending_stop_for_its_worker."""
+    placed, _anywhere = _stop_placement()
+    missing = sorted(site for site, d in STOP_REGISTRY.items()
+                     if d == WITHDRAWS and site not in placed)
+    assert not missing, (
+        "human re-entry path(s) whose claimable set_status is not preceded, in "
+        "the same block, by clear_cancel_request — the next attempt would honour "
+        "a stale stop on turn zero and park straight back:\n  "
+        + "\n  ".join(f"{f}: {fn}" for f, fn in missing))
+
+
+def test_no_machine_reentry_withdraws_a_human_stop():
+    _placed, anywhere = _stop_placement()
+    keeping = sorted(site for site, d in STOP_REGISTRY.items()
+                     if d == KEEPS and site in anywhere)
+    assert not keeping, (
+        f"machine re-entry path(s) (or a helper nested in one) withdraw a "
+        f"human's stop — if deliberate, re-register as WITHDRAWS and say why: {keeping}")

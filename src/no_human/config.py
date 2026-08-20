@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import ipaddress
 import logging
 import math
 import os
@@ -20,6 +21,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 
@@ -104,6 +106,13 @@ CODEX_ALTERNATE_ROUTING_VARS = (
     "AZURE_OPENAI_ENDPOINT",
     "AZURE_OPENAI_AD_TOKEN",
 )
+
+
+# If the operator's local server enforces a key, it lives in ~/.no_human/.env
+# as LOCAL_LLM_API_KEY. Named here so the assert's docstring and the error
+# texts have one source of truth. NOT READ in this ticket — part 2 owns the
+# backend seam that would use it.
+LOCAL_LLM_API_KEY_VAR = "LOCAL_LLM_API_KEY"
 
 
 # Windows cannot express POSIX permission bits: `os.chmod` there only toggles
@@ -543,6 +552,94 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
         )
     os.environ[CODEX_API_KEY_VAR] = key
     return report
+
+
+def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
+    """Enforce the local-model coding backend's safety boundary.
+
+    Called ONLY when ``worker.backend`` is ``"local"``, and IN ADDITION to
+    :func:`assert_subscription_mode` — not instead of it, for the same
+    per-vendor reason :func:`assert_codex_api_key_mode` states: the reviewer,
+    planner, supervisor and utility tiers stay on Claude regardless of what
+    the coder runs on.
+
+    ``base_url`` must point at a server this machine trusts by construction —
+    localhost or a literal loopback/RFC1918 IP address, http or https. A DNS
+    name is refused even if it currently resolves to a loopback address: a
+    name is resolved again at connect time, which is a rebinding surface, so
+    only a literal IP is accepted. A public/routable IP is refused because
+    local mode must not leave the machine. Port numbers and paths are not
+    validated — ``http://localhost:8000`` and ``http://127.0.0.1:1234/v1``
+    are both fine.
+
+    An ambient ``ANTHROPIC_BASE_URL`` is never trusted as a fallback for this
+    setting — it is one of the vars :func:`scrub_metered_auth` removes, and
+    this function re-runs that scrub with ``keep=()`` as a belt-and-braces
+    re-check, exactly like :func:`assert_codex_api_key_mode`.
+
+    If the local server enforces a key, it lives in ``~/.no_human/.env`` as
+    ``LOCAL_LLM_API_KEY`` (see :data:`LOCAL_LLM_API_KEY_VAR`) — this function
+    does not read it; that is part 2's backend seam.
+
+    Raises :class:`AuthError` on any refusal. Never echoes credentials.
+    """
+    url = (base_url or "").strip()
+    if not url:
+        raise AuthError(
+            "worker.backend is 'local' but llm.local_base_url is not set. An "
+            "ambient ANTHROPIC_BASE_URL is scrubbed and never trusted as a "
+            "fallback.\n"
+            "Set it in config.yaml:\n"
+            "  llm:\n"
+            "    local_base_url: http://localhost:8000"
+        )
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise AuthError(
+            f"worker.backend is 'local' but llm.local_base_url ({url!r}) "
+            "could not be parsed as a URL."
+        ) from None
+
+    if parsed.username or parsed.password:
+        raise AuthError(
+            "llm.local_base_url must not embed userinfo credentials before "
+            "the host. The mode lives in config; the key never does — if "
+            "the local server enforces one, put it in ~/.no_human/.env as "
+            f"{LOCAL_LLM_API_KEY_VAR}."
+        )
+
+    if parsed.scheme not in ("http", "https"):
+        raise AuthError(
+            f"llm.local_base_url has scheme {parsed.scheme!r}; only http and "
+            "https are accepted."
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise AuthError(
+            f"llm.local_base_url ({parsed.scheme}://...) has no host."
+        )
+
+    if host != "localhost":
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            raise AuthError(
+                f"llm.local_base_url host {host!r} is a DNS name, not a "
+                "literal IP. A name is resolved again at connect time, which "
+                "is a rebinding surface — use 'localhost' or a literal "
+                "loopback/RFC1918 IP address instead."
+            ) from None
+        if not (ip.is_loopback or ip.is_private):
+            raise AuthError(
+                f"llm.local_base_url host {host!r} is a public/routable "
+                "address. Local mode must not leave the machine — use "
+                "'localhost' or a literal loopback/RFC1918 IP address."
+            )
+
+    return scrub_metered_auth(keep=())
 
 
 def load_env_var(name: str, env_path: Path | None = None) -> str | None:
@@ -1093,6 +1190,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Absolute path to the `codex` binary, for installs where it is not on
         # PATH. None ⇒ resolve it the way the CLI itself is normally found.
         "codex_cli_path": None,
+        # --- Local model backend (only read when worker.backend == "local") ---
+        "local_model": None,        # model id the local server exposes
+        "local_base_url": None,     # e.g. http://localhost:8000 — REQUIRED in local mode
+        "local_cli_path": None,     # None ⇒ the SDK-bundled CLI
         # MoA (Mixture-of-Agents) planning fan-out — on by default. Runs N
         # independent plan proposals from different angles, then ONE
         # aggregator call synthesizes a single plan (evidence-based synthesis,
@@ -2077,6 +2178,36 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
     return profile
 
 
+#: Query-param names, matched case-insensitively as a substring, that mark a
+#: URL as carrying a credential. Covers `key`, `api_key`, `apikey`,
+#: `access_token`/`token`, `secret`, and `password` in one pass.
+_CREDENTIAL_LOOKING_PARAM_MARKERS = ("key", "token", "secret", "password")
+
+
+def _reject_credential_in_url(url: str) -> None:
+    """Fail loudly if *url* embeds a credential (userinfo or a key-looking
+    query param). Never echoes the value. A malformed URL is left to
+    :func:`assert_local_backend_mode` to reject; this returns quietly.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return
+    if parsed.username or parsed.password:
+        raise AuthError(
+            "llm.local_base_url must not embed userinfo credentials before "
+            "the host. The mode lives in config; the key never does."
+        )
+    for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = name.lower()
+        if any(marker in lowered for marker in _CREDENTIAL_LOOKING_PARAM_MARKERS):
+            raise AuthError(
+                f"llm.local_base_url has a credential-looking query "
+                f"parameter ({name!r}). The mode lives in config; the key "
+                "never does."
+            )
+
+
 def _reject_api_key_in_config(data: dict[str, Any]) -> None:
     """Fail loudly if a metered API key was placed in config (it never should).
 
@@ -2085,6 +2216,8 @@ def _reject_api_key_in_config(data: dict[str, Any]) -> None:
     and no credential belongs in one. Adding the second coding backend added a
     second key that could be put there, so it is named here in the same breath;
     a guard that enumerates one vendor is a guard that misses the next one.
+    The rule now also covers a credential smuggled inside a URL, since
+    ``llm.local_base_url`` is a URL and not a bare key.
     """
     banned = {API_KEY_VAR, CODEX_API_KEY_VAR}
 
@@ -2098,6 +2231,9 @@ def _reject_api_key_in_config(data: dict[str, Any]) -> None:
                         "belongs only in ~/.no_human/.env (chmod 600) or the "
                         "process environment."
                     )
+                if isinstance(key, str) and key.lower() == "local_base_url" \
+                        and isinstance(value, str):
+                    _reject_credential_in_url(value)
                 walk(value)
         elif isinstance(node, list):
             for item in node:

@@ -750,3 +750,41 @@ def test_normal_gate_is_byte_identical_to_resume_off(repo):
     assert r_deleted.reasons[0].endswith(
         "— a listed repro test may not be deleted"
     )
+
+
+def test_wrong_shaped_manifest_is_named_not_called_missing(tmp_path):
+    """Task 89db42ea wrote a manifest keyed `repro_tests` (no `tests` list) and
+    was told the file did not exist; the next attempt then redid 99 turns from
+    base. A present-but-wrong manifest must be diagnosed as what it is."""
+    from no_human.testing.repro_gate import manifest_problem, SCHEMA_HINT
+    (tmp_path / ".no_human").mkdir()
+    m = tmp_path / MANIFEST
+    assert manifest_problem(tmp_path) is None          # absent → honest waive
+    m.write_text('{"repro_tests": [{"test": "tests/t.py::t"}], "file": "x"}')
+    problem = manifest_problem(tmp_path)
+    assert problem and '"tests"' in problem and "repro_tests" in problem and SCHEMA_HINT in problem
+    r = run_repro_gate(tmp_path, base_ref="HEAD")
+    assert r.verdict == "waived" and r.reasons == [problem]
+    m.write_text("{not json")
+    assert "not valid JSON" in manifest_problem(tmp_path)
+    m.write_text('{"tests": []}')
+    assert "empty" in manifest_problem(tmp_path)
+    m.write_text('{"tests": ["tests/t.py::t"]}')
+    assert manifest_problem(tmp_path) is None
+
+
+@pytest.mark.parametrize("content", [
+    b"\xff\xfe not utf8", b"{not json", b"[]", b'{"repro_tests": []}',
+    b'{"tests": []}', b'{"tests": [" "]}', b'{"tests": ["tests/t.py::t"]}',
+])
+def test_manifest_problem_and_read_manifest_agree(tmp_path, content):
+    """Two readers of one file: `read_manifest` (the gate's input) and
+    `manifest_problem` (the diagnosis). They must agree on every shape, or a
+    present file can be called missing again — and neither may raise, since
+    the hook now calls the second on every write (a non-UTF-8 byte included)."""
+    from no_human.testing.repro_gate import manifest_problem
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_bytes(content)
+    tests = read_manifest(tmp_path)
+    problem = manifest_problem(tmp_path)
+    assert (tests == []) == (problem is not None)

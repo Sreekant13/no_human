@@ -7,8 +7,10 @@ import pytest
 
 from no_human import config
 from no_human.config import (
+    DEFAULT_CONFIG,
     AuthError,
     _atomic_write_text,
+    assert_local_backend_mode,
     assert_subscription_mode,
     load_config,
     load_env_token,
@@ -481,8 +483,6 @@ def test_the_config_floor_never_inverts_the_retry_window():
 _BASELINE_SIZE_AT_WRITING = 72
 
 _UNDOCUMENTED_AT_BASELINE = frozenset({
-    "approve_merge.enabled",
-    "approve_merge.test_timeout_seconds",
     "blockers.ignore_comment_authors",
     "blockers.max_ci_fix_rounds",
     "blockers.max_ci_gate_fix_rounds",
@@ -660,11 +660,15 @@ def test_every_new_config_key_is_documented(tmp_path):
     Where it is still loose, stated in BOTH directions because the first
     version of this docstring named only the safe one:
 
-    * false FAILURE — a key documented in another file (`worker.backend` is
-      described in docs/BACKENDS.md) counts as undocumented here and sits in
-      the baseline; so do keys whose doc line is inside a list item or an
-      inconsistently-indented block, because the ancestry parser produces a
-      longer path for those.
+    * false FAILURE — a key documented only in another file (e.g. a backend
+      knob covered in docs/BACKENDS.md but never mentioned in
+      docs/configuration.md) counts as undocumented here and sits in the
+      baseline until this file also names it; so do keys whose doc line is
+      inside a list item or an inconsistently-indented block, because the
+      ancestry parser produces a longer path for those. (`worker.backend`
+      used to be this example — it left the baseline once
+      docs/configuration.md's local-backend section started mentioning it
+      literally, which is the intended shrink-only behavior, not a bug.)
     * false PASS, four channels, none of them hypothetical:
       1. the parser cannot tell a fenced YAML block from a wrapped prose line
          that happens to start `word:`. Two such lines exist
@@ -723,3 +727,168 @@ def test_every_new_config_key_is_documented(tmp_path):
     stale = _UNDOCUMENTED_AT_BASELINE - undocumented
     assert not stale, (
         f"these keys are documented now — drop them from the baseline: {sorted(stale)}")
+
+
+# --------------------------------------------------------------------------- #
+# Local model backend (part 1: config keys + assert_local_backend_mode).      #
+# --------------------------------------------------------------------------- #
+
+def test_the_local_backend_keys_ship_with_inert_defaults():
+    llm = DEFAULT_CONFIG["llm"]
+    assert llm["local_model"] is None
+    assert llm["local_base_url"] is None
+    assert llm["local_cli_path"] is None
+    assert llm["primary_model"] == "claude-sonnet-5"
+    assert llm["review_model"] == "claude-opus-4-8"
+    assert llm["planner_model"] == "claude-opus-5"
+    assert llm["supervisor_model"] == "claude-sonnet-5"
+    assert DEFAULT_CONFIG["worker"]["backend"] == "claude"
+
+
+def test_a_config_that_sets_the_local_keys_parses_them(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "llm:\n"
+        "  local_model: my-model\n"
+        "  local_base_url: \"http://localhost:8000\"\n"
+        "  local_cli_path: /opt/bin/cli\n"
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.data["llm"]["local_model"] == "my-model"
+    assert cfg.data["llm"]["local_base_url"] == "http://localhost:8000"
+    assert cfg.data["llm"]["local_cli_path"] == "/opt/bin/cli"
+
+
+def test_a_config_that_omits_the_local_keys_still_resolves_them(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("llm:\n  auth_mode: subscription\n")
+    cfg = load_config(cfg_path)
+    assert cfg.data["llm"]["local_model"] is None
+    assert cfg.data["llm"]["local_base_url"] is None
+    assert cfg.data["llm"]["local_cli_path"] is None
+
+
+def test_local_mode_refuses_a_missing_base_url():
+    for bad in (None, ""):
+        with pytest.raises(AuthError, match="local_base_url") as exc_info:
+            assert_local_backend_mode(bad)
+        assert "ANTHROPIC_BASE_URL" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://localhost",
+    "file:///x",
+    "ws://localhost:1234",
+    "localhost:8000",
+])
+def test_local_mode_refuses_a_non_http_scheme(url):
+    with pytest.raises(AuthError, match="scheme"):
+        assert_local_backend_mode(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://my-llm.internal:8000",
+    "http://localhost.evil.com:8000",
+    "https://example.com",
+])
+def test_local_mode_refuses_a_dns_hostname(url):
+    with pytest.raises(AuthError, match="DNS name"):
+        assert_local_backend_mode(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://8.8.8.8:8000",
+    "http://1.1.1.1",
+    "http://[2001:4860:4860::8888]:8000",
+])
+def test_local_mode_refuses_a_public_ip(url):
+    with pytest.raises(AuthError, match="public"):
+        assert_local_backend_mode(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://user:pass@localhost:8000",
+    "http://tok@127.0.0.1:8000",
+])
+def test_local_mode_refuses_userinfo_in_the_url(url):
+    with pytest.raises(AuthError) as exc_info:
+        assert_local_backend_mode(url)
+    msg = str(exc_info.value)
+    assert "pass" not in msg
+    assert "tok" not in msg
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:1234/v1",
+    "https://localhost",
+    "http://10.0.0.5:8000",
+    "http://192.168.1.20:11434",
+    "http://172.16.3.4:8000",
+    "http://[::1]:8000",
+])
+def test_local_mode_accepts_the_loopback_forms(monkeypatch, url):
+    for var in config.METERED_AUTH_VARS:
+        monkeypatch.delenv(var, raising=False)
+    report = assert_local_backend_mode(url)
+    assert isinstance(report, config.ScrubReport)
+
+
+def test_local_mode_reruns_the_scrub_with_keep_empty(monkeypatch):
+    for var in config.METERED_AUTH_VARS:
+        monkeypatch.setenv(var, "x")
+    report = assert_local_backend_mode("http://localhost:8000")
+    assert set(report.removed) == set(config.METERED_AUTH_VARS)
+    assert report.api_key_present is True
+    for var in config.METERED_AUTH_VARS:
+        assert var not in os.environ
+
+
+def test_the_local_backend_did_not_widen_the_anthropic_scrub_list():
+    assert config.METERED_AUTH_VARS == (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLOUD_ML_REGION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    )
+    assert config.LOCAL_LLM_API_KEY_VAR not in config.METERED_AUTH_VARS
+
+
+@pytest.mark.parametrize("url", [
+    "http://user:pass@localhost:8000",
+    "http://localhost:8000?api_key=sk-x",
+    "http://localhost:8000?apikey=sk-x",
+    "http://localhost:8000?token=sk-x",
+    "http://localhost:8000?secret=sk-x",
+    "http://localhost:8000?PASSWORD=sk-x",
+])
+def test_load_config_rejects_a_credential_embedded_in_local_base_url(tmp_path, url):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(f"llm:\n  local_base_url: \"{url}\"\n")
+    with pytest.raises(AuthError) as exc_info:
+        load_config(cfg_path)
+    assert "sk-x" not in str(exc_info.value)
+    assert "pass" not in str(exc_info.value)
+
+
+def test_load_config_accepts_a_local_base_url_with_a_harmless_query_param(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text('llm:\n  local_base_url: "http://localhost:8000/v1?stream=true"\n')
+    cfg = load_config(cfg_path)
+    assert cfg.data["llm"]["local_base_url"] == "http://localhost:8000/v1?stream=true"
+
+
+def test_the_claude_pinned_roles_and_backend_resolution_are_untouched():
+    from no_human.agent.backend import CLAUDE_PINNED_ROLES, resolve_backend_name
+    assert CLAUDE_PINNED_ROLES == ("reviewer", "planner", "supervisor", "utility", "intake")
+    assert resolve_backend_name(DEFAULT_CONFIG) == "claude"
+    assert resolve_backend_name({"worker": {"backend": "local"}}) == "local"
+    assert resolve_backend_name({"worker": {"backend": "local"}}, role="reviewer") == "claude"

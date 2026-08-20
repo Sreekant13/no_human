@@ -1363,6 +1363,11 @@ async def send_back(
     await store.close_open_attempts(task.id)
     task.context = await store.merge_context(
         task.id, {"resume_from": resume_provenance(None, "human")})
+    # Both human-stop signals go: a board-Paused task that is sent back must
+    # not run while still stamped `blocker.human_stopped` ("stopped by you").
+    task.blocker = None
+    task.wake_check_at = None
+    await store.update_task_columns(task)
     # Reset to IMPLEMENTING so the next `nh watch <id>` retries.
     # Re-entering the loop withdraws any pending board Pause, or the next
     # attempt would honour it on turn zero and park the task straight back

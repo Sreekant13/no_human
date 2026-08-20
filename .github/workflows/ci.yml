@@ -687,7 +687,12 @@ jobs:
             (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name
           }
           if ($lines.Count -eq 0) { throw 'no UNSIGNED artefacts found to checksum' }
-          $lines | Set-Content -Encoding ascii SHA256SUMS-windows.txt
+          # WriteAllText with explicit LF, not Set-Content: on Windows Set-Content
+          # terminates every line with CRLF, and `shasum -c` on a POSIX machine
+          # then reads "no_human-...exe\r" - a filename that does not exist. The
+          # whole point of sha256sum format is that any POSIX machine can verify
+          # the download; measured broken on the first live windows_release run.
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'SHA256SUMS-windows.txt'), (($lines -join "`n") + "`n"), [Text.Encoding]::ASCII)
           Get-Content SHA256SUMS-windows.txt
 
       # 7 days, like the linux packages: long enough for a human to download,

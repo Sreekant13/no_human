@@ -28,6 +28,7 @@ from ..agent.backend import make_backend, resolve_backend_name
 from ..config import (
     AuthError,
     assert_codex_api_key_mode,
+    assert_local_backend_mode,
     assert_subscription_mode,
     load_config,
 )
@@ -186,6 +187,11 @@ def _bootstrap(*, require_auth: bool = True):
             # assertion; it never replaces the first.
             if resolve_backend_name(config.data) == "codex":
                 assert_codex_api_key_mode()
+            # Same rule as codex: the Anthropic assertion above still runs,
+            # because the reviewer/planner/supervisor/utility tiers stay on
+            # Claude regardless of what the coder runs on.
+            if resolve_backend_name(config.data) == "local":
+                assert_local_backend_mode((_llm or {}).get("local_base_url"))
         except AuthError as exc:
             console.print(f"[bold red]auth error:[/] {exc}")
             # The Codex failure carries its own complete remedy (add
@@ -4067,6 +4073,14 @@ def unblock(task_id, fail):
                 t.context = await store.merge_context(
                     t.id,
                     {"resume_from": resume_provenance(checkpoint, "human")})
+                # A human re-entering the loop withdraws any pending stop, or
+                # the next attempt honours it on turn zero and parks straight
+                # back (same as `nh task retry` / `nh reply`; pinned by the
+                # re-entry registry's withdraws-a-pending-stop invariant).
+                # ONLY on this branch: `--fail` parks, and is legal on a LIVE
+                # task, where the flag may be the pause its worker is about to
+                # honour — clearing it there would let the coder run on.
+                await store.clear_cancel_request(t.id)
             else:
                 await store.update_task(t)
             await store.set_status(t, target, validate=False)
@@ -4394,6 +4408,16 @@ def reject(task_id, reason):
             await store.close_open_attempts(t.id)
             t.context = await store.merge_context(
                 t.id, {"resume_from": resume_provenance(None, "human")})
+            # Sending back is a human re-entry: withdraw BOTH human-stop
+            # signals — the cancel flag and the durable `blocker.human_stopped`
+            # hold the board stamps on a paused task (the wake sweep skips it
+            # and the card reads "stopped by you"), which a fresh run must not
+            # carry. `nh unblock` and `nh task resume` drop the blocker the
+            # same way.
+            t.blocker = None
+            t.wake_check_at = None
+            await store.update_task_columns(t)
+            await store.clear_cancel_request(t.id)
             await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
             console.print(
                 f"[yellow]sent back[/] {t.id[:8]} — run [bold]nh watch {t.id[:8]}[/] to retry."

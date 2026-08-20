@@ -2687,3 +2687,84 @@ def test_root_help_names_the_docs_url():
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0, result.output
     assert "Docs: https://getnohuman.com/docs" in result.output, result.output
+
+
+def test_unblock_fail_on_a_live_task_leaves_a_pending_stop_for_its_worker(tmp_path, monkeypatch):
+    """`nh unblock --fail` parks rather than re-enters, and is legal on a LIVE
+    task — where the flag may be the pause its worker is about to honour.
+    Clearing it there lets the coder run on; only the IMPLEMENTING branch
+    withdraws it (re-entry registry: placement, not presence)."""
+    import asyncio
+    from no_human.core.db import Store
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING)
+
+    async def _flag():
+        async with Store(db) as store:
+            await store.request_cancel(task_id, "Paused from board")
+    asyncio.run(_flag())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["unblock", task_id[:8], "--fail"])
+
+    assert result.exit_code == 0, result.output
+    async def _read():
+        async with Store(db) as store:
+            return await store.get_cancel_request(task_id)
+    assert asyncio.run(_read()) == "Paused from board"
+
+
+def test_reject_withdraws_both_human_stop_signals(tmp_path, monkeypatch):
+    """A board-Paused task (flag + durable `blocker.human_stopped`) that is
+    sent back must not run while still stamped 'stopped by you' nor park on
+    turn zero from the stale flag."""
+    import asyncio
+    from no_human.core.db import Store
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.BLOCKED)
+
+    async def _arm():
+        async with Store(db) as store:
+            t = await store.get_task(task_id)
+            t.blocker = {"category": "USER_PAUSED", "question": "Paused from board",
+                         "human_stopped": True}
+            await store.update_task_columns(t)
+            await store.request_cancel(task_id, "Paused from board")
+    asyncio.run(_arm())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["reject", task_id[:8], "--reason", "redo it"])
+
+    assert result.exit_code == 0, result.output
+    async def _read():
+        async with Store(db) as store:
+            t = await store.get_task(task_id)
+            return t.status, t.blocker, await store.get_cancel_request(task_id)
+    status, blocker, flag = asyncio.run(_read())
+    assert status == TaskStatus.IMPLEMENTING
+    assert blocker is None and flag is None
+
+
+def test_unblock_withdraws_a_pending_stop_on_the_re_entry_branch(tmp_path, monkeypatch):
+    """Positive twin of the --fail pin: plain `nh unblock` (re-entry) DOES
+    withdraw the flag — the structural registry check cannot tell the two
+    arms apart, so both behaviours are pinned explicitly."""
+    import asyncio
+    from no_human.core.db import Store
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.BLOCKED)
+
+    async def _flag():
+        async with Store(db) as store:
+            await store.request_cancel(task_id, "Paused from board")
+    asyncio.run(_flag())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["unblock", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    async def _read():
+        async with Store(db) as store:
+            return (await store.get_task(task_id)).status, await store.get_cancel_request(task_id)
+    status, flag = asyncio.run(_read())
+    assert status == TaskStatus.IMPLEMENTING and flag is None

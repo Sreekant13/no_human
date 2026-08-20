@@ -42,6 +42,11 @@ AGENT_OWNED_FILES = frozenset({"PLAN.md", "HANDOVER.md"})
 
 #: Repo-relative scratch directory the coder is told to use for drafts and notes.
 SCRATCH_DIR = ".no_human/scratch"
+#: Agent-owned paths the HARNESS reads back from the working tree — the implement
+#: prompt tells the coder to write them, so the scratch nudge must stay silent
+#: there. Spelled here (not imported from testing.repro_gate) to keep this
+#: module import-light; `tests/test_scope_guard.py` pins the two in sync.
+HARNESS_READ_FILES = frozenset({".no_human/repro_tests.json"})
 _SCRATCH_PARTS = Path(SCRATCH_DIR).parts
 
 
@@ -85,6 +90,14 @@ def scratch_redirect(
     rel = _relative(edited_path, repo_root)
     if rel.parts[: len(_SCRATCH_PARTS)] == _SCRATCH_PARTS:
         return None  # already in the blessed scratch dir — nothing to say
+    if rel.as_posix() in HARNESS_READ_FILES:
+        # The harness READS these from the working tree; "nothing written
+        # there can reach the PR" is true and beside the point. Task 89db42ea
+        # (2026-08-20): the coder wrote the repro manifest where the implement
+        # prompt told it to, this nudge told it to move it to "a real path",
+        # and the REQUIRED repro gate then failed the attempt for having no
+        # manifest — 99 turns lost to two guards contradicting each other.
+        return None
     return (
         f"[SCRATCH] '{rel}' is an agent-owned path, excluded from every git diff, "
         f"so nothing written there can reach the PR. If this file is part of the "
@@ -92,6 +105,28 @@ def scratch_redirect(
         f"throwaway, put it under `{SCRATCH_DIR}/` and move on — do not rewrite it "
         f"in place."
     )
+
+
+def harness_file_hint(edited_path: str | Path, repo_root: str | Path = "") -> str | None:
+    """Immediate feedback on a write to a file the harness reads back.
+
+    The scratch nudge is silent on these paths (see `scratch_redirect`), and
+    silence is not enough: task 89db42ea wrote a well-meant manifest in the
+    wrong SHAPE and learned of it only when the required gate failed the
+    attempt two minutes later, with a reason that named a missing file. Run
+    the gate's own reader on the write and hand the schema back now.
+    """
+    rel = _relative(edited_path, repo_root).as_posix()
+    if rel not in HARNESS_READ_FILES or not repo_root:
+        return None
+    from ..testing.repro_gate import manifest_problem  # function-local: keeps this module import-light
+    try:
+        problem = manifest_problem(Path(repo_root))
+    except Exception as exc:  # noqa: BLE001 — a hook must never raise into the SDK
+        problem = f"{rel} could not be read ({exc.__class__.__name__})"
+    if problem is None:
+        return None
+    return f"[REPRO] {problem}. Fix the file in place — the harness reads it from here."
 
 
 # ── 1. Scope guard ──────────────────────────────────────────────────────── #
@@ -305,6 +340,12 @@ class ScopeGuardHook:
                 self._nudged.add(str(raw))
                 self._on_event("scratch_redirect", nudge)
             return self._context(nudge)
+        hint = harness_file_hint(str(raw), self.repo_root)
+        if hint is not None:
+            # Every time, like the nudge: it is the tool's feedback on THIS
+            # write. Logged every time too — each write may carry a new shape.
+            self._on_event("repro_manifest_hint", hint)
+            return self._context(hint)
         if not self.plan_files:
             return {}
         warning = check_scope(str(raw), self.plan_files, self.repo_root)

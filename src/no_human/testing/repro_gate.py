@@ -63,13 +63,54 @@ class ReproResult:
                 "reasons": self.reasons, "resume_shape": self.resume_shape}
 
 
+SCHEMA_HINT = '{"tests": ["tests/test_x.py::test_y", ...]}'
+
+
+def manifest_problem(repo_path: Path) -> str | None:
+    """Why the manifest yields no tests — or None when it is absent or usable.
+
+    Three states used to collapse into one reason, "no manifest": the file
+    missing, unparseable JSON, and a well-formed JSON document of the wrong
+    SHAPE. Task 89db42ea (2026-08-20) wrote a thoughtful manifest keyed
+    ``repro_tests`` with per-test dicts — no ``tests`` list — and the required
+    gate told it the file did not exist; the next attempt's distillate then
+    named a non-existent file instead of a schema error, and the coder redid
+    99 turns from base. An absent file is still ``None`` here (that is the
+    honest "waived"); everything else names the real defect and the schema.
+    """
+    p = repo_path / MANIFEST
+    if not p.is_file():
+        return None
+    try:
+        # errors="replace": a non-UTF-8 byte must read as a JSON error, never
+        # raise — this runs inside the PostToolUse hook, which had no failure
+        # mode before it (the tamper guard once died on a binary test file
+        # AFTER the coder was paid; same class).
+        data = json.loads(p.read_text(errors="replace"))
+    except OSError as exc:
+        return f"{MANIFEST} is present but unreadable ({exc.__class__.__name__})"
+    except json.JSONDecodeError as exc:
+        return f"{MANIFEST} is present but is not valid JSON ({exc.msg} at line {exc.lineno})"
+    if not isinstance(data, dict):
+        return (f"{MANIFEST} is present but its top level is "
+                f"{type(data).__name__}, not an object — expected {SCHEMA_HINT}")
+    tests = data.get("tests")
+    if not isinstance(tests, list):
+        keys = ", ".join(sorted(map(str, data.keys()))) or "none"
+        return (f"{MANIFEST} is present but has no \"tests\" list (keys found: "
+                f"{keys}) — expected {SCHEMA_HINT}")
+    if not [str(t).strip() for t in tests if str(t).strip()]:
+        return f"{MANIFEST} is present but its \"tests\" list is empty — expected {SCHEMA_HINT}"
+    return None
+
+
 def read_manifest(repo_path: Path) -> list[str]:
     """The declared repro tests, or [] (no manifest / unreadable / empty)."""
     p = repo_path / MANIFEST
     if not p.is_file():
         return []
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(errors="replace"))
     except (OSError, json.JSONDecodeError):
         return []
     tests = data.get("tests") if isinstance(data, dict) else None
@@ -330,7 +371,11 @@ def run_repro_gate(
     """
     tests = read_manifest(repo_path)
     if not tests:
-        return ReproResult("waived", reasons=[f"no {MANIFEST} manifest"])
+        # Same verdict either way — the attempt is sent back under `required`
+        # — but the REASON must name what is actually wrong, because it is
+        # what the next attempt reads.
+        problem = manifest_problem(repo_path)
+        return ReproResult("waived", reasons=[problem or f"no {MANIFEST} manifest"])
 
     python: str | None = None
     test_argv: list[str] | None = None

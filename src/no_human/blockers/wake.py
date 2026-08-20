@@ -130,6 +130,13 @@ class WakeWatcher:
         self.max_park = parse_duration(
             str(blockers_cfg.get("max_park_duration", "48h"))
         ) or timedelta(hours=48)
+        # The watcher's own check cadence — the base for the dead-machine-resume
+        # backoff below. Same config key `nh wake --loop` polls at
+        # (cli/commands.py:3178), so the backoff base is genuinely this
+        # watcher's cadence, not an independent knob.
+        self.wake_poll_interval = parse_duration(
+            str(blockers_cfg.get("wake_poll_interval", "10m"))
+        ) or timedelta(minutes=10)
         # Cap on autonomous PR-comment → revise cycles. A reviewer (or bot) can
         # post comments indefinitely; without this, each batch resets the full
         # attempt budget, so the agent could revise forever. After this many
@@ -518,6 +525,14 @@ class WakeWatcher:
     # watcher is checking this task" a queryable fact (`nh doctor` reads it).
     HEARTBEAT = timedelta(hours=1)
 
+    # Death-blind resume loop guard (forensics 2026-08-13/08-20): a dead
+    # machine-resumed attempt (0 priced tokens, <=1 turn) that keeps getting
+    # re-resumed burns the task's own lifetime budget on a worker/environment
+    # failure, never the task's own. Streak 1-2 backs off instead of
+    # resuming; streak 3 parks honestly rather than resuming a 4th time.
+    DEAD_RESUME_PARK_STREAK = 3
+    DEAD_RESUME_BACKOFF_CAP = timedelta(hours=6)
+
     async def _heartbeat(self, task: Task, *, now: datetime) -> None:
         last = _parse_iso((task.context or {}).get("last_wake_tick"))
         if last and now - last < self.HEARTBEAT:
@@ -638,7 +653,7 @@ class WakeWatcher:
                             await self._escalate_revisions(task, rounds)
                             return "escalated_revisions"
                 if rounds is not None:
-                    return await self._resume(task)
+                    return await self._resume(task, now=now)
                 # The rung and the injection each fetch, so they can see
                 # different data however well they agree on the predicate: a 502
                 # between the two calls, a comment deleted or edited, or the task
@@ -694,11 +709,16 @@ class WakeWatcher:
         )
         return True
 
-    async def _resume(self, task: Task) -> str:
+    async def _resume(self, task: Task, *, now: datetime | None = None) -> str:
         """Flip a parked task back to its prior working state (IMPLEMENTING).
 
         Resume re-enters the loop in a fresh session seeded with the report
         (22.5) — the orchestrator picks it up from the [WIP-BLOCKED] checkpoint.
+
+        ``now`` is keyword-only with a real-clock default so every existing
+        call site keeps working unchanged; the wake-condition rung (the one
+        with a tick ``now`` in scope) passes it through for deterministic
+        backoff math.
         """
         # LOAD-BEARING terminal guard (SCRUM-68). The rung-level rechecks above
         # this call are cheap early-outs; THIS one is the invariant — every
@@ -706,6 +726,33 @@ class WakeWatcher:
         # a rung did since its own recheck reopens the race this closes.
         if await self._is_terminal(task):
             return "skipped_terminal"
+        now = now or datetime.now(timezone.utc)
+
+        # Death-blind resume loop guard. Every resume — whichever of the five
+        # rungs asked for it — funnels through here, so this is the single
+        # chokepoint that can see "the last machine resume died before doing
+        # any work" and stop repeating it blindly.
+        dead_state = (task.context or {}).get("wake_dead_resumes") or {}
+        backoff_until = _parse_iso(dead_state.get("backoff_until"))
+        if backoff_until is not None and backoff_until > now:
+            # Still inside a previously-decided backoff window (e.g. a
+            # network-checked condition like pr_merged fired early). The
+            # event already recorded this decision once; re-emitting every
+            # tick would be noise, and re-evaluating would double-count the
+            # same window.
+            return "wake_backoff_pending"
+
+        verdict, streak, dead_ids = await self._dead_resume_verdict(task, now=now)
+        if verdict == "backoff":
+            await self._backoff_dead_resume(
+                task, streak, dead_ids,
+                anchor=dead_state.get("last_resume_at"), now=now,
+            )
+            return "wake_backoff"
+        if verdict == "park":
+            await self._park_dead_resumes(task, streak, dead_ids)
+            return "parked_dead_resumes"
+
         patch = {
             "resumed_at": now_iso(),
             "resume_reason": "wake_condition_satisfied",
@@ -731,12 +778,155 @@ class WakeWatcher:
         # `resume_reason` beside it says the same thing and is kept for rows
         # written before provenance existed.
         patch["resume_from"] = resume_provenance(checkpoint, "wake")
+        # A real dispatch (human or machine) resets the dead-resume streak and
+        # re-anchors the window at THIS resume: only attempts started at or
+        # after it count toward the next streak evaluation.
+        patch["wake_dead_resumes"] = {
+            "streak": 0, "attempt_ids": [],
+            "last_resume_at": patch["resumed_at"], "backoff_until": None,
+        }
         task.context = await self.store.merge_context(task.id, patch)
         task.wake_check_at = None
         await self.store.update_task_columns(task)
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
         await self._emit(task, "resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
+
+    async def _dead_resume_verdict(
+        self, task: Task, *, now: datetime,
+    ) -> tuple[str, int, list[str]]:
+        """Whether the machine resume due right now would repeat a dead
+        pattern. Returns ``(verdict, streak, dead_attempt_ids)`` where
+        ``verdict`` is ``"proceed"`` (streak 0, resume normally),
+        ``"backoff"`` (streak 1-2, defer instead of resuming) or ``"park"``
+        (streak >= DEAD_RESUME_PARK_STREAK, escalate instead of resuming).
+
+        The streak advances on every consecutive evaluation that reaches this
+        point with only dead evidence on the table — not only when a NEW dead
+        attempt appears. It cannot advance any other way: streak 1/2 are
+        deliberately never dispatched (that is the point of backing off), so
+        no new attempt row can appear between one evaluation and the next: an
+        evaluation gated behind an already-expired backoff window IS the
+        "would resume into the same failure again" signal. Each `backoff`
+        verdict re-arms `backoff_until` further out, so this function is
+        never reached twice for the same window (the `_resume` guard above
+        short-circuits those calls without re-evaluating).
+
+        Fails OPEN on any error (DB blip, malformed state): a healthy task
+        must never be backed off or parked by a bug in this bookkeeping.
+        """
+        try:
+            ctx = task.context or {}
+            if (ctx.get("resume_from") or {}).get("by") != "wake":
+                # No prior resume, or the last one was a human's — the human
+                # reset case (Intake Q3: with no human action ever, there is
+                # no `resume_from` either, so a fresh task also proceeds).
+                return "proceed", 0, []
+            state = ctx.get("wake_dead_resumes") or {}
+            last_resume_at = _parse_iso(state.get("last_resume_at"))
+            if last_resume_at is None:
+                # Nothing to judge against yet — fail open rather than guess.
+                return "proceed", 0, []
+            rows = await self.store.list_attempts(task.id)
+            relevant = [
+                row for row in rows
+                if (started := _parse_iso(row.get("started_at"))) is not None
+                and started >= last_resume_at
+            ]
+            if not relevant:
+                # A healthy dispatch creates its attempt row moments after
+                # `_resume` flips the task to IMPLEMENTING; absence here is
+                # not evidence of death, just of a row not written yet.
+                return "proceed", 0, []
+            usage_cols = self.store._usage_columns()
+
+            def _is_dead(row: dict) -> bool:
+                priced = sum(int(row.get(c) or 0) for c in usage_cols)
+                turns = int(row.get("turns_used") or 0)
+                return priced == 0 and turns <= 1
+
+            if not all(_is_dead(row) for row in relevant):
+                # Any attempt that did real work resets the streak.
+                return "proceed", 0, []
+            dead_ids = sorted({str(row["id"]) for row in relevant})
+            prior_ids = set(state.get("attempt_ids") or [])
+            merged_ids = sorted(prior_ids | set(dead_ids))
+            streak = int(state.get("streak") or 0) + 1
+            verdict = "park" if streak >= self.DEAD_RESUME_PARK_STREAK else "backoff"
+            return verdict, streak, merged_ids
+        except Exception:  # noqa: BLE001 — fail open, never park on a bug
+            log.warning(
+                "dead-resume verdict failed for %s", task.id[:8], exc_info=True)
+            return "proceed", 0, []
+
+    async def _backoff_dead_resume(
+        self, task: Task, streak: int, dead_ids: list[str], *,
+        anchor: str | None, now: datetime,
+    ) -> None:
+        """Defer instead of resuming: push wake_check_at out by a doubling
+        interval (base = the watcher's own poll cadence), capped at 6h."""
+        delay = min(
+            self.wake_poll_interval * (2 ** (streak - 1)),
+            self.DEAD_RESUME_BACKOFF_CAP,
+        )
+        wake_at = now + delay
+        task.wake_check_at = wake_at.isoformat()
+        await self.store.update_task_columns(task)
+        task.context = await self.store.merge_context(task.id, {
+            "wake_dead_resumes": {
+                "streak": streak,
+                "attempt_ids": dead_ids,
+                "last_resume_at": anchor,
+                "backoff_until": wake_at.isoformat(),
+            },
+        })
+        ids_str = ", ".join(dead_ids) if dead_ids else "(none)"
+        await self._emit(
+            task, "wake_backoff",
+            f"{task.id[:8]} dead-resume streak #{streak}/"
+            f"{self.DEAD_RESUME_PARK_STREAK} — the last machine-resumed "
+            f"attempt died before doing work (0 priced tokens, <=1 turn); "
+            f"deferring {delay} instead of resuming (dead attempts: {ids_str})",
+        )
+
+    async def _park_dead_resumes(
+        self, task: Task, streak: int, dead_ids: list[str],
+    ) -> None:
+        """Stop resuming: park with an honest blocker naming the dead-resume
+        pattern and the dead attempt ids, instead of resuming a 4th time."""
+        # Load-bearing terminal guard (SCRUM-68) — see _resume.
+        if await self._is_terminal(task):
+            return
+        ids_str = ", ".join(dead_ids) if dead_ids else "(none recorded)"
+        data = dict(task.blocker or {})
+        data["category"] = "NOVEL_UNKNOWN"
+        data["question"] = (
+            f"The wake watcher would be machine-resuming this task for the "
+            f"{streak}th consecutive time since the last human action, but "
+            f"every machine-resumed attempt in that window died before "
+            f"doing work (0 priced tokens, <=1 turn) — environment/worker "
+            f"failure, not task failure. Dead attempts: {ids_str}. Fix the "
+            f"worker/environment, then resume, or cancel."
+        )
+        data["root_cause_hypothesis"] = (
+            f"{streak} consecutive machine resumes since the last human "
+            f"action died before doing any work (0 priced tokens, <=1 turn "
+            f"each) — worker/environment failure, not a task failure"
+        )
+        data["dead_resume_streak"] = streak
+        data["dead_resume_attempt_ids"] = dead_ids
+        # Leave blocker["wake_condition"] in place: never silently drop it —
+        # the human who fixes the environment must still be able to resume
+        # into it, not lose it because this park cleared the whole blocker.
+        task.blocker = data
+        task.wake_check_at = None
+        await self.store.update_task_columns(task)
+        await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+        await self._emit(
+            task, "escalated_dead_resumes",
+            f"{task.id[:8]} parked after {streak} consecutive dead machine "
+            f"resumes (attempts: {ids_str})",
+        )
 
     async def _inject_pr_feedback(self, task: Task, condition: str) -> int | None:
         """Fetch PR comments and thread them into send_back_feedback.

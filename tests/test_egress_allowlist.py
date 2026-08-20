@@ -204,7 +204,7 @@ INERT_IMPORTS: frozenset[str] = frozenset({
     "concurrent", "contextlib", "contextvars", "copy", "csv", "dataclasses",
     "datetime", "decimal", "difflib", "enum", "errno", "fcntl", "fnmatch",
     "functools", "getpass", "glob", "gzip", "hashlib", "heapq", "hmac", "html",
-    "importlib", "inspect", "io", "itertools", "json", "logging", "math",
+    "importlib", "inspect", "io", "ipaddress", "itertools", "json", "logging", "math",
     "mimetypes", "operator", "os", "pathlib", "pickle", "platform", "pprint",
     "queue", "random", "re", "readline", "secrets", "select", "shlex", "shutil",
     "signal", "site", "sqlite3", "stat", "statistics", "string", "struct",

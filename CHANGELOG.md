@@ -6,6 +6,17 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+- The review gate no longer takes a blocking finding's word for it: on the
+  gate path, a FAIL with non-critical blocking findings now gets one bounded,
+  single-turn refute pass (read-only, ~180s) before it's charged to the
+  coder. A finding demotes to advisory only when the refute pass cites its
+  own counter-evidence at a file:line that itself passes the existing
+  citation-existence check; a goal veto, a `spec_compliance:false` verdict,
+  and critical-severity findings can never be demoted. A refute pass that
+  times out, errors, or reaches no verdict changes nothing — the FAIL stands
+  byte-identical, its tokens folded into the decision like every other
+  discarded round.
+
 ## [0.1.2] — 2026-08-20
 
 Security and release-infrastructure release: same product, patched runtime,

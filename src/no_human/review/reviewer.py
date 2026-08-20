@@ -1788,6 +1788,233 @@ def _gate_verdict(
     return reviewer_passed or any_failing
 
 
+# ── Bounded refute pass ─────────────────────────────────────────────────────
+# A blocking finding survives to the verdict today the moment its cited
+# file:line merely EXISTS (`_citation_fails_in_any`) — that check proves the
+# citation is not hallucinated, never that the finding is CORRECT. And angle
+# passes, the gate's only other independent-confirmation mechanism, run ONLY
+# on a passing complex-tier verdict (`if decision.passed and
+# self._tier_wants_angles(task):`, below), so a FAIL goes straight back to the
+# coder with no second reader ever having tried to knock it down.
+#
+# This closes that gap with ONE fresh-context, single-turn, read-only pass in
+# the shape of `_fast_review` (max_turns=1, `_REFUTE_TIMEOUT`s), run on the
+# gate path only, after a FAIL is decided. It is told to REFUTE the surviving
+# blocking findings with cited counter-evidence — never to re-review, re-score,
+# or pass judgement on the diff as a whole. A finding demotes to advisory only
+# when its refutation cites a counter-file:line that itself passes
+# `_citation_fails_in_any` — the SAME existence check that already gates every
+# other citation in this file, so the refute pass gets no looser a bar than
+# the finding it is trying to knock down.
+#
+# GATE-PATH ONLY, applicability documented here and in the PR body: this pass
+# never runs on a PASS verdict (nothing to refute), never runs inside a
+# REVIEW_ANGLES loop (angles are additive/best-effort by their own contract
+# and are never subject to this or any other second-guessing), and can NEVER
+# flip a goal veto, a `spec_compliance: false` stage, or demote a
+# critical-severity finding — see `_refute_candidates` below. A refute pass
+# that times out, errors, or reaches no verdict changes NOTHING: the FAIL
+# stands byte-identical. This mirrors, deliberately, the angle-skip contract
+# at this file's own call site a little further down (the `skipped is not
+# None` branch a few dozen lines below the angle-pass `asyncio.gather` call):
+# an auxiliary pass that cannot itself decide the gate must never be allowed
+# to fail the gate through its own failure to run. Its tokens still bill —
+# folded in via the same `_carry_usage` channel every other discarded round
+# uses — because the session was paid for regardless of what it found.
+#
+# No numeric scoring anywhere in this block: a citation either checks out or
+# it does not, and a finding is either demoted or it stays exactly as it was.
+_REFUTE_TIMEOUT = 180  # same single-turn window as `_fast_review`
+_REFUTE_JSON = re.compile(r"REFUTE_JSON_START\s*(\{.*?\})\s*REFUTE_JSON_END", re.DOTALL)
+_REFUTE_JSON_START = re.compile(r"REFUTE_JSON_START\s*", re.DOTALL)
+# A demoted critical finding would let the refute pass do what no severity
+# grading and no citation check may: wave through the class of defect
+# `_gate_verdict`'s own docstring calls out as never-severity-gradeable
+# (constraint #3's "refute done" reader must never be the one thing standing
+# between a critical defect and a merge). So critical never enters the
+# candidate set below, full stop — not "harder to demote", not eligible.
+_REFUTE_PROTECTED_SEVERITIES = frozenset({"critical"})
+
+
+def _refute_candidates(decision: ReviewDecision) -> list[ChecklistItem]:
+    """Which of ``decision``'s blocking findings a refute pass may challenge.
+
+    Empty (meaning: skip the refute pass entirely) when:
+      - the gate already PASSED — nothing to refute;
+      - the reviewer reached no verdict at all (`_reached_no_verdict`) — that
+        is the gate not having run, not a finding to challenge;
+      - the FAIL is (wholly or partly) a `spec_compliance: false` stage, or a
+        goal veto (`goal.reachable is False` and not already citation-demoted)
+        — both are protected outright (see below) and neither may ever be
+        demoted, so a FAIL carrying one of these can be refuted on its OTHER
+        blocking findings and STILL never flip, because `_gate_verdict` fails
+        on the protected condition mechanically, independent of the
+        checklist. Refuting the other findings there would spend a fresh Opus
+        session for zero possible change to the verdict — so this function
+        skips the pass ENTIRELY (not just the protected item) whenever either
+        condition is present, which is DELIBERATELY STRICTER than "only the
+        protected item is off the table": it is strictly cheaper, it is still
+        correct (no finding that could legally demote goes unrefuted, because
+        none could have changed the outcome), and it must never be loosened
+        to "run refute on the other findings anyway" without re-deriving that
+        the extra spend buys something.
+
+    Otherwise: every blocking item whose severity is not itself protected
+    (critical, `_REFUTE_PROTECTED_SEVERITIES`) — a refute pass may challenge
+    an unclassified or medium/high finding, never a critical one, and never
+    the goal veto or spec_compliance entries themselves (those are not
+    ChecklistItems in `blocking_items` to begin with; they are stages/goal
+    dict state `_gate_verdict` reads directly).
+    """
+    if decision.passed:
+        return []
+    if _reached_no_verdict(decision):
+        return []
+    stages = decision.stages or {}
+    if stages.get("spec_compliance", {}).get("passed") is False:
+        return []
+    goal = decision.goal
+    if goal is not None and goal.get("reachable") is False and not goal.get("demoted"):
+        return []
+    return [
+        item for item in decision.blocking_items
+        if (item.severity or "").strip().lower() not in _REFUTE_PROTECTED_SEVERITIES
+    ]
+
+
+def _build_refute_prompt(
+    task: Task, candidates: list[ChecklistItem], diff: str, full_files: str,
+    diff_total_len: int = 0,
+) -> str:
+    """Single-turn, no-tools refute prompt: challenge ONLY the listed findings.
+
+    Deliberately narrow, the same reasoning as `_build_angle_prompt`'s own
+    docstring: gluing a "try to refute these" preface onto the full
+    adversarial template would hand the model room to re-review, re-score, or
+    pass judgement on the diff as a whole. It sees only the candidate findings
+    (never passing/advisory items, the goal block, or `confirmed_rules`) plus
+    the same diff/full-file evidence the main review already assembled — no
+    new tool calls, no new reads.
+    """
+    findings = "\n".join(
+        f"  - label: {c.label!r}\n"
+        f"    severity: {c.severity or '(unclassified)'}\n"
+        f"    cited file:line: {c.file or '(none)'}:{c.line}\n"
+        f"    evidence: {c.evidence}"
+        for c in candidates
+    )
+    truncated = diff_total_len and diff_total_len > len(diff)
+    trunc_note = (
+        f"\n\nNOTE: this diff is TRUNCATED — you are seeing {len(diff):,} of "
+        f"{diff_total_len:,} chars. Do not refute a finding whose relevant "
+        "lines you cannot see; silence is always safe."
+        if truncated else "")
+    files_block = f"Full text of changed files:\n{full_files}\n\n" if full_files else ""
+    return (
+        _UNTRUSTED_INPUT
+        + "You are checking an independent reviewer's work, not reviewing the "
+        "diff yourself. Each finding below was raised as BLOCKING. For each "
+        "one, try to REFUTE it: only if you can cite a file:line — in the "
+        "diff or file text below — that PROVES the finding is wrong, emit a "
+        "refutation naming that counter-evidence. Do not re-review the diff, "
+        "do not raise NEW findings, do not grade, score, weight, or rank "
+        "anything. Silence is the honest default: if you cannot disprove a "
+        "finding, say nothing about it — an empty refutations list is a "
+        "complete, valid answer.\n\n"
+        f"Task: {task.title}\n\n"
+        f"Findings under challenge:\n{findings}\n\n"
+        "The diff under review:\n```diff\n" + diff + "\n```" + trunc_note + "\n\n"
+        + files_block
+        + "Output EXACTLY one block and nothing else:\n"
+        'REFUTE_JSON_START {"refutations": [{"label": "<the exact label '
+        'string above>", "file": "path/to/file", "line": 12, "evidence": '
+        '"why this file:line disproves the finding"}]} REFUTE_JSON_END\n'
+    )
+
+
+def _parse_refutations(text: str) -> list[dict[str, Any]]:
+    """Parse a refute pass's output into a list of raw refutation dicts.
+
+    Mirrors `_recover_unterminated_verdict`'s truncation-recovery shape (a
+    single-turn pass can be cut off before REFUTE_JSON_END the same way
+    `_fast_review` angle passes are): try the START...END form first, then
+    fall back to the first balanced JSON object after a bare START marker.
+    Any failure to find or parse a block — including a non-dict payload or a
+    non-list ``refutations`` key — returns ``[]``, the same "no verdict,
+    changes nothing" signal `_refute_candidates`'/the call site's caller
+    already treats an empty list as.
+    """
+    raw = text or ""
+    match = _REFUTE_JSON.search(raw)
+    json_text: str | None = match.group(1) if match else None
+    if json_text is None:
+        start = _REFUTE_JSON_START.search(raw)
+        json_text = _first_json_object(raw[start.end():]) if start else None
+    if json_text is None:
+        return []
+    try:
+        data = loads_lenient(json_text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    refutations = data.get("refutations")
+    if not isinstance(refutations, list):
+        return []
+    return [r for r in refutations if isinstance(r, dict)]
+
+
+def _apply_refutations(
+    decision: ReviewDecision,
+    refutations: list[dict[str, Any]],
+    candidates: list[ChecklistItem],
+    roots: list[tuple[Path, str]],
+) -> None:
+    """Demote each candidate a refutation successfully knocks down. Mutates
+    ``decision`` in place (checklist items' severity/evidence,
+    ``demoted_citations``); never touches ``decision.passed`` — the caller
+    re-derives the verdict itself, once, after this returns.
+
+    Binary throughout, no counters or ratios: a refutation either resolves to
+    exactly one candidate by an EXACT label match (zero or ambiguous matches
+    demote nothing — never guess positionally which finding was meant), cites
+    a non-empty file AND a line > 0 (a blank or zero citation is treated by
+    `_citation_fails`/`_citation_fails_in_any` as "no citation, not a
+    failure" — i.e. it would look VALID and demote everything if not rejected
+    here first), and that citation passes the existing multi-repo existence
+    check — or it demotes nothing, silently. A malformed ``line`` (non-numeric)
+    is treated the same as a missing one.
+    """
+    by_label: dict[str, list[ChecklistItem]] = {}
+    for candidate in candidates:
+        by_label.setdefault(candidate.label, []).append(candidate)
+    for refutation in refutations:
+        label = str(refutation.get("label") or "")
+        matches = by_label.get(label) or []
+        if len(matches) != 1:
+            continue  # zero or ambiguous label match — never demote on a guess
+        item = matches[0]
+        file = str(refutation.get("file") or "").strip()
+        raw_line = refutation.get("line")
+        try:
+            line = int(raw_line) if raw_line is not None else 0
+        except (TypeError, ValueError):
+            line = 0
+        if not file or line <= 0:
+            continue  # blank/zero counter-citation reads as "valid" — reject first
+        probe = ChecklistItem(item.label, False, "", file=file, line=line)
+        if _citation_fails_in_any(probe, roots) is not None:
+            continue
+        evidence_note = str(refutation.get("evidence") or "").strip()
+        item.severity = "low"
+        item.evidence = (
+            f"{item.evidence}\n[refute pass] refuted by {file}:{line} "
+            f"({evidence_note}) — demoted to advisory."
+        ).strip()
+        decision.demoted_citations.append(
+            f"{item.label}: refuted by {file}:{line}")
+
+
 class AdversarialReviewer:
     """Fresh-context reviewer session — read-only, told to refute 'done.'"""
 
@@ -2047,14 +2274,70 @@ class AdversarialReviewer:
                 extra_repos=linked_repos or None,
             )
 
+        # Bounded refute pass (gate path only — see the module-level comment
+        # above `_refute_candidates`). Runs ONLY when the gate just FAILed
+        # with non-critical blocking findings; a finding demotes to advisory
+        # only when the refute pass cites counter-evidence that itself passes
+        # `_citation_fails_in_any`. A refute pass that times out, errors, or
+        # reaches no verdict changes NOTHING — mirrors the angle-skip contract
+        # a few lines below (the `skipped is not None` branch): an auxiliary
+        # pass that cannot decide the gate must never be allowed to fail it by
+        # failing to run.
+        #
+        # `gate_originally_passed` is captured BEFORE the refute pass runs and
+        # is what gates the angle block below — NOT a fresh read of
+        # `decision.passed`. `_refute_candidates` only ever returns a non-empty
+        # list when `decision.passed` was False at entry, so refute logic can
+        # only mutate `decision.passed` (False -> True, on an all-candidates
+        # demotion) on a path where `gate_originally_passed` is already False;
+        # the two are mutually exclusive by construction. Gating on the live
+        # value instead would let a refute-induced FAIL->PASS flip open the
+        # complex-tier angle loop below on a path that never ran before this
+        # pass existed.
+        gate_originally_passed = decision.passed
+        refute_candidates = _refute_candidates(decision)
+        if refute_candidates:
+            refute_result = None
+            refute_reason = ""
+            try:
+                refute_result, refute_reason = await self._run_bounded(
+                    _build_refute_prompt(
+                        task, refute_candidates, diff, full_files,
+                        diff_total_len=diff_total_len,
+                    ),
+                    repo_path, max_turns=1, timeout=_REFUTE_TIMEOUT,
+                    on_event=self._on_event,
+                )
+            except Exception as exc:  # noqa: BLE001 — a refute pass NEVER fails the gate
+                log.warning("refute pass errored: %s — FAIL stands", exc)
+            if refute_result is None:
+                log.warning("refute pass produced no result (%s) — FAIL stands",
+                            refute_reason or "no reason given")
+            else:
+                _carry_usage(decision, [refute_result])
+                refutations = _parse_refutations(refute_result.final_text or "")
+                if refutations:
+                    demoted_before = len(decision.demoted_citations)
+                    _apply_refutations(
+                        decision, refutations, refute_candidates,
+                        [(repo_path, before_ref), *(linked_repos or [])],
+                    )
+                    if len(decision.demoted_citations) > demoted_before:
+                        decision.passed = _gate_verdict(
+                            decision.checklist, {"passed": False},
+                            decision.stages, goal=decision.goal)
+
         # C3-G1: complex-tier tasks get parallel single-turn angle passes.
         # Angles are ADDITIVE and best-effort: one that times out or crashes
         # is dropped with a visible note — it must never fail the gate by
         # itself (the fail-closed rule belongs to the MAIN review only).
         # B2 #11: angles can only ADD findings / keep a fail failed — they can
         # never flip fail→pass — so running them after a decided FAIL is pure
-        # Opus cost. Short-circuit on the main verdict.
-        if decision.passed and self._tier_wants_angles(task):
+        # Opus cost. Short-circuit on the main verdict. Gated on
+        # `gate_originally_passed` (captured above, BEFORE the refute pass),
+        # not a fresh read of `decision.passed` — see that comment for why a
+        # refute-induced flip must not open this block.
+        if gate_originally_passed and self._tier_wants_angles(task):
             angle_prompts = [
                 (name, _build_angle_prompt(task, diff, focus,
                                            diff_total_len=diff_total_len))
