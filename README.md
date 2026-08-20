@@ -171,6 +171,9 @@ uv run nh --help
 
 Issues and pull requests welcome; run `uv run pytest -q` before submitting.
 
+If no_human saved you a review cycle, a star helps other people find it:
+[![GitHub stars](https://img.shields.io/github/stars/no-human-ai/no_human?style=social)](https://github.com/no-human-ai/no_human/stargazers)
+
 ## License
 
 MIT — see [LICENSE](LICENSE). The licence covers the code, not the name:
