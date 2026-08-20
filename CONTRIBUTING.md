@@ -11,7 +11,7 @@ be rejected even if the tests pass:
   action, and there is no auto-merge anywhere.
 - The stack stays lean: SQLite only, no vector database. The coder runs on the
   Claude Agent SDK by default, with OpenAI Codex as the one sanctioned second
-  backend (`worker.backend`); the reviewer, planner, supervisor and utility
+  backend (`worker.backend`); the reviewer, planner, supervisor, utility and intake
   tiers stay on Claude regardless.
 - Review is evidence-based — an independent fresh-context reviewer producing a
   pass/fail checklist with cited evidence. Never a numeric self-score.
@@ -299,7 +299,7 @@ npm run e2e       # the live-flows suite needs a server on :8420
   is short on purpose.
 - Do not add to the stack. SQLite only. No vector database. Coding backends
   are the Claude Agent SDK and OpenAI Codex — a new one is a design decision,
-  not a PR; the reviewer, planner, supervisor and utility tiers stay on Claude.
+  not a PR; the reviewer, planner, supervisor, utility and intake tiers stay on Claude.
   This is a standing project constraint and it is not negotiable in a PR.
 - Tests ship with the module they cover. A PR that adds behaviour and no test
   will be sent back.

@@ -235,7 +235,7 @@ def _declared_counts(worktree_path: Path, sha: str) -> tuple[dict[tuple[str, str
     return out, dups
 
 
-def reconcile_merge_count_drift(worktree_path: Path, base_sha: str, branch_sha: str,
+def reconcile_merge_count_drift(worktree_path: Path, base_ref: str, branch_ref: str,
                                 refusal_text: str) -> tuple[bool, str]:
     """Repair a win-COUNT that is stale ONLY because two reviewed counts met.
 
@@ -259,14 +259,17 @@ def reconcile_merge_count_drift(worktree_path: Path, base_sha: str, branch_sha: 
     review-PASSED task escalated to a human who did this arithmetic by hand;
     twice.
     """
+    # ``base_ref``/``branch_ref`` are commit-ish (a sha, or a ref name such as
+    # ``origin/<branch>`` — the land step passes `resolve_commitish`'s result);
+    # git resolves them, and the same ref the merge used is what gets read.
     drifts = list(COUNT_DRIFT_RE.finditer(refusal_text))
     if not drifts:
         return False, "no count drift in the refusal"
-    mb = _sh(["git", "merge-base", base_sha, branch_sha], cwd=worktree_path)
+    mb = _sh(["git", "merge-base", base_ref, branch_ref], cwd=worktree_path)
     if mb.returncode != 0 or not mb.stdout.strip():
         return False, "no merge base between base and branch"
-    base, bd = _declared_counts(worktree_path, base_sha)
-    branch, rd = _declared_counts(worktree_path, branch_sha)
+    base, bd = _declared_counts(worktree_path, base_ref)
+    branch, rd = _declared_counts(worktree_path, branch_ref)
     anc, ad = _declared_counts(worktree_path, mb.stdout.strip())
     if base is None or branch is None or anc is None:
         return False, f"{CLASSIFICATION_NAME} missing on one side of the merge"
@@ -623,9 +626,10 @@ def _land_in_worktree(
                                     f"arithmetic ({note}):\n"
                                     + approve_proc.stdout + approve_proc.stderr))
                 reconciled_note = note
-                # The rewritten classification is itself a shipped, pinned
-                # file wherever the repo ships it — re-pin it too, or step-7
-                # verify refuses the tree on its stale hash.
+                # Wherever a repo SHIPS its classification file it is pinned,
+                # and the rewrite stales that pin — re-pin it or step-7 verify
+                # refuses. (This repo drops the file, so here it is a no-op;
+                # the land fixture ships it and covers the path.)
                 retry_targets = list(dict.fromkeys(
                     [*shipped_changed,
                      *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))

@@ -295,7 +295,10 @@ def _repo(tmp_path: Path) -> Path:
         # this is the rule the count-drift tests bump. Files added by other
         # tests (on_feature.py, feat_a.py, ...) don't start with "base", so
         # they never touch this rule's declared count.
-        "ship src/**\nship   1  src/base*.py\nship   1  EXPORT_CLASSIFICATION.txt\ndrop tests/**\n", encoding="utf-8"
+        # Models the real repo: the classification file itself is DROPPED (never
+        # pinned), and the tests rule carries a COUNT so a drift in a drop rule
+        # is a real thing `verify` can catch.
+        "ship src/**\nship   1  src/base*.py\ndrop   1  tests/**\ndrop   1  EXPORT_CLASSIFICATION.txt\n", encoding="utf-8"
     )
     (work / "RELEASE_MANIFEST.txt").write_text("# generated pins -- do not hand edit\n", encoding="utf-8")
     src = work / "src"
@@ -307,7 +310,7 @@ def _repo(tmp_path: Path) -> Path:
 
     _git(work, "add", "-A")
     _git(work, "commit", "-qm", "init")
-    _approve(work, ["src/base.py", "EXPORT_CLASSIFICATION.txt"])
+    _approve(work, ["src/base.py"])
     _git(work, "add", "RELEASE_MANIFEST.txt")
     _git(work, "commit", "-qm", "pin base.py")
 
@@ -805,12 +808,12 @@ async def test_an_export_classification_conflict_alone_opens_a_coder_round(store
     wt = tmp_path / "wt_feature"
     _worktree(work, wt, "feature")
     _cls = wt / "EXPORT_CLASSIFICATION.txt"
-    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop tests/**", "drop docs/**\ndrop tests/**"), encoding="utf-8")
+    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop   1  tests/**", "drop docs/**\ndrop   1  tests/**"), encoding="utf-8")
     _git(wt, "commit", "-qam", "feature reclassifies the counted rule to 5")
     _push_branch(work, wt, "feature")
 
     _cls = work / "EXPORT_CLASSIFICATION.txt"
-    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop tests/**", "drop dist/**\ndrop tests/**"), encoding="utf-8")
+    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop   1  tests/**", "drop dist/**\ndrop   1  tests/**"), encoding="utf-8")
     _git(work, "commit", "-qam", "main reclassifies the counted rule to 7")
     _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
 
@@ -848,7 +851,7 @@ async def test_an_export_classification_conflict_mixed_with_manifest_opens_a_cod
     (wt / "src" / "on_feature.py").write_text("on feature\n", encoding="utf-8")
     _git(wt, "add", "src/on_feature.py")
     _cls = wt / "EXPORT_CLASSIFICATION.txt"
-    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop tests/**", "drop docs/**\ndrop tests/**"), encoding="utf-8")
+    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop   1  tests/**", "drop docs/**\ndrop   1  tests/**"), encoding="utf-8")
     _git(wt, "add", "EXPORT_CLASSIFICATION.txt")
     _git(wt, "commit", "-qm", "feature adds on_feature.py, adds a drop rule for docs/ (counts stay correct)")
     _approve(wt, ["src/on_feature.py"])
@@ -859,7 +862,7 @@ async def test_an_export_classification_conflict_mixed_with_manifest_opens_a_cod
     (work / "src" / "on_main.py").write_text("on main\n", encoding="utf-8")
     _git(work, "add", "src/on_main.py")
     _cls = work / "EXPORT_CLASSIFICATION.txt"
-    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop tests/**", "drop dist/**\ndrop tests/**"), encoding="utf-8")
+    _cls.write_text(_cls.read_text(encoding="utf-8").replace("drop   1  tests/**", "drop dist/**\ndrop   1  tests/**"), encoding="utf-8")
     _git(work, "add", "EXPORT_CLASSIFICATION.txt")
     _git(work, "commit", "-qm", "main adds on_main.py, adds a drop rule for dist/ (counts stay correct)")
     _approve(work, ["src/on_main.py"])
@@ -998,30 +1001,29 @@ def test_reconcile_refuses_without_a_merge_base(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_drift_that_skips_approve_is_caught_by_verify_and_escalates(store, tmp_path, monkeypatch):
-    """The branch touches only a DROP-classified file (and re-wrote its
-    manifest, as a coder's re-approve does), so the resolver has nothing
-    ship-classified to approve and the reconcile never runs; main meanwhile
-    added a counted file WITHOUT bumping the count. Step-7 `verify` is the
-    last gate — it must refuse and the task must escalate, pushing nothing.
-    (This is also the known limit of the reconcile: it rides on `approve`.)"""
+    """The branch touches ONLY its manifest (a coder's re-approve comment), so
+    `base..branch` names nothing ship-classified, `approve` never runs and the
+    reconcile never runs; main meanwhile added tests/test_z.py under the
+    COUNTED drop rule without bumping it. Step-7 `verify` is the last gate:
+    it must refuse at step 'verify', the task must escalate, and nothing may
+    be pushed. RED when `check_counts` is removed from the fixture guard's
+    `verify` (the mutant pushes the drifted tree) — the proof that gate is
+    live. Also the reconcile's known limit: it rides on `approve`."""
     _use_stub_export_guard(monkeypatch)
     work = _repo(tmp_path)
     wt_a = tmp_path / "wt_branch_a"
     _worktree(work, wt_a, "branch-a")
-    (wt_a / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
     pins = wt_a / "RELEASE_MANIFEST.txt"
     pins.write_text(pins.read_text(encoding="utf-8") + "# re-approved on the branch\n", encoding="utf-8")
     _git(wt_a, "add", "-A")
-    _git(wt_a, "commit", "-qm", "drop-only change + manifest touch")
+    _git(wt_a, "commit", "-qm", "manifest-only touch")
     _push_branch(work, wt_a, "branch-a")
 
-    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")   # count left at 1
-    _git(work, "add", "-A")
-    _git(work, "commit", "-qm", "add base_three.py, count NOT bumped")
+    (work / "tests" / "test_z.py").write_text("test z\n", encoding="utf-8")   # drop count left at 1
     pins = work / "RELEASE_MANIFEST.txt"
-    pins.write_text(pins.read_text(encoding="utf-8") + "0" * 64 + "  src/base_three.py\n", encoding="utf-8")
-    _git(work, "add", "RELEASE_MANIFEST.txt")
-    _git(work, "commit", "-qm", "hand pin")
+    pins.write_text(pins.read_text(encoding="utf-8") + "# main re-approved\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "add tests/test_z.py, count NOT bumped")
     _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
     before = _git(work, "rev-parse", "origin/branch-a").stdout.strip()
 
@@ -1034,5 +1036,71 @@ async def test_a_drift_that_skips_approve_is_caught_by_verify_and_escalates(stor
     assert result != "resolved_pr_conflict"
     stored = await store.get_task(t.id)
     assert stored.status == TaskStatus.ESCALATED
-    assert "actually wins" in (stored.blocker.get("evidence") or ""), stored.blocker
+    evidence = (stored.blocker.get("evidence") or "") + (stored.blocker.get("question") or "")
+    assert "step 'verify'" in evidence and "actually wins" in evidence, stored.blocker
     assert _git(work, "rev-parse", "origin/branch-a").stdout.strip() == before, "verify refused but something was pushed"
+
+
+
+def test_reconcile_refuses_when_the_classification_is_absent_on_a_side(tmp_path):
+    work, sha, reconcile = _three_way_repo(tmp_path)
+    _git(work, "rm", "-q", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "no classification here")
+    gone = _git(work, "rev-parse", "HEAD").stdout.strip()
+    ok, note = reconcile(work, gone, sha,
+                         "EXPORT_CLASSIFICATION.txt:2: `ship 1  src/base*.py` actually wins 2 file(s).")
+    assert not ok and "missing on one side" in note
+
+
+@pytest.mark.asyncio
+async def test_reconcile_repins_a_shipped_classification_file(store, tmp_path, monkeypatch):
+    """A repo that SHIPS its classification file pins it, and the count rewrite
+    stales that pin. The resolver must re-approve it on the retry or step-7
+    `verify` refuses the tree — this is the derived_conflict copy of that
+    logic (the land fixture covers approve_merge's copy). RED when the
+    `_ship_classified_paths(…, [CLASSIFICATION_NAME])` element is removed
+    from the retry targets."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+    # reclassify the classification file as SHIPPED and pin it (a different
+    # repo's choice; this repo drops it)
+    cls = work / "EXPORT_CLASSIFICATION.txt"
+    cls.write_text(cls.read_text(encoding="utf-8").replace(
+        "drop   1  EXPORT_CLASSIFICATION.txt", "ship   1  EXPORT_CLASSIFICATION.txt"), encoding="utf-8")
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "this repo ships its classification")
+    _approve(work, ["EXPORT_CLASSIFICATION.txt"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin the classification")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "-A")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump 1 -> 2")
+    _approve(wt_a, ["src/base_two.py", "EXPORT_CLASSIFICATION.txt"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin")
+    _push_branch(work, wt_a, "branch-a")
+
+    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")
+    _bump_count(work, "src/base*.py", 2)
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "add base_three.py, bump 1 -> 2")
+    _approve(work, ["src/base_three.py", "EXPORT_CLASSIFICATION.txt"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    assert await dc.conflicting_paths(str(work), "main", "branch-a") == {"RELEASE_MANIFEST.txt"}
+    base_tip = _git(work, "rev-parse", "origin/main").stdout.strip()
+    res = dc.resolve_derived_conflict(str(work), "branch-a", base_tip, remote="origin")
+    assert res.ok, f"{res.step}: {res.detail}"
+    assert "1 -> 3" not in res.reconciled and "2 -> 3" in res.reconciled
+    wt_check = tmp_path / "wt_check"
+    _worktree(work, wt_check, "check", "branch-a")
+    assert "ship   3  src/base*.py" in (wt_check / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    v = _verify(wt_check)
+    assert v.returncode == 0, v.stdout + v.stderr   # the re-pinned classification verifies

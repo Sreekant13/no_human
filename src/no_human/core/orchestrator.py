@@ -458,6 +458,19 @@ class StuckAbort(RuntimeError):
     """
 
 
+class ReviewedShaMismatch(RuntimeError):
+    """Delivery would push an object the review gate never judged.
+
+    Raised by ``_assert_delivery_sha`` and caught in ``_finalize`` — a
+    critical, fail-closed safety gate: the branch tip about to be pushed
+    must be exactly the sha a passing review round stamped into
+    ``review_history`` (or, for a no-reviewer advisory pass-through, no
+    stamp is required at all). Any other state — an unreadable tip, no
+    stamped history, a tip that does not match a stamped pass — refuses to
+    push rather than shipping unreviewed code.
+    """
+
+
 class BudgetAbort(RuntimeError):
     """The running attempt crossed the task's remaining lifetime token budget.
 
@@ -5396,8 +5409,24 @@ class Orchestrator:
 
     async def _finalize(
         self, task, repo, branch, base, commit, attempt_id, result,
-        *, linked_commits: list | None = None,
+        *, linked_commits: list | None = None, human_gated_resume: bool = False,
     ) -> TaskOutcome:
+        # Delivery must push the sha the review gate actually judged, not
+        # whatever the branch tip happens to be right now — a branch ref can
+        # move between the passing review round and this push (a concurrent
+        # commit, a rebase). Fail closed: an unreadable tip or an absent/
+        # unstamped history refuses to push, same as a sha mismatch.
+        try:
+            pre_push_sha = self._assert_delivery_sha(
+                task, repo, branch, human_gated_resume=human_gated_resume)
+        except ReviewedShaMismatch as exc:
+            log.error("%s", exc)
+            self.emit("delivery_sha_mismatch", str(exc))
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=str(exc),
+                completed_at=_now())
+            return await self._escalate(task, str(exc), repo=repo, branch=branch)
+
         # C3: validate base branch against project's declared default. If the
         # profile never set one, auto-detect the remote's actual default
         # (origin/HEAD) so a stale local checkout doesn't silently skip this
@@ -5528,6 +5557,27 @@ class Orchestrator:
             except Exception as exc2:  # noqa: BLE001
                 return await self._escalate(
                     task, f"opening PR failed twice: {exc2}", repo=repo, branch=branch)
+
+        # Close the race between the pre-push assertion above and the push
+        # itself: confirm the sha `open_pr` actually reports having pushed is
+        # the exact tip that was asserted reviewed. An empty pushed_sha (an
+        # adapter/fake that doesn't report one) is advisory, matching how
+        # `verify_pr_receipt` already treats an empty local_sha — a mismatched
+        # non-empty sha means the branch moved during delivery and refuses.
+        pushed = getattr(pr, "pushed_sha", "") or ""
+        if pushed and pushed != pre_push_sha:
+            detail = (
+                f"push landed {pushed} but the reviewed/pre-push tip was "
+                f"{pre_push_sha} — the branch moved during delivery")
+            log.error("%s", detail)
+            self.emit("delivery_sha_mismatch", detail)
+            await self.store.update_attempt(
+                attempt_id, pr_url=pr.url, status="failed",
+                failure_reason=detail, completed_at=_now())
+            return await self._escalate(task, detail, repo=repo, branch=branch)
+        if not pushed:
+            self._advisory("push reported no sha; pushed-object identity unverified")
+
         # D2 #1 ground-truth receipt: "gh said ok" is not delivery. Verify the
         # FORGE's view of the PR against what this attempt believes it pushed
         # (the commit_paths incident shipped PRs missing coder-created files
@@ -7212,7 +7262,14 @@ class Orchestrator:
         result = SimpleNamespace(
             final_text="Resumed after the human-gated CI step was cleared.",
             num_turns=0)
-        return await self._finalize(task, repo, branch, base, commit, attempt_id, result)
+        # human_gated_resume=True: this flow checks out the parked branch and
+        # nothing commits between the pre-parking review stamp and this
+        # resume, so the exact-match rule in _assert_delivery_sha still
+        # holds — the flag only names this flow in an escalation message,
+        # it does NOT waive the sha match (waiving it here would reopen the
+        # exact hole this gate closes).
+        return await self._finalize(task, repo, branch, base, commit, attempt_id, result,
+                                    human_gated_resume=True)
 
     async def _park_quota(self, task: Task, exc: QuotaExhausted, *,
                           repo: GitRepo | None = None) -> TaskOutcome:
@@ -7389,6 +7446,68 @@ class Orchestrator:
             for ans in replies[-3:]:
                 lines.append(f"  - {ans[:400]}")
         return "\n".join(lines)
+
+    def _passing_review_shas(self, task: Task) -> set[str]:
+        """Every sha a PASSing review round stamped into ``review_history``.
+
+        Factored out of the parsing `_already_satisfied_eligible` already did
+        (kept there untouched — see that method's docstring) so
+        `_assert_delivery_sha` can reuse the same tolerant parsing without
+        depending on that method's orphan-recovery-only gating.
+        """
+        history = (task.context or {}).get("review_history")
+        if isinstance(history, str):
+            try:
+                import ast
+                history = ast.literal_eval(history)
+            except (ValueError, SyntaxError):
+                history = None
+        if not isinstance(history, list):
+            history = []
+        return {
+            str(rec.get("sha")).strip()
+            for rec in history
+            if isinstance(rec, dict)
+            and rec.get("passed") is True
+            and str(rec.get("sha") or "").strip()
+        }
+
+    def _assert_delivery_sha(
+        self, task: Task, repo, branch: str, *, human_gated_resume: bool = False,
+    ) -> str:
+        """Fail closed unless the branch tip about to be pushed is exactly a
+        sha a passing review round stamped (or the review gate ran advisory
+        no-reviewer pass-through this attempt, in which case no diff was ever
+        judged and no stamp can exist).
+
+        Exact string equality only — never `is_ancestor` — same rationale as
+        `_already_satisfied_eligible`: an ancestor match would let a PASS on
+        an earlier commit cover code added after it.
+        """
+        try:
+            tip = repo.branch_sha(branch)
+        except Exception as exc:  # noqa: BLE001 — unreadable tip ⇒ fail closed
+            raise ReviewedShaMismatch(
+                f"branch tip unreadable for {branch!r}: {exc}") from exc
+        if getattr(self, "_review_gate_advisory", False):
+            self.emit(
+                "delivery_sha_unverified",
+                f"pushing {tip} on {branch} without a review stamp — the "
+                "review gate ran advisory (no reviewer configured, "
+                "reviewer.allow_advisory=true), so nothing was ever reviewed",
+            )
+            return tip
+        shas = self._passing_review_shas(task)
+        if not shas:
+            raise ReviewedShaMismatch(
+                f"no review round stamped a sha for this task "
+                f"(human_gated_resume={human_gated_resume})")
+        if tip not in shas:
+            raise ReviewedShaMismatch(
+                f"delivery refused: branch {branch} tip {tip} is not the "
+                f"reviewed sha (passing rounds stamped: {sorted(shas)}) "
+                f"(human_gated_resume={human_gated_resume})")
+        return tip
 
     def _already_satisfied_eligible(
         self, task: Task, repo, base: str | None,
@@ -8521,19 +8640,58 @@ class Orchestrator:
             # this open failed transiently and `_finalize`'s (idempotent) open is the
             # retry, so the sequence a reader sees is failure -> retry -> pr_open.
             #
-            # Deliberately NO retry loop of its own. Adding one would make three
-            # open_pr calls on the transient path and duplicate the retry contract that
-            # `_finalize` already owns and documents; the draft is best-effort and the
-            # next call IS the retry.
-            self.emit("pr_open_retry",
-                      f"draft PR open before review failed ({exc}); the PR will be "
-                      f"opened at finalize instead")
-            self._advisory(
-                f"draft PR not opened before review ({type(exc).__name__}: {exc}) — the "
-                f"gate still runs, and a PR-body criterion will fail honestly rather "
-                f"than impossibly")
-            self._draft_pr_absent = "open failed"
-            return ""
+            # Deliberately NO retry loop of its own for the general (transient forge/
+            # network) case: a second attempt would duplicate the retry contract that
+            # `_finalize` already owns and documents, and the draft is best-effort —
+            # the next call IS the retry.
+            #
+            # ONE NAMED EXCEPTION to "no retry loop of its own", scoped exactly as
+            # narrowly as `_finalize`'s own `forced` decision (~5510) is scoped: a
+            # `pr_conflict` round (`self._mechanical_round`) rebases the already-
+            # pushed task branch BY CONSTRUCTION, so the plain push above is rejected
+            # non-fast-forward on EVERY such round, not transiently — degrading to "no
+            # draft" here would review that round with no PR, the exact state 0a /
+            # PR-021 exists to prevent (see the docstring). `_finalize`'s force
+            # decision is the single source of truth for when a force-push is safe;
+            # this reuses its module-level predicate verbatim (~195) rather than
+            # inventing a second heuristic — the only extra conjunct is the round
+            # marker, because this call retries *before* a review verdict exists for
+            # `_finalize`'s own predicate to read. `PushBehindRemote` is re-raised
+            # above and the predicate itself returns False for it (belt and braces).
+            # Unlike `_finalize`'s transient-forge retry, this rejection is
+            # deterministic, not a race, so no `asyncio.sleep` before it. A forced
+            # retry that fails again falls through to the ordinary skip below, exactly
+            # like any other failure here (intake-resolved: non-escalating).
+            err: BaseException = exc
+            pr = None
+            if _is_non_fast_forward(err) and await self._mechanical_round(task):
+                self.emit(
+                    "pr_open_retry",
+                    f"draft PR open failed ({err}); retrying with --force-with-lease: "
+                    f"the branch was rebased in this pr_conflict round, so a "
+                    f"fast-forward is impossible")
+                try:
+                    pr = await asyncio.to_thread(
+                        open_pr, repo, branch, title, body,
+                        base=base or "main",
+                        github_hosts=self.config.get("git", {}).get("github_hosts"),
+                        force_with_lease=True,
+                    )
+                except PushBehindRemote:
+                    raise
+                except Exception as exc2:  # noqa: BLE001
+                    err = exc2
+                    pr = None
+            if pr is None:
+                self.emit("pr_open_retry",
+                          f"draft PR open before review failed ({err}); the PR will be "
+                          f"opened at finalize instead")
+                self._advisory(
+                    f"draft PR not opened before review ({type(err).__name__}: {err}) — the "
+                    f"gate still runs, and a PR-body criterion will fail honestly rather "
+                    f"than impossibly")
+                self._draft_pr_absent = "open failed"
+                return ""
         url = getattr(pr, "url", "") or ""
         if url:
             # 🔴 DELIBERATELY NOT WRITTEN TO attempts.pr_url. My first version did, and
@@ -8586,6 +8744,12 @@ class Orchestrator:
         Eval and replay flows that deliberately skip the gate must say so with
         ``reviewer.allow_advisory``, and even then it is announced on the board.
         """
+        # Delivery-sha gate marker (_assert_delivery_sha): reset at the top of
+        # every review round so a PASS-through set by an earlier attempt can
+        # never leak into this one. Only the no-reviewer/allow_advisory branch
+        # below sets it True — every other exit (held-out fail, real reviewer
+        # run) leaves it False, meaning "a stamp is required".
+        self._review_gate_advisory = False
         # Held-out first (B2 #8): deterministic, cheap, and independent of the
         # reviewer — including advisory mode, which skips the LLM reviewer but
         # must not skip a verifiable signal that already exists on disk. This
@@ -8627,6 +8791,11 @@ class Orchestrator:
                 "reviewer.allow_advisory=true. This diff was NOT reviewed.",
                 advisory=True,
             )
+            # Nothing was ever reviewed, so no stamp can exist — the delivery
+            # gate must accept this attempt without one (loudly, via its own
+            # advisory event) rather than reading the absent stamp as a
+            # mismatch and refusing to push.
+            self._review_gate_advisory = True
             return ReviewDecision(
                 passed=True,
                 checklist=[ChecklistItem(

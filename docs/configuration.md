@@ -18,7 +18,7 @@ changes in code and not here fails the suite.
 | `bounds.max_turns_per_attempt` | `500` | Agent turns before an attempt is cut off |
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
-| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor and utility stay on Claude. See [BACKENDS.md](BACKENDS.md) |
+| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. See [BACKENDS.md](BACKENDS.md) |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
@@ -108,9 +108,9 @@ llm:
   review_timeout_seconds: 1500    # wall-clock per review session; a round that
                                   # dies on this wall escalates UNREVIEWED
   code_review_timeout_seconds: 1800  # same, for `nh review` on a whole PR diff
-  local_model: null               # worker.backend: local — model id the local server serves
-  local_base_url: null            # e.g. http://localhost:8000 — required in local mode
-  local_cli_path: null            # null ⇒ the SDK-bundled CLI
+  local_model: null               # NOT LIVE YET — see llm.local_* below
+  local_base_url: null            # e.g. http://localhost:8000 (not live yet)
+  local_cli_path: null            # null ⇒ the SDK-bundled CLI (not live yet)
 
 database:
   path: ~/.no_human/no_human.db   # SQLite (WAL). No Postgres/Redis.
@@ -366,7 +366,7 @@ exception, for friends/commercial installs that pay Anthropic directly with
 
 ### `llm.local_model` / `llm.local_base_url` / `llm.local_cli_path`
 
-Only read when `worker.backend: local`. `local_base_url` is **required** in
+Reserved for `worker.backend: local`. `local_base_url` is **required** in
 that mode — an ambient `ANTHROPIC_BASE_URL` is scrubbed and never trusted as a
 fallback. It must be `http` or `https`, and the host must be `localhost` or a
 **literal** loopback/RFC1918 IP address: a DNS name is refused (it is
@@ -378,6 +378,10 @@ numbers and paths are not validated — `http://localhost:8000` and
 config, the key never does. If the local server enforces a key, it goes in
 `~/.no_human/.env` as `LOCAL_LLM_API_KEY`, never in `config.yaml`.
 `local_cli_path` is optional; `null` uses the SDK-bundled CLI.
+**These keys are not live yet.** They are validated and scrubbed, but the coder
+seam that would run against a local server has not landed — setting
+`worker.backend: local` today fails at task start with
+`unknown coding backend 'local'`.
 
 ## `learning:` — memory lifecycle
 

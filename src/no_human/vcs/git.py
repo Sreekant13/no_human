@@ -257,6 +257,14 @@ class GitRepo:
                 return cand
         return None
 
+    def branch_sha(self, branch: str) -> str:
+        """The tip of the NAMED branch (not HEAD, which can have drifted)."""
+        sha = self._run("rev-parse", "--verify", "--quiet",
+                         f"{branch}^{{commit}}", check=False)
+        if not sha:
+            raise GitError(f"cannot resolve branch tip for {branch!r}")
+        return sha
+
     def create_branch(self, name: str, *, base: str | None = None) -> str:
         if _branch_protected(name, self.never_push_to):
             raise ProtectedBranch(f"refusing to create protected branch: {name}")

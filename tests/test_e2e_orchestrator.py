@@ -622,9 +622,25 @@ async def test_human_gated_ci_resume_opens_pr_without_rerunning_agent(
     bare_repo, tmp_path, store
 ):
     cfg = _config(tmp_path)
-    # First run: park on the gate.
+    # First run: park on the gate. Give it a real (fake) passing reviewer so a
+    # genuine review round stamps `review_history` with this commit's sha
+    # before parking — advisory (no-reviewer) passes deliberately do NOT
+    # stamp (see orchestrator.py `_run_review`'s advisory branch), and the
+    # delivery-sha gate (`_assert_delivery_sha`) fails closed on a resume
+    # that crosses a fresh `Orchestrator` instance with nothing stamped, by
+    # design: an advisory pass means "nothing was reviewed", so there is
+    # nothing honest to accept after a restart. A real stamped PASS is what
+    # this test's resume path is actually meant to exercise.
+    passing_decision = ReviewDecision(
+        passed=True,
+        checklist=[
+            ChecklistItem("mul(a,b) implemented", True, "calc.py:3 returns a*b"),
+            ChecklistItem("tests added", True, "test_calc.py:5 test_mul asserts mul(2,3)==6"),
+        ],
+    )
+    reviewer = FakeReviewer(passing_decision)
     orch = Orchestrator(store, cfg.data, FakeBackend(_feature_mutate),
-                        SlackNotifier(None), ci_runner=_GatedCI())
+                        SlackNotifier(None), ci_runner=_GatedCI(), reviewer=reviewer)
     t = Task.new("add mul()", repo_path=str(bare_repo))
     await store.create_task(t)
     assert (await orch.run_task(t)).status is TaskStatus.BLOCKED

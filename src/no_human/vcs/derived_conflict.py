@@ -324,10 +324,10 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                                 f"arithmetic ({note}):\n"
                                 + approve_proc.stdout + approve_proc.stderr))
             reconciled = note
-            # The rewritten classification is itself a shipped, pinned file
-            # wherever the repo ships it — re-pin it too, or step-7 verify
-            # refuses the tree on its stale hash (found by the land-path
-            # fixture, whose classification is pinned like the real repo's).
+            # Wherever a repo SHIPS its classification file it is pinned, and
+            # the rewrite stales that pin — re-pin it or step-7 verify refuses.
+            # (This repo drops the file, so here it is a no-op; the land
+            # fixture ships it and covers the path.)
             retry_targets = list(dict.fromkeys(
                 [*shipped_changed,
                  *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))

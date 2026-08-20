@@ -10,8 +10,8 @@ The default is unchanged and always will be the default unless you change it.
 | Model | `llm.primary_model` | `llm.codex_model` |
 | Install | `npm install -g @anthropic-ai/claude-code` | `npm install -g @openai/codex` |
 
-Everything except the coder — reviewer, planner, supervisor, utility — stays on
-Claude regardless of this setting. The review gate and the four model tiers are
+Everything except the coder — reviewer, planner, supervisor, utility, intake —
+stays on Claude regardless of this setting. The review gate and the four model tiers are
 fixed by the project's non-negotiable constraints, and the amendment that
 sanctioned a second *coding* backend moved none of them. So selecting `codex`
 means your run bills **two** vendors: OpenAI for the implementer, Anthropic for

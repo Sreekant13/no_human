@@ -911,14 +911,21 @@ async def test_finalize_hands_the_pr_body_the_branch_it_is_opening(
     work = _repo_with_two_commits(tmp_path)
     repo = GitRepo(work)
     orch = _orch(store, tmp_path)
+    head_sha = repo.head_sha()
 
     task = Task.new("t", repo_path=str(work))
+    # Delivery must push the review-approved sha (test_delivery_pushes_
+    # reviewed_sha.py): stamp a PASS for this exact head so `_finalize`'s
+    # pre-push gate lets this test reach `open_pr` at all.
+    task.context = {"review_history": [
+        {"round": 1, "sha": head_sha, "passed": True, "blocking": [], "advisory": []},
+    ]}
     await store.create_task(task)
     await store.set_status(task, TaskStatus.TESTING, validate=False)
     attempt_id = await store.create_attempt(task.id, 1)
 
     commit = _Commit()
-    commit.sha = repo.head_sha()
+    commit.sha = head_sha
     out = await orch._finalize(task, repo, "feat/x", "main", commit,
                                attempt_id, _Result())
     assert out.status == TaskStatus.AWAITING_APPROVAL
@@ -937,24 +944,37 @@ async def test_finalize_scopes_the_review_dossier_to_the_head_it_is_shipping(
     store, tmp_path, captured_pr_body,
 ):
     """The same wiring, read through C4: without `repo`, `_rounds_for_head`
-    has nothing to test ancestry against and every stale round renders."""
+    has nothing to test ancestry against and every stale round renders.
+
+    Also stamps a real PASS for the actual head — since
+    test_delivery_pushes_reviewed_sha.py, `_finalize`'s pre-push gate refuses
+    to push at all without one, so the off-branch round alone can no longer
+    reach `open_pr` to exercise this. Two rounds prove BOTH halves at once:
+    the off-branch round's finding must not leak (unchanged assertion), and
+    the real round's PASSED verdict — the one `_finalize` actually delivered
+    on — must be exactly what renders."""
     work = _repo_with_two_commits(tmp_path)
     repo = GitRepo(work)
     orch = _orch(store, tmp_path)
+    head_sha = repo.head_sha()
 
     task = Task.new("t", repo_path=str(work))
-    # A round stamped with a commit that is NOT on this branch.
-    task.context = {"review_history": [{
-        "round": 1, "sha": "0" * 40, "passed": False,
-        "blocking": ["a finding about a diff that is not in front of you"],
-        "advisory": [],
-    }]}
+    task.context = {"review_history": [
+        # A round stamped with a commit that is NOT on this branch.
+        {"round": 1, "sha": "0" * 40, "passed": False,
+         "blocking": ["a finding about a diff that is not in front of you"],
+         "advisory": []},
+        # The real PASS for this head — required by `_finalize`'s delivery
+        # gate before it will push at all.
+        {"round": 2, "sha": head_sha, "passed": True,
+         "blocking": [], "advisory": []},
+    ]}
     await store.create_task(task)
     await store.set_status(task, TaskStatus.TESTING, validate=False)
     attempt_id = await store.create_attempt(task.id, 1)
 
     commit = _Commit()
-    commit.sha = repo.head_sha()
+    commit.sha = head_sha
     await orch._finalize(task, repo, "feat/x", "main", commit,
                          attempt_id, _Result())
     body = captured_pr_body["body"]
@@ -962,7 +982,9 @@ async def test_finalize_scopes_the_review_dossier_to_the_head_it_is_shipping(
     assert "a finding about a diff that is not in front of you" not in body, (
         "a verdict on another commit rendered on this PR — `repo` is not "
         "reaching `_review_evidence_section` from `_finalize`")
-    assert "no review has run against this commit yet" in body
+    assert "final verdict: **PASSED**" in body, (
+        "the real round for this head did not render — `repo` is not "
+        "reaching `_review_evidence_section` from `_finalize`")
 
 
 async def test_the_review_gate_stamps_the_commit_it_judged(store, tmp_path):

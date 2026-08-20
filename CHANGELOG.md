@@ -97,7 +97,7 @@ Also in this release — reliability, honesty, and cost, measured not asserted
 - `CONTRIBUTING.md`, `docs/adapters.md` and the `nh task add --backend` help no
   longer say "a single Claude backend": the coder runs on the Claude Agent SDK
   by default with OpenAI Codex as the sanctioned second backend
-  (`worker.backend`); reviewer, planner, supervisor and utility tiers stay on
+  (`worker.backend`); reviewer, planner, supervisor, utility and intake tiers stay on
   Claude.
 
 ### Fixed
