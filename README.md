@@ -43,6 +43,13 @@ that CLI for every task. To pay Anthropic directly instead, set
 `llm.auth_mode: "api_key"` and put your `ANTHROPIC_API_KEY` in
 `~/.no_human/.env`.
 
+### One line (CLI + board)
+
+```bash
+uv tool install no-human   # or: pipx install no-human — the wheel ships the board
+nh init && nh doctor       # token, config, first repo; then prove the install is real
+```
+
 ### Desktop app
 
 [![Download for macOS](https://img.shields.io/badge/Download%20for-macOS-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest) [![Download for Windows](https://img.shields.io/badge/Download%20for-Windows-4C9AFF?style=for-the-badge)](https://getnohuman.com/) [![Download for Linux](https://img.shields.io/badge/Download%20for-Linux-4C9AFF?style=for-the-badge)](https://getnohuman.com/)

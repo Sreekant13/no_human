@@ -163,6 +163,13 @@ uv tool install --editable .      # then `nh` works from anywhere
 — or activate the venv once per shell (`source .venv/bin/activate`) and drop
 the `uv run` prefix everywhere.
 
+Don't want a checkout at all? The released wheel on PyPI ships the board
+built in, so one line gives you a bare `nh` everywhere:
+
+```bash
+uv tool install no-human          # or: pipx install no-human
+```
+
 ## 3. Run `nh init`
 
 ```bash
