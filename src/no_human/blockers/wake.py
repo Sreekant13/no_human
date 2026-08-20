@@ -1643,11 +1643,16 @@ class WakeWatcher:
                     f"; unpinned (drop-classified): {', '.join(result.unpinned)}"
                     if result.unpinned else ""
                 )
+                reconciled = getattr(result, "reconciled", "")
+                reconciled_note = (
+                    f"; EXPORT_CLASSIFICATION.txt count reconciled by merge "
+                    f"arithmetic: {reconciled}" if reconciled else ""
+                )
                 await self._emit(
                     task, "pr_conflict_resolved",
                     f"{task.id[:8]} PR CONFLICTING — resolved mechanically "
                     f"(derived artefact(s) only: {conflict_desc}), pushed "
-                    f"{result.pushed_sha[:8]}{unpinned_note}",
+                    f"{result.pushed_sha[:8]}{unpinned_note}{reconciled_note}",
                 )
                 return "resolved_pr_conflict"
 

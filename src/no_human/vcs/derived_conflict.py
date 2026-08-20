@@ -14,7 +14,11 @@ needs — "is this conflict confined to derived artefacts?" and, if so,
 membership rule (see `DERIVED_ARTEFACTS` below) even though it sits next to
 `RELEASE_MANIFEST.txt` in the export gate: its per-rule win-COUNTs are
 hand-maintained, not rebuilt by any command, so a conflict touching it still
-needs a coder round exactly as before this module existed.
+needs a coder round exactly as before this module existed. ONE exception,
+which is not a decision: when the file merged CLEANLY and a count is stale
+only because both sides bumped it for files each added, the correct number is
+base + (branch - merge-base), and `_reconcile_merge_count_drift` writes it
+under exactly that equality (INCIDENT 2026-08-20, task c309a6a3).
 
 `resolve_derived_conflict` is synchronous (it shells out, like
 `approve_merge.py`, which it reuses); the async watcher calls it via
@@ -32,10 +36,13 @@ from pathlib import Path
 from .approve_merge import (
     _APPROVE_TIMEOUT_S,
     _VERIFY_TIMEOUT_S,
+    CLASSIFICATION_NAME,
+    COUNT_DRIFT_RE,
     _cap,
     _cleanup_worktree,
     _sh,
     _ship_classified_paths,
+    reconcile_merge_count_drift,
 )
 from .git import GitError, GitRepo, ProtectedBranch
 from .pr_watcher import _base_tips, _git_rc, merge_tree_conflicts, refs_resolvable
@@ -55,7 +62,9 @@ from .pr_watcher import _base_tips, _git_rc, merge_tree_conflicts, refs_resolvab
 #: win-COUNT (`ship 293  tests/*.py`), and no command in `export_guard.py`
 #: re-tallies that count — `approve` rebuilds manifest pins and nothing else,
 #: `verify` only checks the count against the tree and REFUSES on a mismatch,
-#: it never repairs one. Taking `--ours` on a real conflict there would
+#: it never repairs one (the one repair this module makes, the merge
+#: arithmetic in `_reconcile_merge_count_drift`, applies only to a file that
+#: did NOT conflict). Taking `--ours` on a real conflict there would
 #: silently discard a hand decision (a ship/drop flip, a new pattern) that
 #: only a coder round can make correctly — the exact thing this module exists
 #: to avoid doing to genuinely derived content. So a conflict touching this
@@ -136,6 +145,10 @@ class DerivedResolution:
     pushed_sha: str = ""
     unpinned: list[str] = field(default_factory=list)
     detail: str = ""
+    #: Non-empty when a win-count in EXPORT_CLASSIFICATION.txt — a file this
+    #: module otherwise never touches — was rewritten by merge arithmetic;
+    #: the human gate must see that, so the caller puts it in the event.
+    reconciled: str = ""
 
 
 def _run_export_guard(worktree_path: Path, subargs: list[str], *,
@@ -288,6 +301,7 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     })
     shipped_changed = _ship_classified_paths(worktree_path, changed)
     unpinned = sorted(set(changed) - set(shipped_changed))
+    reconciled = ""
 
     if shipped_changed:
         _sh(["git", "add", "-A", "--", *shipped_changed], cwd=worktree_path)
@@ -297,6 +311,33 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
             return DerivedResolution(
                 ok=False, step="regenerate", unpinned=unpinned,
                 detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s")
+
+        if approve_proc.returncode == 2 and COUNT_DRIFT_RE.search(
+                approve_proc.stdout + approve_proc.stderr):
+            ok, note = reconcile_merge_count_drift(
+                worktree_path, base_tip_sha, branch_tip_sha,
+                approve_proc.stdout + approve_proc.stderr)
+            if not ok:
+                return DerivedResolution(
+                    ok=False, step="regenerate", unpinned=unpinned,
+                    detail=_cap(f"{CLASSIFICATION_NAME} count drift is not merge "
+                                f"arithmetic ({note}):\n"
+                                + approve_proc.stdout + approve_proc.stderr))
+            reconciled = note
+            # The rewritten classification is itself a shipped, pinned file
+            # wherever the repo ships it — re-pin it too, or step-7 verify
+            # refuses the tree on its stale hash (found by the land-path
+            # fixture, whose classification is pinned like the real repo's).
+            retry_targets = list(dict.fromkeys(
+                [*shipped_changed,
+                 *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))
+            approve_proc = _run_export_guard(
+                worktree_path, ["approve", *retry_targets], timeout=_APPROVE_TIMEOUT_S)
+            if approve_proc is None:
+                return DerivedResolution(
+                    ok=False, step="regenerate", unpinned=unpinned,
+                    detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s "
+                           f"(after count reconcile: {note})")
 
         if approve_proc.returncode == 2:
             combined = approve_proc.stdout + approve_proc.stderr
@@ -384,8 +425,11 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
 
     return DerivedResolution(
         ok=True, step="ok", pushed_sha=merge_sha, unpinned=unpinned,
+        reconciled=reconciled,
         detail=f"regenerated derived artefact(s) from the merged tree, "
                f"pushed {merge_sha[:8]}"
                + (f"; unpinned (drop-classified): {', '.join(unpinned)}"
-                  if unpinned else ""),
+                  if unpinned else "")
+               + (f"; {CLASSIFICATION_NAME} count reconciled by merge "
+                  f"arithmetic: {reconciled}" if reconciled else ""),
     )

@@ -109,7 +109,7 @@ from ..vcs.receipts import verify_pr_receipt
 from ..vcs.task_pr import resolve_task_pr
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector, error_signature
-from ..blockers.taxonomy import resume_checkpoint
+from ..blockers.taxonomy import carried_checkpoint, resume_checkpoint
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
 from .infra_breaker import infra_breaker
@@ -2140,7 +2140,39 @@ class Orchestrator:
         self, task: Task, repo: GitRepo | None, branch: str | None, reason: str
     ) -> TaskOutcome:
         """Stop where we are, keeping the work: checkpoint, park, clear the flag."""
+        before = ""
+        if repo is not None:
+            try:
+                before = repo.head_sha()
+            except Exception:  # noqa: BLE001 — a missing head reads as "nothing committed now"
+                before = ""
         sha = self._checkpoint_wip(repo, task) if repo is not None else ""
+        # KEEP A RICHER CHECKPOINT. `_checkpoint_wip` returns HEAD when the
+        # tree is clean, and at `_drive` entry (a stop honoured before the
+        # route split) the checkout sits at BASE — so a blind overwrite
+        # replaced a parked blocker's real `resume_commit`/`resume_branch`
+        # (the task's own work) with the base sha and a blank branch, and
+        # `nh task resume` then branched from base. When nothing was
+        # committed now and the prior checkpoint descends from HEAD (it
+        # carries at least what HEAD does), the prior one stands; a divergent
+        # or missing prior, or a fresh WIP commit, uses what was just
+        # measured. Found by the independent review of the `_drive`
+        # pre-check (2026-08-20).
+        # Freshest record first: a human's send-back writes `resume_from`
+        # with NO sha — a veto the retained blocker's older sha must not
+        # override (`blockers.carried_checkpoint` owns the precedence).
+        prior = carried_checkpoint(task) or {}
+        committed_now = bool(sha) and sha != before
+        kept_prior = False
+        if (not committed_now and prior.get("sha")
+                and (not sha or self._ancestor_of(repo, sha, prior["sha"]))):
+            # `not sha`: nothing could be measured at all (no repo, or a
+            # protected-branch refusal) — the prior is all there is. Taken as
+            # a PAIR: the prior's sha lives on the prior's branch, not on
+            # whatever branch this worker happens to have active.
+            sha, branch = prior["sha"], (prior.get("branch") or "")
+            kept_prior = True
+        prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
         task.blocker = {
             "category": "USER_PAUSED",
             "question": reason,
@@ -2148,6 +2180,12 @@ class Orchestrator:
             "resume_commit": sha,
             "resume_branch": branch or "",
         }
+        if prior_blocker and prior_blocker.get("category") not in (None, "USER_PAUSED"):
+            # The record of what the pause landed on; the wake condition is
+            # deliberately NOT re-armed — a human's stop is not a timer's to undo.
+            task.blocker["paused_over"] = {
+                k: prior_blocker.get(k) for k in ("category", "wake_condition")
+                if prior_blocker.get(k)}
         task.wake_check_at = None
         # Columns only. This runs on `nh task pause` — i.e. WHILE a human is
         # issuing commands — and it is the writer that records `resume_commit`.
@@ -2160,7 +2198,8 @@ class Orchestrator:
         self.emit(
             "cancelled",
             f"stopped by operator: {reason}"
-            + (f" — work checkpointed at {sha[:8]}" if sha else ""),
+            + (f" — keeping checkpoint {sha[:8]}" if kept_prior
+               else f" — work checkpointed at {sha[:8]}" if sha else ""),
             status="blocked",
         )
         self.notifier.notify("task_paused", f"{task.title} stopped: {reason}")

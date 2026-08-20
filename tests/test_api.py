@@ -3036,3 +3036,19 @@ async def test_send_back_withdraws_the_durable_human_stop_too(client, store):
     assert fresh.status == TaskStatus.IMPLEMENTING
     assert fresh.blocker is None
     assert await store.get_cancel_request(t.id) is None
+
+
+@pytest.mark.asyncio
+async def test_board_pause_direct_park_carries_the_checkpoint(client, store):
+    """R1's third writer: the board's direct park (no worker owns the task)
+    used to write a USER_PAUSED blocker with no checkpoint, so the next
+    resume branched from base; it now carries the one the task had."""
+    from no_human.blockers import resume_checkpoint
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    t.blocker = {"category": "CI_GATE", "resume_commit": "b" * 40, "resume_branch": "no-human/w"}
+    await store.update_task_columns(t)
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.BLOCKED and fresh.blocker["category"] == "USER_PAUSED"
+    assert resume_checkpoint(fresh.blocker) == {"sha": "b" * 40, "branch": "no-human/w"}

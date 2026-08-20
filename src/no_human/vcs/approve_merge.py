@@ -58,6 +58,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,10 @@ class LandResult:
     message: str = ""
     stderr: str = ""
     skipped: bool = False
+    #: Non-empty when the land step rewrote a win-count in
+    #: EXPORT_CLASSIFICATION.txt by merge arithmetic — the human who approved
+    #: must be able to see that a hand-maintained file was touched.
+    reconciled: str = ""
 
 
 def _cap(text: str) -> str:
@@ -195,6 +200,117 @@ def _load_export_builder(root: Path):
         return module
     except Exception:  # noqa: BLE001 — advisory narrowing only
         return None
+
+
+CLASSIFICATION_NAME = "EXPORT_CLASSIFICATION.txt"
+
+#: The guard names a drifted rule like ``EXPORT_CLASSIFICATION.txt:248: `ship
+#: 299  tests/*.py` actually wins 300 file(s).`` (build_public_export.
+#: classification_errors; approve prints it on stderr, rc 2).
+COUNT_DRIFT_RE = re.compile(
+    r"`(?P<verb>ship|drop)\s+(?P<declared>\d+)\s+(?P<pattern>\S+)` actually wins "
+    r"(?P<real>\d+) file")
+_RULE_LINE_RE = re.compile(
+    r"^(?P<verb>ship|drop)(?P<sp1>\s+)(?P<count>\d+)(?P<sp2>\s+)(?P<pattern>\S+)\s*$")
+
+
+def _declared_counts(worktree_path: Path, sha: str) -> tuple[dict[tuple[str, str], int] | None, set]:
+    """(``{(verb, pattern): declared}`` at *sha*, keys that appear MORE THAN
+    ONCE there). None when the file is absent at *sha*. A duplicated
+    ``(verb, pattern)`` is legal in the grammar (the shadowed line declares 0),
+    so it is reported rather than collapsed last-wins."""
+    show = _sh(["git", "show", f"{sha}:{CLASSIFICATION_NAME}"], cwd=worktree_path)
+    if show.returncode != 0:
+        return None, set()
+    out: dict[tuple[str, str], int] = {}
+    dups: set = set()
+    for line in show.stdout.splitlines():
+        m = _RULE_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        key = (m["verb"], m["pattern"])
+        if key in out:
+            dups.add(key)
+        out[key] = int(m["count"])
+    return out, dups
+
+
+def reconcile_merge_count_drift(worktree_path: Path, base_sha: str, branch_sha: str,
+                                refusal_text: str) -> tuple[bool, str]:
+    """Repair a win-COUNT that is stale ONLY because two reviewed counts met.
+
+    `EXPORT_CLASSIFICATION.txt` is not a derived artefact: its counts are
+    hand-maintained and a textual conflict in it is a ship/drop decision no
+    mechanical step may make. This is the one case that is NOT a decision.
+    The file merged cleanly, base and branch each bumped a rule's count for
+    files each added — both commits passed the count gate — and the merged
+    tree carries both sets of files, so the only correct count is
+
+        base_declared + (branch_declared - merge_base_declared)
+
+    The guard's own refusal names the drift; the three declared values are
+    read from git; the number is rewritten ONLY under exactly that equality
+    (and only when the rule is present, once, on every side); anything else
+    is refused with the arithmetic shown. Used by both merge sites — the
+    derived-conflict resolver (a PR that went CONFLICTING) and `nh approve`'s
+    land step (a squash onto a moved tip) — which hit the identical refusal.
+    INCIDENT 2026-08-20, task c309a6a3 / PR #511: 298→299 on both sides, real
+    300, `approve` refused, the mechanical round failed at 'regenerate', a
+    review-PASSED task escalated to a human who did this arithmetic by hand;
+    twice.
+    """
+    drifts = list(COUNT_DRIFT_RE.finditer(refusal_text))
+    if not drifts:
+        return False, "no count drift in the refusal"
+    mb = _sh(["git", "merge-base", base_sha, branch_sha], cwd=worktree_path)
+    if mb.returncode != 0 or not mb.stdout.strip():
+        return False, "no merge base between base and branch"
+    base, bd = _declared_counts(worktree_path, base_sha)
+    branch, rd = _declared_counts(worktree_path, branch_sha)
+    anc, ad = _declared_counts(worktree_path, mb.stdout.strip())
+    if base is None or branch is None or anc is None:
+        return False, f"{CLASSIFICATION_NAME} missing on one side of the merge"
+    path = worktree_path / CLASSIFICATION_NAME
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    notes: list[str] = []
+    for m in drifts:
+        key = (m["verb"], m["pattern"])
+        declared, real = int(m["declared"]), int(m["real"])
+        if key in bd or key in rd or key in ad:
+            return False, (f"rule `{m['verb']} {m['pattern']}` appears more than once on "
+                           "a side of the merge — ambiguous, a hand decision")
+        if key not in base or key not in branch or key not in anc:
+            return False, (f"rule `{m['verb']} {m['pattern']}` is not present on every "
+                           "side of the merge — a hand decision, not merge arithmetic")
+        expected = base[key] + (branch[key] - anc[key])
+        if real != expected:
+            return False, (f"rule `{m['verb']} {m['pattern']}`: real {real} != base {base[key]} "
+                           f"+ (branch {branch[key]} - merge-base {anc[key]}) = {expected} — "
+                           "not a mechanical merge of two reviewed counts")
+        hits = 0
+        for i, line in enumerate(lines):
+            lm = _RULE_LINE_RE.match(line.strip())
+            if lm and (lm["verb"], lm["pattern"]) == key and int(lm["count"]) == declared:
+                # keep the column: counts are right-aligned, so absorb a
+                # width change into the leading pad when there is room.
+                sp1 = lm["sp1"]
+                delta = len(str(real)) - len(str(declared))
+                if 0 < delta < len(sp1):
+                    sp1 = sp1[delta:]
+                elif delta < 0:
+                    sp1 = sp1 + " " * (-delta)
+                lines[i] = line.replace(f"{lm['verb']}{lm['sp1']}{declared}{lm['sp2']}",
+                                        f"{lm['verb']}{sp1}{real}{lm['sp2']}", 1)
+                hits += 1
+        if hits != 1:
+            return False, f"rule `{m['verb']} {m['pattern']}` matched {hits} line(s), expected 1"
+        notes.append(f"{m['verb']} {m['pattern']}: {declared} -> {real} "
+                     f"(base {base[key]} + branch {branch[key]} - merge-base {anc[key]})")
+    path.write_text("".join(lines), encoding="utf-8")
+    add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
+    if add.returncode != 0:
+        return False, _cap(add.stderr)
+    return True, "; ".join(notes)
 
 
 def _ship_classified_paths(root: Path, paths: list[str]) -> list[str]:
@@ -463,6 +579,7 @@ def _land_in_worktree(
 
     # -- step 4: manifest merge-result ledger rule ------------------------ #
     _step(on_step, "manifest")
+    reconciled_note = ""
     guard = worktree_path / "scripts" / "export_guard.py"
     manifest = worktree_path / "RELEASE_MANIFEST.txt"
     if guard.exists() and manifest.exists():
@@ -492,6 +609,37 @@ def _land_in_worktree(
                 return LandResult(
                     ok=False, step="manifest", branch=branch, pr_url=pr_url,
                     stderr=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s")
+            if approve_proc.returncode == 2 and COUNT_DRIFT_RE.search(
+                    approve_proc.stdout + approve_proc.stderr):
+                # Same refusal the derived-conflict resolver meets, same
+                # arithmetic: a squash onto a tip that also bumped the count.
+                ok, note = reconcile_merge_count_drift(
+                    worktree_path, tip_sha, resolved_branch,
+                    approve_proc.stdout + approve_proc.stderr)
+                if not ok:
+                    return LandResult(
+                        ok=False, step="manifest", branch=branch, pr_url=pr_url,
+                        stderr=_cap(f"{CLASSIFICATION_NAME} count drift is not merge "
+                                    f"arithmetic ({note}):\n"
+                                    + approve_proc.stdout + approve_proc.stderr))
+                reconciled_note = note
+                # The rewritten classification is itself a shipped, pinned
+                # file wherever the repo ships it — re-pin it too, or step-7
+                # verify refuses the tree on its stale hash.
+                retry_targets = list(dict.fromkeys(
+                    [*shipped_changed,
+                     *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))
+                try:
+                    approve_proc = _sh(
+                        [sys.executable, "scripts/export_guard.py", "approve",
+                         *retry_targets],
+                        cwd=worktree_path, timeout=_APPROVE_TIMEOUT_S,
+                    )
+                except subprocess.TimeoutExpired:
+                    return LandResult(
+                        ok=False, step="manifest", branch=branch, pr_url=pr_url,
+                        stderr=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s "
+                               f"(after count reconcile: {note})")
             if approve_proc.returncode != 0:
                 why = ("scan-hit refusal" if approve_proc.returncode == 1
                        else "refused before writing pins")
@@ -629,4 +777,5 @@ def _land_in_worktree(
     if close_note:
         msg += f"; {close_note}"
     return LandResult(ok=True, step="close_pr", branch=branch, pr_url=pr_url,
+                      reconciled=reconciled_note,
                        landed_sha=landed_sha, message=msg)

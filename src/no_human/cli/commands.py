@@ -1452,8 +1452,15 @@ def task_pause(task_id, reason):
                 return
 
             # No server: nothing is running, so this process is the only writer.
+            # Carry the checkpoint the task already had (twin of the board's
+            # direct-park branch; `carried_checkpoint` honours a human's
+            # sha-less `resume_from` as a veto).
+            from ..blockers import carried_checkpoint
+            prior = carried_checkpoint(t) or {}
             t.blocker = {"category": "USER_PAUSED", "question": reason,
-                         "root_cause_hypothesis": reason}
+                         "root_cause_hypothesis": reason,
+                         "resume_commit": prior.get("sha", ""),
+                         "resume_branch": prior.get("branch", "")}
             await store.update_task(t)
             await store.set_status(t, TaskStatus.BLOCKED)
             await store.clear_cancel_request(t.id)

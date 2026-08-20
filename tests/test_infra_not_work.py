@@ -475,3 +475,101 @@ async def test_drive_honours_a_pending_stop_before_the_human_gated_route(
     fresh = await store.get_task(task.id)
     assert fresh.blocker["category"] == "USER_PAUSED"
     assert await store.get_cancel_request(task.id) is None, "honoured stops are cleared"
+
+
+async def test_honoured_stop_keeps_a_richer_parked_checkpoint(
+        store, bare_repo, tmp_path):
+    """R1 from the `_drive` pre-check review: at `_drive` entry the checkout
+    sits at BASE, so honouring a stop with a clean tree used to overwrite the
+    parked blocker's real `resume_commit`/`resume_branch` with the base sha
+    and a blank branch. A prior checkpoint that descends from HEAD stands."""
+    import subprocess
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    # real work on the task's branch, then back to base (the _drive-entry shape)
+    _git(bare_repo, "checkout", "-q", "-b", "no-human/work")
+    (bare_repo / "work.py").write_text("work\n")
+    _git(bare_repo, "add", "work.py")
+    _git(bare_repo, "commit", "-qm", "[WIP-PARTIAL] real work")
+    work_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=bare_repo,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    _git(bare_repo, "checkout", "-q", "main")
+    task.blocker = {"category": "CI_GATE", "wake_condition": "after:2h",
+                    "resume_commit": work_sha, "resume_branch": "no-human/work"}
+    await store.update_task_columns(task)
+
+    outcome = await orch._honor_cancel(task, repo, None, "Paused from board")
+
+    assert outcome.status == TaskStatus.BLOCKED
+    fresh = await store.get_task(task.id)
+    assert fresh.blocker["category"] == "USER_PAUSED"
+    assert resume_checkpoint(fresh.blocker) == {"sha": work_sha, "branch": "no-human/work"}
+    assert fresh.blocker["paused_over"] == {"category": "CI_GATE", "wake_condition": "after:2h"}
+    assert fresh.wake_check_at is None
+
+
+async def test_honoured_stop_with_fresh_wip_records_the_new_commit(
+        store, bare_repo, tmp_path):
+    """Control: uncommitted work is committed and recorded — a prior that is
+    an ANCESTOR of the new commit never wins (by the ancestry rule; the
+    `committed_now` clause is defensive redundancy, not what this pins)."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    base = repo.head_sha()
+    task.blocker = {"category": "CI_GATE", "resume_commit": base, "resume_branch": "x"}
+    _git(bare_repo, "checkout", "-q", "-b", "no-human/live")   # main is protected
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return b + a\n")
+
+    await orch._honor_cancel(task, repo, "no-human/live", "Paused from board")
+
+    fresh = await store.get_task(task.id)
+    cp = resume_checkpoint(fresh.blocker)
+    assert cp["sha"] != base and cp["branch"] == "no-human/live"
+
+
+async def test_honoured_stop_with_no_measurable_checkpoint_keeps_the_prior(
+        store, bare_repo, tmp_path):
+    """A checkpoint that cannot be measured (no repo in hand, or a
+    protected-branch refusal) must not erase a prior one."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, _repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.blocker = {"category": "CI_GATE", "resume_commit": "a" * 40, "resume_branch": "no-human/w"}
+
+    await orch._honor_cancel(task, None, None, "Paused from board")
+
+    fresh = await store.get_task(task.id)
+    assert resume_checkpoint(fresh.blocker) == {"sha": "a" * 40, "branch": "no-human/w"}
+
+
+async def test_honoured_stop_respects_a_send_backs_cleared_checkpoint(
+        store, bare_repo, tmp_path):
+    """D1 of the first review: a human's send-back writes `resume_from` with
+    NO sha ("branch from base, do not credit the abandoned partial") and
+    leaves the blocker's older sha in place. The pause must not revive it —
+    the next resume would stamp it `by: human` and disarm the zero-diff gate
+    over sent-back work."""
+    import subprocess
+    from no_human.blockers import resume_checkpoint, resume_provenance
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    _git(bare_repo, "checkout", "-q", "-b", "no-human/work")
+    (bare_repo / "work.py").write_text("work\n")
+    _git(bare_repo, "add", "work.py")
+    _git(bare_repo, "commit", "-qm", "[WIP-PARTIAL] abandoned")
+    work_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=bare_repo,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    _git(bare_repo, "checkout", "-q", "main")
+    task.blocker = {"category": "CI_GATE", "resume_commit": work_sha, "resume_branch": "no-human/work"}
+    await store.update_task_columns(task)
+    task.context = await store.merge_context(
+        task.id, {"resume_from": resume_provenance(None, "human")})   # the send-back's write
+
+    await orch._honor_cancel(task, repo, None, "Paused from board")
+
+    fresh = await store.get_task(task.id)
+    assert resume_checkpoint(fresh.blocker) is None or resume_checkpoint(fresh.blocker)["sha"] == repo.head_sha(), (
+        "the pause revived the checkpoint the human's send-back cleared")
+    assert (resume_checkpoint(fresh.blocker) or {}).get("sha") != work_sha

@@ -1461,8 +1461,15 @@ async def pause_task(
                             "attempt will stop at its next checkpoint")}
     # Nothing this server is running: park it directly, and withdraw the flag
     # so a later retry/resume does not re-park on turn zero.
+    # Carry the checkpoint the task already had (a crashed worker's park is
+    # exactly where it is worth keeping) — `carried_checkpoint` honours a
+    # human's sha-less `resume_from` as a veto, like `_honor_cancel`.
+    from ..blockers import carried_checkpoint
+    prior = carried_checkpoint(task) or {}
     task.blocker = {"category": "USER_PAUSED", "question": "Paused from board",
-                    "root_cause_hypothesis": "Paused by operator via web board"}
+                    "root_cause_hypothesis": "Paused by operator via web board",
+                    "resume_commit": prior.get("sha", ""),
+                    "resume_branch": prior.get("branch", "")}
     await store.update_task_columns(task)
     await store.set_status(task, TaskStatus.BLOCKED, validate=False)
     await store.clear_cancel_request(task.id)

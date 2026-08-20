@@ -178,6 +178,32 @@ def resume_checkpoint(blocker: dict[str, Any] | None) -> dict[str, str] | None:
     return {"sha": sha, "branch": blocker.get("resume_branch") or ""}
 
 
+def carried_checkpoint(task: Any) -> dict[str, str] | None:
+    """The checkpoint a NEW park should carry forward — freshest write wins.
+
+    Two records can name one: ``context.resume_from`` (re-stamped by EVERY
+    re-entry — wake, orphan requeue, human) and the retained ``blocker``
+    (written by the LAST park, never cleared by a machine resume). They can
+    disagree in one direction that matters: a human's send-back / reject
+    writes ``resume_from`` with ``sha: None`` — "branch from base, do not
+    credit the abandoned partial" — and leaves the blocker's older sha in
+    place. A park that then read the blocker revived exactly the checkpoint
+    the human cleared, and the next resume stamped it ``by: human``, disarming
+    the zero-diff honesty gate over sent-back work. So: a PRESENT
+    ``resume_from`` decides — its sha if it has one, a veto if it has none —
+    and only an ABSENT one falls back to the blocker. Same rule
+    `_park_quota` applies; this is the one home for it.
+    """
+    ctx = getattr(task, "context", None) or {}
+    rf = ctx.get("resume_from") if isinstance(ctx, dict) else None
+    if isinstance(rf, dict):
+        sha = rf.get("sha") or ""
+        if not sha:
+            return None
+        return {"sha": sha, "branch": rf.get("branch") or ""}
+    return resume_checkpoint(getattr(task, "blocker", None))
+
+
 def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, Any]:
     """The COMPLETE ``resume_from`` value for one resume, by one actor.
 

@@ -23,6 +23,8 @@ changes in code and not here fails the suite.
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
 | `usage_ledger.retention_days` | `90` | Age past which `unattributed_usage` rows are rolled up (not deleted — totals stay exact, per-row `ts`/`task_id` detail is lost); `0` disables compaction |
+| `approve_merge.enabled` | `true` | Whether `nh approve` lands the PR itself — squash the branch into one commit, push the default branch, close the PR. `false` records the approval and leaves the merge to you; neither is a failure |
+| `approve_merge.test_timeout_seconds` | `1800` | Wall-clock seconds the change-scoped test run that gates a landing gets. Exceeding it fails the landing at the test step, so nothing is pushed |
 
 Review depth scales with diff size: a gate review of a diff at or under
 `max_diff_lines` changed lines runs SINGLE-TURN, no tools — the diff, the full
@@ -198,14 +200,16 @@ git:
     name: ""                      # empty -> resolved from this repo's git
     email: ""                     # config (user.name/user.email)
 
-`approve_merge.enabled` (default **true**) is what makes `nh approve` LAND the
-pull request: squash the branch into one commit, push it to the default branch,
-and close the PR. Set it to `false` and `nh approve` still records your
-approval and still marks the task approved — it just does not merge, leaving
-the PR for you to merge in your git host. The same record-only path is taken
-when there is no PR or no `gh` on PATH; none of those is a failure.
-`approve_merge.test_timeout_seconds` (default **1800**) bounds the test run
-that gates that landing.
+`approve_merge.enabled` is what makes `nh approve` LAND the pull request:
+squash the branch into one commit, push it to the default branch, and close
+the PR. Set it to `false` and `nh approve` still records your approval and
+still marks the task approved — it just does not merge, leaving the PR for you
+to merge in your git host. The same record-only path is taken when there is no
+PR or no `gh` on PATH; none of those is a failure.
+`approve_merge.test_timeout_seconds` bounds the test run that gates that
+landing. Both defaults are in the table at the top of this file, which is
+pinned to `DEFAULT_CONFIG` by the suite; stating a default here as well would
+put an unguarded second copy in the file.
 
 `git.approve_identity.name`/`.email` is the identity the ONE commit `nh
 approve` lands when it squash-merges a PR is attributed to — the human merge

@@ -2768,3 +2768,27 @@ def test_unblock_withdraws_a_pending_stop_on_the_re_entry_branch(tmp_path, monke
             return (await store.get_task(task_id)).status, await store.get_cancel_request(task_id)
     status, flag = asyncio.run(_read())
     assert status == TaskStatus.IMPLEMENTING and flag is None
+
+
+def test_task_pause_without_a_server_carries_the_checkpoint(tmp_path, monkeypatch):
+    """R1's second writer: `nh task pause` with no server parks directly and
+    used to drop the task's checkpoint; it now carries it."""
+    import asyncio
+    from no_human.core.db import Store
+    from no_human.blockers import resume_checkpoint
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING)
+
+    async def _arm():
+        async with Store(db) as store:
+            t = await store.get_task(task_id)
+            t.blocker = {"category": "CI_GATE", "resume_commit": "c" * 40, "resume_branch": "no-human/v"}
+            await store.update_task_columns(t)
+    asyncio.run(_arm())
+    runner = _make_runner(db, monkeypatch)
+    monkeypatch.setattr("no_human.cli.commands._server_owns_worker", lambda cfg: False)
+
+    result = runner.invoke(cli, ["task", "pause", task_id[:8], "--reason", "hold"])
+
+    assert result.exit_code == 0, result.output
+    assert resume_checkpoint(_get_task(db, task_id).blocker) == {"sha": "c" * 40, "branch": "no-human/v"}

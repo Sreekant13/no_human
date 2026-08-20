@@ -217,12 +217,31 @@ def _shipped(root):
     return set(cls.shipped)
 
 
+def _count_drift(root):
+    """The real guard's classification_errors, count half: every rule's real
+    win-count must equal its declared one. Same phrasing, same stream."""
+    b = _builder()
+    text = (root / b.CLASSIFICATION_NAME).read_text()
+    rules = b.parse_classification(text)
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, text=True).stdout
+    tracked = [p for p in out.split("\\0") if p]
+    cls = b.classify(rules, tracked)
+    return [f"{b.CLASSIFICATION_NAME}:{r.lineno}: `{r.verb} {r.declared}  {r.pattern}` "
+            f"actually wins {cls.wins[r.lineno]} file(s)."
+            for r in rules if cls.wins[r.lineno] != r.declared]
+
+
 def cmd_approve(args, root):
     if (root / "REFUSE_SCAN").exists():
         print("approve: REFUSED (stub) - 1 scan hit(s)", file=sys.stderr)
         return 1
     if (root / "REFUSE_BEFORE_WRITE").exists():
         print("approve: REFUSED (stub) - the advisory scan cannot run", file=sys.stderr)
+        return 2
+    drift = _count_drift(root)
+    if drift:
+        print("approve: REFUSED (stub) - fix EXPORT_CLASSIFICATION.txt first:\\n  "
+              + "\\n  ".join(drift), file=sys.stderr)
         return 2
     shipped = _shipped(root)
     pins = _pins(root)
@@ -341,8 +360,15 @@ class LandEnv:
         _git(self.clone, "checkout", "-q", "-B", name, "origin/main")
         (self.clone / "src" / "feature.py").write_text("def feature():\n    return 3\n")
         cls_path = self.clone / "EXPORT_CLASSIFICATION.txt"
-        cls_path.write_text(cls_path.read_text().replace(
-            "ship 2 src/*.py", "ship 3 src/*.py"))
+        text = cls_path.read_text().replace("ship 2 src/*.py", "ship 3 src/*.py")
+        # Every added `tests/*.py` extra bumps its counted drop rule, the way a
+        # real attempt's commit must (the stub guard, like the real one,
+        # refuses `approve` on a drifted count).
+        added_tests = sum(1 for rel in (extra_files or {})
+                          if rel.startswith("tests/") and rel.endswith(".py") and rel.count("/") == 1)
+        if added_tests:
+            text = text.replace("drop 1 tests/*.py", f"drop {1 + added_tests} tests/*.py")
+        cls_path.write_text(text)
         if corrupt_manifest:
             (self.clone / "RELEASE_MANIFEST.txt").write_text("# RELEASE_MANIFEST.txt\n")
         for rel, content in (extra_files or {}).items():
@@ -428,6 +454,10 @@ def land_env(tmp_path, monkeypatch) -> LandEnv:
     (seed / "scripts" / "build_public_export.py").write_text(_MINI_BUILD_PUBLIC_EXPORT)
     (seed / "scripts" / "export_guard.py").write_text(_EXPORT_GUARD_STUB)
     (seed / "EXPORT_CLASSIFICATION.txt").write_text(_CLASSIFICATION)
+    # The classification declares `ship 1 RELEASE_MANIFEST.txt`, and the stub
+    # guard — like the real one — refuses `approve` while a declared count is
+    # wrong, so the manifest must exist (and be staged) before the first run.
+    (seed / "RELEASE_MANIFEST.txt").write_text("# RELEASE_MANIFEST.txt\n")
     # `git ls-files` (what the guard classifies from) only sees the INDEX, so
     # everything must be staged before `approve` runs.
     _git(seed, "add", "-A")
@@ -1587,3 +1617,71 @@ async def test_fresh_merge_claim_blocks_a_second_claim(tmp_path):
             "a live (non-stale) claim must refuse a second claim"
     finally:
         await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# A squash onto a tip that also bumped a counted rule: merge arithmetic       #
+# --------------------------------------------------------------------------- #
+
+
+def _advance_origin_with_counted_file(land_env, name: str, *, bump: bool) -> str:
+    """Land `src/<name>.py` on origin/main from a third clone, bumping (or,
+    for the negative control, NOT bumping) `ship N src/*.py`."""
+    race = land_env.tmp_path / f"race-{name}"
+    _git(land_env.tmp_path, "clone", "-q", str(land_env.origin), str(race))
+    (race / "src" / f"{name}.py").write_text(f"def {name}():\n    return 9\n")
+    if bump:
+        cls = race / "EXPORT_CLASSIFICATION.txt"
+        cls.write_text(cls.read_text().replace("ship 2 src/*.py", "ship 3 src/*.py"))
+    _git(race, "add", "-A")
+    if bump:
+        # a real landed commit carries its own pin (the gate requires it)
+        subprocess.run([sys.executable, "scripts/export_guard.py", "approve", f"src/{name}.py"],
+                       cwd=race, check=True, capture_output=True, text=True)
+        _git(race, "add", "-A")
+    _git(race, "commit", "-qm", f"main: add {name}.py")
+    _git(race, "push", "-q", "origin", "HEAD:main")
+    return _git(race, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_land_reconciles_two_reviewed_count_bumps(land_env):
+    """c309a6a3's shape at the `nh approve` site: the branch added feature.py
+    and bumped 2->3; main then added another src file and bumped 2->3; the
+    squash merges the classification cleanly at 3 while the tree holds 4.
+    `approve` refuses; land does base + (branch - merge-base) == real and
+    lands, and the result says so."""
+    # corrupt_manifest=False: the watcher keeps a PR branch's manifest mergeable
+    # before approval; what reaches land here is a tip that moved AFTER that,
+    # with a manifest change that auto-merges and a count that does not.
+    branch, _ = land_env.cut_branch("no-human/t-arith", corrupt_manifest=False)
+    _advance_origin_with_counted_file(land_env, "other", bump=True)
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, f"{result.step}: {result.stderr}"
+    assert "2 -> 4" not in result.reconciled and "3 -> 4" in result.reconciled, result.reconciled
+    cls = _git(land_env.origin, "show", f"{result.landed_sha}:EXPORT_CLASSIFICATION.txt").stdout
+    assert "ship 4 src/*.py" in cls
+    manifest = _git(land_env.origin, "show", f"{result.landed_sha}:RELEASE_MANIFEST.txt").stdout
+    assert "src/feature.py" in manifest and "src/other.py" in manifest
+
+
+def test_land_refuses_a_count_drift_that_is_not_merge_arithmetic(land_env):
+    """Negative control: main added a counted file WITHOUT bumping — a stale
+    count on one side is a hand problem; land must refuse at 'manifest' with
+    the arithmetic shown, and push nothing."""
+    # corrupt_manifest=False: the watcher keeps a PR branch's manifest mergeable
+    # before approval; what reaches land here is a tip that moved AFTER that,
+    # with a manifest change that auto-merges and a count that does not.
+    branch, _ = land_env.cut_branch("no-human/t-arith-neg", corrupt_manifest=False)
+    tip = _advance_origin_with_counted_file(land_env, "sloppy", bump=False)
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert not result.ok and result.step == "manifest"
+    assert "not a mechanical merge" in result.stderr, result.stderr
+    assert land_env.remote_main_sha() == tip
