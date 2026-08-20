@@ -20,7 +20,7 @@
     "dist:linux:bundled": "bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never"
   },
   "devDependencies": {
-    "electron": "38.2.1",
+    "electron": "38.8.6",
     "electron-builder": "^26.15.3"
   },
   "nhPackagedFiles": {
