@@ -81,6 +81,11 @@ REGISTRY: dict[tuple[str, str], str] = {
     ("core/orchestrator.py", "Orchestrator._honor_server_stop"): INHERITS_ELSE_STAMPS,
     # --- internal, within a run the loop already entered ---
     ("core/orchestrator.py", "Orchestrator._run_attempt"): INTERNAL,
+    # _advance_after_review's target is a plain variable (TESTING or
+    # AWAITING_APPROVAL at its two call sites, both post-review), so the
+    # opaque-target scan flags it; it never moves a task back to a
+    # parked/terminal state, same as _run_attempt itself. Incident 6408aba0.
+    ("core/orchestrator.py", "Orchestrator._advance_after_review"): INTERNAL,
 }
 
 CLAIMABLE = {"PENDING", "IMPLEMENTING"}
@@ -307,6 +312,7 @@ STOP_REGISTRY: dict[tuple[str, str], str] = {
     # cancel outrank the stop while the process lives.)
     ("core/orchestrator.py", "Orchestrator._honor_server_stop"): KEEPS,
     ("core/orchestrator.py", "Orchestrator._run_attempt"): STOP_INTERNAL,
+    ("core/orchestrator.py", "Orchestrator._advance_after_review"): STOP_INTERNAL,
 }
 
 

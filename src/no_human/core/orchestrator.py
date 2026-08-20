@@ -122,7 +122,7 @@ from .pricing import (
 )
 from .pricing import weighted_tokens as _weighted_tokens
 from .pr_evidence import PrEvidence, collapse_appendix
-from .task import Task, TaskSpec, TaskStatus
+from .task import IllegalTransition, Task, TaskSpec, TaskStatus
 from .worktree import _LIVE_WORKTREES, reset_agent_workspace, teardown_worktree
 
 log = logging.getLogger("no_human.orchestrator")
@@ -5032,7 +5032,9 @@ class Orchestrator:
         )
 
         # --- test: run local suite, record results ---
-        await self.store.set_status(task, TaskStatus.TESTING)
+        await self._advance_after_review(
+            task, TaskStatus.TESTING, attempt_id=attempt_id, branch=branch,
+            base=base, commit=commit, pr_url=draft_pr, stage="post_review")
         self.emit("state", "testing", status="testing")
         test_cmd, test_cwd = await self._resolve_test_target(repo)
 
@@ -5827,7 +5829,10 @@ class Orchestrator:
         for _url in (pr.url, *linked_pr_urls):
             await record_pr_opened(self.store, task.id, _url)
 
-        await self.store.set_status(task, TaskStatus.AWAITING_APPROVAL)
+        await self._advance_after_review(
+            task, TaskStatus.AWAITING_APPROVAL, attempt_id=attempt_id,
+            branch=branch, base=base, commit=commit, pr_url=pr.url,
+            stage="delivery")
         self.emit("pr_open", pr.url, pr_kind=pr.kind, status="awaiting_approval")
         self.notifier.notify(
             "needs_approval",
@@ -5904,6 +5909,94 @@ class Orchestrator:
         NOVEL_UNKNOWN report (never bare prose; 22.4)."""
         blocker = fallback_blocker(detail, goal=goal or task.title)
         return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+
+    async def _advance_after_review(
+        self, task: Task, target: TaskStatus, *, attempt_id: str,
+        branch: str | None = None, base: str | None = None,
+        commit: Any = None, pr_url: str = "", stage: str = "",
+    ) -> None:
+        """Move *task* to *target* after a review PASS, without ever crashing.
+
+        `set_status` validates against the in-process handle (`task.status`),
+        which two production paths can silently regress to IMPLEMENTING
+        between the review verdict and this call — `Store.update_task`
+        refreshing `task.status` from the row, or `WakeWatcher._resume`
+        writing IMPLEMENTING with `validate=False` (`blockers/wake.py:737`).
+        Incident 6408aba0: a fully reviewed change was discarded this way.
+
+        `IMPLEMENTING -> TESTING` is now a legal edge (`task.py`), so the
+        `try` below succeeds on that path. This wrapper is the fallback for
+        whatever edge still is NOT legal (e.g. IMPLEMENTING ->
+        AWAITING_APPROVAL) — it preserves the reviewed work (branch, commit,
+        PR) instead of losing it to an escaping `IllegalTransition`, and
+        completes the move only when the attempt's own row confirms a
+        verified review PASS and the target is one of the two post-review
+        states. Anything else re-raises: this can never launder a pre-review
+        jump.
+        """
+        try:
+            await self.store.set_status(task, target)
+            return
+        except IllegalTransition as exc:
+            # `except ... as exc` unbinds `exc` at the end of THIS block
+            # (Python clears it to break the traceback's reference cycle) —
+            # every use below needs it to survive past the block.
+            caught = exc
+
+        sha = getattr(commit, "sha", None)
+        if not sha and isinstance(commit, str):
+            sha = commit
+        fields: dict[str, Any] = {}
+        if branch:
+            fields["branch_name"] = branch
+        if sha:
+            fields["commit_sha"] = sha
+        if pr_url:
+            fields["pr_url"] = pr_url
+        # Deliberately does NOT stamp review_passed here: both real call
+        # sites already write it on the attempt row BEFORE calling this
+        # helper (the review-PASS branches in `_run_attempt` and the
+        # already-passed round `_finalize` runs in). Stamping it here too
+        # would make the "did this attempt's row actually confirm a PASS"
+        # check below tautological — this helper would launder ANY target,
+        # reviewed or not, by writing the very fact it then reads back.
+        if fields:
+            await self.store.update_attempt(attempt_id, **fields)
+
+        recovery = {
+            "at": _now(), "from": task.status.value, "to": target.value,
+            "stage": stage, "branch": branch, "base": base, "commit": sha,
+            "pr_url": pr_url, "error": str(caught),
+        }
+        task.context = await self.store.merge_context(
+            task.id, {"post_review_recovery": recovery})
+
+        try:
+            await self.store.save_events(task.id, [{
+                "source": "orchestrator",
+                "kind": "post_review_transition_recovered",
+                "text": f"{task.status.value} -> {target.value} refused "
+                        f"after review PASS; branch={branch} pr={pr_url}",
+                "ts": time.time(),
+            }])
+        except Exception:  # noqa: BLE001 — best-effort, same contract as
+            # the crash-recording path scheduler.py:1101 relies on.
+            log.exception("post_review_transition_recovered event not saved")
+
+        log.warning(
+            "post-review transition %s -> %s refused (%s); preserved "
+            "branch=%s pr=%s", task.status.value, target.value, caught,
+            branch, pr_url)
+        self.emit("state_recovery", str(caught), status=task.status.value,
+                  target=target.value)
+
+        attempt_rows = await self.store.list_attempts(task.id)
+        row = next((a for a in attempt_rows if a.get("id") == attempt_id), None)
+        review_passed = bool(row and row.get("review_passed"))
+        if review_passed and target in (TaskStatus.TESTING, TaskStatus.AWAITING_APPROVAL):
+            await self.store.set_status(task, target, validate=False)
+            return
+        raise caught
 
     async def _record_review_usage(self, attempt_id: str, source: Any) -> None:
         """THE channel for reviewer spend onto the attempt row. One function,

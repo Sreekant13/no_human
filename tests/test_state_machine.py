@@ -98,3 +98,37 @@ def test_task_parent_id_default_none():
     assert t.parent_id is None
     row = t.to_row()
     assert row["parent_id"] is None
+
+
+def test_review_pass_from_implementing_has_a_path_forward():
+    """Incident 6408aba0: a review verdict can land while the row still reads
+    IMPLEMENTING (the review runs inside the implement round), so a review
+    PASS must have a legal, non-crashing way onward to delivery."""
+    assert can_transition(S.IMPLEMENTING, S.TESTING)
+    assert can_transition(S.TESTING, S.AWAITING_APPROVAL)
+
+
+@pytest.mark.parametrize(
+    "src,dst",
+    [
+        # TaskStatus has no "closed" member; DONE and FAILED are its
+        # terminal states (task.py TERMINAL_STATES) — these are the
+        # closed-equivalent illegal edges.
+        (S.DONE, S.IMPLEMENTING),
+        (S.DONE, S.TESTING),
+        (S.FAILED, S.IMPLEMENTING),
+        (S.FAILED, S.TESTING),
+        (S.PENDING, S.IMPLEMENTING),
+        (S.PENDING, S.DONE),
+        (S.CONTEXT, S.TESTING),
+        (S.IMPLEMENTING, S.AWAITING_APPROVAL),
+        (S.IMPLEMENTING, S.DONE),
+    ],
+)
+def test_the_guard_was_not_weakened(src, dst):
+    """The new IMPLEMENTING->TESTING edge is the ONLY edge added; every other
+    previously-illegal transition, including ones adjacent to the new edge,
+    must still raise."""
+    assert not can_transition(src, dst)
+    with pytest.raises(IllegalTransition):
+        assert_transition(src, dst)

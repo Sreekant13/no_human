@@ -99,6 +99,17 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     table[TaskStatus.REVIEWING].add(TaskStatus.IMPLEMENTING)
     table[TaskStatus.TESTING].add(TaskStatus.IMPLEMENTING)
 
+    # implementing -> testing: a review verdict can be reached while the row
+    # still reads IMPLEMENTING — the review runs INSIDE the implement round
+    # (_run_attempt), and the handle regresses to the row's status whenever
+    # Store.update_task refreshes it (db.py) or WakeWatcher._resume writes
+    # IMPLEMENTING with validate=False (blockers/wake.py:737). Incident
+    # 6408aba0 (2026-08-19): review PASSED at 17:35:57, this transition
+    # raised one second later, and a fully reviewed change was discarded.
+    # Skipping REVIEWING is not a skipped review here — REVIEWING is a
+    # reporting state for work that already happened.
+    table[TaskStatus.IMPLEMENTING].add(TaskStatus.TESTING)
+
     # approval gate
     table[TaskStatus.AWAITING_APPROVAL].add(TaskStatus.IMPLEMENTING)  # sent back
     table[TaskStatus.AWAITING_APPROVAL] |= _OFF_RAMPS
