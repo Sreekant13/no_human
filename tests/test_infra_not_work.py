@@ -223,6 +223,106 @@ async def test_incident_attempt_leaves_lifetime_attempts_unchanged(
         "the attempt row must still exist — it is the only durable record")
 
 
+async def test_quota_prose_wall_leaves_lifetime_attempts_unchanged(
+        store, bare_repo, tmp_path):
+    """The OTHER shape of the same wall — the CLI's own prose ("You've hit
+    your weekly limit"), which `_quota_signal` already parks correctly. RED
+    before the fix: the park never closed the attempt row, so it stayed
+    `in_progress`, the next attempt tombstoned it as "superseded by a newer
+    attempt", and the budget gate charged it. INCIDENT (2026-08-20, task
+    021899de): seven hourly quota-wake retries, ZERO tokens each, consumed
+    attempts 2-8 of 9 before the wall lifted."""
+    orch, backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result(
+            final_text="You've hit your weekly limit · resets 2am (Asia/Jerusalem)"))
+
+    with pytest.raises(QuotaExhausted):
+        await orch._run_attempt(task, repo, 1, "main")
+
+    assert backend.calls, "the backend never ran — the test proves nothing"
+    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    assert used_attempts == 0, "a quota wall charged a lifetime attempt"
+    attempts = await store.list_attempts(task.id)
+    assert len(attempts) == 1, "the row must still exist — it is the record"
+    assert attempts[0]["status"] != "in_progress", (
+        "the park must close its own row, or the next attempt tombstones it "
+        "as 'superseded' and the budget gate charges it")
+    assert attempts[0]["failure_reason"].startswith("quota: "), attempts[0]
+
+
+async def test_quota_park_inherits_the_checkpoint_it_was_resumed_from(
+        store, bare_repo, tmp_path):
+    """Second half of the same incident: the park wrote a blocker with NO
+    checkpoint, so the next wake deleted `resume_from.sha` and branched from
+    base — attempts 3-9 of 021899de redid attempt 1's 224 turns. With no repo
+    in hand (the planner-level catch) the park must carry the checkpoint the
+    loop was already on."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, _repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.blocker = {"category": "TRANSIENT_INFRA", "resume_commit": "c0e1aede",
+                    "resume_branch": "no-human/abc"}
+
+    outcome = await orch._park_quota(task, QuotaExhausted("weekly limit"))
+
+    assert outcome.status == TaskStatus.PAUSED_QUOTA
+    assert resume_checkpoint(task.blocker) == {
+        "sha": "c0e1aede", "branch": "no-human/abc"}
+    assert task.blocker["wake_condition"] == "quota_refreshed"
+
+
+async def test_quota_park_with_repo_checkpoints_head(store, bare_repo, tmp_path):
+    """With the repo in hand (the attempt-loop catch) the park records the
+    tree's HEAD — the branch point this attempt was given, or its WIP — the
+    same rule `_honor_cancel` uses."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.blocker = None
+
+    await orch._park_quota(task, QuotaExhausted("weekly limit"), repo=repo)
+
+    cp = resume_checkpoint(task.blocker)
+    assert cp and cp["sha"] == repo.head_sha() and cp["branch"] == "main"
+
+
+async def test_quota_park_on_pr_revision_path_records_no_checkpoint(
+        store, bare_repo, tmp_path):
+    """A task with `pr_branch` set resumes by checking the PR branch out by
+    name, so a checkpoint here is inert for branching — and a `wake`-stamped
+    sha would make `_is_own_partial` fail a correct 'nothing to add' revision
+    round as fabrication (D15 class). Independent review of the first cut."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.context = {**(task.context or {}), "pr_branch": "no-human/abc"}
+    await store.update_task(task)
+    task.blocker = None
+
+    await orch._park_quota(task, QuotaExhausted("weekly limit"), repo=repo)
+
+    assert resume_checkpoint(task.blocker) is None
+    assert task.blocker["wake_condition"] == "quota_refreshed"
+
+
+async def test_quota_park_prefers_the_freshest_resume_from_over_a_stale_blocker(
+        store, bare_repo, tmp_path):
+    """An orphan requeue re-stamps `resume_from` with a NEWER sha without
+    clearing the older blocker; the planner-level park must adopt the newer
+    one, never its own earlier stamp."""
+    from no_human.blockers.taxonomy import resume_checkpoint
+    orch, _backend, task, _repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.context = {**(task.context or {}),
+                    "resume_from": {"sha": "newer111", "branch": "b", "by": "orphan_recovery"}}
+    await store.update_task(task)
+    task.blocker = {"category": "TRANSIENT_INFRA", "resume_commit": "older000"}
+
+    await orch._park_quota(task, QuotaExhausted("weekly limit"))
+
+    assert resume_checkpoint(task.blocker)["sha"] == "newer111"
+
+
 async def test_genuine_failure_still_consumes_an_attempt_and_fails(
         store, bare_repo, tmp_path):
     """Criterion 2 — must be GREEN both before and after: no weakening of

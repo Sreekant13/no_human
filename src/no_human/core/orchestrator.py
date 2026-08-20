@@ -109,6 +109,7 @@ from ..vcs.receipts import verify_pr_receipt
 from ..vcs.task_pr import resolve_task_pr
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector, error_signature
+from ..blockers.taxonomy import resume_checkpoint
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
 from .infra_breaker import infra_breaker
@@ -2924,7 +2925,7 @@ class Orchestrator:
             try:
                 outcome = await self._run_attempt(task, repo, attempt_n, base_branch)
             except QuotaExhausted as exc:
-                return await self._park_quota(task, exc)
+                return await self._park_quota(task, exc, repo=repo)
             # Only a plain FAILED attempt is retried (bounded exploration, 22.3).
             # Any off-ramp (escalated / awaiting_input / blocked / paused_quota /
             # a budget-terminated FAILED) or a ready PR returns immediately —
@@ -4053,7 +4054,23 @@ class Orchestrator:
                 or result.cache_creation_tokens):
             infra_breaker().record_healthy()
         if result.is_error and _quota_signal(result.final_text or ""):
-            raise QuotaExhausted(_quota_reason(result.final_text or ""))
+            # Close THIS row before the park, classified exactly like the SDK
+            # shape below: a billing wall is not the coder's failure and must
+            # not consume a lifetime attempt. Left open, `_park_quota` never
+            # touched the row, the next attempt's `create_attempt` tombstoned
+            # it as "superseded by a newer attempt", and the budget gate
+            # (`infra_failure` NULL) charged it. INCIDENT (2026-08-20, task
+            # 021899de): seven hourly quota-wake retries at ZERO tokens each
+            # consumed attempts 2-8 of 9 before the wall lifted — one review
+            # FAIL away from BUDGET_EXHAUSTED on a task that did nothing
+            # wrong. The token columns stay as recorded above; only the
+            # attempt COUNT is spared. No breaker bump: the pool-wide pause
+            # is `_park_quota`'s, the breaker is for dead dispatches.
+            quota_reason = _quota_reason(result.final_text or "")
+            await self.store.update_attempt(
+                attempt_id, status="failed",
+                failure_reason=f"quota: {quota_reason}", infra_failure=1)
+            raise QuotaExhausted(quota_reason)
 
         # INCIDENT (2026-08-13): the SDK/transport shapes `_quota_signal`
         # cannot see — no CLI prose to match, sometimes zero tokens streamed
@@ -7144,7 +7161,8 @@ class Orchestrator:
             num_turns=0)
         return await self._finalize(task, repo, branch, base, commit, attempt_id, result)
 
-    async def _park_quota(self, task: Task, exc: QuotaExhausted) -> TaskOutcome:
+    async def _park_quota(self, task: Task, exc: QuotaExhausted, *,
+                          repo: GitRepo | None = None) -> TaskOutcome:
         # Name the exhausted subscription: parking stops the whole pool, and with
         # more than one profile configured "quota exhausted" alone does not tell
         # the operator which token to top up or switch away from.
@@ -7152,6 +7170,49 @@ class Orchestrator:
         subscription = f"'{profile}' subscription" if profile else "subscription"
         detail = f"{exc} ({subscription})" if profile else str(exc)
         task.wake_check_at = exc.resets_at
+        # THE CHECKPOINT MUST SURVIVE THE PARK. `WakeWatcher._resume` branches
+        # the next attempt from `resume_checkpoint(task.blocker)` and, when the
+        # blocker names none, DELETES `resume_from.sha` (by design — see
+        # `blockers.resume_provenance`). This park used to write a fresh
+        # blocker with no checkpoint, so the FIRST quota wake still resumed
+        # from the prior blocker's sha, and every wake after it branched from
+        # base. INCIDENT (2026-08-20, task 021899de): attempt 2 resumed from
+        # c0e1aede (224 turns, draft PR open), hit the wall at zero tokens,
+        # and attempts 3-9 re-ran the whole task from base. Same rule as
+        # `_honor_cancel`: checkpoint the tree when the repo is in hand
+        # (`_checkpoint_wip` returns HEAD when it is clean — i.e. exactly the
+        # branch point this attempt was given), else inherit whatever
+        # checkpoint the loop was already on. Provenance stays `wake`, so the
+        # zero-diff honesty gate is unchanged — this decides where the next
+        # attempt BRANCHES, never what it is credited with.
+        #
+        # NOT on the PR-revision path. A task with `pr_branch` set resumes by
+        # checking the PR branch out BY NAME (`_run_attempt`'s revision
+        # branch), never through `_resume_branch_point` — so a checkpoint here
+        # would be inert for branching, yet `_is_own_partial` reads a
+        # `wake`-stamped sha as the loop's own abandoned partial and would
+        # fail a correct "nothing to add" revision round as fabrication (the
+        # D15 class its docstring describes). Found by independent review of
+        # this change; pinned by test_quota_park_on_pr_revision_path_records_no_checkpoint.
+        ctx = task.context or {}
+        sha, branch = "", ""
+        if not ctx.get("pr_branch"):
+            if repo is not None:
+                sha = self._checkpoint_wip(repo, task)
+                try:
+                    branch = repo.current_branch()
+                except Exception:  # noqa: BLE001 — a name is a convenience, the sha is the record
+                    branch = ""
+            if not sha:
+                # Freshest write wins: `resume_from` is re-stamped by every
+                # resume (wake, orphan requeue, human), while the retained
+                # blocker may be an OLDER park's — adopting the older sha is
+                # the "inherit its own earlier stamp" failure
+                # `scheduler._inherited_checkpoint` documents.
+                prior = (ctx.get("resume_from")
+                         or resume_checkpoint(task.blocker) or {})
+                sha = prior.get("sha") or ""
+                branch = branch or prior.get("branch") or ""
         # The BLOCKER is what makes the wake time usable. `wake.py` reads the
         # condition off the blocker and short-circuits on a null one
         # (`if not condition: return False`) BEFORE it ever looks at
@@ -7171,8 +7232,14 @@ class Orchestrator:
             "raised_at": _now(),
             "root_cause_hypothesis": detail,
             "confidence": 1.0,
+            "resume_commit": sha,
+            "resume_branch": branch,
         }
-        await self.store.update_task(task)
+        # Columns only (blocker, wake_check_at): `update_task` would rewrite
+        # the whole context blob from this in-memory copy and drop whatever
+        # the CLI or the watcher merged meanwhile — and the blocker is now the
+        # only record of the checkpoint. Same reasoning as `_honor_cancel`.
+        await self.store.update_task_columns(task)
         await self.store.set_status(task, TaskStatus.PAUSED_QUOTA)
         self.emit("paused_quota", detail, status="paused_quota", auth_profile=profile)
         self.notifier.notify(
