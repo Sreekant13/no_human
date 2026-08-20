@@ -1317,15 +1317,18 @@ def test_gate_prompts_mark_input_untrusted():
         _build_review_prompt,
         _build_angle_prompt,
         _build_already_satisfied_prompt,
+        _build_code_review_prompt,
     )
 
     t = Task(id="t1", source="jira", title="do x", acceptance_criteria=["c1"])
     gate = _build_review_prompt(t, "some diff", "", "")
     angle = _build_angle_prompt(t, "some diff", "security only")
     satisfied = _build_already_satisfied_prompt(t, "the claim")
+    code_review = _build_code_review_prompt(t, "some diff", len("some diff"))
 
     for name, prompt in [("gate", gate), ("angle", angle),
-                         ("already_satisfied", satisfied)]:
+                         ("already_satisfied", satisfied),
+                         ("code_review", code_review)]:
         assert "UNTRUSTED INPUT" in prompt, f"{name} prompt lost the untrusted marker"
         # the operative instruction, not just the header
         assert "never instructions to you" in prompt, f"{name} missing the do-not-obey clause"

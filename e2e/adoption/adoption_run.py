@@ -291,7 +291,12 @@ class Ctx:
                 if not m:
                     continue
                 arg = m.group(1)
-                if arg.startswith("-") or "://" in arg or "/issues/" in arg:
+                # A quoted argument is the documented freeform-sentence form
+                # (`nh task add "some title" ...`), not a bare ticket key —
+                # the capture stops at the first space, so `arg` here is only
+                # the sentence's opening word wrapped in its leading quote.
+                if (arg.startswith("-") or arg.startswith('"')
+                        or "://" in arg or "/issues/" in arg):
                     continue
                 # A line that explicitly says it does NOT work is documentation,
                 # not a promise.

@@ -6,8 +6,6 @@
 
 **From ticket to reviewed pull request.**<br>***Free and open-source, on your machine.***
 
-Give it a ticket. Get back a pull request, with the evidence that it works.
-
 [![latest release](https://img.shields.io/github/v/release/no-human-ai/no_human?label=release&color=4C9AFF)](https://github.com/no-human-ai/no_human/releases/latest) [![CI](https://img.shields.io/github/actions/workflow/status/no-human-ai/no_human/ci.yml?branch=main&label=CI)](https://github.com/no-human-ai/no_human/actions/workflows/ci.yml) [![python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/) [![license MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [getnohuman.com](https://getnohuman.com) · [Quickstart](docs/quickstart.md) · [Docs](docs/README.md) · [Watch it work a sprint](https://getnohuman.com/demo)
@@ -45,18 +43,7 @@ that CLI for every task. To pay Anthropic directly instead, set
 
 ### Desktop app
 
-Download the build for your platform from the
-[latest release](https://github.com/no-human-ai/no_human/releases/latest), open
-it, and paste your credential on the **Connect Claude** screen. The app bundles
-its own Python, the server and the board — nothing to clone, no `uv sync`.
-
-- **macOS** (Apple silicon) — `no_human-<version>.dmg`, signed and notarized.
-  Drag to Applications.
-- **Windows** (x64) — `no_human-<version>-UNSIGNED.exe`. Not code-signed yet, so
-  SmartScreen warns: choose *More info → Run anyway*. Installs per user, no
-  administrator prompt.
-- **Linux** (x64) — `no_human-<version>-linux-amd64.deb` (recommended; `sudo apt
-  install ./no_human-<version>-linux-amd64.deb`) or the `.AppImage`.
+[![Download for macOS](https://img.shields.io/badge/Download%20for-macOS-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest) [![Download for Windows](https://img.shields.io/badge/Download%20for-Windows-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest) [![Download for Linux](https://img.shields.io/badge/Download%20for-Linux-4C9AFF?style=for-the-badge)](https://github.com/no-human-ai/no_human/releases/latest)
 
 Each release ships a SHA-256 alongside the artifact. Platform notes and the
 first-run walk-through: [docs/quickstart.md](docs/quickstart.md).

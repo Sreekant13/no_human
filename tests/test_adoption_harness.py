@@ -143,6 +143,60 @@ def test_every_persona_step_cites_a_document():
                 or "UNDOCUMENTED" in r or "SOURCE ONLY" in r), r
 
 
+def test_bare_ticket_key_detector_ignores_quoted_titles_but_catches_bare_keys(tmp_path):
+    """ADOPT-5 regression: a quoted freeform title is a sentence, not a key.
+
+    The detector takes the first token after `nh task add` and used to skip
+    it only when it started with `-`, or contained `://` or `/issues/`. For
+    the documented freeform form (`nh task add "Fix the flaky E2E test" ...`)
+    the capture stops at the first space, so the token is `"Fix` — the
+    opening word of a quoted sentence — which passed all three checks and
+    got reported as a bare ticket key: a false HIGH finding against a doc
+    that is correct.
+
+    Three of the five lines fed to the detector below are quoted verbatim out
+    of docs/quickstart.md (not paraphrased), so a wording change there makes
+    this test track it rather than go stale. quickstart.md deliberately does
+    not document a bare key or its removal, so those two lines are
+    synthesized to drive the two skip paths this check must still hit.
+    """
+    import adoption_run
+
+    quickstart = (REPO_ROOT / "docs" / "quickstart.md").read_text()
+    doc_lines = [ln for ln in quickstart.splitlines()
+                 if re.search(r"nh task add\s+([^\s`]+)", ln)]
+
+    title_lines = [l for l in doc_lines if re.search(r"nh task add\s+--title", l)]
+    quoted_lines = [l for l in doc_lines if re.search(r'nh task add\s+"', l)]
+    url_lines = [l for l in doc_lines if "nh task add https://" in l]
+    assert title_lines and quoted_lines and url_lines, (
+        "docs/quickstart.md no longer documents one of the three forms this "
+        "test drives verbatim; update the extraction, not the assertions")
+
+    bare_key_line = "uv run nh task add AVI-1 --repo ~/git/my-repo"
+    disclaimed_line = "uv run nh task add PROJ-42 is no longer supported --repo ~/git/my-repo"
+
+    product = tmp_path / "product"
+    (product / "docs").mkdir(parents=True)
+    (product / "docs" / "quickstart.md").write_text("\n".join([
+        title_lines[0], quoted_lines[0], url_lines[0],
+        bare_key_line, disclaimed_line,
+    ]))
+
+    # The method doesn't touch `self`; call it unbound to exercise the real
+    # detector without constructing the rest of Ctx's persona-run state.
+    hits = adoption_run.Ctx.docs_still_promise_bare_ticket_key(None, product)
+    joined = "\n".join(hits)
+
+    assert "AVI-1" in joined, f"a genuine bare key must still be flagged, got {hits}"
+    assert "Fix the flaky E2E test" not in joined, (
+        f"a quoted freeform title must not be flagged as a bare key, got {hits}")
+    assert "https://github.com" not in joined, f"a documented issue URL was flagged, got {hits}"
+    assert "PROJ-42" not in joined, (
+        f"a line whose prose disclaims the bare-key form must stay skipped, got {hits}")
+    assert len(hits) == 1, f"expected only the bare key to be flagged, got {hits}"
+
+
 def test_fakes_are_labelled_as_fakes():
     """A mocked pass must never be reportable as a live one."""
     import fakes

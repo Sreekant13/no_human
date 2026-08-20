@@ -475,6 +475,34 @@ def test_goal_prompt_tells_the_judge_an_empty_diff_can_be_correct():
     assert "AGENT REPORT" not in p2
 
 
+def test_goal_prompt_states_the_missing_input_rule():
+    """JUDGE_CALIBRATION.md's "two different standards" section records two
+    conflicting rulings on requests whose named input does not exist in the
+    sandbox: ns-f5cb4cb0 (an honest stop naming the missing input) was scored
+    not-satisfied, while ns-01c3d46d (an empty diff excused by the absence)
+    was scored satisfied. The prompt must state one standard that resolves
+    both the same way, in both renderings, ahead of the output-format
+    markers."""
+    from no_human.eval.judge import build_goal_prompt
+
+    # Shape A: honest refusal that names the missing input.
+    p_refusal = build_goal_prompt(
+        "review PR on <unreachable host>", [], "", "blocked",
+        report="the host does not resolve; stopping")
+    # Shape B: empty diff / invented stand-in for a missing input.
+    p_empty = build_goal_prompt("fix the bug in nonexistent_module.py", [], "", "done")
+
+    for p in (p_refusal, p_empty):
+        assert "does not exist or is not reachable in this environment" in p
+        assert "names the specific missing input" in p
+        assert "NOT a quality failure" in p
+        assert "NEVER satisfied merely because something was produced" in p
+        assert "Never give a numeric score." in p
+        rule_idx = p.index("Missing-input rule:")
+        marker_idx = p.index("JUDGE_JSON_START")
+        assert rule_idx < marker_idx
+
+
 class _JudgeBackend:
     """Fake backend: returns `replies` in order. A reply is a str (final_text,
     is_error=False) or a (str, is_error) tuple."""

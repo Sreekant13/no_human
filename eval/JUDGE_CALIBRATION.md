@@ -96,7 +96,7 @@ policy per spec.
 |---|---|
 | model evidence-audit | done, 2026-08-03, κ_audit = 1.00 over 20 pairs |
 | human calibration (κ ≥ 0.8) | **not done** — sheet with the operator, slots empty |
-| missing-input rule for the judge | **not done** — required by bench-v2 V4 |
+| missing-input rule for the judge | done — explicit policy paragraph in `build_goal_prompt`, `src/no_human/eval/judge.py` (pinned by `tests/test_northstar.py::test_goal_prompt_states_the_missing_input_rule`) |
 
 Until the middle row changes, treat "goal satisfied" in any published bench
 report as one model's evidence-backed opinion, audited by another model of the

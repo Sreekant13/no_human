@@ -1221,7 +1221,8 @@ def _build_code_review_prompt(
         "Your job is to provide constructive, evidence-based feedback that helps the\n"
         "author improve the code. Be rigorous but fair — acknowledge good patterns\n"
         "while flagging real issues.\n\n"
-        "If the diff appears truncated for any file, use your read tools to open\n"
+        + _UNTRUSTED_INPUT
+        + "If the diff appears truncated for any file, use your read tools to open\n"
         "the full file and understand the complete change before making judgments.\n"
         "Never flag 'missing code' or 'orphaned constant' without first reading\n"
         "the full file to confirm.\n\n"
