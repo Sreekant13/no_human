@@ -1364,6 +1364,10 @@ async def send_back(
     task.context = await store.merge_context(
         task.id, {"resume_from": resume_provenance(None, "human")})
     # Reset to IMPLEMENTING so the next `nh watch <id>` retries.
+    # Re-entering the loop withdraws any pending board Pause, or the next
+    # attempt would honour it on turn zero and park the task straight back
+    # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
+    await store.clear_cancel_request(task.id)
     await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
@@ -1422,10 +1426,41 @@ async def pause_task(
             status_code=409,
             detail=f"task is {task.status.value!r} — only active tasks can be paused",
         )
+    # A task the scheduler is RUNNING is owned by its worker: raise the cancel
+    # flag — the only signal a live orchestrator observes — and let it stop at
+    # its next cooperative checkpoint, commit the tree as [WIP-BLOCKED] and
+    # park itself (`Orchestrator._honor_cancel`). That is exactly what
+    # `nh task pause` does (`cli/commands.py`). Writing BLOCKED from here
+    # instead flipped the status under a worker that kept running, and the
+    # pause recorded NO checkpoint — so a later resume branched from base and
+    # the attempt's work was thrown away. Found by the 2026-08-20 sweep of
+    # every blocker writer for a missing `resume_commit`.
+    # Raise the flag FIRST, before the inflight check, so the two branches
+    # below differ only in who parks: the worker (flag left for it) or this
+    # handler (flag withdrawn again). A worker this server cannot see
+    # (`nh watch`/`nh serve` in another process is invisible to
+    # `scheduler.inflight`) is NOT covered here — the direct-park branch
+    # withdraws the flag before such a worker's 3s poll would see it; the CLI
+    # covers that case by probing the server, not `inflight`.
+    await store.request_cancel(task.id, "Paused from board")
+    sched = _sched(request)
+    if sched is not None and task.id in getattr(sched, "inflight", set()):
+        tasks = await _board_tasks(store, scheduler=sched)
+        await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
+                              "tasks": [t.model_dump() for t in tasks]})
+        # Honoured at the attempt's next cooperative checkpoint — the coder
+        # session's next tool call, or the top of the next attempt when the
+        # pause lands during planning/review/testing.
+        return {"ok": True,
+                "message": (f"pause requested {task_id[:8]} — the running "
+                            "attempt will stop at its next checkpoint")}
+    # Nothing this server is running: park it directly, and withdraw the flag
+    # so a later retry/resume does not re-park on turn zero.
     task.blocker = {"category": "USER_PAUSED", "question": "Paused from board",
                     "root_cause_hypothesis": "Paused by operator via web board"}
     await store.update_task_columns(task)
     await store.set_status(task, TaskStatus.BLOCKED, validate=False)
+    await store.clear_cancel_request(task.id)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
                           "tasks": [t.model_dump() for t in tasks]})
@@ -1471,6 +1506,10 @@ async def resume_task(
     await store.update_task_columns(task)
     task.context = await store.merge_context(
         task.id, {"resume_from": resume_provenance(checkpoint, "human")})
+    # Re-entering the loop withdraws any pending board Pause, or the next
+    # attempt would honour it on turn zero and park the task straight back
+    # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
+    await store.clear_cancel_request(task.id)
     await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
@@ -1497,6 +1536,9 @@ async def cancel_task(
     reason = reason.strip()[:500] or "Cancelled from board"
     task.context = await store.merge_context(
         task.id, {"cancel_reason": reason})
+    # Nothing can honour a pending board Pause after the kill below — withdraw
+    # it, as `nh task cancel` does (cli/commands.py).
+    await store.clear_cancel_request(task.id)
     await store.set_status(
         task, TaskStatus.FAILED, validate=False, human_override=True)
     # Cancel must STOP the work, not just flip the status. A running task's SDK
@@ -1612,6 +1654,10 @@ async def retry_task(
         task.id, {"cancel_reason": None, "retried_at": _now(),
                   "resume_from": None})
     await store.update_task_columns(task)
+    # Re-entering the loop withdraws any pending board Pause, or the next
+    # attempt would honour it on turn zero and park the task straight back
+    # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
+    await store.clear_cancel_request(task.id)
     await store.set_status(
         task, TaskStatus.PENDING, validate=False, human_override=True)
     tasks = await _board_tasks(store, scheduler=_sched(request))
@@ -3070,6 +3116,10 @@ async def reply_task(
     task.context = await store.merge_context(task.id, patch)
     task.wake_check_at = None
     await store.update_task_columns(task)
+    # Re-entering the loop withdraws any pending board Pause, or the next
+    # attempt would honour it on turn zero and park the task straight back
+    # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
+    await store.clear_cancel_request(task.id)
     await store.set_status(task, resume_to, validate=False)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({

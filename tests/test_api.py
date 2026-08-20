@@ -2922,3 +2922,99 @@ async def test_restore_is_idempotent_on_a_live_row(client, store):
 async def test_restore_unknown_id_is_404(client):
     r = await client.post("/api/learnings/does-not-exist/restore")
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pause_on_inflight_task_requests_cancel_and_leaves_status_to_the_worker(
+        client, store):
+    """A task the scheduler is RUNNING is paused the way `nh task pause` does
+    it: raise the cancel flag and let the worker checkpoint + park itself
+    (`_honor_cancel` writes the USER_PAUSED blocker WITH `resume_commit`).
+    Flipping BLOCKED from the API under a live worker recorded no checkpoint,
+    so the eventual resume branched from base. Negative control for this
+    branch is `test_pause_on_implementing_still_transitions_to_blocked` (no
+    scheduler → nothing is running it → parked directly)."""
+    from types import SimpleNamespace
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    app.state.scheduler = SimpleNamespace(inflight={t.id},
+                                          get_live_status=lambda tid: None)
+    try:
+        r = await client.post(f"/api/tasks/{t.id}/pause")
+    finally:
+        app.state.scheduler = None
+    assert r.status_code == 200, r.text
+    assert "checkpoint" in r.json()["message"]
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.IMPLEMENTING, "status is the worker's to change"
+    assert fresh.blocker is None, "the worker writes the checkpointed blocker"
+    assert await store.get_cancel_request(t.id) == "Paused from board"
+
+
+@pytest.mark.asyncio
+async def test_pause_with_scheduler_present_but_task_not_inflight_parks_directly_and_leaves_no_flag(
+        client, store):
+    """Forward guard (green on the parent too — it does not demonstrate the
+    change): a scheduler IS present but is not running this task → direct
+    park, and the flag raised first is withdrawn again, so a later
+    retry/resume does not re-park on turn zero."""
+    from types import SimpleNamespace
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    app.state.scheduler = SimpleNamespace(inflight=set(),
+                                          get_live_status=lambda tid: None)
+    try:
+        r = await client.post(f"/api/tasks/{t.id}/pause")
+    finally:
+        app.state.scheduler = None
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.BLOCKED
+    assert fresh.blocker.get("category") == "USER_PAUSED"
+    assert await store.get_cancel_request(t.id) is None
+
+
+@pytest.mark.asyncio
+async def test_board_retry_and_resume_withdraw_a_pending_pause(client, store):
+    """Board Pause (flag set) → worker killed before honouring → Retry/Resume
+    must clear `cancel_requested`, or the fresh run honours the stale pause on
+    turn zero and parks straight back (the CLI twins already do this)."""
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    await store.request_cancel(t.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t.id}/retry")
+    assert r.status_code == 200, r.text
+    assert await store.get_cancel_request(t.id) is None
+
+    t2 = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t2.blocker = {"category": "USER_PAUSED", "question": "Paused from board"}
+    await store.update_task_columns(t2)
+    await store.request_cancel(t2.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t2.id}/resume")
+    assert r.status_code == 200, r.text
+    assert await store.get_cancel_request(t2.id) is None
+
+
+@pytest.mark.asyncio
+async def test_board_reply_send_back_and_cancel_withdraw_a_pending_pause(client, store):
+    """The other three board re-entries/exits clear `cancel_requested` too —
+    reply and send-back re-enter the loop (a stale flag would park the fresh
+    attempt on turn zero); cancel kills the worker, so nothing could ever
+    honour it (the CLI twin clears it as well)."""
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"question": "Which DB?", "category": "need_clarification"}
+    await store.update_task(t)
+    await store.request_cancel(t.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "SQLite only"})
+    assert r.status_code == 200, r.text
+    assert await store.get_cancel_request(t.id) is None
+
+    t2 = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await store.request_cancel(t2.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t2.id}/send-back",
+                          json={"message": "Handle the empty-input edge case."})
+    assert r.status_code == 200, r.text
+    assert await store.get_cancel_request(t2.id) is None
+
+    t3 = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    await store.request_cancel(t3.id, "Paused from board")
+    r = await client.post(f"/api/tasks/{t3.id}/cancel")
+    assert r.status_code == 200, r.text
+    assert await store.get_cancel_request(t3.id) is None
