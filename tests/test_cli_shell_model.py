@@ -250,6 +250,144 @@ def test_render_lanes_marks_the_selected_task():
     assert "reverse" not in other_line
 
 
+# --------------------------------------------------------------------------- #
+# Row shape — title on one part, status and tags on the next, aligned          #
+# --------------------------------------------------------------------------- #
+
+def _full_task(**kw) -> dict:
+    """A task carrying EVERY field a row can show, so a test can assert that
+    the row shape change dropped none of them."""
+    base = _t(id="feedbeef1234", title="Gate must refuse to start",
+              status="paused_quota", live_status="waits quota",
+              claimed=True, approved_at="2026-08-20T10:00:00Z",
+              blocker_human_stopped=True, subtask_progress="2/5 subtasks",
+              total_tokens=1_234, total_cache_read=4_000_000)
+    base.update(kw)
+    return base
+
+
+def _row_lines(out: str, short_id: str) -> tuple[str, str]:
+    lines = out.splitlines()
+    i = next(n for n, ln in enumerate(lines) if short_id in ln)
+    return lines[i], lines[i + 1]
+
+
+def test_a_row_is_title_then_an_aligned_meta_line():
+    out = render_lanes([_full_task()])
+    title_line, meta_line = _row_lines(out, "feedbeef")
+    assert "Gate must refuse to start" in title_line
+    # the status moved off the title line and onto its own, indented, line
+    assert "waits quota" not in title_line
+    assert "waits quota" in meta_line
+    assert meta_line.startswith(" " * 13), repr(meta_line)
+
+
+def test_every_field_visible_today_is_still_visible():
+    out = render_lanes([_full_task()])
+    _, meta_line = _row_lines(out, "feedbeef")
+    for needle in ("waits quota", "running", "waits for its own signal",
+                   "approved - merge pending", "you stopped it",
+                   "2/5 subtasks", "4,001,234 tok"):
+        assert needle in meta_line, needle
+
+
+def test_status_takes_the_boards_colour_vocabulary():
+    running = render_lanes([_t(id="aaaa0000", status="implementing", claimed=True)])
+    waiting = render_lanes([_t(id="bbbb0000", status="paused_quota")])
+    failed = render_lanes([_t(id="cccc0000", status="failed")])
+    plain = render_lanes([_t(id="dddd0000", status="pending")])
+    assert "[green]implementing[/]" in running
+    assert "[yellow]paused_quota[/]" in waiting
+    assert "[red]failed[/]" in failed
+    assert "[dim]pending[/]" in plain
+
+
+def test_a_long_title_wraps_with_a_hanging_indent_when_a_width_is_given():
+    title = "one two three four five six seven eight nine ten eleven twelve"
+    out = render_lanes([_t(id="eeee0000", title=title)], width=40)
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "eeee0000" in ln)
+    continuation = lines[first + 1]
+    # the title continues under the title column, not under the id
+    assert continuation.startswith(" " * 13), repr(continuation)
+    assert "twelve" in out
+    # and the meta line comes AFTER the whole title, every line between indented
+    meta = next(n for n in range(first + 1, first + 6) if "pending" in lines[n])
+    assert "twelve" in "".join(lines[first:meta])
+    assert all(lines[n].startswith(" " * 13) for n in range(first + 1, meta + 1))
+    # no line of THIS task's block is wider than the pane (markup tags take
+    # no cells; the lane's empty hints are not this test's business)
+    import re
+    for ln in lines[first:meta + 1]:
+        assert len(re.sub(r"\[/?[^\]]*\]", "", ln)) <= 40, repr(ln)
+
+
+def test_a_long_meta_line_wraps_under_the_title_column_too():
+    """Seen on the live shell: a task carrying status, approved-pending and a
+    nine-digit burn put its last tag back at column 0. Tags wrap as units —
+    never mid-tag — and every overflow row keeps the indent."""
+    out = render_lanes([_full_task(id="abab1212", title="Short")], width=40)
+    import re
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "abab1212" in ln)
+    block = []
+    for ln in lines[first + 1:]:
+        if not ln.startswith(" " * 13):
+            break
+        block.append(ln)
+    assert len(block) >= 2, block
+    plain = [re.sub(r"\[/?[^\]]*\]", "", ln) for ln in block]
+    assert all(len(ln) <= 40 for ln in plain), plain
+    joined = " ".join(" ".join(plain).split())
+    for needle in ("waits quota", "running", "waits for its own signal",
+                   "approved - merge pending", "you stopped it",
+                   "2/5 subtasks", "4,001,234 tok"):
+        assert needle in joined, needle
+    # a tag is never split across rows
+    assert not any(ln.rstrip().endswith("-") for ln in plain)
+
+
+def test_a_single_tag_wider_than_the_pane_is_broken_not_overflowed():
+    """Review of 740827caf: a long server-supplied `subtask_progress` was
+    emitted as one row wider than the pane, which Textual then wrapped back
+    to column 0 — the defect this change removes. A tag that alone exceeds
+    the column is hard-wrapped and every piece keeps the indent."""
+    long_tag = "phase 3 of 5: waiting on the reviewer to finish its second pass"
+    out = render_lanes([_t(id="cafe0000", title="T", subtask_progress=long_tag)], width=40)
+    import re
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "cafe0000" in ln)
+    block = [ln for ln in lines[first + 1:first + 8] if ln.startswith(" " * 13)]
+    plain = [re.sub(r"\[/?[^\]]*\]", "", ln) for ln in block]
+    assert all(len(ln) <= 40 for ln in plain), plain
+    assert long_tag in " ".join(" ".join(plain).split())
+
+
+def test_cell_counting_treats_an_escaped_bracket_as_one_cell():
+    """Review of 740827caf: `_cells("[dim]a\\[b[/]")` returned 2 for a
+    3-cell string, because the markup regex swallowed the escaped bracket.
+    A title or tag containing "[" must be measured as it renders."""
+    from no_human.cli.shell_lanes import render_lanes as rl
+    tag = "[x] 2/5 done"
+    out = rl([_t(id="beef0000", title="T", subtask_progress=tag)], width=40)
+    import re
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "beef0000" in ln)
+    meta = [ln for ln in lines[first + 1:first + 4] if ln.startswith(" " * 13)]
+    # protect escaped brackets FIRST, as Rich does, then strip the tags
+    rendered = [re.sub(r"\[/?[^\]]*\]", "", ln.replace("\\[", "\x00")).replace("\x00", "[")
+                for ln in meta]
+    assert any(tag in ln for ln in rendered), rendered
+    assert all(len(ln) <= 40 for ln in rendered), rendered
+
+
+def test_without_a_width_the_title_is_never_wrapped():
+    title = "x " * 80
+    out = render_lanes([_t(id="ffff0000", title=title)])
+    title_line, _ = _row_lines(out, "ffff0000")
+    assert title.strip() in title_line
+
+
 def test_empty_loud_lane_says_so_instead_of_going_blank():
     out = render_lanes([])
     assert "All caught up" in out

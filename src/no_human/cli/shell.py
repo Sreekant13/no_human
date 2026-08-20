@@ -57,6 +57,19 @@ def _escape(text: object) -> str:
     return str(text).replace("[", r"\[")
 
 
+class LanesPane(Static):
+    """The lanes column. Its `Resize` arrives AFTER layout has given it the
+    new size, which is why the repaint hangs off the widget and not the App:
+    the App's own `Resize` fires first, while the pane still reports the
+    old width, and a repaint from there wraps every title for a pane that
+    no longer exists (review of 740827caf)."""
+
+    def on_resize(self) -> None:
+        app = self.app
+        if isinstance(app, ShellApp):
+            app._paint()
+
+
 class ShellApp(App):
     """The whole surface. `client` is injected so tests never need a server."""
 
@@ -110,6 +123,7 @@ class ShellApp(App):
         #: Seconds to wait before re-opening an event stream the server closed.
         #: 0 disables reconnection (tests that assert on one pass of a fake).
         self.follow_reconnect = follow_reconnect
+        self._relayout_paint_pending = False
         self.tasks: list[dict[str, Any]] = []
         self.selected_id: str | None = None
         self.intake: IntakeSession | None = None
@@ -144,7 +158,7 @@ class ShellApp(App):
         yield Static("", id="header")
         with Horizontal(id="body"):
             with VerticalScroll(id="lanes-scroll"):
-                yield Static("", id="lanes")
+                yield LanesPane("", id="lanes")
             with Vertical(id="right"):
                 yield RichLog(id="conversation", markup=True, wrap=True,
                               highlight=False, min_width=0)
@@ -237,9 +251,32 @@ class ShellApp(App):
             self.run_worker(self._follow(task_id), group="events", exclusive=True)
 
     def _paint(self) -> None:
+        # Reachable from `call_after_refresh` and from the lanes pane's own
+        # resize, both of which can land in the shutdown window the comment
+        # above describes — same guard as every other writer here.
+        if not self.is_running:
+            return
         self.query_one("#header", Static).update(render_header(self.tasks))
-        self.query_one("#lanes", Static).update(
-            render_lanes(self.tasks, selected_id=self.selected_id))
+        lanes = self.query_one("#lanes", Static)
+        # `Widget.size` is already the content box — Textual shrinks the
+        # region by the gutter (padding + border) before reporting it — so
+        # this IS the number of cells a row can use. 0 before the first
+        # layout: hand the renderer None and let Textual wrap as it always
+        # has, then paint once more after the refresh that lays the pane out.
+        width = lanes.size.width
+        if width <= 0:
+            # The board fetch can win the race with the first layout. Draw
+            # now so nothing is blank, and once more after the refresh —
+            # bounded to one retry so a pane that never gets a size cannot
+            # schedule paints forever.
+            width = None
+            if not self._relayout_paint_pending:
+                self._relayout_paint_pending = True
+                self.call_after_refresh(self._paint)
+        else:
+            self._relayout_paint_pending = False
+        lanes.update(render_lanes(self.tasks, selected_id=self.selected_id,
+                                  width=width))
 
     async def _follow(self, task_id: str) -> None:
         """GET /api/tasks/{id}/events/stream, rendered like `nh watch`.

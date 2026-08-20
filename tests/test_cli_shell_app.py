@@ -21,7 +21,7 @@ import time
 
 import pytest
 from click.testing import CliRunner
-from textual.widgets import RichLog
+from textual.widgets import Static, RichLog
 
 from no_human.cli import shell as shell_mod
 from no_human.cli.api_client import NhApiError, NhServerUnreachable
@@ -243,6 +243,75 @@ async def test_a_line_wider_than_the_pane_survives_into_a_second_row(pane):
     assert reflowed(used) == long_line, (
         f"{pane} cut the line instead of wrapping it; painted: {used!r}"
     )
+
+
+async def test_a_long_title_wraps_under_its_own_column_in_the_lanes_pane():
+    """A wrapped title used to fall back to column 0 on its second row, where
+    it read as a new task. With the pane width fed to the renderer, every
+    continuation row and the status row start under the title column, and
+    the full title still reaches the screen — nothing is cut."""
+    title = " ".join(f"word{n:02d}" for n in range(14))  # 97 cells
+    app = make_app(FakeClient([_t(id="abcdef012345", title=title, status="implementing")]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        rows = _lanes_rows(app)
+    first = next(n for n, r in enumerate(rows) if "abcdef01" in r)
+    block = []
+    for r in rows[first + 1:]:
+        if not r.strip() or not r.startswith(" " * 13):
+            break
+        block.append(r)
+    assert block, f"no indented continuation rows after the title row: {rows!r}"
+    assert "implementing" in block[-1], f"status row is not the last indented row: {block!r}"
+    painted = reflowed([rows[first]] + block[:-1])
+    assert title in painted, f"title was cut or mis-wrapped: {painted!r}"
+
+
+def _lanes_rows(app) -> list[str]:
+    """The rows the lanes pane PAINTS, over its whole box. `render_lines`
+    takes a region in the widget's outer coordinates, so cropping at
+    `size.width` (the content box) would slice the last cell of every full
+    row and hide an overflow behind the crop; the outer `region` is the
+    honest window — it includes the 1-cell padding on each side."""
+    from textual.geometry import Region
+    lanes = app.query_one("#lanes", Static)
+    return [strip.text for strip in lanes.render_lines(
+        Region(0, 0, lanes.region.width, lanes.region.height))]
+
+
+def _title_block(rows: list[str], short_id: str) -> tuple[str, list[str]]:
+    first = next(n for n, r in enumerate(rows) if short_id in r)
+    block = []
+    for r in rows[first + 1:]:
+        if not r.strip() or not r.startswith(" " * 13):
+            break
+        block.append(r)
+    return rows[first], block
+
+
+async def test_a_terminal_resize_rewraps_titles_under_the_column_at_once():
+    """Review of 740827caf: the App-level `on_resize` repainted with the
+    pane's PRE-resize width, so after 150→90 the continuation rows sat at
+    column 1 until the next 3 s poll. The lanes pane now repaints on ITS
+    resize, which carries the new size, and the wrap is right immediately."""
+    title = " ".join(f"word{n:02d}" for n in range(14))
+    app = make_app(FakeClient([_t(id="abcdef012345", title=title, status="implementing")]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        wide_width = app.query_one("#lanes", Static).region.width
+        await pilot.resize_terminal(90, 30)
+        await pilot.pause()
+        rows = _lanes_rows(app)
+        narrow_width = app.query_one("#lanes", Static).region.width
+    assert narrow_width < wide_width, (wide_width, narrow_width)
+    title_row, block = _title_block(rows, "abcdef01")
+    assert block, f"no indented rows after resize: {rows!r}"
+    assert "implementing" in block[-1], block
+    assert title in reflowed([title_row] + block[:-1]), rows
+    assert all(len(r) == narrow_width for r in [title_row] + block), rows
+    # the continuation rows are not pressed against the pane's right edge:
+    # a row that ends in a non-space at the last content cell was cropped
+    assert all(r.endswith(" ") for r in block), block
 
 
 async def test_the_lanes_pane_draws_the_board_columns_in_board_order():

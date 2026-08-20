@@ -12,6 +12,7 @@ and the counts are not — they mirror the JS line for line.
 
 from __future__ import annotations
 
+import textwrap
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -194,37 +195,129 @@ def render_header(tasks: Iterable[Task]) -> str:
             f"burn [b]{burn:,}[/] tok [dim](incl. cache reads)[/]")
 
 
-def _task_line(task: Task, *, selected: bool) -> str:
+#: Cells before the title column: " " + marker + " " + 8-char id + "  ".
+#: Continuation lines of a wrapped title and the meta line both start here,
+#: so a row reads as one block under its title rather than bleeding back to
+#: column 0 where it looks like a new task.
+_TITLE_COLUMN = 13
+
+
+def _status_style(task: Task) -> str:
+    """The board's state vocabulary, in the terminal's four colours: green
+    while an agent holds it, yellow while it waits on its own signal, red
+    when it failed, dim for everything else (pending, done, in review...)."""
+    if task.get("claimed"):
+        return "green"
+    if is_waiting(task):
+        return "yellow"
+    if _status_of(task) == "failed":
+        return "red"
+    return "dim"
+
+
+def _wrap_title(title: str, width: int | None) -> list[str]:
+    """Split the RAW title into chunks that fit the title column. Escaping
+    happens per chunk afterwards, so a literal "[" costs one cell in the
+    arithmetic here and one cell on screen."""
+    if width is None:
+        return [title]
+    avail = width - _TITLE_COLUMN
+    if avail < 10:  # a pane too narrow to wrap sensibly: let Textual wrap
+        return [title]
+    return textwrap.wrap(title, width=avail, break_long_words=True,
+                         break_on_hyphens=False) or [title]
+
+
+#: A meta tag is carried as (style, plain text) until it is packed into rows,
+#: so its width is the plain text's length — never a guess made by stripping
+#: markup back out of a string that may itself contain an escaped bracket.
+Tag = tuple[str, str]
+
+
+def _markup(tag: Tag) -> str:
+    style, text = tag
+    return f"[{style}]{_escape(text)}[/]"
+
+
+def _pack_tags(tags: list[Tag], width: int | None) -> list[str]:
+    """The meta line, wrapped tag by tag so no tag is split across rows and
+    every overflow row keeps the title column's indent. A single tag wider
+    than the column (a long server-supplied `subtask_progress`) is the one
+    case that must break mid-tag: it is hard-wrapped into pieces that fit,
+    because a row wider than the pane comes back from Textual at column 0 —
+    the defect this whole block exists to remove. Without a width it is the
+    single line it always was."""
+    sep = " [dim]·[/] "
+    if width is None or width - _TITLE_COLUMN < 10:
+        return [sep.join(_markup(t) for t in tags)]
+    avail = width - _TITLE_COLUMN
+    fitted: list[Tag] = []
+    for style, text in tags:
+        if len(text) <= avail:
+            fitted.append((style, text))
+        else:
+            fitted.extend((style, piece) for piece in textwrap.wrap(
+                text, width=avail, break_long_words=True, break_on_hyphens=False))
+    rows: list[str] = []
+    current: list[Tag] = []
+    used = 0
+    for tag in fitted:
+        cost = len(tag[1]) + (3 if current else 0)  # " · " between tags
+        if current and used + cost > avail:
+            rows.append(sep.join(_markup(t) for t in current))
+            current, used = [tag], len(tag[1])
+        else:
+            current.append(tag)
+            used += cost
+    if current:
+        rows.append(sep.join(_markup(t) for t in current))
+    return rows
+
+
+def _task_lines(task: Task, *, selected: bool, width: int | None = None) -> list[str]:
+    """One task as a block: the title (wrapped with a hanging indent when the
+    pane width is known), then one indented meta line with the status and
+    every tag the row has always carried. Nothing that was visible on the
+    old single-line row is dropped; it is only moved under the title."""
     marker = "[reverse]>[/reverse]" if selected else " "
     status = _status_of(task) or "unknown"
     live = task.get("live_status")
     detail = str(live) if isinstance(live, str) and live else status
-    tags = []
+    tags: list[Tag] = [(_status_style(task), detail)]
     if task.get("claimed"):
-        tags.append("[green]running[/]")
+        tags.append(("green", "running"))
     if is_waiting(task):
-        tags.append("[dim]waits for its own signal[/]")
+        tags.append(("dim", "waits for its own signal"))
     if task.get("approved_at"):
-        tags.append("[dim]approved - merge pending[/]")
+        tags.append(("dim", "approved - merge pending"))
     if task.get("blocker_human_stopped"):
-        tags.append("[dim]you stopped it[/]")
+        tags.append(("dim", "you stopped it"))
     if task.get("subtask_progress"):
-        tags.append(f"[dim]{_escape(task['subtask_progress'])}[/]")
+        tags.append(("dim", str(task["subtask_progress"])))
     burn = task_burn(task)
     if burn:
-        tags.append(f"[dim]{burn:,} tok[/]")
-    suffix = ("  " + " ".join(tags)) if tags else ""
-    title = _escape(task.get("title") or "(untitled)")
+        tags.append(("dim", f"{burn:,} tok"))
+    raw_title = str(task.get("title") or "(untitled)")
+    chunks = [_escape(c) for c in _wrap_title(raw_title, width)]
     if selected:
-        title = f"[reverse]{title}[/reverse]"
-    return f" {marker} [dim]{_short(task)}[/] {title}  [dim]{_escape(detail)}[/]{suffix}"
+        chunks = [f"[reverse]{c}[/reverse]" for c in chunks]
+    indent = " " * _TITLE_COLUMN
+    lines = [f" {marker} [dim]{_short(task):<8}[/]  {chunks[0]}"]
+    lines.extend(indent + c for c in chunks[1:])
+    lines.extend(indent + row for row in _pack_tags(tags, width))
+    return lines
 
 
-def render_lanes(tasks: Iterable[Task], selected_id: str | None = None) -> str:
+def render_lanes(tasks: Iterable[Task], selected_id: str | None = None,
+                 *, width: int | None = None) -> str:
     """The board's columns as stacked sections, top to bottom in board order.
 
     The gate lanes are the point of the whole surface, so they get a filled
-    header bar; the rest get a plain one.
+    header bar; the rest get a plain one. `width` is the lanes pane's content
+    width in cells when the caller knows it; with it, long titles wrap under
+    their own column instead of back to the margin. Without it (tests, a pane
+    that has not been laid out yet) nothing is wrapped here and Textual wraps
+    as before.
     """
     tasks = list(tasks or ())
     groups = group_by_lane(tasks)
@@ -241,6 +334,7 @@ def render_lanes(tasks: Iterable[Task], selected_id: str | None = None) -> str:
         if not rows:
             lines.append(f"   [dim]{lane.empty_hint}[/]")
         for task in rows:
-            lines.append(_task_line(task, selected=str(task.get("id")) == selected_id))
+            lines.extend(_task_lines(task, selected=str(task.get("id")) == selected_id,
+                                     width=width))
         lines.append("")
     return "\n".join(lines).rstrip()
