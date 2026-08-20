@@ -1110,6 +1110,12 @@ class Orchestrator:
         # rebuild from, so it stays None and the park must be honest about it.
         self.ci_runner_conf: dict[str, Any] | None = None
         self.learning_queue = learning_queue
+        # Set by `_checkpoint_wip` on every call: "" on success (including a
+        # clean-tree no-op), the failure detail when the seam could not
+        # produce a commit. `_raise_blocker` reads this to put the loss on
+        # the persisted blocker's evidence — a `log.warning` alone is
+        # invisible to the operator (criterion #4).
+        self._last_checkpoint_error: str = ""
 
     # ----------------------------- events ---------------------------------- #
 
@@ -7121,6 +7127,17 @@ class Orchestrator:
             sha = self._checkpoint_wip(repo, task)
             if sha:
                 blocker.resume_commit = sha
+            else:
+                # A lost checkpoint must reach the TASK, not just the log —
+                # `_checkpoint_wip` already emitted `checkpoint_failed` on
+                # the event stream; this puts the same fact on the
+                # persisted blocker so it renders on the escalation card.
+                note = self._last_checkpoint_error or "WIP checkpoint failed"
+                loss = f"NO resume commit: {note}"
+                blocker.evidence = (
+                    f"{blocker.evidence}\n\n--- Checkpoint ---\n{loss}"
+                    if blocker.evidence else loss
+                )
             if branch:
                 blocker.resume_branch = branch
 
@@ -7335,15 +7352,46 @@ class Orchestrator:
             log.warning("learning proposal failed: %s", exc)
 
     def _checkpoint_wip(self, repo: GitRepo, task: Task) -> str:
-        """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha."""
+        """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha.
+
+        Routes through the same manifest-repair seam as the normal commit
+        path (`commit_with_manifest_repair`, orchestrator.py:4698): a WIP
+        checkpoint that touches a pinned file must survive the gate's own
+        refusal exactly like a real commit does, instead of being the one
+        path that bypasses the seam and silently loses the work.
+        """
+        repaired: list[tuple[list[str], str]] = []
         try:
             if repo.has_changes():
-                commit = repo.commit_all(f"[WIP-BLOCKED] {self._commit_message(task)}")
+                try:
+                    commit = commit_with_manifest_repair(
+                        repo, None,
+                        f"[WIP-BLOCKED] {self._commit_message(task)}",
+                        on_repair=lambda p, note: repaired.append((p, note)),
+                    )
+                finally:
+                    # A ledger mutation is NEVER absent from the record, even
+                    # when the retry below still fails — same
+                    # drain-on-every-exit-path rule as orchestrator.py:4728.
+                    if repaired:
+                        rep_paths, rep_note = repaired[0]
+                        self.emit(
+                            "manifest_repaired",
+                            f"re-approved {len(rep_paths)} pinned file(s): "
+                            + ", ".join(rep_paths)[:300]
+                            + (f" — {rep_note[:200]}" if rep_note else ""),
+                            paths=rep_paths[:20],
+                        )
                 self.emit("checkpoint", f"WIP-BLOCKED {commit.sha[:8]}")
+                self._last_checkpoint_error = ""
                 return commit.sha
+            self._last_checkpoint_error = ""
             return repo.head_sha()
         except Exception as exc:  # noqa: BLE001 — checkpoint must never crash routing
-            log.warning("WIP checkpoint failed: %s", exc)
+            detail = f"WIP checkpoint failed: {str(exc).strip()[:800]}"
+            log.warning("%s", detail)
+            self._last_checkpoint_error = detail
+            self.emit("checkpoint_failed", detail[:500])
             return ""
 
     def _escalate_below_conf(self) -> float:

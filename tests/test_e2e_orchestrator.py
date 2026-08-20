@@ -6788,20 +6788,270 @@ async def test_a_repair_before_a_second_refusal_is_still_on_the_record(
     kinds = [e["kind"] for e in events]
     # Regression guard on the exact bug: `if repaired:` used to sit
     # unreachable after the except-return, so the event count was 0 on this
-    # path. It must be exactly 1 — never dropped, never duplicated by the
+    # path. It must be at least 1 — never dropped, never duplicated by the
     # finally on a success path that never happens here.
-    assert kinds.count("manifest_repaired") == 1, kinds
+    #
+    # It is exactly 2 here, not 1: with `max_attempts=1` the failed attempt's
+    # commit refusal (via the mocked seam) is followed by a max-attempts
+    # blocker whose checkpoint ALSO routes through the same mocked seam
+    # (`_checkpoint_wip` now uses `commit_with_manifest_repair` too — the fix
+    # under test) and fires `on_repair` again on its own refused retry. Both
+    # firings are real ledger mutations and neither may be silently dropped.
+    assert kinds.count("manifest_repaired") == 2, kinds
     repaired_events = [e for e in events if e["kind"] == "manifest_repaired"]
-    repaired_event = repaired_events[0]
-    assert repaired_event["paths"] == approved_paths
-    assert "src/pkg/mod.py" in repaired_event["text"]
-    assert "tests/test_mod.py" in repaired_event["text"]
-    assert "1 stale pin(s)" in repaired_event["text"]
+    for repaired_event in repaired_events:
+        assert repaired_event["paths"] == approved_paths
+        assert "src/pkg/mod.py" in repaired_event["text"]
+        assert "tests/test_mod.py" in repaired_event["text"]
+        assert "1 stale pin(s)" in repaired_event["text"]
 
     assert "commit_refused" in kinds, kinds
+    # The checkpoint's own refusal must not be silently swallowed either.
+    assert "checkpoint_failed" in kinds, kinds
 
     attempts = await store.list_attempts(t.id)
     assert attempts, "no attempt was recorded"
     for a in attempts:
         assert a["status"] == "failed", a
         assert "REFUSED" in a["failure_reason"], a["failure_reason"]
+
+
+# --------------------------------------------------------------------------- #
+# _checkpoint_wip / _raise_blocker unit-level coverage (the ticket under
+# test): the WIP-BLOCKED checkpoint used to bypass the manifest-repair seam
+# entirely (`repo.commit_all` called directly), so 9/9 checkpoints were lost
+# on the live server whenever a repairable gate refusal hit. These drive
+# `_checkpoint_wip`/`_raise_blocker` directly against a real `GitRepo` on
+# `bare_repo`, with the seam itself mocked the same way the tests above do.
+# --------------------------------------------------------------------------- #
+
+async def test_wip_checkpoint_survives_a_repairable_manifest_refusal(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criteria #1, #5: `_checkpoint_wip` must route through
+    `commit_with_manifest_repair` with `paths=None` — the exact bug this
+    ticket fixes. Mutation proof: reverting `_checkpoint_wip` to call
+    `repo.commit_all` directly leaves `calls` empty and fails the first
+    assertion below."""
+    from no_human.core import orchestrator as orch_mod
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/checkpoint-survives")
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n")
+
+    calls = []
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        calls.append((edited, commit_msg))
+        return repo_arg.commit_all(commit_msg)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("checkpoint test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)
+
+    assert calls, ("commit_with_manifest_repair was never called — the "
+                   "checkpoint bypassed the repair seam")
+    edited, commit_msg = calls[0]
+    assert edited is None, f"paths must be None (whole-tree WIP commit), got {edited!r}"
+    assert commit_msg.startswith("[WIP-BLOCKED] "), commit_msg
+    assert sha, "checkpoint must return a non-empty resume sha"
+    assert _SHA_RE.match(sha), sha
+    assert [e["kind"] for e in events].count("checkpoint") == 1
+
+
+async def test_a_checkpoint_repair_is_on_the_task_record(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criterion #2: when the seam repairs a stale pin before committing
+    successfully, the checkpoint path must emit `manifest_repaired` — same
+    event shape as the normal commit path (orchestrator.py:4733)."""
+    from no_human.core import orchestrator as orch_mod
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/checkpoint-repair-recorded")
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return a + b + 1\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        if on_repair is not None:
+            on_repair(["src/pkg/mod.py"], "1 stale pin(s)")
+        return repo_arg.commit_all(commit_msg)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("checkpoint repair test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)
+
+    assert sha, "the repaired commit must still produce a resume sha"
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("manifest_repaired") == 1, kinds
+    repaired = [e for e in events if e["kind"] == "manifest_repaired"][0]
+    assert repaired["paths"] == ["src/pkg/mod.py"]
+    assert "src/pkg/mod.py" in repaired["text"]
+
+
+async def test_a_checkpoint_repair_before_a_second_refusal_is_still_recorded(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criterion #2 (ledger-never-silent): a repair that happens but is
+    followed by a second refusal must still surface `manifest_repaired` —
+    the mutation already happened in the working tree, same
+    drain-on-every-exit-path rule as the normal commit path's `finally`
+    (orchestrator.py:4728)."""
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/checkpoint-repair-then-refused")
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return a + b + 2\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        if on_repair is not None:
+            on_repair(["src/pkg/mod.py"], "1 stale pin(s)")
+        raise GitError(_MANIFEST_REFUSAL)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("checkpoint repair-then-refuse test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)
+
+    assert sha == "", "an unrepairable second refusal must not fabricate a sha"
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("manifest_repaired") == 1, kinds
+    assert "checkpoint_failed" in kinds, kinds
+
+
+async def test_an_unrepairable_checkpoint_refusal_never_crashes_routing(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criterion #3: an unparseable refusal, and a `ProtectedBranch`, must
+    both be swallowed by `_checkpoint_wip`'s own guarantee — "checkpoint
+    must never crash routing" — even though the normal commit path
+    re-raises `ProtectedBranch`. That re-raise is deliberately NOT mirrored
+    here (out of scope, unchanged): a checkpoint must never crash, full
+    stop."""
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError, ProtectedBranch
+
+    cfg = _config(tmp_path)
+
+    for exc in (GitError("some unrelated hook failure"),
+                ProtectedBranch("refusing to commit on protected branch: main")):
+        repo = GitRepo(bare_repo)
+        repo.create_branch(f"wip/checkpoint-crash-guard-{exc.__class__.__name__}")
+        (bare_repo / "calc.py").write_text(
+            f"def add(a, b):\n    return a + b  # {exc.__class__.__name__}\n")
+
+        def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg,
+                                             on_repair=None, _exc=exc):
+            raise _exc
+
+        monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                            fake_commit_with_manifest_repair)
+
+        events = []
+        orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                            SlackNotifier(None), event_sink=events.append)
+        t = Task.new("checkpoint crash guard test", repo_path=str(bare_repo))
+        await store.create_task(t)
+
+        sha = orch._checkpoint_wip(repo, t)  # must not raise
+
+        assert sha == "", f"{exc.__class__.__name__} must not produce a sha"
+        assert "checkpoint_failed" in [e["kind"] for e in events]
+
+
+async def test_a_lost_checkpoint_reaches_the_task_not_just_the_log(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criterion #4: a lost checkpoint must reach the TASK — both an event
+    AND a blocker (intake resolution "(c) both") — not just `log.warning`.
+    Drives `_raise_blocker` directly with a seam that always refuses."""
+    from no_human.blockers import Blocker, BlockerCategory
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/lost-checkpoint-reaches-task")
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return a + b + 3\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        raise GitError(_MANIFEST_REFUSAL)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("lost checkpoint test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    blocker = Blocker(
+        category=BlockerCategory.NOVEL_UNKNOWN, transient=False, confidence=0.5,
+        goal="implement the feature", root_cause_hypothesis="unknown",
+    )
+
+    await orch._raise_blocker(t, blocker, repo=repo)
+
+    kinds = [e["kind"] for e in events]
+    assert "checkpoint_failed" in kinds, kinds
+
+    done = await store.get_task(t.id)
+    assert done.blocker is not None
+    assert done.blocker["resume_commit"] == ""
+    assert "NO resume commit" in done.blocker["evidence"], done.blocker["evidence"]
+
+
+async def test_a_clean_park_returns_head_and_creates_no_commit(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Criterion #6: negative control — a park with no uncommitted changes
+    must return `repo.head_sha()` and create no empty commit; the repair
+    seam must never even be called."""
+    from no_human.core import orchestrator as orch_mod
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/clean-park-no-commit")
+    before_sha = repo.head_sha()
+    before_count = _git_out(bare_repo, "rev-list", "--count", "HEAD")
+
+    calls = []
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        calls.append((edited, commit_msg))
+        return repo_arg.commit_all(commit_msg)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("clean park test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)
+
+    assert sha == before_sha == repo.head_sha()
+    after_count = _git_out(bare_repo, "rev-list", "--count", "HEAD")
+    assert after_count == before_count, "a clean park must create no commit"
+    assert not calls, "the repair seam must never be called on a clean tree"
+    assert "checkpoint" not in [e["kind"] for e in events]
