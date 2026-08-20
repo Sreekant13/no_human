@@ -518,6 +518,9 @@ class ClaudeBackend:
         tools: list[str] | None = None,
         system_prompt: str | None = None,
         compact_window_tokens: int | None = None,
+        extra_env: dict[str, str] | None = None,
+        cli_path: str | None = None,
+        capabilities: BackendCapabilities | None = None,
     ):
         self.model = model
         # The auto-compaction window override (coder cache-burn ticket). `None`
@@ -573,12 +576,29 @@ class ClaudeBackend:
             ({} if readonly else _TOOL_RESULT_CAPS)
             if tool_result_caps is None else tool_result_caps
         )
+        # Local backend seam (part 2): extra per-subprocess env entries merged
+        # into `ClaudeAgentOptions.env` on top of the compact-window override
+        # below — never into `os.environ`, and never persisted beyond a single
+        # `_options()` call, so nothing here can leak across a reused backend
+        # instance or another role's session. `None`/`{}` (every existing
+        # construction site) means "inject nothing"; `make_backend`'s local
+        # branch is the only caller that passes a non-empty dict.
+        self.extra_env = dict(extra_env or {})
+        # Absolute path to a `claude` CLI binary. `None` (every existing
+        # construction site) means "let the SDK resolve its own bundled CLI",
+        # exactly as before this parameter existed.
+        self.cli_path = cli_path
+        # Overrides the reference `CLAUDE_CAPABILITIES` contract for a backend
+        # that is still the same harness but talks to a different model
+        # server (the local backend). `None` (every existing construction
+        # site) preserves today's behavior exactly.
+        self._capabilities = capabilities or CLAUDE_CAPABILITIES
 
     @property
     def capabilities(self) -> BackendCapabilities:
         """Satisfies the seam's ``CodingBackend`` protocol. See
         :data:`CLAUDE_CAPABILITIES`."""
-        return CLAUDE_CAPABILITIES
+        return self._capabilities
 
     def _options(
         self, cwd: Path, max_turns: int, *, effort: str | None = None,
@@ -639,14 +659,18 @@ class ClaudeBackend:
             )
         if agents:
             kwargs["agents"] = agents
+        # Additive: ClaudeAgentOptions.env merges into the subprocess
+        # environment rather than replacing it, and this is a fresh options
+        # object per call, so nothing here can leak across a reused backend
+        # instance or another role's session, and never into `os.environ`.
+        env: dict[str, str] = {}
         if self.compact_window_tokens:
-            # Additive: ClaudeAgentOptions.env merges into the subprocess
-            # environment rather than replacing it, and this is a fresh
-            # options object per call, so nothing here can leak across a
-            # reused backend instance or another role's session.
-            kwargs["env"] = {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(self.compact_window_tokens))
-            }
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(self.compact_window_tokens))
+        env.update(self.extra_env)
+        if env:
+            kwargs["env"] = env
+        if self.cli_path:
+            kwargs["cli_path"] = self.cli_path
         # ALWAYS set explicitly. Never leave this to the SDK default.
         #
         # This block used to set the field only for writing or skilled sessions

@@ -660,6 +660,25 @@ def load_env_var(name: str, env_path: Path | None = None) -> str | None:
     return os.environ.get(name) or None
 
 
+def read_env_var_value(name: str, env_path: Path | None = None) -> str | None:
+    """Read a single secret's VALUE without exporting it to ``os.environ``.
+
+    Same source-of-truth discipline as :func:`load_env_var` — ``~/.no_human/.env``
+    (chmod 600, gitignored) wins, an inherited process-env value is a fallback —
+    but this is a pure read: unlike :func:`load_env_var` it never mutates
+    ``os.environ``, so a caller building a per-subprocess env dict (the local
+    coding backend's ``extra_env``, for example) cannot accidentally leak the
+    value into ITS OWN process environment just by looking it up. Returns the
+    active value or None.
+    """
+    if name in METERED_AUTH_VARS:
+        # Same defensive guard as `load_env_var`: a metered-auth var must
+        # never be loaded through this generic-secret path either.
+        raise AuthError(f"{name} is a metered-auth variable and must never be loaded.")
+    env_path = ENV_PATH if env_path is None else env_path
+    return _read_env_file(env_path).get(name) or os.environ.get(name) or None
+
+
 def credential_status(
     keys: list[str], env_path: Path | None = None
 ) -> dict[str, bool]:

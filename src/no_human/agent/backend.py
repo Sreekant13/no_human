@@ -297,6 +297,68 @@ def _resolve_coder_compact_window_tokens(bounds_cfg: dict[str, Any] | None) -> i
     return value
 
 
+#: The local coding backend's honest contract. It is still the SAME harness
+#: (the Agent SDK's Claude Code CLI, just pointed at a different
+#: ``ANTHROPIC_BASE_URL``) so it keeps every structural capability the Claude
+#: reference implementation has — tool-call blocking, post-tool hooks, session
+#: resume, subagents, skills, native max-turns, incremental usage. Two fields
+#: differ, both because they depend on the MODEL behind the CLI rather than the
+#: CLI itself: ``thinking_budget`` is Anthropic-specific extended-thinking
+#: wiring a third-party model server has no reason to understand, and
+#: ``cache_creation_accounting`` assumes Anthropic's prompt-caching billing
+#: shape, which a local server generally does not bill or report at all.
+LOCAL_CAPABILITIES = BackendCapabilities(
+    name="local",
+    blocks_tool_calls=True,
+    post_tool_hooks=True,
+    session_resume=True,
+    subagents=True,
+    skills=True,
+    thinking_budget=False,
+    incremental_usage=True,
+    cache_creation_accounting=False,
+    native_max_turns=True,
+)
+
+#: Fallback child-process ``ANTHROPIC_API_KEY`` for the local backend when the
+#: operator's ``~/.no_human/.env`` has no ``LOCAL_LLM_API_KEY``. Most local
+#: model servers (llama.cpp, vLLM, LM Studio, ollama's OpenAI-compat shim...)
+#: do not check the key at all, but the SDK's CLI still requires SOME value in
+#: this env var to start — a real Anthropic key must never land here by
+#: accident, so this is a literal, obviously-fake string rather than empty.
+LOCAL_BACKEND_FALLBACK_API_KEY = "no-key-local-backend"
+
+
+def _local_child_env(llm_cfg: dict[str, Any]) -> dict[str, str]:
+    """The EXACT per-subprocess env for the local backend — nothing more.
+
+    Three entries, injected into ``ClaudeAgentOptions.env`` (never into
+    ``os.environ``) by :class:`~.claude_backend.ClaudeBackend`:
+
+    * ``ANTHROPIC_BASE_URL`` — the local server, already validated by
+      :func:`no_human.config.assert_local_backend_mode` before this is called.
+    * ``ANTHROPIC_API_KEY`` — ``LOCAL_LLM_API_KEY`` from ``~/.no_human/.env``
+      if the operator set one (read via
+      :func:`no_human.config.read_env_var_value`, which never exports it to
+      ``os.environ``), else :data:`LOCAL_BACKEND_FALLBACK_API_KEY`.
+    * ``CLAUDE_CODE_OAUTH_TOKEN`` — explicitly overridden to the empty string.
+      A local run must never carry the operator's real subscription/enterprise
+      token to a third-party model server; the CLI checks ``ANTHROPIC_API_KEY``
+      first when both are present, but an explicit empty override — rather
+      than relying on that precedence — is the difference between "the token
+      happens not to be used" and "the token cannot reach this subprocess".
+    """
+    from ..config import LOCAL_LLM_API_KEY_VAR, read_env_var_value
+
+    return {
+        "ANTHROPIC_BASE_URL": str(llm_cfg.get("local_base_url") or ""),
+        "ANTHROPIC_API_KEY": (
+            read_env_var_value(LOCAL_LLM_API_KEY_VAR) or LOCAL_BACKEND_FALLBACK_API_KEY
+        ),
+        "CLAUDE_CODE_OAUTH_TOKEN": "",
+    }
+
+
 def make_backend(
     *,
     model: str,
@@ -371,9 +433,52 @@ def make_backend(
             readonly=readonly,
         )
 
+    if name == "local":
+        from ..config import assert_local_backend_mode
+        from .claude_backend import ClaudeBackend
+
+        cfg_llm = (config or {}).get("llm") or {}
+        # Enforces the safety boundary (localhost/RFC1918-only, no DNS name,
+        # no userinfo credentials, ambient ANTHROPIC_BASE_URL scrubbed) and
+        # re-scrubs the metered-auth vars — same discipline as the Codex
+        # branch's `assert_codex_api_key_mode`. Raises AuthError on refusal.
+        assert_local_backend_mode(cfg_llm.get("local_base_url"))
+
+        model_id = str(cfg_llm.get("local_model") or "").strip()
+        if not model_id:
+            raise BackendUnavailable(
+                "worker.backend is 'local' but llm.local_model is not set. "
+                "Set it in config.yaml:\n"
+                "  llm:\n"
+                "    local_model: <the model id the local server exposes>"
+            )
+
+        # Same scope guard as the claude branch: only the coder gets the
+        # compact-window override, and only when not readonly.
+        compact_window_tokens = None
+        if role == "coder" and not readonly:
+            compact_window_tokens = _resolve_coder_compact_window_tokens(
+                (config or {}).get("bounds"))
+
+        return ClaudeBackend(
+            model=model_id,
+            forbidden_paths=forbidden_paths,
+            never_push_to=never_push_to,
+            permission_mode=permission_mode,
+            readonly=readonly,
+            supervisor_hook=supervisor_hook,
+            lint_hook=lint_hook,
+            tool_result_caps=tool_result_caps,
+            compact_window_tokens=compact_window_tokens,
+            extra_env=_local_child_env(cfg_llm),
+            cli_path=cfg_llm.get("local_cli_path"),
+            capabilities=LOCAL_CAPABILITIES,
+        )
+
     raise BackendUnavailable(
         f"unknown coding backend {name!r}. Supported: 'claude' (default), "
-        f"'codex'. Set it with `worker.backend` in ~/.no_human/config.yaml."
+        f"'codex', 'local'. Set it with `worker.backend` in "
+        f"~/.no_human/config.yaml."
     )
 
 
@@ -398,6 +503,8 @@ __all__ = [
     "CLAUDE_PINNED_ROLES",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODER_COMPACT_WINDOW_TOKENS",
+    "LOCAL_CAPABILITIES",
+    "LOCAL_BACKEND_FALLBACK_API_KEY",
     "make_backend",
     "resolve_backend_name",
 ]

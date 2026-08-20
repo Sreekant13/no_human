@@ -1,14 +1,14 @@
 # Coding backends
 
-no_human's implementer ("coder") runs on a **coding backend**. There are two.
+no_human's implementer ("coder") runs on a **coding backend**. There are three.
 The default is unchanged and always will be the default unless you change it.
 
-| | `claude` (default) | `codex` |
-|---|---|---|
-| Harness | Claude Agent SDK → `claude` CLI | `codex exec --json` → `codex` CLI |
-| Credential | `CLAUDE_CODE_OAUTH_TOKEN` (subscription) or `ANTHROPIC_API_KEY` (BYO) | `OPENAI_API_KEY` (BYO **only**) |
-| Model | `llm.primary_model` | `llm.codex_model` |
-| Install | `npm install -g @anthropic-ai/claude-code` | `npm install -g @openai/codex` |
+| | `claude` (default) | `codex` | `local` |
+|---|---|---|---|
+| Harness | Claude Agent SDK → `claude` CLI | `codex exec --json` → `codex` CLI | Claude Agent SDK → `claude` CLI, pointed at your own server |
+| Credential | `CLAUDE_CODE_OAUTH_TOKEN` (subscription) or `ANTHROPIC_API_KEY` (BYO) | `OPENAI_API_KEY` (BYO **only**) | `ANTHROPIC_API_KEY`, per-subprocess only (see below) |
+| Model | `llm.primary_model` | `llm.codex_model` | `llm.local_model` |
+| Install | `npm install -g @anthropic-ai/claude-code` | `npm install -g @openai/codex` | none — reuses the Claude CLI |
 
 Everything except the coder — reviewer, planner, supervisor, utility, intake —
 stays on Claude regardless of this setting. The review gate and the four model tiers are
@@ -98,7 +98,81 @@ prices only. A Codex model id is unknown to it and prices at the conservative
 fallback premium, and is reported by `unknown_pricing_models()`. Dollar figures
 for Codex runs are estimates with a wider error bar than Claude ones.
 
-## Adding a third backend
+## `local` — your own model server
+
+`local` is still the Claude Agent SDK harness (the same `claude` CLI the
+default backend runs) — only three environment variables change what it talks
+to. It is for a self-hosted or third-party server that speaks the Anthropic
+`/v1/messages` API, not a different agent loop.
+
+```yaml
+# ~/.no_human/config.yaml
+worker:
+  backend: local
+llm:
+  local_model: <the model id the local server exposes>   # REQUIRED, no default
+  local_base_url: http://localhost:8000                  # REQUIRED, no default
+  local_cli_path: null                                    # null ⇒ the SDK-bundled CLI
+```
+
+```bash
+# ~/.no_human/.env  (chmod 600, gitignored) — only if your server enforces a key
+LOCAL_LLM_API_KEY=whatever-your-server-expects
+```
+
+**The child process env is exactly three entries**, injected into that one
+subprocess's environment only — never into `os.environ`, never into any other
+role's session (reviewer/planner/supervisor/utility all stay on Claude
+regardless of this setting, per `CLAUDE_PINNED_ROLES`):
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_BASE_URL` | `llm.local_base_url`, verbatim |
+| `ANTHROPIC_API_KEY` | `LOCAL_LLM_API_KEY` from `~/.no_human/.env` if set, else the literal `no-key-local-backend` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | explicitly set to `""` |
+
+That last line is deliberate, not incidental: a local run must never carry your
+real subscription/enterprise OAuth token to a third-party server, so it is
+overridden to empty rather than left to whichever credential the CLI happens to
+prefer.
+
+**`llm.local_base_url` is validated, not trusted, before any subprocess
+starts** (`config.assert_local_backend_mode`):
+
+- it must be set — an ambient `ANTHROPIC_BASE_URL` in your shell is scrubbed
+  and never used as a fallback;
+- `http`/`https` only;
+- the host must be `localhost` or a **literal** loopback/RFC1918 IP address —
+  a DNS name is refused even if it currently resolves to one, because a name is
+  resolved again at connect time, which is a rebinding surface;
+- a public/routable IP is refused — local mode must not leave the machine;
+- no userinfo credentials embedded in the URL (`http://user:pass@host` is
+  refused) — if your server needs a key, it goes in `.env` as
+  `LOCAL_LLM_API_KEY`, never in the URL or in config.yaml.
+
+**Honest limits.** This is still your own local model, not Claude, wearing the
+Claude harness:
+
+- answer quality is entirely the local model's, not Anthropic's — no_human does
+  not evaluate or curate it;
+- `thinking_budget` is off (`BackendCapabilities.thinking_budget=False`) —
+  extended-thinking wiring is Anthropic-specific and a third-party server has
+  no reason to implement it;
+- `cache_creation_accounting` is off — most local servers do not bill or report
+  prompt-cache writes the way Anthropic's API does, so that figure is not
+  tracked rather than reported as zero;
+- nothing here is billed to Anthropic — but `core/pricing.py` has no published
+  price for an arbitrary local model id, so cost figures for `local` runs price
+  at the conservative unknown-model fallback and the model id is named in
+  `unknown_pricing_models()`;
+- only loopback/RFC1918 addresses are accepted — there is no supported way to
+  point `local` at a remote/hosted server; that is what `claude`'s BYO-API-key
+  mode or `codex` are for;
+- the reviewer, planner, supervisor and utility tiers are unaffected — only
+  `role="coder"` ever consults `worker.backend` (`resolve_backend_name`), so a
+  `local` run still bills Anthropic for everything except the implementer.
+
+## Adding a fourth backend
 
 `agent/backend.py` is the seam: implement `CodingBackend`, declare a
 `BackendCapabilities`, add a branch to `make_backend`. The orchestrator is typed
