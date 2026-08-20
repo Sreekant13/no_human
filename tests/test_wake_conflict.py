@@ -13,6 +13,7 @@ import pytest
 from no_human.blockers.wake import WakeWatcher
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
+from no_human.vcs import derived_conflict as dc
 
 
 @pytest.fixture
@@ -20,6 +21,24 @@ async def store(tmp_path):
     s = await Store(tmp_path / "nh.db").connect()
     yield s
     await s.close()
+
+
+@pytest.fixture(autouse=True)
+def _resolvable_conflicting_paths(monkeypatch):
+    """This file drives `_check_open_pr`/`_check_pr_conflict` against a fake,
+    non-existent `repo_path` ("/tmp/x") -- it exists to test round-counting,
+    bound enforcement, and shipped-check logic, never conflicting-path
+    enumeration itself (that is `test_orchestrator_pr_conflict.py`'s job,
+    against real from-scratch git repos). Since a real `/tmp/x` cannot be
+    enumerated, `conflicting_paths()` would return `None` for every test here
+    -- which is now, correctly, an enumeration failure that escalates rather
+    than falls through to a coder round (the bugfix this file's sibling
+    covers). Stub it to a fixed, non-derived path so every test below
+    exercises exactly the "enumeration succeeded, real source conflict"
+    branch its assertions were written against, unchanged."""
+    async def fake_conflicting_paths(repo_path, base_tip, branch):
+        return {"src/unrelated.py"}
+    monkeypatch.setattr(dc, "conflicting_paths", fake_conflicting_paths)
 
 
 async def _approval_task(store, url="https://code.example.com/dev/x/pull/26"):

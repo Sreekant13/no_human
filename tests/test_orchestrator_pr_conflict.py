@@ -419,18 +419,29 @@ async def test_the_pr_conflict_event_names_the_conflicting_paths(store, tmp_path
     assert "src/base.py" in text
 
 
-async def test_an_unenumerable_conflict_says_so_and_still_opens_a_round(store):
+async def test_an_unenumerable_conflict_escalates_instead_of_opening_a_round(store):
     """repo_path unresolvable (as in the pre-existing fake-repo tests):
-    conflicting_paths() can't run, conflict_desc says so, behaviour is the
-    unchanged coder-round fallthrough."""
+    conflicting_paths() returns None without raising, on both the first
+    attempt and the post-fetch retry -- an unknown, so it escalates instead
+    of opening a coder round on an unresolved question (bugfix: this used to
+    fall through to `_resume` with a bare "could not enumerate" event)."""
     events = []
     t = await _approval_task(store, "/tmp/does-not-exist")
     w = _watcher(store, events=events)
     result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
 
-    assert result == "resumed"
-    text = next(txt for k, txt in events if k == "pr_conflict")
-    assert "could not enumerate" in text
+    assert result == "escalated_pr_conflict"
+    kinds = [k for k, _ in events]
+    assert "pr_conflict" not in kinds
+    text = next(txt for k, txt in events if k == "escalated_pr_conflict")
+    assert "could not enumerate" not in text
+    assert "no coder round opened" in text
+
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    assert stored.blocker["category"] == "NOVEL_UNKNOWN"
+    assert stored.blocker["evidence"]
+    assert not (stored.context or {}).get("send_back_feedback")
 
 
 async def test_a_manifest_only_conflict_is_resolved_without_a_coder_session(store, tmp_path, monkeypatch):
@@ -495,6 +506,168 @@ async def test_a_manifest_only_conflict_is_resolved_without_a_coder_session(stor
     pins_text = (wt_check / "RELEASE_MANIFEST.txt").read_text(encoding="utf-8")
     assert "src/on_feature.py" in pins_text
     assert "src/on_main.py" in pins_text
+
+
+async def test_a_raising_enumeration_recovers_after_a_ref_fetch_and_resolves_mechanically(
+        store, tmp_path, monkeypatch):
+    """conflicting_paths() raises once (simulating a stale/missing ref) then
+    succeeds once `fetch_conflict_refs` has run -- the mechanical resolver is
+    still reached and no coder round is opened."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_f = tmp_path / "wt_feature"
+    _worktree(work, wt_f, "feature")
+    (wt_f / "src" / "on_feature.py").write_text("on feature\n", encoding="utf-8")
+    _git(wt_f, "add", "src/on_feature.py")
+    _git(wt_f, "commit", "-qm", "add on_feature.py")
+    _approve(wt_f, ["src/on_feature.py"])
+    _git(wt_f, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_f, "commit", "-qm", "pin on_feature.py")
+    _push_branch(work, wt_f, "feature")
+
+    (work / "src" / "on_main.py").write_text("on main\n", encoding="utf-8")
+    _git(work, "add", "src/on_main.py")
+    _git(work, "commit", "-qm", "add on_main.py")
+    _approve(work, ["src/on_main.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin on_main.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    # sanity: confirm the conflict is real and confined to the manifest.
+    assert await dc.conflicting_paths(str(work), "main", "feature") == {"RELEASE_MANIFEST.txt"}
+
+    real_conflicting_paths = dc.conflicting_paths
+    real_fetch = dc.fetch_conflict_refs
+    calls = {"n": 0}
+    fetch_calls = []
+
+    async def flaky(repo_path, base_tip, branch):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("bad object main")
+        return await real_conflicting_paths(repo_path, base_tip, branch)
+
+    async def spying_fetch(repo_path, base, branch):
+        fetch_calls.append((repo_path, base, branch))
+        return await real_fetch(repo_path, base, branch)
+
+    monkeypatch.setattr(dc, "conflicting_paths", flaky)
+    monkeypatch.setattr(dc, "fetch_conflict_refs", spying_fetch)
+
+    events = []
+    t = await _approval_task(store, str(work))
+    resolver_calls = []
+
+    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin"):
+        resolver_calls.append((repo_path, branch, base_tip_sha))
+        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha, remote=remote)
+
+    w = _watcher(store, events=events, derived_resolver=spying_resolver)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
+
+    assert fetch_calls == [(str(work), "main", "feature")]
+    assert calls["n"] == 2
+    assert result == "resolved_pr_conflict"
+    assert len(resolver_calls) == 1
+    kinds = [k for k, _ in events]
+    assert "pr_conflict" not in kinds  # no coder round
+    assert "pr_conflict_resolved" in kinds
+
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL  # unchanged, not IMPLEMENTING
+    assert stored.context.get("pr_conflict_enumerate_error")
+    assert "bad object main" in stored.context["pr_conflict_enumerate_error"]
+
+
+async def test_an_always_raising_enumeration_escalates_instead_of_opening_a_coder_round(
+        store, tmp_path, monkeypatch):
+    """conflicting_paths() raises on both the first attempt and the retry
+    after a failed fetch -- the repro for the bugfix: escalate NOVEL_UNKNOWN
+    with the exception text, never open a coder round. Uses a real repo (not
+    the unresolvable-path shape of the None-return test above) so this
+    exercises the actual raise-handling branch, distinct from a plain None
+    return."""
+    work = _repo(tmp_path)
+
+    async def always_raises(repo_path, base_tip, branch):
+        raise RuntimeError("fatal: bad object refs/heads/main")
+
+    async def fetch_always_fails(repo_path, base, branch):
+        return False
+
+    monkeypatch.setattr(dc, "conflicting_paths", always_raises)
+    monkeypatch.setattr(dc, "fetch_conflict_refs", fetch_always_fails)
+
+    events = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
+
+    assert result == "escalated_pr_conflict"
+
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    assert stored.blocker["category"] == "NOVEL_UNKNOWN"
+    assert "bad object refs/heads/main" in stored.blocker["evidence"]
+    assert stored.context.get("pr_conflict_enumerate_error")
+    assert "bad object refs/heads/main" in stored.context["pr_conflict_enumerate_error"]
+
+    kinds = [k for k, _ in events]
+    assert "pr_conflict" not in kinds  # no coder round
+    assert not (stored.context or {}).get("send_back_feedback")
+
+    text = next(txt for k, txt in events if k == "escalated_pr_conflict")
+    assert "bad object refs/heads/main" in text
+    assert "could not enumerate" not in text
+
+    persisted = await store.list_events(t.id)
+    escalate_events = [e for e in persisted if e.get("kind") == "escalated_pr_conflict"]
+    assert escalate_events
+    assert "bad object refs/heads/main" in escalate_events[0].get("error", "")
+
+
+async def test_a_successful_enumeration_never_fetches_or_escalates(store, tmp_path, monkeypatch):
+    """A source-only conflict that enumerates cleanly on the first try must
+    never call `fetch_conflict_refs` and must never escalate -- the
+    fetch/retry machinery is purely a failure-recovery path."""
+    work = _repo(tmp_path)
+    wt = tmp_path / "wt_feature"
+    _worktree(work, wt, "feature")
+    (wt / "src" / "base.py").write_text("base\nfeature change\n", encoding="utf-8")
+    _git(wt, "commit", "-qam", "feature edits base.py")
+    _push_branch(work, wt, "feature")
+
+    (work / "src" / "base.py").write_text("base\nmain change\n", encoding="utf-8")
+    _git(work, "commit", "-qam", "main also edits base.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    fetch_calls = []
+
+    async def spy_fetch(repo_path, base, branch):
+        fetch_calls.append((repo_path, base, branch))
+        return True
+
+    monkeypatch.setattr(dc, "fetch_conflict_refs", spy_fetch)
+
+    events = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
+
+    assert result == "resumed"
+    assert fetch_calls == []
+    kinds = [k for k, _ in events]
+    assert "pr_conflict" in kinds
+    assert "escalated_pr_conflict" not in kinds
+    text = next(txt for k, txt in events if k == "pr_conflict")
+    assert "src/base.py" in text
+
+    persisted = await store.list_events(t.id)
+    pr_conflict_events = [e for e in persisted if e.get("kind") == "pr_conflict"]
+    assert pr_conflict_events
+    assert "error" not in pr_conflict_events[0]
 
 
 def test_derived_artefacts_is_exact_repo_root_paths():

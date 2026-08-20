@@ -125,6 +125,24 @@ async def conflicting_paths(repo_path: str, base_tip: str,
     return result[1]
 
 
+async def fetch_conflict_refs(repo_path: str, base: str, branch: str) -> bool:
+    """Best-effort ``git fetch origin <base> <branch>`` — the common cause of
+    an enumeration failure (`conflicting_paths` raising, or returning
+    ``None``) is a stale/missing ref in the watcher's checkout. Returns
+    whether the fetch succeeded; the caller retries the enumeration EITHER
+    WAY (per the intake answer: a transient fetch failure must not
+    short-circuit the retry).
+
+    ``_git_rc`` already swallows `OSError` (git absent) and enforces
+    `_GIT_TIMEOUT`, returning `rc=1` for both — so this never raises for
+    those; it only additionally guards empty arguments.
+    """
+    if not repo_path or not base or not branch:
+        return False
+    rc, _ = await _git_rc(repo_path, "fetch", "--quiet", "origin", base, branch)
+    return rc == 0
+
+
 def all_derived(paths: set[str] | None) -> bool:
     """True iff `paths` is non-empty and every path in it is a derived
     artefact — the mechanical-resolution eligibility test. `None` (could not

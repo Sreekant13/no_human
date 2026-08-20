@@ -951,17 +951,22 @@ class WakeWatcher:
         await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
         return rounds
 
-    async def _emit(self, task: Task, kind: str, text: str) -> None:
+    async def _emit(self, task: Task, kind: str, text: str, *,
+                     extra: dict | None = None) -> None:
         """Persist a watcher action as a task event and mirror it to the host.
 
         Persistence is unconditional: the board and the DB record must show
         what the watcher did even when the host wires no callback — the server
-        ran with a silent watcher for exactly that reason.
+        ran with a silent watcher for exactly that reason. `extra`, when
+        truthy, is merged into the persisted event dict (e.g. `error`) —
+        `_on_event`'s 2-arg host callback signature is unchanged; the extra
+        fields are for the persisted record only.
         """
+        event = {"source": "watcher", "kind": kind, "text": text, "ts": time.time()}
+        if extra:
+            event.update(extra)
         try:
-            await self.store.save_events(task.id, [
-                {"source": "watcher", "kind": kind, "text": text, "ts": time.time()},
-            ])
+            await self.store.save_events(task.id, [event])
         except Exception:  # noqa: BLE001 — visibility must never break the action
             log.warning("failed to persist watcher event %r", kind, exc_info=True)
         self._on_event(kind, text)
@@ -1605,6 +1610,7 @@ class WakeWatcher:
         from ..vcs.derived_conflict import (
             all_derived,
             conflicting_paths,
+            fetch_conflict_refs,
             resolve_base_tip,
             resolve_derived_conflict,
         )
@@ -1612,15 +1618,92 @@ class WakeWatcher:
         branch_name = branch or ctx.get("pr_branch")
         base_branch = ctx.get("base_branch")
         conflict_paths: set[str] | None = None
+        # enumerate_error non-empty => enumeration is STILL unresolved after a
+        # git-fetch retry (whether the underlying call raised or simply
+        # returned None for an unresolvable ref) — the caller must escalate,
+        # never open a coder round on an unknown. recovered_error non-empty
+        # => the first attempt failed but the retry succeeded, so the round
+        # proceeds normally with the reason recorded for visibility.
+        enumerate_error = ""
+        recovered_error = ""
         if task.repo_path and branch_name and base_branch:
+            first_reason = ""
             try:
                 conflict_paths = await conflicting_paths(
                     task.repo_path, base_branch, branch_name)
             except Exception as exc:  # noqa: BLE001 — a probe error must not crash the watcher
+                first_reason = f"{exc.__class__.__name__}: {exc}"
                 log.warning(
                     "failed to enumerate conflicting paths for %s: %s",
                     task.id[:8], exc)
                 conflict_paths = None
+            if conflict_paths is None:
+                if not first_reason:
+                    first_reason = (
+                        "conflicting_paths() returned no result "
+                        "(unresolvable ref?)")
+                try:
+                    fetched = await fetch_conflict_refs(
+                        task.repo_path, base_branch, branch_name)
+                except Exception as fexc:  # noqa: BLE001 — best-effort precondition
+                    fetched = False
+                    log.warning(
+                        "ref fetch before the enumeration retry failed "
+                        "for %s: %s", task.id[:8], fexc)
+                retry_reason = ""
+                try:
+                    conflict_paths = await conflicting_paths(
+                        task.repo_path, base_branch, branch_name)
+                except Exception as exc2:  # noqa: BLE001
+                    conflict_paths = None
+                    retry_reason = f"{exc2.__class__.__name__}: {exc2}"
+                else:
+                    if conflict_paths is None:
+                        retry_reason = (
+                            "conflicting_paths() returned no result "
+                            "(unresolvable ref?)")
+                if conflict_paths is not None:
+                    recovered_error = (
+                        f"{first_reason} (recovered after git fetch, "
+                        f"fetch_ok={fetched})")
+                else:
+                    enumerate_error = (
+                        f"{first_reason}; retry after git fetch "
+                        f"(fetch_ok={fetched}) also failed: {retry_reason}")
+
+        if enumerate_error or recovered_error:
+            task.context = await self.store.merge_context(
+                task.id,
+                {"pr_conflict_enumerate_error": enumerate_error or recovered_error})
+
+        if enumerate_error:
+            # A None return after the fetch retry is an UNKNOWN, not a
+            # confirmed source conflict — it must never fall through to the
+            # coder round below (the exact regression this gate closes).
+            if await self._is_terminal(task):
+                return None
+            data = task.blocker or {}
+            data["category"] = "NOVEL_UNKNOWN"
+            data["question"] = (
+                f"PR {url} is CONFLICTING but the conflicting paths could "
+                f"not be enumerated even after fetching {base_branch} and "
+                f"{branch_name}. Advise, or take over?"
+            )
+            data["root_cause_hypothesis"] = (
+                f"conflicting-path enumeration failed: {url}"
+            )
+            data["evidence"] = enumerate_error
+            task.blocker = data
+            await self.store.update_task_columns(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            await self._emit(
+                task, "escalated_pr_conflict",
+                f"{task.id[:8]} PR {url} CONFLICTING — enumeration failed: "
+                f"{enumerate_error}; no coder round opened",
+                extra={"error": enumerate_error},
+            )
+            return "escalated_pr_conflict"
+
         conflict_desc = (
             ", ".join(sorted(conflict_paths))
             if conflict_paths else "could not enumerate"
@@ -1731,6 +1814,7 @@ class WakeWatcher:
             f"{task.id[:8]} PR CONFLICTING — rebase round "
             f"{rounds}/{self.max_pr_conflict_rounds} — "
             f"conflicting paths: {conflict_desc}",
+            extra={"error": recovered_error} if recovered_error else None,
         )
         return await self._resume(task)
 

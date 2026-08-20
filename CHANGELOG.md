@@ -6,6 +6,14 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+- The wake watcher's PR-conflict rung no longer falls through to an
+  expensive coder round when it can't tell what's conflicting: a failed
+  conflicting-path enumeration — whether `conflicting_paths()` raises, or
+  simply returns no result for an unresolvable ref, the more common case —
+  now retries once after a best-effort `git fetch` of the base and branch
+  refs, and if it's still unresolved afterward, escalates `NOVEL_UNKNOWN`
+  instead of guessing. The failure reason now reaches both `task.context`
+  and the persisted event's new `error` field, not only the log.
 - The review gate no longer takes a blocking finding's word for it: on the
   gate path, a FAIL with non-critical blocking findings now gets one bounded,
   single-turn refute pass (read-only, ~180s) before it's charged to the

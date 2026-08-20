@@ -22,6 +22,7 @@ from no_human.core.bounds import Bounds
 from no_human.core.db import Store
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
+from no_human.vcs import derived_conflict as dc
 
 
 @pytest.fixture
@@ -29,6 +30,23 @@ async def store(tmp_path):
     s = await Store(tmp_path / "nh.db").connect()
     yield s
     await s.close()
+
+
+@pytest.fixture(autouse=True)
+def _resolvable_conflicting_paths(monkeypatch):
+    """`_approval_task` below uses a fake, non-existent `repo_path`
+    ("/tmp/x") -- this file is testing the mechanical-round/attempt-counter
+    logic, never conflicting-path enumeration (that's
+    `tests/test_orchestrator_pr_conflict.py`'s job, against real git repos).
+    A real `/tmp/x` cannot be enumerated, which now correctly escalates
+    instead of falling through to a coder round (see
+    `tests/test_wake_conflict.py`'s identical fixture). Stub a fixed,
+    non-derived path so `test_pass_then_conflict_rebase_does_not_increment_attempts`
+    still exercises the "enumeration succeeded" branch its assertions were
+    written against."""
+    async def fake_conflicting_paths(repo_path, base_tip, branch):
+        return {"src/unrelated.py"}
+    monkeypatch.setattr(dc, "conflicting_paths", fake_conflicting_paths)
 
 
 def _orch(store):
