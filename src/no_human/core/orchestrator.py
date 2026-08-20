@@ -7523,6 +7523,13 @@ class Orchestrator:
             "confidence": 1.0,
             "resume_commit": sha,
             "resume_branch": branch,
+            # Whose wall this is, as a FIELD: `Scheduler.recover_quota_cooldown`
+            # honours a recorded wall on restart only when it belongs to the
+            # profile the new process exported — `nh auth use <other>` +
+            # restart is the operator's way past a wall and must not idle
+            # behind the old profile's park. The prose above names it for
+            # humans; this names it for code.
+            "auth_profile": profile,
         }
         # Columns only (blocker, wake_check_at): `update_task` would rewrite
         # the whole context blob from this in-memory copy and drop whatever

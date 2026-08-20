@@ -10,7 +10,7 @@
 | Category | Route | Notify |
 |----------|-------|--------|
 | `TRANSIENT_INFRA` | auto-retry (max 2), then escalate | silent until exhausted |
-| `QUOTA` | `paused_quota`; watcher resumes on refresh | silent |
+| `QUOTA` | `paused_quota`; watcher resumes on refresh. The park pauses the whole pool until the reset; a restarted server re-reads the newest park for its own auth profile and keeps honouring that wall (`nh auth use <other>` + restart is the way past it) | silent |
 | `DEPENDENCY_WAIT` | `blocked` + wake condition; watcher polls | silent |
 | `MISSING_ACCESS` | escalate immediately | **now** |
 | `AMBIGUITY` | `awaiting_input`; ask ONE question | **now** |

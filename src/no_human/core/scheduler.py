@@ -29,7 +29,7 @@ from typing import Awaitable, Callable
 
 from ..agent.worker_context import WorkerContext, set_worker_context
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
-from ..config import (DEFAULT_CONFIG, parallelism_enabled,
+from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
                       worktree_isolation_enabled)
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
@@ -407,6 +407,66 @@ class Scheduler:
 
     def _in_quota_cooldown(self, now: datetime) -> bool:
         return self._quota_cooldown_until is not None and now < self._quota_cooldown_until
+
+    async def recover_quota_cooldown(self) -> datetime | None:
+        """Re-derive an open quota wall from the DB, at startup, before any
+        dispatch. Returns the reset time it armed, or None.
+
+        INCIDENT (2026-08-20, task 426fe079): the cooldown lived only in
+        process memory, armed when a dispatch of THIS process died on the
+        wall (`_run`). A restart forgot the wall while the tasks table still
+        held five ``paused_quota`` rows naming its reset time, so the new
+        process fed four pending tasks straight into it — four dead SDK
+        sessions, four more parks, for a wall the DB already knew.
+
+        Same source of truth as the live arming: the NEWEST ``paused_quota``
+        park's ``wake_check_at`` (the reset time `_park_quota` computed for
+        it). Newest by when it was RAISED (``blocker.raised_at``, falling back
+        to the row's ``updated_at``) — that is the park the dead process armed
+        last and the wall as the vendor last described it; an older park with
+        a longer stamp is history, not a longer wall. A stamp in the past, an
+        unparseable stamp, or no park at all arms nothing; a cooldown this
+        process already holds is never shortened (the LIVE arming in `_run`
+        overwrites unconditionally — that is a fresh wall, this is a
+        remembered one). Resume from the world, not from what a dead process
+        remembered.
+
+        Whose wall: a park stamped ``auth_profile`` (written by `_park_quota`)
+        counts only when it matches the profile THIS process exported
+        (`active_auth_profile`) — ``nh auth use <other>`` + restart is the
+        operator's sanctioned way past a wall and must not idle for the old
+        profile's hour. A park with no stamp cannot be attributed and is
+        honoured: <=1 h idle is the cheaper mistake against N dead sessions.
+        """
+        now = datetime.now(timezone.utc)
+        mine = active_auth_profile()
+        newest_raised: datetime | None = None
+        newest: datetime | None = None
+        newest_profile: str | None = None
+        for task in await self.store.list_tasks(TaskStatus.PAUSED_QUOTA):
+            resets = _parse_iso(getattr(task, "wake_check_at", None))
+            if resets is None:
+                continue
+            blocker = task.blocker if isinstance(task.blocker, dict) else {}
+            theirs = blocker.get("auth_profile")
+            if theirs and mine and theirs != mine:
+                continue                      # another profile's wall
+            raised = (_parse_iso(blocker.get("raised_at"))
+                      or _parse_iso(getattr(task, "updated_at", None))
+                      or datetime.min.replace(tzinfo=timezone.utc))
+            if newest_raised is None or raised > newest_raised:
+                newest_raised, newest, newest_profile = raised, resets, theirs
+        if newest is None or newest <= now:
+            return None
+        if self._quota_cooldown_until is not None and self._quota_cooldown_until >= newest:
+            return newest
+        self._quota_cooldown_until = newest
+        whose = f"'{newest_profile}' profile" if newest_profile else "an unattributed park"
+        self._on_event("quota_pause",
+                       f"pool paused until {newest.isoformat()} (recovered from "
+                       f"the DB at startup — {whose}'s wall, parked before this "
+                       "process; `nh auth use <other>` + restart clears it)")
+        return newest
 
     async def _claimable(self) -> list:
         out = []
@@ -1217,6 +1277,13 @@ class Scheduler:
         await self._reconcile_terminal_task_attempts()
         await self._sweep_stale_worktrees()
         await self._recover_orphans()
+        # AFTER the orphan sweep (which only moves rows between claimable
+        # states) and BEFORE the first tick: a wall the previous process was
+        # honouring must gate this one's first dispatch, not its second.
+        try:
+            await self.recover_quota_cooldown()
+        except Exception as exc:  # noqa: BLE001 — recovery must not kill the pool
+            log.warning("quota cooldown recovery failed: %s", exc)
         while not stop.is_set():
             await self.tick()
             # After the tick, so a task dispatched this pass is already in
