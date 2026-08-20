@@ -52,6 +52,10 @@ on:
         description: "Wheel: keep the board-carrying wheel as a 90-day run artefact"
         type: boolean
         default: false
+      windows_release:
+        description: "Windows: build the UNSIGNED installer + zip and keep them as a 7-day run artefact"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -642,6 +646,67 @@ jobs:
           ) + $skip
           uv @argv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # RELEASE BUILD ONLY, the Windows twin of the linux job's release lane:
+      # every gate above has already passed by the time these run, and they run
+      # ONLY on a workflow_dispatch that set windows_release=true — a bundle
+      # built from a random main push must not sit on the public repo as a
+      # downloadable artefact (same refusal as the linux job's comment). The
+      # full `npm ci` (scripts on) replaces the --ignore-scripts install above
+      # because electron-builder needs the real Electron binary to package.
+      - name: Install the desktop shell's dependencies WITH scripts (release build only)
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_release
+        working-directory: desktop
+        timeout-minutes: 10
+        run: npm ci
+
+      - name: Package the NSIS installer and the zip (release build only)
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_release
+        working-directory: desktop
+        timeout-minutes: 15
+        run: npm run dist:win
+
+      # Same contract as the linux job's verify step: exit 3 ("every check that
+      # ran passed, and at least one was weakened") is the honest verdict for a
+      # tree verifying the artefact it itself built, and is accepted HERE ONLY;
+      # any other non-zero fails the job.
+      - name: Verify the artefact against the source that built it (release build only)
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_release
+        run: |
+          uv run python scripts/verify_artefact.py desktop/dist/win-unpacked/resources/nh-server --repo . --repo-built-this-artefact
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3) { exit $LASTEXITCODE }
+          exit 0
+
+      # sha256sum's own output format (lowercase hash, two spaces, filename),
+      # so `shasum -a 256 -c` on any POSIX machine verifies the download.
+      - name: Checksums (release build only)
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_release
+        working-directory: desktop/dist
+        run: |
+          $lines = Get-ChildItem -File | Where-Object { $_.Name -like 'no_human-*-UNSIGNED.exe' -or $_.Name -like 'no_human-*-UNSIGNED.zip' } | Sort-Object Name | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name
+          }
+          if ($lines.Count -eq 0) { throw 'no UNSIGNED artefacts found to checksum' }
+          $lines | Set-Content -Encoding ascii SHA256SUMS-windows.txt
+          Get-Content SHA256SUMS-windows.txt
+
+      # 7 days, like the linux packages: long enough for a human to download,
+      # re-verify the sums and attach to the GitHub release by hand; short
+      # enough that a forgotten run is not a standing unsigned download.
+      # latest.yml is never included: no auto-update path ships
+      # (nhCanAutoUpdate is false on every platform).
+      - name: Upload the packages (release build only — workflow_dispatch with windows_release)
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_release
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ github.sha }}
+          path: |
+            desktop/dist/no_human-*-UNSIGNED.exe
+            desktop/dist/no_human-*-UNSIGNED.zip
+            desktop/dist/SHA256SUMS-windows.txt
+            desktop/dist/win-unpacked/resources/nh-server/BUILD_STAMP
+          if-no-files-found: error
+          retention-days: 7
 
   # Linux is the third member of ONE product (docs/LINUX.md). Same gating as
   # `windows`: every push to main, opt-in `linux` label on PRs, and on demand

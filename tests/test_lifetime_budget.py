@@ -172,11 +172,24 @@ async def test_per_task_override_wins_over_config(store):
 
 
 async def test_killed_rows_with_zero_tokens_still_count_as_attempts(store):
-    """Pre-1638427 rows recorded zero tokens; they still spent the attempt."""
+    """Pre-1638427 rows recorded zero tokens; they still spent the attempt.
+
+    Closed with `status="failed"` rather than left for `create_attempt`'s own
+    supersede sweep to close: a row the sweep tags `status="interrupted"` with
+    zero recorded work is the 2026-08-20 DEAD shape (a worker that died before
+    doing anything) and is now excluded from the cap by design — see THE
+    BOUNDARY in `Store.lifetime_usage_by_class`. A pre-1638427 row is the
+    opposite: real work happened and genuinely CLOSED, only its token columns
+    under-reported it because of the metering gap that commit fixed. `failed`
+    always counts whatever its token columns say, so stamping it here is what
+    keeps this test asserting the pre-1638427 guarantee instead of colliding
+    with the new one.
+    """
     t = Task.new("task", repo_path="/tmp/x")
     await store.create_task(t)
     for n in range(1, 10):
-        await store.create_attempt(t.id, n)  # no token columns at all
+        aid = await store.create_attempt(t.id, n)  # no token columns at all
+        await store.update_attempt(aid, status="failed")
 
     b = await _orch(store)._check_lifetime_budget(t)
     assert b is not None and "attempts 9/9" in b.root_cause_hypothesis

@@ -6,6 +6,25 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-20
+
+Security and release-infrastructure release: same product, patched runtime,
+and a release lane for every platform.
+
+- Dependency security: Electron moves to 38.8.6 (the last 38.x), clearing
+  every advisory patched within the current major; js-yaml 4.3.1, fast-uri
+  3.1.5, undici 6.28.0, postcss 8.5.26, mcp 1.29.0 and cryptography 50.0.0
+  likewise. 21 of the repository's 40 open Dependabot alerts closed by
+  measurement, not estimate; 19 remain — 18 gated on the Electron 39 major
+  (deliberately deferred to a scheduled release) and one, extract-zip
+  (GHSA alert #45, high), with no patched version in existence to move to.
+- The Windows job gains the same on-demand release lane the Linux job has
+  (`workflow_dispatch` + `windows_release`): build, verify against the tree
+  that built it, checksum, 7-day artefact. Ordinary CI runs are untouched.
+- Windows bundles now carry the same BUILD_STAMP provenance
+  (`commit=/dirty=/board_sha256=`) POSIX builds have had since the stale-DMG
+  incident — an absent stamp fails verification rather than passing quietly.
+
 ## [0.1.1] — 2026-08-20
 
 Also in this release — reliability, honesty, and cost, measured not asserted
@@ -93,6 +112,7 @@ evidence it works. A human approves and merges.
   2026-08-18, built by the public repository's CI. `SHA256SUMS-linux.txt`
   ships alongside.
 
-[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/no-human-ai/no_human/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/no-human-ai/no_human/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/no-human-ai/no_human/releases/tag/v0.1.0

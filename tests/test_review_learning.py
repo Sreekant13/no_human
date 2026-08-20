@@ -459,11 +459,20 @@ async def test_the_attempts_axis_of_the_ceiling_gates_both_callers(store):
     buy a utility call for a task the loop head refuses to run.
 
     Spends NO tokens: the tokens clause cannot be what fires here.
+
+    Each row is closed `status="failed"` (zero tokens, same as before) rather
+    than left for `create_attempt`'s own supersede sweep: a row the sweep
+    tags `status="interrupted"` with zero recorded work is the 2026-08-20
+    DEAD-worker shape and is now excluded from the lifetime cap by design
+    (see THE BOUNDARY in `Store.lifetime_usage_by_class`) — a `failed` row
+    always counts whatever its token columns say, which is exactly the
+    zero-token/attempts-axis case this test is pinning.
     """
     o = _orch(store)
     t = await _task(store)
     for n in range(1, o.bounds.lifetime_attempts + 1):
-        await store.create_attempt(t.id, n)
+        aid = await store.create_attempt(t.id, n)
+        await store.update_attempt(aid, status="failed")
 
     assert await o._at_lifetime_ceiling(t) is True
     assert await o._check_lifetime_budget(t) is not None, "the two disagree"

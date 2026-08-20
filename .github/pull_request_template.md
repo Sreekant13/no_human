@@ -25,8 +25,8 @@ Example:
       agent never merges (it opens a PR and stops; merge is a human action),
       review stays evidence-based (independent fresh-context reviewer, never
       a numeric self-scoring gate), and the locally installed product keeps
-      its lean stack (SQLite only, a single Claude backend via the Agent SDK,
-      no extra services).
+      its lean stack (SQLite only, no extra services, and no re-implementation
+      of what the coding backend's SDK already provides).
 - [ ] First PR only: I have read `CLA.md` and added my `contributors/<handle>.md`
       entry to this PR. (Ticking this box is not the record — the file is. CI
       checks for the file.)

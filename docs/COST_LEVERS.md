@@ -52,8 +52,8 @@ PreCompact events ever fired    0
 1. **SDK auto-compaction has NEVER fired** (0 `compact` events across the whole DB). Sessions end
    below the CLI's auto-compact threshold, so there is nothing to "engage" — do not go looking for
    a compaction knob, and do not rebuild SDK-owned compaction (per the project's lean-stack
-   constraint: the product keeps a single Claude backend via the Agent SDK and never
-   re-implements capabilities the SDK already owns).
+   constraint: the product never re-implements capabilities the SDK it runs on
+   already owns).
    **CORRECTION (coder-in-attempt cache-burn ticket, landed — see Lever 2 below):** "nothing to
    engage" was the wrong read of the same fact. Auto-compaction never fired because its window
    defaults to the ~200k-token full model context, and the coder's own context plateaus around

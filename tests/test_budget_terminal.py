@@ -69,12 +69,23 @@ def _orch(store, tmp_path, notifier=None, *, config_over=None):
 
 
 async def _exhausted(store, title="over budget"):
-    """A task whose lifetime attempt cap is spent."""
+    """A task whose lifetime attempt cap is spent.
+
+    Each row is closed with a real terminal status and nonzero tokens —
+    mirroring how a real attempt loop closes a row before the next one
+    starts. Left bare, `create_attempt`'s own supersede sweep would tag the
+    older row `status="interrupted"` with zero recorded work, which is the
+    2026-08-20 DEAD-worker shape and is now excluded from the lifetime cap
+    by design (see THE BOUNDARY in `Store.lifetime_usage_by_class`); a
+    helper meant to represent a genuinely spent cap must not collide with
+    that exclusion by accident.
+    """
     t = Task.new(title, repo_path="/tmp/r")
     t.config = {"lifetime_attempts": 2}
     await store.create_task(t)
     for n in (1, 2):
-        await store.create_attempt(t.id, n)
+        aid = await store.create_attempt(t.id, n)
+        await store.update_attempt(aid, status="failed", tokens_used=100)
     return t
 
 

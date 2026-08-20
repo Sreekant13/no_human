@@ -163,6 +163,44 @@ if (-not (Test-Path (Join-Path $Bundle 'web\dist\index.html'))) {
 $sql = @(Get-ChildItem -Path (Join-Path $Bundle 'migrations') -Filter '*.sql' -ErrorAction SilentlyContinue)
 if ($sql.Count -lt 1) { Fail "no migrations in $Bundle\migrations" }
 
+# BUILD_STAMP - the provenance scripts/verify_artefact.py REQUIRES: an absent
+# stamp is exit 1 there, never a skipped check. build-installer.sh has written
+# these same three lines on POSIX since the stale-DMG incident; this is its
+# .ps1 twin, added when the windows_release CI lane's verify step exposed that
+# no Windows bundle carried a stamp at all (independent review, 2026-08-20).
+# The board digest is computed by the venv's Python with the exact algorithm
+# verify_artefact.py::board_digest documents (byte-sorted "hash  relpath"
+# lines, trailing newline) - a pwsh reimplementation would have to reproduce
+# LC_ALL=C byte ordering by hand, and a digest that drifts fails every honest
+# artefact's verification.
+$commit = (& git -C $Root rev-parse HEAD 2>$null)
+if ($commit -notmatch '^[0-9a-f]{40}$') {
+  Fail 'cannot resolve HEAD of the checkout - the artefact would carry no provenance at all. Build from a git checkout.'
+}
+$gitStatus = & git -C $Root status --porcelain 2>$null
+if ($LASTEXITCODE -ne 0) { $dirty = 'unknown' }
+elseif ($gitStatus) { $dirty = 'yes' } else { $dirty = 'no' }
+$PyExe = Join-Path $Root '.venv\Scripts\python.exe'
+if (-not (Test-Path $PyExe)) { Fail "no python at $PyExe - run 'uv sync' first" }
+$boardSha = & $PyExe -c @'
+import hashlib, os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+blobs = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+lines = sorted(
+    hashlib.sha256(blobs[p]).hexdigest().encode("ascii") + b"  "
+    + os.fsencode(p.relative_to(root).as_posix())
+    for p in sorted(blobs)
+)
+print(hashlib.sha256(b"\n".join(lines) + b"\n").hexdigest())
+'@ (Join-Path $Bundle 'web\dist')
+if ($LASTEXITCODE -ne 0 -or $boardSha -notmatch '^[0-9a-f]{64}$') {
+  Fail "the board digest came out as '$boardSha', which is not a sha256. Refusing to write an unusable stamp."
+}
+$stampPath = Join-Path $Bundle 'BUILD_STAMP'
+@("commit=$commit", "dirty=$dirty", "board_sha256=$boardSha") | Set-Content -Encoding ascii $stampPath
+Write-Host "==> build stamp: commit=$commit dirty=$dirty board_sha256=$boardSha"
+
 # 4/5. Modules that must never ship. Searching the bundle for the NAME cannot do
 # this job: pure modules live in the zlib-compressed PYZ, so the string is absent
 # from the bytes while the module is inside. PyInstaller's own module table is

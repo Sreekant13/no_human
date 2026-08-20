@@ -7814,7 +7814,12 @@ class Orchestrator:
         Frozen exactly when `_budget_frozen_by_pass` says so — see
         `_check_lifetime_budget`'s matching short-circuit. This advisory guard
         must not disagree with the gate it advises; that drift is exactly what
-        `_over_lifetime_caps`'s docstring was written to prevent."""
+        `_over_lifetime_caps`'s docstring was written to prevent.
+
+        Inherits the zero-priced dead-interrupted-attempt exclusion for free
+        (see `_check_lifetime_budget`'s docstring) because both read the same
+        `store.lifetime_usage_by_class` count — there is no second filter
+        applied here to keep in sync."""
         if await self._budget_frozen_by_pass(task):
             return False
         used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
@@ -10271,6 +10276,19 @@ class Orchestrator:
         bare verdict check would freeze the gate for that too — see
         `_budget_frozen_by_pass`'s docstring. The per-attempt `attempt_tokens`
         cap (`BudgetAbort`) is untouched, so a single runaway round still ends.
+
+        The `used_attempts` this reads (`store.lifetime_usage_by_class`)
+        already excludes infra-classified dispatches (`infra_failure = 1`),
+        mechanical rounds (`mechanical_round = 1`), and — INCIDENT
+        2026-08-20 — dead `status = 'interrupted'` rows that burned zero
+        priced work (a worker process that died mid-attempt without closing
+        its row; `Store._zero_priced_work_sql()`). THE BOUNDARY: an
+        interrupted attempt WITH real priced spend still counts toward this
+        cap — the work happened and was lost, and that spend pressure is
+        real. Only the zero-priced interrupted shape is excluded. This is a
+        single chokepoint, not a filter re-applied here: `_at_lifetime_ceiling`
+        reads the exact same `lifetime_usage_by_class` count, so the two
+        gates cannot disagree about what counts.
         """
         if await self._budget_frozen_by_pass(task):
             self.emit(

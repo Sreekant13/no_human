@@ -1078,6 +1078,16 @@ class Store:
             # about to land.
             "mechanical_round": "INTEGER",
         }
+        # A THIRD exclusion lives beside these two, but needs no new column:
+        # `status = 'interrupted'` (the base column, written only by
+        # `create_attempt`'s stale-row sweep, `close_open_attempts` and
+        # `close_attempts_of_terminal_tasks` — never by the agent) AND zero
+        # priced work (`_zero_priced_work_sql()`, over `_usage_columns()`) is
+        # also excluded from `lifetime_usage_by_class`'s attempt COUNT, at the
+        # same chokepoint `infra_failure` / `mechanical_round` use. The
+        # boundary: an interrupted attempt WITH real priced spend still
+        # counts — only the zero-priced interrupted shape does not. See
+        # `lifetime_usage_by_class` for the full incident and reasoning.
         for col, decl in att_wanted.items():
             if col not in att_existing:
                 await self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} {decl}")
@@ -1997,12 +2007,17 @@ class Store:
 
     async def count_attempts(self, task_id: str) -> int:
         """Raw row count — how many attempt rows exist for this task,
-        INCLUDING infra-classified ones (`infra_failure = 1`).
+        INCLUDING infra-classified ones (`infra_failure = 1`), mechanical
+        rounds (`mechanical_round = 1`), and dead interrupted rows that
+        burned zero priced work (`status = 'interrupted'` AND
+        `_zero_priced_work_sql()`).
 
-        NOT the budget counter: a dead SDK dispatch still gets a row (the row
-        is the only durable record of it), but it must not consume a lifetime
-        attempt — see `lifetime_usage_by_class`, which is what
-        `_check_lifetime_budget` / `_at_lifetime_ceiling` actually read.
+        NOT the budget counter: none of those three shapes did real work, so
+        none of them may consume a lifetime attempt — but the row is never
+        skipped here, because it is the only durable record of what
+        happened. See `lifetime_usage_by_class`, which is what
+        `_check_lifetime_budget` / `_at_lifetime_ceiling` actually read for
+        the budget-relevant count.
         """
         row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", (task_id,)
@@ -2052,6 +2067,39 @@ class Store:
         return tuple(
             col for cols in cls._usage_columns_by_class().values() for col in cols
         )
+
+    @classmethod
+    def _zero_priced_work_sql(cls) -> str:
+        """SQL for "this attempt row burned NO priced work".
+
+        Built from ``_usage_columns()`` — the same addend column set
+        ``lifetime_usage`` sums and the same one the budget gate splats into
+        ``pricing.weighted_tokens`` — so a role or class added to
+        ``USAGE_ROLES`` widens this predicate at the exact moment it widens
+        the caps. There is no second, independently-typed list to drift out
+        of sync with it (the ``eval/northstar_card.score_did_priced_work``
+        lesson: one definition, two consumers).
+
+        Raw-zero over those addends IS priced-zero, not merely correlated
+        with it: ``pricing.weighted_tokens`` is a non-negative linear
+        combination of exactly these addends with every weight strictly
+        positive (``FRESH_WEIGHT`` 1.0, ``CACHE_CREATION_WEIGHT`` 1.25,
+        ``CACHE_READ_WEIGHT`` 0.1), so the weighted sum is 0 exactly when
+        every addend is 0. This SQL is therefore the priced predicate, not a
+        second rule that happens to agree with it today.
+
+        ``output_tokens`` is deliberately excluded: `_output_columns_by_class`
+        documents it as a SLICE of `tokens_used`, already inside that addend,
+        not a bucket beside it — including it would re-open the double-count
+        trap for no change in verdict (it cannot be non-zero while
+        ``tokens_used`` is zero).
+
+        ``COALESCE`` per column: a row whose split was never recorded stores
+        SQL NULL, and NULL must read as "no recorded spend", the same
+        treatment ``lifetime_usage_by_class``'s SUMs already give it.
+        """
+        return "(" + " + ".join(
+            f"COALESCE({c}, 0)" for c in cls._usage_columns()) + ") = 0"
 
     @classmethod
     def _output_columns_by_class(cls) -> dict[str, tuple[str, ...]]:
@@ -2120,11 +2168,44 @@ class Store:
         # re-verification tick that changes no code (INCIDENT 2026-08-13:
         # tasks 79183501 and 1a4b7bf7 PASSED review, then rebase rounds under
         # supervising-train landings burned the rest of their lifetime
-        # attempts). The token SUMs above are UNCHANGED: both kinds of
-        # attempt still have their real spend counted if any was recorded.
+        # attempts) — OR `status = 'interrupted'` AND zero priced work
+        # (`_zero_priced_work_sql`) — a worker process that died without
+        # closing its row (`create_attempt`'s stale-row sweep,
+        # `close_open_attempts`, `close_attempts_of_terminal_tasks`) before
+        # metering anything (INCIDENT 2026-08-20: a weekly-quota outage left
+        # four concurrent tasks accumulating rows closed by the supersede
+        # sweep — turns <= 1, zero priced tokens; task 123dea00 had 8 of its
+        # 9 attempts this shape and was FAILED by attempt-cap exhaustion with
+        # no real attempt having failed; 021899de, 7553b865, e2d0802d needed
+        # manual `lifetime_attempts` raises to survive).
+        #
+        # THE BOUNDARY, stated once and load-bearing: an interrupted attempt
+        # that burned REAL priced work STILL COUNTS — the work happened and
+        # was lost, and that spend pressure is real and the orphan-spend
+        # accounting depends on it. Only the zero-priced interrupted shape is
+        # excluded. A `failed` attempt always counts, whatever its token
+        # columns say — a genuine failure that recorded nothing is still a
+        # datum, which is exactly why the exclusion below tests `status =
+        # 'interrupted'` and not merely "zero priced work" on its own.
+        #
+        # This stays outside the coder's influence: the excluded shape
+        # requires `status = 'interrupted'`, which only `db.py` writes —
+        # never the agent, and never `update_attempt(status='failed')` from
+        # the attempt loop — AND zero recorded spend, which an agent cannot
+        # fake downward because any session it runs meters tokens. There is
+        # no way for a coder to convert its own failing attempts into free
+        # ones.
+        #
+        # The token SUMs above are UNCHANGED (a dead row contributes 0
+        # anyway), and the row is never deleted or skipped — it is the
+        # durable record; only the COUNT changes, at the single chokepoint
+        # both budget gates (`_check_lifetime_budget`, `_at_lifetime_ceiling`)
+        # read, so they cannot disagree about whether a dead dispatch or a
+        # dead interrupted row counted.
         row = await self._fetchone(
             "SELECT COALESCE(SUM(CASE WHEN COALESCE(infra_failure, 0) = 0 "
             "AND COALESCE(mechanical_round, 0) = 0 "
+            f"AND NOT (status = 'interrupted' AND {self._zero_priced_work_sql()}) "
             f"THEN 1 ELSE 0 END), 0) AS n, {selects} FROM attempts "
             "WHERE task_id = ?",
             (task_id,),

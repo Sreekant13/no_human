@@ -18,6 +18,7 @@ changes in code and not here fails the suite.
 | `bounds.max_turns_per_attempt` | `500` | Agent turns before an attempt is cut off |
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
+| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor and utility stay on Claude. See [BACKENDS.md](BACKENDS.md) |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |

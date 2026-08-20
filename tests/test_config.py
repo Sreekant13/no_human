@@ -550,7 +550,6 @@ _UNDOCUMENTED_AT_BASELINE = frozenset({
     "telemetry.posthog_publishable",
     "updates.enabled",
     "updates.interval_seconds",
-    "worker.backend",
 })
 
 

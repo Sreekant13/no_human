@@ -32,6 +32,14 @@ project's own MCP config by anyone who opens this repo in Claude Code —
 including no_human's coder sessions working in this repo — and that is not what
 this is for.
 
+## The skill
+
+This plugin also ships an agent skill at
+[`skills/file-a-task/SKILL.md`](skills/file-a-task/SKILL.md) teaching an
+agent when and how to file work into no_human with `task_add` and
+`task_status`. As it says there too: no_human opens the pull request and
+stops — merge is always the human's action.
+
 ## Try it
 
 In Claude Code with the plugin loaded:

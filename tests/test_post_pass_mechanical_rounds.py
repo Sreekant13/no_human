@@ -62,12 +62,22 @@ def _watcher(store, *, mergeable=None, merge_state=""):
 
 
 async def _spend(store, task_id, attempts, *, last_verdict=None):
-    """Create `attempts` ordinary (non-mechanical) attempt rows. If
-    `last_verdict` is not None, the LAST one records that review verdict
-    (0 = FAIL, 1 = PASS)."""
+    """Create `attempts` ordinary (non-mechanical) attempt rows, each closed
+    with a real terminal status and nonzero tokens — mirroring how a real
+    attempt loop closes every row (`update_attempt(..., status=..., …)`)
+    before the next one starts. Left bare, `create_attempt`'s own supersede
+    sweep would tag every-but-the-newest row `status="interrupted"` with
+    zero recorded work the moment the next attempt is created — the exact
+    2026-08-20 DEAD-worker shape that is now excluded from the lifetime cap
+    by design (see THE BOUNDARY in `Store.lifetime_usage_by_class`) — so a
+    helper meant to represent N genuinely CONSUMED attempts must close each
+    row itself rather than rely on that sweep by accident. If `last_verdict`
+    is not None, the LAST one also records that review verdict (0 = FAIL,
+    1 = PASS)."""
     aid = None
     for n in range(1, attempts + 1):
         aid = await store.create_attempt(task_id, n)
+        await store.update_attempt(aid, status="succeeded", tokens_used=1_000)
     if last_verdict is not None and aid is not None:
         await store.update_attempt(aid, review_passed=last_verdict)
     return aid
@@ -204,15 +214,22 @@ async def test_the_cap_still_fires_on_a_task_with_no_pass(store):
 
 
 async def test_a_later_review_fail_re_arms_the_cap(store):
-    """Freeze bound: a PASS followed by a NEWER FAIL restores enforcement."""
+    """Freeze bound: a PASS followed by a NEWER FAIL restores enforcement.
+
+    Every row is closed with a real terminal status and nonzero tokens (see
+    `_spend`'s docstring above for why a bare `create_attempt` loop would
+    instead collide with the 2026-08-20 dead-interrupted-row exclusion)."""
     t = Task.new("pass-then-fail", repo_path="/tmp/x")
     await store.create_task(t)
     for n in range(1, 8):
-        await store.create_attempt(t.id, n)
+        aid = await store.create_attempt(t.id, n)
+        await store.update_attempt(aid, status="succeeded", tokens_used=1_000)
     aid8 = await store.create_attempt(t.id, 8)
-    await store.update_attempt(aid8, review_passed=1)
+    await store.update_attempt(
+        aid8, status="succeeded", tokens_used=1_000, review_passed=1)
     aid9 = await store.create_attempt(t.id, 9)
-    await store.update_attempt(aid9, review_passed=0)
+    await store.update_attempt(
+        aid9, status="failed", tokens_used=1_000, review_passed=0)
 
     assert await store.latest_review_verdict(t.id) == 0
 
