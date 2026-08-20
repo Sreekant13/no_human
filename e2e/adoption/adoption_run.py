@@ -105,6 +105,38 @@ FORBIDDEN_ON_PATH = ("nh",)
 # Environment construction
 # --------------------------------------------------------------------------- #
 
+# The two documents the public onboarding path sends a new user to. A finding
+# about "is X documented" is only allowed to come from having read these.
+ONBOARDING_DOCS = ("README.md", "docs/quickstart.md")
+
+
+@dataclass
+class DocSearch:
+    """The result of searching the onboarding docs for one term.
+
+    This is what "having read the file" looks like as data, rather than as an
+    assertion — a check can hand back a `DocSearch` and a test can show it was
+    produced by a real read, instead of trusting a hardcoded conclusion. Every
+    rel path in `docs` gets an entry in `hits`; a doc that is missing or
+    unreadable counts as -1 (never silently 0, and never silently skipped) and
+    the reason lands in `notes`, both surfaced by `evidence()`.
+    """
+    term: str
+    hits: dict[str, int]
+    notes: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def missing_from(self) -> list[str]:
+        """rel paths where the term was not found (includes unreadable docs)."""
+        return [rel for rel, n in self.hits.items() if n <= 0]
+
+    def evidence(self) -> str:
+        return json.dumps(
+            {"term": self.term, "searched": list(self.hits),
+             "hits": self.hits, "notes": self.notes},
+            indent=2)
+
+
 @dataclass
 class Ctx:
     work: Path
@@ -320,6 +352,39 @@ class Ctx:
                     continue
                 hits.append(f"{rel}: {line.strip()[:100]}")
         return hits
+
+    def onboarding_docs_mentioning(self, product: Path, term: str,
+                                    docs: tuple[str, ...] = ONBOARDING_DOCS,
+                                    ) -> DocSearch:
+        """Count occurrences of `term` in each of `docs`, read from `product`.
+
+        The rule this exists to enforce: a finding about the content of a file
+        is only allowed to come from having read that file. Case-insensitive
+        substring count, so `nh doctor` also matches inside `` `uv run nh
+        doctor` `` and `` `nh doctor --verify-auth` ``.
+
+        Fails closed (memory: gates fail closed): a doc that does not exist or
+        cannot be read counts as -1 occurrences, not 0 and not a skip, and is
+        recorded in `missing_from` with the reason in `notes` — an absent
+        README is a failure of the search, never a silent pass.
+
+        A pure function of the filesystem (does not touch `self`), so it can
+        be called unbound in tests exactly like
+        `docs_still_promise_bare_ticket_key(None, product)` above.
+        """
+        needle = term.lower()
+        hits: dict[str, int] = {}
+        notes: dict[str, str] = {}
+        for rel in docs:
+            f = product / rel
+            try:
+                text = f.read_text().lower()
+            except OSError as exc:
+                hits[rel] = -1
+                notes[rel] = f"unreadable: {exc}"
+                continue
+            hits[rel] = text.count(needle)
+        return DocSearch(term, hits, notes)
 
     def documented_env_keys_nothing_reads(self, product: Path) -> list[str]:
         """Keys in configuration.md's `.env` table that no source file reads.

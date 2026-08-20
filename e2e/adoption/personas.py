@@ -188,6 +188,40 @@ def _nh_init_scriptable(ctx, run: PersonaRun, product: Path) -> None:
               stdin_devnull=True, allow_fail=True)
 
 
+def _doctor_is_documented(ctx, run: PersonaRun, product: Path) -> None:
+    """Run `nh doctor`, then check the "is it documented" claim by READING
+    README.md and docs/quickstart.md, rather than asserting it.
+
+    ADOPT-4 (2026-08-02, then re-litigated twice more): the original version
+    raised a finding whenever `nh doctor` merely ran successfully, hardcoding
+    the belief that it is "named in neither the README nor the quickstart".
+    The check never read either file, so the finding fired on every run where
+    the command worked — which is every run — and stayed wrong long after
+    both docs were fixed to mention it.
+
+    A non-zero exit is a different defect (the product is broken) from being
+    undocumented (the docs don't mention a working command); this only asks
+    the documentation question once the command has proven it works, and the
+    exit itself is already fully visible via the `StepResult` `ctx.shell`
+    records regardless of outcome.
+    """
+    r = ctx.shell(run, "doctor", "Check it is actually alive before trusting it.",
+                  "README.md#install; docs/quickstart.md", "uv run nh doctor",
+                  cwd=product, allow_fail=True)
+    if not r.ok:
+        return
+    search = ctx.onboarding_docs_mentioning(product, "nh doctor")
+    if search.missing_from:
+        run.findings.append(Finding(
+            run.name, "doctor", "low",
+            ("`nh doctor` is the one command that tells a new user whether "
+             "the install is real, and it is not named in "
+             f"{', '.join(search.missing_from)} — the document(s) the public "
+             "onboarding path sends a new user to."),
+            "README.md#install; docs/quickstart.md", search.evidence(),
+            ticket="ADOPT-4"))
+
+
 def persona_dana(ctx) -> PersonaRun:
     """The first-install walk, following README 'Install' then quickstart §1-3."""
     run = PersonaRun(**DANA)
@@ -278,19 +312,9 @@ def persona_dana(ctx) -> PersonaRun:
     # personas behind her.
     ctx.seed_config()
 
-    # -- README says nothing about verifying the install; quickstart doesn't
-    #    either. `nh doctor` is in `nh --help` only. -------------------------- #
-    r = sh(run, "doctor", "Check it is actually alive before trusting it.",
-           "UNDOCUMENTED — found in `nh --help`, absent from README and quickstart",
-           "uv run nh doctor", cwd=product, allow_fail=True)
-    if r.ok:
-        run.findings.append(Finding(
-            run.name, "doctor", "low",
-            ("`nh doctor` is the one command that tells a new user whether the "
-             "install is real, and it is named in neither the README nor the "
-             "quickstart. It is also the natural place to surface the two "
-             "problems above and does not."),
-            "UNDOCUMENTED", r.stdout[-1200:], ticket="ADOPT-4"))
+    # -- README/quickstart: verify the install, then check the "is it
+    #    documented" claim by reading the docs. --------------------------- #
+    _doctor_is_documented(ctx, run, product)
     return run
 
 

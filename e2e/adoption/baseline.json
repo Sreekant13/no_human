@@ -20,14 +20,6 @@
       "step": "serve-help",
       "summary": "`nh serve` has no drain-and-exit mode: it runs until interrupted, and its only option is --max-workers. There is therefore no supported way to run 'work the queue, then stop' from a script, a CI job or a cron entry, and no exit code that says whether the queue drained. Anyone automating the overnight drain the quickstart recommends has to supervise the process themselves and poll `nh status --json` to know when to stop it.",
       "tracked_as": "docs/KNOWN_ISSUES.md KI-3"
-    },
-    {
-      "ticket": "ADOPT-4",
-      "severity": "low",
-      "persona": "Dana",
-      "step": "doctor",
-      "summary": "`nh doctor` is the one command that tells a new user whether the install is real, and it is named in neither the README nor the quickstart. It is also the natural place to surface the two problems above and does not.",
-      "tracked_as": ""
     }
   ]
 }
