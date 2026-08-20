@@ -24,7 +24,7 @@ from rich.table import Table
 from . import print_path_error, stdio_is_interactive
 from .. import __version__
 from ..agent.claude_backend import ClaudeBackend
-from ..agent.backend import make_backend, resolve_backend_name
+from ..agent.backend import make_backend, resolve_backend_name, SUPPORTED_BACKENDS
 from ..config import (
     AuthError,
     assert_codex_api_key_mode,
@@ -858,9 +858,10 @@ def task() -> None:
 @click.option("-v", "--verbose", is_flag=True, help="Show full tool-call log (default: compact progress).")
 @click.option("--grill/--no-grill", default=True,
               help="Ask a few questions to refine the spec (default: on; --no-grill to skip).")
-@click.option("--backend", default=None, type=click.Choice(["claude"]),
-              help="Label this task's backend (recorded on the task; the coder backend "
-                   "itself is chosen by `worker.backend` in config: claude or codex).")
+@click.option("--backend", default=None, type=click.Choice(list(SUPPORTED_BACKENDS)),
+              help="Run THIS task's coder on the named backend instead of "
+                   "`worker.backend` from config. Only the coder moves; reviewer, "
+                   "planner, supervisor and utility stay on Claude.")
 @click.option("--approve-plan", is_flag=True, default=False,
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")

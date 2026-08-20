@@ -229,7 +229,8 @@ class CodexBackend:
         key = env.get("OPENAI_API_KEY")
         if not key:
             raise CodexAuthError(
-                "worker.backend is 'codex' but no OPENAI_API_KEY was found. "
+                "the coder backend is 'codex' (worker.backend, or this task's "
+                "--backend) but no OPENAI_API_KEY was found. "
                 "Codex runs on YOUR OWN OpenAI API key — there is no "
                 "subscription path (OpenAI's terms prohibit using ChatGPT to "
                 "power third-party services). Add the key to ~/.no_human/.env "

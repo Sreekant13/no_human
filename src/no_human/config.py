@@ -541,7 +541,8 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
             del os.environ[var]
     if not key:
         raise AuthError(
-            "worker.backend is 'codex' but no OPENAI_API_KEY was found. The "
+            "the coder backend is 'codex' (worker.backend, or a task's "
+            "--backend) but no OPENAI_API_KEY was found. The "
             "Codex backend runs on YOUR OWN OpenAI API key — there is no "
             "subscription path, because OpenAI's terms prohibit using ChatGPT "
             "to power third-party services.\n"
@@ -586,7 +587,8 @@ def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
     url = (base_url or "").strip()
     if not url:
         raise AuthError(
-            "worker.backend is 'local' but llm.local_base_url is not set. An "
+            "the coder backend is 'local' (worker.backend, or a task's "
+            "--backend) but llm.local_base_url is not set. An "
             "ambient ANTHROPIC_BASE_URL is scrubbed and never trusted as a "
             "fallback.\n"
             "Set it in config.yaml:\n"

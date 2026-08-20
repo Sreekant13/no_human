@@ -19,6 +19,10 @@ everything else. Both credentials must be present.
 
 ## Switching
 
+For every task, in config — or for ONE task, on the task: `nh task add … --backend codex`
+(or `"backend": "codex"` on `POST /api/tasks`). The per-task value wins for that
+task's coder only and gets the same credential/CLI preflight as the global key.
+
 ```yaml
 # ~/.no_human/config.yaml
 worker:
@@ -169,8 +173,9 @@ Claude harness:
   point `local` at a remote/hosted server; that is what `claude`'s BYO-API-key
   mode or `codex` are for;
 - the reviewer, planner, supervisor and utility tiers are unaffected — only
-  `role="coder"` ever consults `worker.backend` (`resolve_backend_name`), so a
-  `local` run still bills Anthropic for everything except the implementer.
+  `role="coder"` ever consults `worker.backend` (`resolve_backend_name`) or a
+  task's `--backend`, so a `local` run still bills Anthropic for everything
+  except the implementer.
 
 ## Adding a fourth backend
 

@@ -6,6 +6,15 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+- `nh task add --backend` (and `backend` on `POST /api/tasks`) now routes
+  THAT task's coder to the named backend — `claude`, `codex` or `local` —
+  instead of only labelling it while `worker.backend` decided. Reviewer,
+  planner, supervisor and utility stay on Claude either way: the factory
+  ignores an override for any non-coder role. An unknown name is refused at
+  intake (CLI choice / HTTP 422); a per-task codex/local run gets the same
+  credential and CLI preflight the global setting gets, at orchestrator
+  construction, before any model call. (public issue #5)
+
 ## [0.1.3] — 2026-08-20
 
 Registry release: the package now carries what the official MCP Registry

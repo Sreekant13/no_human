@@ -18,15 +18,64 @@ from .db import Store
 from .orchestrator import Orchestrator
 
 
+def task_backend_override(task: Any) -> str | None:
+    """The backend THIS task asked for, or None to follow `worker.backend`.
+
+    `nh task add --backend codex` and the API's `backend` field record the
+    choice on `task.config["backend"]` (the board's composer has no picker
+    yet). Until public issue #5 that value was
+    only displayed; the coder still ran on the global key, so the flag looked
+    like a per-task switch and was not one. Here it becomes one — for the
+    CODER only: `make_backend` ignores any override for a non-coder role (see
+    `CLAUDE_PINNED_ROLES`), and this module calls it with role="coder" only. An absent/blank value means "no
+    opinion", so a task created before the flag existed is unchanged.
+    """
+    cfg = getattr(task, "config", None)
+    if not isinstance(cfg, dict):
+        return None
+    value = str(cfg.get("backend") or "").strip().lower()
+    return value or None
+
+
+def assert_task_backend_usable(name: str | None, config: dict[str, Any] | None) -> None:
+    """The per-task twin of the CLI's startup preflight for a GLOBAL backend.
+
+    `nh start`/`nh serve` run `assert_codex_api_key_mode` /
+    `assert_local_backend_mode` and the codex-CLI probe only when
+    `worker.backend` names that backend (cli/commands.py). A task that picks
+    codex or local on a claude-default install would otherwise skip all of it
+    and die at its first coder turn, after planning tokens were spent — found
+    by the independent review of this change. So the same assertions run here,
+    at orchestrator construction, before any model call. Raises AuthError /
+    BackendUnavailable naming `--backend`, never the global key.
+    """
+    if name == "codex":
+        from ..agent.backend import BackendUnavailable
+        from ..agent.codex_backend import find_codex_cli
+        from ..config import assert_codex_api_key_mode
+        assert_codex_api_key_mode()
+        if find_codex_cli(((config or {}).get("llm") or {}).get("codex_cli_path")) is None:
+            raise BackendUnavailable(
+                "this task asked for `--backend codex` but the `codex` CLI was "
+                "not found. Install it (npm install -g @openai/codex) or file "
+                "the task without --backend.")
+    elif name == "local":
+        from ..config import assert_local_backend_mode
+        assert_local_backend_mode(((config or {}).get("llm") or {}).get("local_base_url"))
+
+
 def build_orchestrator(config, store: Store, *, event_sink: Any = None,
                         task: Any = None) -> Orchestrator:
     # THE ONE SWITCH. `make_backend` returns exactly the ClaudeBackend this
     # line used to construct — same class, same arguments — unless
     # `worker.backend` says otherwise. The orchestrator below is handed a
     # `CodingBackend` and cannot tell which it got.
+    task_backend = task_backend_override(task)
+    assert_task_backend_usable(task_backend, config.data)
     backend = make_backend(
         model=config.primary_model,
         config=config.data,
+        backend=task_backend,
         role="coder",
         forbidden_paths=config["safety"]["forbidden_paths"],
         never_push_to=config["git"]["never_push_to"],

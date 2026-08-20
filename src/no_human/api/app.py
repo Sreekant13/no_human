@@ -672,8 +672,18 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     pinned_base = (body.base_branch or "").strip()
     if pinned_base:
         task.context = {**(task.context or {}), "base_branch": pinned_base}
-    if body.backend and body.backend == "claude":
-        task.config["backend"] = body.backend
+    if body.backend:
+        # Per-task coder backend (public issue #5) — set by API clients; the
+        # board's composer has no picker yet. Validated against the one
+        # tuple `make_backend` accepts, so a typo is a 422 here instead of a
+        # BackendUnavailable on the first attempt.
+        from ..agent.backend import SUPPORTED_BACKENDS
+        chosen = body.backend.strip().lower()
+        if chosen not in SUPPORTED_BACKENDS:
+            raise HTTPException(
+                422, f"unknown backend {body.backend!r}; one of "
+                     f"{', '.join(SUPPORTED_BACKENDS)}")
+        task.config["backend"] = chosen
     # GAP 1: opt in to the human plan-approval gate. Never for an imported
     # ticket — see CreateTaskRequest.plan_approval.
     if body.plan_approval and source != "jira":

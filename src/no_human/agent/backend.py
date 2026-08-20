@@ -249,6 +249,13 @@ class BackendUnavailable(RuntimeError):
 CLAUDE_PINNED_ROLES = ("reviewer", "planner", "supervisor", "utility", "intake")
 
 
+#: Every name `make_backend` accepts, in the order the docs list them. The CLI
+#: (`nh task add --backend`) and the API (`CreateTaskRequest.backend`) validate
+#: against THIS tuple, so a backend added below is offered everywhere at once
+#: and a typo is refused at intake instead of at the first attempt.
+SUPPORTED_BACKENDS: tuple[str, ...] = ("claude", "codex", "local")
+
+
 def resolve_backend_name(config: dict[str, Any] | None, *, role: str = "coder") -> str:
     """Which backend name *role* should use, given a config mapping.
 
@@ -388,6 +395,11 @@ def make_backend(
     directly, with identical arguments. An operator who changes nothing sees
     no behavioural difference.
     """
+    if role != "coder":
+        # The pin is the FACTORY's, not the caller's: an explicit `backend=`
+        # for a reviewer/planner/supervisor/utility role is ignored, so no
+        # call site can put the review on the model that wrote the code.
+        backend = None
     name = (backend or resolve_backend_name(config, role=role)).strip().lower()
 
     if name in ("claude", "", "claude-agent-sdk"):
@@ -440,14 +452,18 @@ def make_backend(
         cfg_llm = (config or {}).get("llm") or {}
         # Enforces the safety boundary (localhost/RFC1918-only, no DNS name,
         # no userinfo credentials, ambient ANTHROPIC_BASE_URL scrubbed) and
-        # re-scrubs the metered-auth vars — same discipline as the Codex
-        # branch's `assert_codex_api_key_mode`. Raises AuthError on refusal.
+        # re-scrubs the metered-auth vars. (The Codex credential check is
+        # not here: it runs at startup for a global `worker.backend: codex`
+        # and in `core/runtime.assert_task_backend_usable` for a per-task
+        # one, so `make_backend(backend="codex")` stays constructible in
+        # tests and `nh doctor` without a key.) Raises AuthError on refusal.
         assert_local_backend_mode(cfg_llm.get("local_base_url"))
 
         model_id = str(cfg_llm.get("local_model") or "").strip()
         if not model_id:
             raise BackendUnavailable(
-                "worker.backend is 'local' but llm.local_model is not set. "
+                "the coder backend is 'local' (worker.backend, or this task's "
+                "--backend) but llm.local_model is not set. "
                 "Set it in config.yaml:\n"
                 "  llm:\n"
                 "    local_model: <the model id the local server exposes>"
@@ -476,9 +492,10 @@ def make_backend(
         )
 
     raise BackendUnavailable(
-        f"unknown coding backend {name!r}. Supported: 'claude' (default), "
-        f"'codex', 'local'. Set it with `worker.backend` in "
-        f"~/.no_human/config.yaml."
+        f"unknown coding backend {name!r}. Supported: "
+        f"{', '.join(repr(n) for n in SUPPORTED_BACKENDS)} ('claude' is the "
+        f"default). Set it with `worker.backend` in ~/.no_human/config.yaml, "
+        f"or per task with `nh task add --backend`."
     )
 
 
@@ -503,6 +520,7 @@ __all__ = [
     "CLAUDE_PINNED_ROLES",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODER_COMPACT_WINDOW_TOKENS",
+    "SUPPORTED_BACKENDS",
     "LOCAL_CAPABILITIES",
     "LOCAL_BACKEND_FALLBACK_API_KEY",
     "make_backend",

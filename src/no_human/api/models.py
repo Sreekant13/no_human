@@ -342,7 +342,7 @@ class TaskSummaryOut(BaseModel):
     # moving it out of its lane (see isNeedsYou / actionHint / narrativeFor).
     blocker_human_stopped: bool = False
     last_activity: str | None = None
-    backend: str | None = None  # "claude" (single in-process backend)
+    backend: str | None = None  # the coder backend THIS task asked for, if any
     total_tokens: int | None = None
     total_cache_read: int | None = None
     total_cache_creation: int | None = None
@@ -502,7 +502,7 @@ class CreateTaskRequest(BaseModel):
     kind: str = "feature"
     priority: str = "medium"
     acceptance_criteria: list[str] = []
-    backend: str | None = None  # "claude"; None = use global config
+    backend: str | None = None  # claude | codex | local; None = worker.backend
     # "board" (typed) or "jira" (Import from Jira) — any other value falls back
     # to "board" server-side. Task.source already models this (intake/jira.py's
     # poller stamps "jira" too); this just lets the web create path pick it.

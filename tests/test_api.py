@@ -3052,3 +3052,17 @@ async def test_board_pause_direct_park_carries_the_checkpoint(client, store):
     fresh = await store.find_task(t.id)
     assert fresh.status == TaskStatus.BLOCKED and fresh.blocker["category"] == "USER_PAUSED"
     assert resume_checkpoint(fresh.blocker) == {"sha": "b" * 40, "branch": "no-human/w"}
+
+
+@pytest.mark.asyncio
+async def test_create_task_records_a_supported_backend_and_refuses_an_unknown_one(client, store):
+    """Public issue #5: the board's backend field is a real per-task switch,
+    validated at intake against the factory's own tuple."""
+    r = await client.post("/api/tasks", json={"title": "On codex", "backend": "codex"})
+    assert r.status_code == 201, r.text
+    task = await store.get_task(r.json()["id"])
+    assert task.config["backend"] == "codex"
+
+    r = await client.post("/api/tasks", json={"title": "Typo", "backend": "kodex"})
+    assert r.status_code == 422, r.text
+    assert "codex" in r.json()["detail"]

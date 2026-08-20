@@ -19,7 +19,7 @@ changes in code and not here fails the suite.
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `concurrency.stop_grace_s` | `60` | Seconds a stopping server (`nh stop`, SIGTERM) waits for running attempts to checkpoint (`[WIP-PARTIAL]` commit + `resume_from`) and unwind before exiting anyway. `nh stop --timeout` defaults to this plus 15 |
-| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. See [BACKENDS.md](BACKENDS.md) |
+| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. One task can override it: `nh task add --backend codex` (or `backend` on `POST /api/tasks`). See [BACKENDS.md](BACKENDS.md) |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
