@@ -28,6 +28,14 @@ dependencies = [
     "uvicorn[standard]>=0.49.0",
 ]
 
+[project.urls]
+Homepage = "https://getnohuman.com"
+Source = "https://github.com/no-human-ai/no_human"
+Documentation = "https://github.com/no-human-ai/no_human/blob/main/docs/README.md"
+Changelog = "https://github.com/no-human-ai/no_human/blob/main/CHANGELOG.md"
+Issues = "https://github.com/no-human-ai/no_human/issues"
+"Release notes" = "https://github.com/no-human-ai/no_human/releases"
+
 [project.scripts]
 nh = "no_human.cli.commands:main"
 # The same entry point under the package's own name, so `uvx no-human mcp-serve`

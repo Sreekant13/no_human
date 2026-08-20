@@ -6,6 +6,10 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+- The PyPI project page links back to the site, source, docs, changelog,
+  issues and release notes (`[project.urls]`); the package had no project
+  links before.
+
 - `nh task add --backend` (and `backend` on `POST /api/tasks`) now routes
   THAT task's coder to the named backend — `claude`, `codex` or `local` —
   instead of only labelling it while `worker.backend` decided. Reviewer,
