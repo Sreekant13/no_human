@@ -104,6 +104,18 @@ def _aux_totals(attempts: list[dict] | None) -> tuple[int | None, int | None, in
     return (_auxsum(0), _auxsum(1), _auxsum(2))
 
 
+def _operator_cancelled(task: Task) -> bool:
+    """True when this task's FAILED status came from an operator cancel, not a
+    capability failure — boardLanes.js `isRealFailure`'s `task.cancelled`.
+
+    Shared by TaskOut (drawer) and TaskSummaryOut (board card / list) so the
+    list and detail endpoints can never disagree about the same task: before
+    this helper existed only the summary computed it inline, so the drawer
+    for a cancelled task had no `cancelled` field at all.
+    """
+    return bool((task.context or {}).get("cancel_reason"))
+
+
 class TaskOut(BaseModel):
     id: str
     # SCRUM-16: the scheduler has this task actively in-flight right now —
@@ -169,6 +181,10 @@ class TaskOut(BaseModel):
     # component-only field, so this is drawer parity, not new surface.
     escalation_attempts: int | None = None
     escalation_tokens: int | None = None
+    #: Mirrors TaskSummaryOut.cancelled — same `_operator_cancelled` predicate,
+    #: so the drawer (this model) and the list/board card can never disagree
+    #: about whether the same task's FAILED status was an operator cancel.
+    cancelled: bool = False
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":
@@ -222,6 +238,7 @@ class TaskOut(BaseModel):
             failure_reason=_failure_reason(task, attempts),
             escalation_attempts=escalation_attempts,
             escalation_tokens=escalation_tokens,
+            cancelled=_operator_cancelled(task),
         )
 
 
@@ -486,7 +503,7 @@ class TaskSummaryOut(BaseModel):
             wall_seconds=_wall_seconds(task.created_at, _last_activity(task, attempts)),
             parent_id=task.parent_id,
             has_spec=bool((task.context or {}).get("spec")),
-            cancelled=bool((task.context or {}).get("cancel_reason")),
+            cancelled=_operator_cancelled(task),
             approved_at=(task.context or {}).get("approved_at"),
             pr_conflict_rounds=_coerce_round_count(
                 (task.context or {}).get("pr_conflict_rounds")),

@@ -3552,10 +3552,19 @@ def status(as_json):
     waiting = {TaskStatus.PAUSED_QUOTA}
 
     async def _go():
+        # Lazy: keeps `commands.py`'s import graph from pulling in the API
+        # layer at CLI-startup time, matching the existing `from ..api.app
+        # import app as _app` precedent elsewhere in this file. This is the
+        # SAME predicate `api/models.py:489` (TaskSummaryOut) and the drawer's
+        # TaskOut.cancelled field read, so `nh status`, the CLI Failed lane,
+        # and the API can never disagree about which failed tasks were
+        # operator cancels.
+        from ..api.models import _operator_cancelled
         async with Store(config.db_path) as store:
             tasks = await store.list_tasks()
             buckets = {"needs you": 0, "queued": 0, "working": 0, "waiting": 0,
                        "failed": 0, "done": 0}
+            cancelled_failed = 0
             for t in tasks:
                 if t.status == TaskStatus.BLOCKED:
                     # Match the board: a blocked task auto-resolves (→ waiting)
@@ -3572,6 +3581,8 @@ def status(as_json):
                     buckets["waiting"] += 1
                 elif t.status == TaskStatus.FAILED:
                     buckets["failed"] += 1
+                    if _operator_cancelled(t):
+                        cancelled_failed += 1
                 elif t.status == TaskStatus.DONE:
                     buckets["done"] += 1
             # The intake spend no task owns (interactive grill rounds run
@@ -3614,12 +3625,19 @@ def status(as_json):
                 else:
                     working_n = busy
                     queued_n = buckets["queued"] + max(0, buckets["working"] - busy)
+            # Human-readable only — an operator cancel is not a capability
+            # failure (same split the board's Outcomes table and the CLI
+            # Failed lane make). The --json bucket keeps summing both: it is a
+            # documented consumer contract this line does not touch.
+            real_failed = buckets["failed"] - cancelled_failed
+            failed_display = (f"{real_failed} (+{cancelled_failed} cancelled)"
+                               if cancelled_failed else f"{real_failed}")
             console.print(
                 f"[yellow]needs you[/] {buckets['needs you']}  "
                 f"[dim]queued[/] {queued_n}  "
                 f"[bold]working[/] {working_n}/{mw}{mw_note}  "
                 f"[blue]waiting[/] {buckets['waiting']}  "
-                f"[red]failed[/] {buckets['failed']}  "
+                f"[red]failed[/] {failed_display}  "
                 f"[green]done[/] {buckets['done']}")
             # Printed only when there IS a residual (whole-ledger total, same
             # gate as before), so the line appears exactly when it has

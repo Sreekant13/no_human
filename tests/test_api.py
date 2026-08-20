@@ -1322,6 +1322,63 @@ def test_task_summary_marks_operator_cancelled_tasks():
     assert TaskSummaryOut.from_task(genuine).cancelled is False
 
 
+def test_task_out_and_task_summary_out_share_one_cancelled_predicate():
+    """The list endpoint (TaskSummaryOut, api/models.py) and the drawer
+    (TaskOut) must never disagree about whether the same task's FAILED status
+    was an operator cancel. Proven by IDENTITY — both call sites are the same
+    imported function object, not two hand-written `bool((task.context or
+    {}).get("cancel_reason"))` expressions that happen to agree today and can
+    silently diverge tomorrow.
+    """
+    import inspect
+
+    from no_human.api import models as models_mod
+    from no_human.api.models import TaskOut, TaskSummaryOut, _operator_cancelled
+
+    src_task_out = inspect.getsource(TaskOut.from_task)
+    src_summary_out = inspect.getsource(TaskSummaryOut.from_task)
+    assert "_operator_cancelled(" in src_task_out
+    assert "_operator_cancelled(" in src_summary_out
+
+    cancelled = Task.new("superseded task", repo_path="/tmp/x")
+    cancelled.status = TaskStatus.FAILED
+    cancelled.context = {"cancel_reason": "superseded by a fresh run"}
+
+    # Monkeypatch the ONE shared function and watch both models move together
+    # — the behaviour only a genuinely shared predicate (not a coincidence of
+    # two identical expressions) can produce.
+    original = models_mod._operator_cancelled
+    try:
+        models_mod._operator_cancelled = lambda task: False
+        assert TaskOut.from_task(cancelled, []).cancelled is False
+        assert TaskSummaryOut.from_task(cancelled).cancelled is False
+    finally:
+        models_mod._operator_cancelled = original
+
+    assert TaskOut.from_task(cancelled, []).cancelled is True
+    assert TaskSummaryOut.from_task(cancelled).cancelled is True
+    assert _operator_cancelled(cancelled) is True
+
+
+@pytest.mark.asyncio
+async def test_get_task_detail_cancelled_matches_the_list_endpoint(client, store):
+    """AC2: GET /api/tasks/<id> must report `cancelled` for a cancel_reason-only
+    task, and it must equal what GET /api/tasks (the list/summary endpoint)
+    reports for the SAME task — before this fix the drawer had no `cancelled`
+    field at all, so the two views of one task disagreed."""
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    t.context = {"cancel_reason": "Cancelled from board"}
+    await store.update_task(t)
+
+    detail = (await client.get(f"/api/tasks/{t.id}")).json()
+    listing = (await client.get("/api/tasks")).json()
+    summary = next(item for item in listing if item["id"] == t.id)
+
+    assert detail["cancelled"] is True, detail
+    assert summary["cancelled"] is True, summary
+    assert detail["cancelled"] == summary["cancelled"]
+
+
 @pytest.mark.asyncio
 async def test_attachment_upload_stores_file_and_records_path(
     client, store, tmp_path, monkeypatch,

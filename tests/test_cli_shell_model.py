@@ -24,6 +24,7 @@ from no_human.cli.shell_lanes import (
     LANES,
     flat_order,
     group_by_lane,
+    is_real_failure,
     is_waiting,
     lane_for,
     needs_you,
@@ -391,6 +392,52 @@ def test_without_a_width_the_title_is_never_wrapped():
 def test_empty_loud_lane_says_so_instead_of_going_blank():
     out = render_lanes([])
     assert "All caught up" in out
+
+
+# --------------------------------------------------------------------------- #
+# Failed lane — an operator cancel stays listed but drops out of the count     #
+# --------------------------------------------------------------------------- #
+
+def test_is_real_failure_excludes_a_cancelled_task():
+    """boardLanes.js `isRealFailure` ported: `failed` + `cancelled` is an
+    operator stop, not a capability failure."""
+    assert is_real_failure(_t(status="failed")) is True
+    assert is_real_failure(_t(status="failed", cancelled=True)) is False
+    assert is_real_failure(_t(status="done")) is False
+    assert is_real_failure(None) is False
+
+
+def test_render_lanes_failed_count_excludes_cancels_but_lists_both_rows():
+    """Two FAILED tasks, one an operator cancel: the header count must read 1,
+    both rows must still be listed, and the cancelled row must carry a
+    distinguishing tag — the same "list it, don't hide it" treatment the
+    board's Failed Outcomes table gives a cancelled row."""
+    tasks = [
+        _t(id="aaaa1111", title="Real failure", status="failed"),
+        _t(id="bbbb2222", title="Cancelled task", status="failed", cancelled=True),
+    ]
+    out = render_lanes(tasks)
+
+    failed_head = [ln for ln in out.splitlines() if "Failed" in ln][0]
+    assert "1" in failed_head, failed_head
+    assert "2" not in failed_head, failed_head
+    assert "Real failure" in out
+    assert "Cancelled task" in out
+    _, cancelled_meta = _row_lines(out, "bbbb2222")
+    _, real_meta = _row_lines(out, "aaaa1111")
+    assert "cancelled" in cancelled_meta
+    assert "cancelled" not in real_meta
+
+
+def test_render_lanes_failed_lane_with_only_cancels_shows_rows_not_the_empty_hint():
+    """A lane holding only cancelled rows must not print its empty-hint above
+    a row that IS there — the exact regression a prior fix introduced by
+    gating the empty-hint on the filtered count instead of on row presence."""
+    out = render_lanes([_t(id="cccc3333", title="Only a cancel", status="failed",
+                            cancelled=True)])
+
+    assert "No failures" not in out
+    assert "Only a cancel" in out
 
 
 # --------------------------------------------------------------------------- #

@@ -1308,6 +1308,41 @@ def test_status_default_unchanged(tmp_path, monkeypatch):
         json.loads(result.output)
 
 
+def test_status_excludes_operator_cancels_from_the_failed_count(tmp_path, monkeypatch):
+    """A task an operator cancelled ends in FAILED status but is not a
+    capability failure — `web/src/boardLanes.js` `isRealFailure` already
+    excludes it from the board's Outcomes count. `nh status` never adopted
+    that split: two FAILED tasks, one a cancel, printed `failed 2`, hiding
+    the one real failure inside a number that also counts intentional stops.
+    The --json bucket keeps summing both (a documented consumer contract,
+    see `test_status_json_bucket_counts`); only the human-readable line
+    changes, to `failed 1 (+1 cancelled)`.
+    """
+    db = tmp_path / "test.db"
+    real_failure = _seed_task(db, TaskStatus.FAILED, title="Real failure")
+    cancelled = _seed_task(db, TaskStatus.FAILED, title="Cancelled task")
+    _seed_task(db, TaskStatus.DONE)
+
+    async def _cancel():
+        async with Store(db) as s:
+            t = await s.find_task(cancelled)
+            t.context = {"cancel_reason": "Cancelled from board"}
+            await s.update_task(t)
+    asyncio.run(_cancel())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["status"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "failed 1 (+1 cancelled)" in out, out
+    assert "done 1" in out, out
+
+    # The --json shape is untouched: it still sums both under "failed".
+    json_out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+    assert json_out["failed"] == 2, json_out
+
+
 def test_status_json_empty(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     runner = _make_runner(db, monkeypatch)

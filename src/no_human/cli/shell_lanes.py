@@ -122,6 +122,17 @@ def needs_you_count(tasks: Iterable[Task]) -> int:
     return sum(1 for t in tasks or () if needs_you(t))
 
 
+def is_real_failure(task: Task | None) -> bool:
+    """boardLanes.js `isRealFailure` — a cancelled task ends `failed` but is
+    not a capability failure: it stays listed in the Failed lane (tagged
+    "cancelled" by `_task_line`) but drops out of the lane's header count,
+    the same split `nh status` and the board's Outcomes table already make.
+    """
+    if not isinstance(task, Mapping):
+        return False
+    return _status_of(task) == "failed" and not task.get("cancelled")
+
+
 def group_by_lane(tasks: Iterable[Task]) -> dict[str, list[Task]]:
     """Every lane key, in board order, present even when empty."""
     groups: dict[str, list[Task]] = {lane.key: [] for lane in LANES}
@@ -292,6 +303,8 @@ def _task_lines(task: Task, *, selected: bool, width: int | None = None) -> list
         tags.append(("dim", "approved - merge pending"))
     if task.get("blocker_human_stopped"):
         tags.append(("dim", "you stopped it"))
+    if task.get("cancelled"):
+        tags.append(("dim", "cancelled"))
     if task.get("subtask_progress"):
         tags.append(("dim", str(task["subtask_progress"])))
     burn = task_burn(task)
@@ -329,7 +342,15 @@ def render_lanes(tasks: Iterable[Task], selected_id: str | None = None,
             head = (f"[black on {lane.colour}] ! {lane.label}  {live} [/]"
                     if live else f"[{lane.colour}]{lane.label}  0[/]")
         else:
-            head = f"[bold {lane.colour}]{lane.label}[/] [dim]{len(rows)}[/]"
+            # The Failed lane's header count excludes operator cancels (still
+            # listed below, tagged "cancelled") — every other outcome/working
+            # lane counts every row it holds. Only the count is scoped; the
+            # empty-hint below stays gated on row presence for every lane, so
+            # a lane holding only cancelled rows still shows its rows instead
+            # of an empty-hint sitting above them.
+            count = (sum(1 for t in rows if is_real_failure(t))
+                      if lane.key == "failed" else len(rows))
+            head = f"[bold {lane.colour}]{lane.label}[/] [dim]{count}[/]"
         lines.append(head)
         if not rows:
             lines.append(f"   [dim]{lane.empty_hint}[/]")
