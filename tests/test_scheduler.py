@@ -112,6 +112,9 @@ async def test_quota_pause_gates_the_whole_pool(store):
     await sched.tick(now=now)
     await asyncio.sleep(0.05)                    # first task parks PAUSED_QUOTA
     assert sched._quota_cooldown_until is not None
+    # public property (consumed by /api/queue/health) mirrors the internal
+    # cooldown clock exactly — no second clock, no drift between the two.
+    assert sched.quota_cooldown_until == sched._quota_cooldown_until
 
     # A new task arrives, but the pool is paused until the reset time.
     await _mk_tasks(store, 1)

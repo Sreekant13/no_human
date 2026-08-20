@@ -3009,7 +3009,12 @@ async def queue_health_endpoint(request: Request) -> dict[str, Any]:
     sched = getattr(request.app.state, "scheduler", None)
     inflight = set(sched.inflight) if sched is not None else set()
     max_workers = sched.max_workers if sched is not None else 0
-    h = await queue_health(store, inflight_ids=inflight, max_workers=max_workers)
+    # getattr, not `sched.quota_cooldown_until`: existing test doubles (e.g.
+    # SimpleNamespace(inflight=..., max_workers=...)) predate this field and
+    # would otherwise AttributeError on every /api/queue/health call.
+    quota_cooldown_until = getattr(sched, "quota_cooldown_until", None) if sched is not None else None
+    h = await queue_health(store, inflight_ids=inflight, max_workers=max_workers,
+                            quota_cooldown_until=quota_cooldown_until)
     return h.as_dict()
 
 

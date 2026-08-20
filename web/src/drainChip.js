@@ -19,17 +19,38 @@ export function formatDrainEta(seconds) {
   return `~${(seconds / 3600).toFixed(1)} h to drain`;
 }
 
+// 2026-08-20 evidence: `/api/queue/health` reported "not stuck, 0 busy, 7
+// queued, ETA 210 min" while the pool sat behind a quota wall — every field
+// individually true, the picture false. `paused_until` is the scheduler's
+// own cooldown clock (never re-derived here); this only formats it.
+export function formatPausedUntil(iso) {
+  if (!iso) return "unknown time";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "unknown time";
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 // input: the flat {workers_busy, max_workers, queue_depth, est_drain_seconds,
-// error} object. error is the most recent poll's failure (if any) — that
-// always wins over any cached counts, per the AC's explicit unreachable state.
+// error, paused, paused_until} object (the raw /api/queue/health payload —
+// field names match 1:1, see core/health.py QueueHealth.as_dict). error is
+// the most recent poll's failure (if any) — that always wins over any cached
+// counts, per the AC's explicit unreachable state. A quota pause wins over
+// the normal busy/queued/ETA readout: reporting "0/4 workers busy · 7
+// queued · ~3.5 h to drain" with no word of a wall is the defect this exists
+// to close.
 export function drainChip({
   workers_busy = 0,
   max_workers = 0,
   queue_depth = 0,
   est_drain_seconds = null,
   error = null,
+  paused = false,
+  paused_until = null,
 } = {}) {
   if (error) return { text: "server unreachable", tone: "error" };
+  if (paused) return { text: `Paused — quota resets ${formatPausedUntil(paused_until)}`, tone: "warn" };
 
   const parts = [`${workers_busy}/${max_workers} workers busy`, `${queue_depth} queued`];
   if (queue_depth > 0) parts.push(formatDrainEta(est_drain_seconds));

@@ -24,7 +24,7 @@ import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
 import { createReconnector } from "./wsReconnect.js";
 import { connectionBanner } from "./connectionBanner.js";
-import { drainChip } from "./drainChip.js";
+import { drainChip, formatPausedUntil } from "./drainChip.js";
 import { initialDrainReadout, nextDrainReadout, readoutPayload } from "./drainReadout.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { promptFromIssue, externalIdFromIssue } from "./jiraImport.js";
@@ -1094,7 +1094,21 @@ export default function App() {
               Queue stuck — {queueHealth.open_tasks} open, nothing finishing
             </div>
           )}
-          {!queueHealth?.stuck && queueHealth?.eta_minutes != null && queueHealth.open_tasks > 0 && (
+          {/* 2026-08-20 evidence: /api/queue/health reported "not stuck, 0
+              busy, 7 queued, ETA 210 min" while the pool sat behind a quota
+              wall — every field individually true, the picture false. A
+              pause is deliberate, not a wedge (`stuck` stays false), so it
+              gets its own line rather than piggybacking on the alarm. */}
+          {!queueHealth?.stuck && queueHealth?.paused && (
+            <div className="nh-status-indicator" role="status"
+                 title={queueHealth.paused_profile ? `${queueHealth.paused_profile} profile hit its quota` : "Pool-wide quota cooldown"}>
+              <div className="nh-ws-dot" />
+              <span className="nh-status-label">
+                Paused — quota resets {formatPausedUntil(queueHealth.paused_until)}
+              </span>
+            </div>
+          )}
+          {!queueHealth?.stuck && !queueHealth?.paused && queueHealth?.eta_minutes != null && queueHealth.open_tasks > 0 && (
             <div className="nh-status-indicator" title={`${queueHealth.completed_in_window} finished in the last ${queueHealth.window_minutes} min`}>
               <div className="nh-ws-dot live" />
               <span className="nh-status-label">

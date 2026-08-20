@@ -180,6 +180,69 @@ def test_claimable_statuses_match_scheduler():
     assert set(CLAIMABLE_STATUSES) == {s.value for s in _CLAIMABLE}
 
 
+async def test_quota_pause_reports_paused_state_with_eta_from_reset(store):
+    """2026-08-20 evidence: `/api/queue/health` returned "not stuck, 0 busy,
+    7 queued, ETA 210 min" while the pool was in its quota cooldown, after
+    tasks parked `paused_quota` on the personal2 session limit. Every field
+    individually true, the picture false. With a live cooldown, health must
+    say so — and the ETA must count from the reset, not from now."""
+    for _ in range(7):
+        await _task(store, TaskStatus.PENDING)
+    done_task = await _task(store, TaskStatus.DONE)
+    await _attempt(store, done_task.id, duration_seconds=60)
+
+    parked = await _task(store, TaskStatus.PAUSED_QUOTA)
+    parked.blocker = {"auth_profile": "personal2"}
+    await store.update_task(parked)
+
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    h = await queue_health(store, max_workers=4, quota_cooldown_until=reset_at)
+
+    assert h.paused is True
+    assert h.paused_reason == "quota"
+    assert h.paused_until == reset_at.isoformat()
+    assert h.paused_profile == "personal2"
+    assert h.stuck is False, "a quota wall is a deliberate pause, not a wedge"
+
+    # available = max_workers(4) - busy(0) = 4; normal drain = 60s * 7 / 4
+    expected_normal_drain = 60.0 * 7 / 4
+    resume_in = (reset_at - datetime.now(timezone.utc)).total_seconds()
+    assert h.est_drain_seconds == pytest.approx(
+        expected_normal_drain + resume_in, abs=2)
+    assert h.eta_minutes == pytest.approx(h.est_drain_seconds / 60.0, rel=0.01)
+
+
+async def test_expired_quota_cooldown_is_not_a_pause(store):
+    """A cooldown timestamp already in the past must not report paused —
+    the scheduler would have already resumed dispatch."""
+    await _task(store, TaskStatus.PENDING)
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    h = await queue_health(store, max_workers=2, quota_cooldown_until=past)
+    assert h.paused is False
+    assert h.paused_reason is None
+    assert h.paused_until is None
+
+
+async def test_no_quota_cooldown_leaves_payload_unchanged(store):
+    """Default (no scheduler cooldown passed): existing callers/behaviour are
+    untouched — this is the "with no cooldown the payload is unchanged from
+    today" half of the acceptance criterion."""
+    for _ in range(4):
+        await _task(store, TaskStatus.PENDING)
+    await _task(store, TaskStatus.DONE, updated_min_ago=5)
+
+    h = await queue_health(store, max_workers=2)
+    assert h.paused is False
+    assert h.paused_reason is None
+    assert h.paused_until is None
+    assert h.paused_profile is None
+    d = h.as_dict()
+    assert d["paused"] is False
+    assert d["paused_reason"] is None
+    assert d["paused_until"] is None
+    assert d["paused_profile"] is None
+
+
 async def test_queue_depth_excludes_done_and_blocked(store):
     """Boundary test: queue_depth counts only CLAIMABLE_STATUSES. A DONE task
     and a BLOCKED (human_stopped) task must not inflate the count — only the

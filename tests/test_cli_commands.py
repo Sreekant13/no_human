@@ -1222,6 +1222,43 @@ def test_status_reports_unclaimed_implementing_rows_as_queued(tmp_path, monkeypa
     assert "working 4/4" in out, out
 
 
+def test_status_prints_the_quota_pause_line_from_the_same_fields(tmp_path, monkeypatch):
+    """2026-08-20 evidence: `nh status` (like the board header) must say WHY
+    nothing is moving when the pool is behind a quota wall, sourced from the
+    same `paused_*` fields `/api/queue/health` already reports — not a
+    second, independently-derived clock."""
+    db = tmp_path / "test.db"
+    for _ in range(7):
+        _seed_task(db, TaskStatus.PENDING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {
+        "max_workers": 4, "workers_busy": 0, "queue_depth": 7,
+        "paused": True, "paused_reason": "quota",
+        "paused_until": "2026-08-20T17:20:00+00:00",
+        "paused_profile": "personal2",
+    })
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "paused" in out, out
+    assert "quota cooldown" in out, out
+    assert "personal2 profile" in out, out
+    assert "2026-08-20T17:20:00+00:00" in out, out
+
+
+def test_status_prints_no_pause_line_when_not_paused(tmp_path, monkeypatch):
+    """Negative control: an ordinary (non-cooldown) payload must not grow a
+    pause line — unchanged from today, per the acceptance criterion."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 4, "workers_busy": 1})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "paused" not in out, out
+
+
 def test_status_still_prints_a_saturated_pool_as_saturated(tmp_path, monkeypatch):
     """Negative control: the fix must not make a genuinely busy pool look
     idle. Exactly 4 IMPLEMENTING rows against a 4-wide, fully-busy pool is

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { drainChip, formatDrainEta } from "./drainChip.js";
+import { drainChip, formatDrainEta, formatPausedUntil } from "./drainChip.js";
 
 test("idle: 0 busy, 0 queued, no drain time", () => {
   const chip = drainChip({ workers_busy: 0, max_workers: 4, queue_depth: 0, est_drain_seconds: null });
@@ -38,6 +38,36 @@ test("server-unreachable overrides any cached counts", () => {
   assert.equal(chip.tone, "error");
 });
 
+test("quota pause overrides the normal busy/queued/ETA readout (2026-08-20 evidence)", () => {
+  // Same numbers the live defect reported ("not stuck, 0 busy, 7 queued,
+  // ETA 210 min") — with `paused` set, the chip must say why instead of
+  // reciting the individually-true-but-misleading figures.
+  const chip = drainChip({
+    workers_busy: 0,
+    max_workers: 4,
+    queue_depth: 7,
+    est_drain_seconds: 12600,
+    paused: true,
+    paused_reason: "quota",
+    paused_until: "2026-08-20T17:20:00+00:00",
+  });
+  assert.ok(chip.text.startsWith("Paused — quota resets "));
+  assert.ok(!chip.text.includes("workers busy"), "must not also recite the misleading busy/queued readout");
+  assert.equal(chip.tone, "warn");
+});
+
+test("quota pause wins over a missing paused_until (falls back to unknown time, never crashes)", () => {
+  const chip = drainChip({ workers_busy: 0, max_workers: 4, queue_depth: 7, paused: true });
+  assert.equal(chip.text, "Paused — quota resets unknown time");
+});
+
+test("formatPausedUntil formats an ISO timestamp as local HH:MM, and never fabricates a time", () => {
+  const formatted = formatPausedUntil("2026-08-20T17:20:00+00:00");
+  assert.match(formatted, /^\d{2}:\d{2}$/);
+  assert.equal(formatPausedUntil(null), "unknown time");
+  assert.equal(formatPausedUntil("not-a-date"), "unknown time");
+});
+
 test("formatDrainEta never fabricates a number when the estimate is missing", () => {
   assert.equal(formatDrainEta(null), "no estimate");
   assert.equal(formatDrainEta(undefined), "no estimate");
@@ -55,6 +85,7 @@ test("tone is always one of the closed set of tokens (no CSS vars emitted)", () 
     { workers_busy: 2, max_workers: 4, queue_depth: 5, est_drain_seconds: 2400 },
     { workers_busy: 4, max_workers: 4, queue_depth: 8, est_drain_seconds: 5700 },
     { error: "ECONNREFUSED", workers_busy: 1, max_workers: 4, queue_depth: 1, est_drain_seconds: 60 },
+    { workers_busy: 0, max_workers: 4, queue_depth: 7, paused: true, paused_until: "2026-08-20T17:20:00+00:00" },
   ];
   for (const c of cases) {
     assert.ok(["ok", "warn", "error"].includes(drainChip(c).tone));

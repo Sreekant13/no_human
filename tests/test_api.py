@@ -1769,6 +1769,46 @@ async def test_queue_health_endpoint_includes_worker_fields(client, store):
     assert "eta_minutes" in body
 
 
+async def test_queue_health_endpoint_reports_quota_pause(client, store):
+    """2026-08-20 evidence: `/api/queue/health` reported "not stuck, 0 busy,
+    7 queued, ETA 210 min" while the pool was in its quota cooldown. This
+    proves the full endpoint wiring (app.py reading sched.quota_cooldown_until
+    and the most recent paused_quota blocker), not just queue_health() in
+    isolation — a scheduler test double that predates this field (see
+    test_queue_health_endpoint_includes_worker_fields) must also keep
+    working, which is why app.py must use getattr with a default."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    from no_human.core.task import Task, TaskStatus
+
+    for i in range(7):
+        t = Task.new(f"queued-{i}", repo_path="/r")
+        await store.create_task(t)
+
+    parked = Task.new("parked one", repo_path="/r")
+    await store.create_task(parked)
+    await store.set_status(parked, TaskStatus.PAUSED_QUOTA, validate=False)
+    parked.blocker = {"auth_profile": "personal2"}
+    await store.update_task(parked)
+
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    fastapi_app.state.scheduler = SimpleNamespace(
+        inflight=set(), max_workers=4, quota_cooldown_until=reset_at)
+    try:
+        r = await client.get("/api/queue/health")
+    finally:
+        del fastapi_app.state.scheduler
+
+    body = r.json()
+    assert body["paused"] is True
+    assert body["paused_reason"] == "quota"
+    assert body["paused_until"] == reset_at.isoformat()
+    assert body["paused_profile"] == "personal2"
+    assert body["stuck"] is False, "a quota wall is a deliberate pause, not a wedge"
+
+
 async def test_board_query_is_not_n_plus_1(client, store, monkeypatch):
     """B2 #16: the board issued one attempts query PER TASK, every 2s, per
     socket. It must now use a single grouped query regardless of task count."""

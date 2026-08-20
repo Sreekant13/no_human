@@ -409,6 +409,12 @@ class Scheduler:
     def inflight(self) -> set[str]:
         return set(self._inflight)
 
+    @property
+    def quota_cooldown_until(self) -> datetime | None:
+        """The pool-wide quota wall's reset time, or None if not paused.
+        Read by `/api/queue/health` — the single clock, never re-derived."""
+        return self._quota_cooldown_until
+
     def get_live_status(self, task_id: str) -> str | None:
         """Return the latest live status summary for a task, or None."""
         return self._live_status.get(task_id)

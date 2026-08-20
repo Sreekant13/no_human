@@ -123,7 +123,7 @@ def _pidfile_owner_alive() -> bool:
     return _probe_pid(pid) is True
 
 
-def _running_pool_stats(config) -> tuple[int | None, int] | None:
+def _running_pool_stats(config) -> tuple[int | None, int, dict | None] | None:
     """The (busy, width) of the pool that is actually draining the queue, or
     None when there is nothing to ask.
 
@@ -147,7 +147,11 @@ def _running_pool_stats(config) -> tuple[int | None, int] | None:
     which is not a running pool) all mean "no live stats" — the caller then
     says so instead of passing a config number off as an observation.
 
-    Returns `(busy, width)` when reachable, where `busy` is
+    Returns `(busy, width, pause)` when reachable, where `pause` is
+    `{"reason", "until", "profile"}` from the same `/api/queue/health`
+    payload's `paused_*` fields when `paused` is true, else `None` — so a
+    quota-cooldown pool prints why it isn't draining instead of a bare
+    `working 0/N` next to an ETA computed as if work were flowing. `busy` is
     `int(payload["workers_busy"])` when that key is present and parses to a
     non-negative int, and `None` when the key is absent or unparseable —
     `busy is None` means "the endpoint answered but did not report a
@@ -187,7 +191,14 @@ def _running_pool_stats(config) -> tuple[int | None, int] | None:
             busy = int(busy_raw) if busy_raw is not None else None
             if busy is not None and busy < 0:
                 busy = None
-            return busy, width
+            pause = None
+            if payload.get("paused"):
+                pause = {
+                    "reason": payload.get("paused_reason"),
+                    "until": payload.get("paused_until"),
+                    "profile": payload.get("paused_profile"),
+                }
+            return busy, width, pause
     except (urllib.error.URLError, OSError, ValueError, TypeError, TimeoutError):
         return None
 
@@ -3590,12 +3601,13 @@ def status(as_json):
             # where `/api/queue/health`'s own `queue_depth` already counts an
             # unclaimed IMPLEMENTING row.
             stats = _running_pool_stats(config)
+            pause = None
             if stats is None:
                 mw = config.data.get("concurrency", {}).get("max_workers", 1)
                 mw_note = " [dim](configured; server not running)[/]"
                 working_n, queued_n = buckets["working"], buckets["queued"]
             else:
-                busy, mw = stats
+                busy, mw, pause = stats
                 mw_note = ""
                 if busy is None:
                     working_n, queued_n = buckets["working"], buckets["queued"]
@@ -3616,6 +3628,15 @@ def status(as_json):
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {failed_display}  "
                 f"[green]done[/] {buckets['done']}")
+            # Same fields the board header reads from `/api/queue/health` —
+            # a quota-paused pool prints WHY nothing is moving instead of a
+            # bare `working 0/N` next to a ETA computed as if work were
+            # flowing (2026-08-20 evidence: "not stuck, 0 busy, ETA 210 min").
+            if pause and pause.get("reason") == "quota":
+                who = f" ({pause['profile']} profile)" if pause.get("profile") else ""
+                until = pause.get("until") or "unknown"
+                console.print(
+                    f"[magenta]paused[/] — quota cooldown{who}, resumes {until}")
             # Printed only when there IS a residual (whole-ledger total, same
             # gate as before), so the line appears exactly when it has
             # something to say. Within it, "no task owns it" is scoped to the
