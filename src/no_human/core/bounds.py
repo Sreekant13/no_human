@@ -135,6 +135,18 @@ class Bounds:
     # real attempts) and clears the largest measured successful attempt (306k
     # weighted) by 6.5x.
     attempt_tokens: int = 2_000_000
+    # The smallest COST-WEIGHTED spend an attempt costs before its first model
+    # turn does any work: attempt_distill + the implement prompt + skills + map,
+    # re-accumulated per attempt. Used only when a task has no measured history
+    # (see `Orchestrator._min_viable_attempt_cost`, which prefers a real prior
+    # attempt's first-10-message `cache_burn` figure over this floor).
+    # Derived from run 123dea00 (2026-08-20): attempt 11's startup was 884,932
+    # raw = 157 fresh + 59,837 cache-write + 824,938 cache-read = 157,447
+    # weighted (1.0 / 1.25 / 0.1, core.pricing), and attempt 10's first
+    # cache_burn (10 messages) was 479k read + 52k write = ~113k weighted.
+    # 250,000 is ~1.6x the largest of those — a floor that refuses a
+    # guaranteed-dead attempt without refusing one that could do real work.
+    min_viable_attempt_weighted_tokens: int = 250_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":

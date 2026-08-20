@@ -16,6 +16,7 @@ changes in code and not here fails the suite.
 | `llm.code_review_timeout_seconds` | `1800` | The same wall for `code_review` mode, which reads a whole PR diff at twice the gate's cap |
 | `bounds.max_attempts` | `3` | Implement/review cycles in one loop |
 | `bounds.max_turns_per_attempt` | `500` | Agent turns before an attempt is cut off |
+| `bounds.min_viable_attempt_weighted_tokens` | `250000` | The cost-weighted floor the loop-head gate refuses to START an attempt under: an attempt's startup alone (re-accumulated context, implement prompt, skills, map) costs ~110–160k weighted before its first real turn, so a remaining lifetime budget below this can only buy a turn-0 budget-abort. Used only when the task has no measured history — a real prior attempt's first-10-message `cache_burn` figure is preferred. Refusal parks the task `BUDGET_EXHAUSTED` naming both numbers, distinct from the over-cap refusal |
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `concurrency.stop_grace_s` | `60` | Seconds a stopping server (`nh stop`, SIGTERM) waits for running attempts to checkpoint (`[WIP-PARTIAL]` commit + `resume_from`) and unwind before exiting anyway. `nh stop --timeout` defaults to this plus 15 |

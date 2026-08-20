@@ -42,8 +42,10 @@ def _mutate(cwd):
     )
 
 
-def _orch(store, tmp_path, backend=None, events=None):
+def _orch(store, tmp_path, backend=None, events=None, bounds=None):
     cfg = _config(tmp_path)
+    if bounds:
+        cfg.data.setdefault("bounds", {}).update(bounds)
     return Orchestrator(
         store, cfg.data, backend or FakeBackend(_mutate), SlackNotifier(None),
         event_sink=(events.append if events is not None else None),
@@ -302,7 +304,17 @@ async def test_mid_attempt_budget_cross_parks_behind_budget_exhausted(
     task.config = {"lifetime_tokens": 50_000, "budget_unit": "weighted"}
     await store.create_task(task)
 
-    orch = _orch(store, tmp_path, backend=_TokenGusherBackend())
+    # This test's whole point is a MID-ATTEMPT cross — a fresh task's first
+    # attempt must actually be allowed to start so the sink's own ceiling
+    # check is what stops it. `min_viable_attempt_weighted_tokens` (the
+    # loop-head startup floor, `_check_attempt_startup_floor`) would
+    # otherwise refuse to start it first: a brand-new task has no measured
+    # attempt history, so the floor falls back to the config default
+    # (250,000), which this fixture's tiny lifetime cap can never clear.
+    # Zeroing it neutralizes a gate this test isn't exercising, restoring
+    # the pre-existing behavior this test was written to pin.
+    orch = _orch(store, tmp_path, backend=_TokenGusherBackend(),
+                 bounds={"min_viable_attempt_weighted_tokens": 0})
     outcome = await orch.run_task(task)
 
     assert outcome.status is not TaskStatus.DONE
@@ -430,7 +442,13 @@ async def test_lifetime_park_still_records_a_resume_checkpoint(
     task.config = {"lifetime_tokens": 50_000, "budget_unit": "weighted"}
     await store.create_task(task)
 
-    orch = _orch(store, tmp_path, backend=_TokenGusherWithWipBackend())
+    # See the sibling test above: a fresh task's first attempt has no
+    # measured history, so the loop-head startup floor
+    # (`_check_attempt_startup_floor`) would otherwise refuse to start it
+    # against this fixture's tiny lifetime cap before the mid-attempt path
+    # under test ever runs. Zeroed for the same reason.
+    orch = _orch(store, tmp_path, backend=_TokenGusherWithWipBackend(),
+                 bounds={"min_viable_attempt_weighted_tokens": 0})
     await orch.run_task(task)
 
     reloaded = await store.find_task(task.id)

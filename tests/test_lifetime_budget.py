@@ -1143,3 +1143,220 @@ def test_a_write_never_changes_what_an_untouched_cap_means():
                 assert before == after, (
                     f"writing {written} changed {untouched}: {before:,} -> "
                     f"{after:,} (marked={marked}, override={override})")
+
+
+# --- Attempt-startup floor: refuse to START an attempt the remaining ------
+# --- lifetime budget cannot pay for, instead of starting it and ------------
+# --- budget-aborting at turn 0 (INCIDENT 2026-08-20, run 123dea00). --------
+#
+# `_check_attempt_startup_floor` runs at the loop head immediately AFTER
+# `_check_lifetime_budget` — the task is provably UNDER both lifetime caps
+# already; this asks the narrower question of whether what remains can even
+# survive the cheapest attempt's fixed startup cost.
+
+
+async def _burn_event(attempt_number, *, read=0, write=0, fresh=0, ts=1):
+    """A persisted `cache_burn` event shaped exactly like the live emission
+    at orchestrator.py's `_CACHE_BURN_EVERY` cadence — flat fields, NOT
+    nested under `meta`."""
+    return {
+        "source": "orchestrator", "kind": "cache_burn", "text": "",
+        "attempt_number": attempt_number, "ts": ts,
+        "tokens_used": fresh, "cache_read": read, "cache_creation": write,
+        "total": fresh + read + write, "compactions": 0,
+    }
+
+
+async def test_an_attempt_the_remaining_budget_cannot_pay_for_never_starts(store):
+    """AC1 / repro: remaining weighted budget 150,000, prior attempt startup
+    cost 160,000 -> the gate refuses, naming both numbers, and the loop-head
+    contract (`_drive` emits `attempt_start` only when this returns None) is
+    upheld directly: a caller that only emits on None never gets there.
+
+    RED on unfixed code: `_check_attempt_startup_floor` does not exist.
+    """
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    # 1,500,000 cache-read raw = 150,000 weighted (0.1x) already spent.
+    await store.update_attempt(aid, status="succeeded", cache_read_tokens=1_500_000)
+    await store.save_events(t.id, [await _burn_event(1, read=1_600_000)])  # 160,000 weighted
+
+    events = []
+    o = _orch(store, {"lifetime_tokens": 300_000})  # remaining = 300,000 - 150,000 = 150,000
+    o._sink = events.append
+
+    assert await o._check_lifetime_budget(t) is None  # under the cap — the floor is the new question
+    b = await o._check_attempt_startup_floor(t)
+    assert b is not None
+    assert b.category is BlockerCategory.BUDGET_EXHAUSTED
+    assert "150,000" in b.root_cause_hypothesis
+    assert "160,000" in b.root_cause_hypothesis
+
+    ev = next(e for e in events if e["kind"] == "lifetime_budget" and e.get("floor_refusal"))
+    assert ev["tokens_remaining"] == 150_000
+    assert ev["min_viable_attempt"] == 160_000
+
+    # The loop-head half of this contract — that `_drive` never reaches
+    # `attempt_start` when this returns non-None — is proven for real (a live
+    # `_drive`/`run_task`, not a hand-simulated emit) by
+    # test_e2e_orchestrator.py::test_the_loop_head_refuses_to_start_an_attempt_it_cannot_afford.
+
+
+async def test_the_floor_blockers_suggested_raise_actually_clears_the_floor(store):
+    """Review finding (attempt 2): the shared `raise_to['lifetime_tokens']`
+    formula (`ceil(used_tokens * 1.5 / 100k) * 100k`) was written for the
+    OVER-CAP caller, where `used_tokens >= cap_tokens` by construction, so
+    1.5x always clears the cap. The floor caller is different — it fires
+    while STILL under the cap — and with this exact scenario (cap=300,000,
+    used=150,000, floor=160,000) the naive 1.5x formula suggests 300,000,
+    i.e. NO CHANGE: a human who applies it and retries gets `remaining =
+    300,000 - 150,000 = 150,000 < 160,000` again — instant re-park. The
+    fix must offer a raise that, once applied, leaves `remaining >= floor`.
+    """
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="succeeded", cache_read_tokens=1_500_000)
+    await store.save_events(t.id, [await _burn_event(1, read=1_600_000)])  # 160,000 weighted
+
+    # ASK_THE_HUMAN (non-terminal) so the raise-budget option is populated —
+    # under the default terminal mode there is no option to inspect at all,
+    # only `wake_condition`, which is built from the same `raise_to` dict.
+    o = _orch(store, {"lifetime_tokens": 300_000}, config=ASK_THE_HUMAN)
+    b = await o._check_attempt_startup_floor(t)
+    assert b is not None
+    assert b.options, "expected a raise-budget option (non-terminal mode)"
+    raise_option = next(
+        opt for opt in b.options
+        if opt.action and "set_task_config" in opt.action
+    )
+    suggested = raise_option.action["set_task_config"]["lifetime_tokens"]
+    used_tokens = 150_000
+    floor = 160_000
+    assert suggested > 300_000, (
+        f"suggested raise {suggested:,} is a no-op against the current cap "
+        f"300,000 — applying it and retrying would re-park immediately")
+    assert suggested - used_tokens >= floor, (
+        f"applying the suggested raise ({suggested:,}) still leaves "
+        f"remaining ({suggested - used_tokens:,}) below the floor "
+        f"({floor:,}) — retrying would re-park immediately")
+
+
+async def test_remaining_above_the_floor_still_starts_the_attempt(store):
+    """AC2a: the same history, but remaining 400,000 >= floor 160,000 ->
+    unaffected, exactly as today."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="succeeded", cache_read_tokens=1_500_000)
+    await store.save_events(t.id, [await _burn_event(1, read=1_600_000)])
+
+    o = _orch(store, {"lifetime_tokens": 550_000})  # remaining = 550,000 - 150,000 = 400,000
+    assert await o._check_attempt_startup_floor(t) is None
+
+
+async def test_a_review_pass_freeze_is_exempt_from_the_startup_floor(store):
+    """AC2b: a task parked in AWAITING_APPROVAL with a PASS on record is
+    frozen by `_budget_frozen_by_pass` before the floor is even computed —
+    same exemption `_check_lifetime_budget` gets, same reason (INCIDENT
+    2026-08-13)."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="succeeded", tokens_used=1_000,
+                               review_passed=1)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    fresh = await store.get_task(t.id)
+
+    # A cap so tight the floor would fire on anything but a frozen task.
+    o = _orch(store, {"lifetime_tokens": 1})
+    assert await o._check_attempt_startup_floor(fresh) is None
+
+
+async def test_a_mechanical_round_is_exempt_from_the_startup_floor(store):
+    """AC2b: a mechanical round (pr_conflict rebase / re-verification tick)
+    is exempt the same way `_check_lifetime_budget` is."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    o = _orch(store, {"lifetime_tokens": 1})
+
+    async def _mechanical(_task):
+        return True
+
+    o._mechanical_round = _mechanical
+    assert await o._check_attempt_startup_floor(t) is None
+
+
+async def test_the_floor_uses_the_cheapest_measured_startup(store):
+    """When more than one attempt reached 10 messages, the floor is the
+    CHEAPEST of them — the question is "can the next attempt survive", and
+    the cheapest prior attempt is the most optimistic honest answer."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        await _burn_event(1, read=3_000_000, ts=1),  # 300,000 weighted
+        await _burn_event(2, read=1_000_000, ts=2),  # 100,000 weighted — cheaper
+    ])
+
+    o = _orch(store)
+    floor, provenance = await o._min_viable_attempt_cost(t)
+    assert floor == 100_000
+    assert "attempt #2" in provenance
+
+
+async def test_an_attempt_that_never_reached_ten_messages_is_excluded(store):
+    """A crashed attempt (never reached message 10) emits no `cache_burn` at
+    all — excluded structurally, no extra status filter, per the resolved
+    intake answer."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        {"source": "orchestrator", "kind": "attempt_start", "text": "",
+         "attempt_number": 1, "ts": 1},  # crashed before message 10
+        await _burn_event(2, read=5_000_000, ts=2),  # 500,000 weighted
+    ])
+
+    o = _orch(store)
+    floor, provenance = await o._min_viable_attempt_cost(t)
+    assert floor == 500_000
+    assert "attempt #2" in provenance
+
+
+async def test_with_no_history_the_config_floor_applies(store):
+    """No attempt ever reached 10 messages (or none exist) -> the config
+    floor (`bounds.min_viable_attempt_weighted_tokens`) applies."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    o = _orch(store)
+    floor, provenance = await o._min_viable_attempt_cost(t)
+    assert floor == Bounds().min_viable_attempt_weighted_tokens == 250_000
+    assert "config floor" in provenance
+
+
+async def test_the_floor_refusal_reads_differently_from_the_over_cap_refusal(store):
+    """AC3: a human reading a parked task must be able to tell the two
+    BUDGET_EXHAUSTED reasons apart — the over-cap gate says "exhausted:
+    ...", the floor gate says "floor: remaining ... < minimum viable
+    attempt ..." — never the same string."""
+    t1 = Task.new("over-cap", repo_path="/tmp/x")
+    await store.create_task(t1)
+    await _spend(store, t1.id, attempts=9, tokens_each=100)
+    over_blocker = await _orch(store)._check_lifetime_budget(t1)
+    assert over_blocker is not None
+    assert "floor" not in over_blocker.root_cause_hypothesis
+
+    t2 = Task.new("floor", repo_path="/tmp/x")
+    await store.create_task(t2)
+    aid = await store.create_attempt(t2.id, 1)
+    await store.update_attempt(aid, status="succeeded", cache_read_tokens=1_500_000)
+    await store.save_events(t2.id, [await _burn_event(1, read=1_600_000)])
+    floor_blocker = await _orch(
+        store, {"lifetime_tokens": 300_000}
+    )._check_attempt_startup_floor(t2)
+    assert floor_blocker is not None
+    assert "floor" in floor_blocker.root_cause_hypothesis
+    assert "minimum viable attempt" in floor_blocker.root_cause_hypothesis
+    assert floor_blocker.root_cause_hypothesis != over_blocker.root_cause_hypothesis

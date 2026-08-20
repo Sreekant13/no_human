@@ -3157,6 +3157,16 @@ class Orchestrator:
                 return await self._raise_blocker(
                     task, budget_blocker, repo=repo, branch=self._active_branch
                 )
+            # Under the cap is not the same question as "can afford to
+            # start" — remaining budget strictly between 0 and one attempt's
+            # fixed startup cost is a guaranteed-dead attempt otherwise: it
+            # burns an attempt slot and ~0.9M raw tokens before failing with
+            # the same BUDGET_EXHAUSTED it would have failed with for free.
+            floor_blocker = await self._check_attempt_startup_floor(task)
+            if floor_blocker is not None:
+                return await self._raise_blocker(
+                    task, floor_blocker, repo=repo, branch=self._active_branch
+                )
             self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}",
                       max_turns=self.bounds.max_turns_per_attempt)
             # C2: systematic root-cause step at the START of a retry — two
@@ -11161,23 +11171,9 @@ class Orchestrator:
             if used_attempts >= cap_attempts
             else f"cost-weighted tokens {used_tokens:,}/{cap_tokens:,}"
         )
-        # The raise is proportional to what the task has actually spent — a
-        # human raising the budget buys roughly one more bounded loop, not
-        # unbounded life. Rounded to 100k, not 1M: the caps are weighted now
-        # and a whole bounded loop is ~1.6M, so 1M granularity would have
-        # rounded a modest raise up into a doubling.
-        raise_to = {
-            "lifetime_attempts": used_attempts + self.bounds.max_attempts,
-            "lifetime_tokens": math.ceil(used_tokens * 1.5 / 100_000) * 100_000,
-        }
-        # ...still computed in TERMINAL mode: it is the concrete number the
-        # revival instruction names, so a human who does decide to raise the cap
-        # gets the same proportional figure the option used to offer.
-        terminal = self._budget_exhaustion_terminal()
-        return Blocker(
-            category=BlockerCategory.BUDGET_EXHAUSTED,
-            transient=False, confidence=1.0, goal=task.title,
-            root_cause_hypothesis=f"lifetime budget exhausted: {over}",
+        return self._budget_exhausted_blocker(
+            task,
+            root_cause=f"lifetime budget exhausted: {over}",
             evidence=(
                 f"lifetime spend: {used_attempts} attempts, {used_tokens:,} "
                 f"cost-weighted tokens across all runs and resumes; "
@@ -11192,6 +11188,61 @@ class Orchestrator:
                 f"By class: {breakdown}"
                 + self._spend_shape_note(task)
             ),
+            used_attempts=used_attempts, used_tokens=used_tokens, over=over,
+        )
+
+    def _budget_exhausted_blocker(
+        self, task: Task, *, root_cause: str, evidence: str,
+        used_attempts: int, used_tokens: int, over: str,
+        min_raise_tokens: int | None = None,
+    ) -> Blocker:
+        """Shared BUDGET_EXHAUSTED blocker body for both `_check_lifetime_budget`
+        (over the cap) and `_check_attempt_startup_floor` (can't afford the
+        NEXT attempt's startup even though under the cap) — same raise-option
+        arithmetic, same terminal/question/options shape; only the diagnosis
+        text (`root_cause`, `evidence`) differs per caller, so a human reading
+        two different park reasons still sees one blocker shape, not two.
+
+        Extracted from `_check_lifetime_budget` unchanged: every field below
+        was computed inline there before this split; `used_attempts`,
+        `used_tokens` and `over` are exactly what fed `raise_to` and the
+        question/root-cause strings at that call site.
+
+        `min_raise_tokens` (only ever passed by `_check_attempt_startup_floor`,
+        as its `floor`): the 1.5x-of-used-tokens formula below was written for
+        the OVER-CAP caller, where `used_tokens >= cap_tokens` by construction,
+        so 1.5x always clears the current cap. The floor caller is different:
+        it fires while STILL under the cap (`remaining = cap - used > 0`), so
+        1.5x-of-used can land at or below the existing cap — a "raise" a human
+        could apply and retry with, that changes nothing and re-parks on the
+        same floor immediately (review finding, attempt 2). Folding in
+        `used_tokens + min_raise_tokens` guarantees the offered raise leaves
+        `remaining >= floor` once applied.
+        """
+        # The raise is proportional to what the task has actually spent — a
+        # human raising the budget buys roughly one more bounded loop, not
+        # unbounded life. Rounded to 100k, not 1M: the caps are weighted now
+        # and a whole bounded loop is ~1.6M, so 1M granularity would have
+        # rounded a modest raise up into a doubling.
+        raise_tokens = math.ceil(used_tokens * 1.5 / 100_000) * 100_000
+        if min_raise_tokens is not None:
+            raise_tokens = max(
+                raise_tokens,
+                math.ceil((used_tokens + min_raise_tokens) / 100_000) * 100_000,
+            )
+        raise_to = {
+            "lifetime_attempts": used_attempts + self.bounds.max_attempts,
+            "lifetime_tokens": raise_tokens,
+        }
+        # ...still computed in TERMINAL mode: it is the concrete number the
+        # revival instruction names, so a human who does decide to raise the cap
+        # gets the same proportional figure the option used to offer.
+        terminal = self._budget_exhaustion_terminal()
+        return Blocker(
+            category=BlockerCategory.BUDGET_EXHAUSTED,
+            transient=False, confidence=1.0, goal=task.title,
+            root_cause_hypothesis=root_cause,
+            evidence=evidence,
             # TERMINAL (the default): no question and no options, because there
             # is no decision left to make — `budget.exhaustion_terminal` states
             # the standing answer. What the human gets instead is the same
@@ -11218,6 +11269,140 @@ class Orchestrator:
                 BlockerOption(label="stop — keep the work parked as-is",
                               action={"park": True}),
             ],
+        )
+
+    async def _min_viable_attempt_cost(self, task: Task) -> tuple[int, str]:
+        """The floor `_check_attempt_startup_floor` refuses to start an
+        attempt under: the cheapest prior attempt's measured first-
+        `_CACHE_BURN_EVERY`-message weighted spend, or the config floor
+        (`bounds.min_viable_attempt_weighted_tokens`) when there is none.
+
+        Why the FIRST `cache_burn` event of an attempt IS its startup cost:
+        `_CACHE_BURN_EVERY == 10`, so it fires at assistant message 10 and its
+        `cache_read` / `cache_creation` / `tokens_used` fields are the running
+        totals of those first 10 messages — attempt_distill + the implement
+        prompt + skills + map, re-accumulated before the first real model
+        turn does any work.
+
+        An attempt that never reached 10 messages (crashed during startup)
+        emits no `cache_burn` at all and is therefore excluded with no extra
+        status filter — the intake answer ("exclude crashed attempts")
+        realised structurally, not by a filter re-applied here.
+
+        `output_tokens` is deliberately omitted from the weighting: the event
+        carries no fresh/output split, and `pricing.weighted_tokens` prices a
+        missing split as 0 — the honest treatment, and it biases the floor
+        DOWN (toward starting an attempt), never toward a false refusal.
+        """
+        try:
+            events = await self.store.list_events(task.id)
+        except Exception as exc:  # noqa: BLE001 — a telemetry read must
+            # never break the loop; fall back exactly as "no history" would.
+            self._advisory(
+                f"could not read attempt history for the startup floor: {exc}"
+            )
+            return (
+                self.bounds.min_viable_attempt_weighted_tokens,
+                "config floor (history unavailable)",
+            )
+
+        seen_attempts: set[int] = set()
+        cheapest: tuple[int, int] | None = None  # (attempt_number, weighted)
+        for event in events:
+            if event.get("kind") != "cache_burn":
+                continue
+            attempt_number = event.get("attempt_number")
+            if attempt_number is None or attempt_number in seen_attempts:
+                continue
+            # `list_events` orders oldest -> newest, so the first cache_burn
+            # seen per attempt_number is that attempt's FIRST one.
+            seen_attempts.add(attempt_number)
+            weighted = _weighted_tokens(
+                tokens_used=int(event.get("tokens_used", 0)),
+                cache_read_tokens=int(event.get("cache_read", 0)),
+                cache_creation_tokens=int(event.get("cache_creation", 0)),
+            )
+            if cheapest is None or weighted < cheapest[1]:
+                cheapest = (attempt_number, weighted)
+
+        if cheapest is None:
+            return (
+                self.bounds.min_viable_attempt_weighted_tokens,
+                "config floor (no measured attempt startup)",
+            )
+        attempt_number, weighted = cheapest
+        return (
+            weighted,
+            f"measured: attempt #{attempt_number}'s first "
+            f"{_CACHE_BURN_EVERY} messages",
+        )
+
+    async def _check_attempt_startup_floor(
+        self, task: Task
+    ) -> "Blocker | None":
+        """Refuse to START an attempt the remaining lifetime budget cannot
+        pay for its own startup, rather than starting it and budget-aborting
+        at turn 0.
+
+        Runs at the loop head immediately AFTER `_check_lifetime_budget`
+        returns None — so the task is provably under both the attempts and
+        the token caps already; this asks a narrower question: is the
+        remaining headroom enough to survive even the CHEAPEST measured
+        attempt's fixed startup (attempt_distill + implement prompt + skills
+        + map, re-accumulated before the first model turn)? Below that, an
+        attempt started here is guaranteed to budget-abort at turn 0 and
+        burns an attempt slot and ~0.9M raw tokens for nothing — the exact
+        defect this gate exists to close.
+
+        Frozen exactly like `_check_lifetime_budget`, same reason: a
+        mechanical round or a PASSed park spends no attempt, so there is
+        nothing here to refuse.
+        """
+        if await self._budget_frozen_by_pass(task):
+            return None
+        used_attempts, by_class = await self.store.lifetime_usage_by_class(
+            task.id
+        )
+        used_tokens = _weighted_tokens(**by_class)
+        _cap_attempts, cap_tokens = self._lifetime_limits(task)
+        remaining = cap_tokens - used_tokens
+        floor, provenance = await self._min_viable_attempt_cost(task)
+        if remaining >= floor:
+            return None
+        # `_check_lifetime_budget` (called first, every attempt) already
+        # emitted this attempt's running-total `lifetime_budget` event; only
+        # the refusal path emits a second one here, and it is distinguished
+        # from the over-cap event by `floor_refusal=True` — never rendered as
+        # the same reason.
+        self.emit(
+            "lifetime_budget",
+            f"remaining {remaining:,} < min viable attempt {floor:,}",
+            floor_refusal=True, tokens_remaining=remaining,
+            min_viable_attempt=floor, min_viable_source=provenance,
+            tokens_cap=cap_tokens, tokens_weighted=used_tokens,
+            attempts_used=used_attempts,
+        )
+        over = f"cost-weighted tokens {used_tokens:,}/{cap_tokens:,}"
+        return self._budget_exhausted_blocker(
+            task,
+            root_cause=(
+                f"lifetime budget floor: remaining {remaining:,} < minimum "
+                f"viable attempt {floor:,} cost-weighted tokens"
+            ),
+            evidence=(
+                f"remaining lifetime budget: {remaining:,} cost-weighted "
+                f"tokens ({used_tokens:,}/{cap_tokens:,} spent, "
+                f"{used_attempts} attempts); minimum viable attempt cost: "
+                f"{floor:,} cost-weighted tokens ({provenance}); by class so "
+                f"far: {_class_breakdown(**by_class)}. The next attempt's "
+                "fixed startup (attempt_distill + implement prompt + skills "
+                "+ map) is re-accumulated before its first model turn does "
+                "any work, so starting one here is guaranteed to "
+                "budget-abort at turn 0 and burn the attempt slot for "
+                "nothing."
+            ),
+            used_attempts=used_attempts, used_tokens=used_tokens, over=over,
+            min_raise_tokens=floor,
         )
 
     def _budget_exhaustion_terminal(self) -> bool:

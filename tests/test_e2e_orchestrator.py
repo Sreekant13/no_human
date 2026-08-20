@@ -4546,6 +4546,13 @@ async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
     from no_human.core.orchestrator import BudgetAbort
 
     cfg = _config(tmp_path)
+    # A fresh task's first attempt has no measured startup history, so the
+    # loop-head startup floor (`_check_attempt_startup_floor`) would
+    # otherwise fall back to the config default (250,000) and refuse to
+    # start the attempt at all against this fixture's tiny lifetime cap —
+    # before the mid-attempt abort path this test exercises ever runs.
+    # Zeroed to neutralize a gate this test isn't exercising.
+    cfg.data.setdefault("bounds", {})["min_viable_attempt_weighted_tokens"] = 0
     backend = _AbortingNudgeBackend(BudgetAbort("attempt spend crossed the cap"))
     orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
     t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
@@ -4592,6 +4599,65 @@ async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
     # a retryable attempt and raise the same blocker a second time.
     assert outcome.off_ramp is True, outcome
     assert (fresh.blocker or {}).get("question") is None, fresh.blocker
+
+
+class _MustNotRunBackend(WrongShapeBackend):
+    """A backend that asserts if the coder path ever reaches it — proves a
+    "don't start" gate for real, the way
+    ``test_infra_not_work.py::test_drive_honours_a_pending_stop_before_the_human_gated_route``
+    proves ``_resume_human_gated`` is skipped: by making the wrong path
+    explode, not by re-deriving "was it skipped" from a hand-simulated emit.
+    """
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        raise AssertionError(
+            "the backend ran — the loop started an attempt the remaining "
+            "lifetime budget could not afford")
+
+
+async def test_the_loop_head_refuses_to_start_an_attempt_it_cannot_afford(
+    bare_repo, tmp_path, store
+):
+    """AC1, loop-head half (INCIDENT 2026-08-20, run 123dea00): the unit test
+    in test_lifetime_budget.py proves `_check_attempt_startup_floor`'s own
+    verdict; this proves the LOOP honours it — that `_drive` never reaches
+    `attempt_start` / the backend when the floor refuses, which is the actual
+    defect (a dead attempt was STARTED, not merely computable as unaffordable).
+
+    RED on pre-fix code (no startup-floor gate at all): the loop starts the
+    attempt regardless of how little budget remains, `_MustNotRunBackend.run`
+    is reached and raises, and the `attempt_start` / attempt-count assertions
+    below fail.
+    """
+    cfg = _config(tmp_path)
+    backend = _MustNotRunBackend()
+    events: list = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    # No prior attempt exists, so `_min_viable_attempt_cost` has no measured
+    # history and falls back to the config default
+    # (`bounds.min_viable_attempt_weighted_tokens`, 250,000 — see bounds.py).
+    # A cap this tight is UNDER both lifetime caps (nothing has been spent
+    # yet, so `_check_lifetime_budget` returns None) but leaves a remaining
+    # budget the startup floor refuses outright.
+    t.config = {"lifetime_tokens": 100, "budget_unit": "weighted"}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert backend.calls == [], (
+        "the backend was invoked despite an unaffordable startup floor")
+    assert not any(e.get("kind") == "attempt_start" for e in events), events
+    assert await store.list_attempts(t.id) == []
+    fresh = await store.find_task(t.id)
+    assert (fresh.blocker or {}).get("category") == "BUDGET_EXHAUSTED", \
+        fresh.blocker
+    assert "floor" in (fresh.blocker or {}).get("root_cause_hypothesis", "")
+    assert outcome.off_ramp is True, outcome
 
 
 async def test_a_stuck_abort_in_the_nudge_fails_the_attempt_with_its_reason(

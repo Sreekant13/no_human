@@ -1400,6 +1400,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # never parks the task. Raised with the lifetime cap (2:1 shape).
         # Rationale on core.bounds.Bounds.attempt_tokens.
         "attempt_tokens": 2_000_000,
+        # The floor the loop-head startup gate refuses to start an attempt
+        # under. Rationale on core.bounds.Bounds.min_viable_attempt_weighted_tokens.
+        "min_viable_attempt_weighted_tokens": 250_000,
     },
     # A separate section from `bounds` on purpose: `bounds` is mirrored
     # key-for-key by core.bounds.Bounds and guarded by
