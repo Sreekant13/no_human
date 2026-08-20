@@ -382,6 +382,15 @@ jobs:
           assert cli, "installed nh finds no claude CLI (the Agent SDK should bundle one)"
           print("board:", board); print("claude:", cli)
           EOF
+          # THE RESOLUTION THIS STEP UNIQUELY SEES. `uv tool install` resolves
+          # dependencies from PyPI, not from uv.lock — so this env is the only
+          # one in CI that matches what a user gets. On 2026-08-20 that
+          # difference shipped a broken `nh mcp-serve` in three releases: the
+          # MCP SDK dropped `mcp.server.fastmcp` in 2.0.0, the requirement had
+          # no upper bound, and every locked lane stayed green on 1.29.0.
+          # Importing the bridge here is the cheap half of the check (it needs
+          # no running API) and it fails on exactly that class.
+          "$UV_TOOL_DIR/no-human/bin/python" -c "import no_human.intake.mcp_bridge; print('mcp bridge imports under a fresh resolution')"
 
       - name: Upload the wheel (release build only — workflow_dispatch with wheel_release)
         if: github.event_name == 'workflow_dispatch' && inputs.wheel_release

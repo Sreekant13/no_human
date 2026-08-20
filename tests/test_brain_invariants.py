@@ -94,7 +94,13 @@ FROZEN_DEPENDENCIES = [
     "click>=8.4.1",
     "fastapi>=0.138.0",
     "httpx>=0.28.1",
-    "mcp>=1.28.0",
+    # Narrowed 2026-08-21 (public issue #15), not added: the MCP SDK removed
+    # `mcp.server.fastmcp` in 2.0.0, which `intake/mcp_bridge.py` imports, so an
+    # unbounded requirement shipped a broken `nh mcp-serve` to every PyPI user.
+    # A bound edit on a package already on this list is a one-line deliberate
+    # update here; the invariant this file exists for — no NEW runtime package —
+    # is asserted by name below and is untouched by it.
+    "mcp>=1.28.0,<2",
     "psutil>=7.0.0",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
@@ -123,6 +129,26 @@ def _declared_dependencies() -> list[str]:
 
 def test_L1_the_dependency_list_is_unchanged():
     assert _declared_dependencies() == FROZEN_DEPENDENCIES
+
+
+def test_L1_no_new_runtime_package_by_name():
+    """The half of L1 that a version-bound edit must never be able to satisfy.
+
+    The exact-string comparison above is deliberately brittle so that even a
+    loosened bound is a decision somebody takes. This one states the property
+    that must hold no matter how the bounds move: the SET OF PACKAGES is
+    closed. A future contributor editing the frozen literal for a bound has to
+    leave this one alone; adding a package trips both.
+    """
+    def _names(reqs):
+        return sorted(r.split(">=")[0].split("==")[0].split("[")[0].split("<")[0].strip()
+                      for r in reqs)
+
+    assert _names(_declared_dependencies()) == _names(FROZEN_DEPENDENCIES)
+    assert _names(_declared_dependencies()) == [
+        "aiosqlite", "claude-agent-sdk", "click", "fastapi", "httpx", "mcp",
+        "psutil", "pyyaml", "rich", "slack-sdk", "textual", "uvicorn",
+    ]
 
 
 def test_L1_probe_detects_an_added_dependency():

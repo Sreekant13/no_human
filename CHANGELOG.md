@@ -6,6 +6,30 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-08-21
+
+Fixes `nh mcp-serve` on every install that resolves dependencies from PyPI —
+which is every install that is not a git checkout.
+
+- **The MCP SDK requirement is capped below 2.0.0.** `intake/mcp_bridge.py`
+  imports `mcp.server.fastmcp`; the SDK removed that path in 2.0.0, and the
+  requirement (`mcp>=1.28.0`) had no upper bound. So `uvx no-human mcp-serve`,
+  `nh mcp-serve` after `uv tool install no-human`, and the Claude Code plugin's
+  command all died with `ModuleNotFoundError` on 0.1.1, 0.1.2 and 0.1.3, while
+  CI, the MCP container, the desktop bundles and every dev checkout stayed
+  green on the locked 1.29.0. Workaround on an older version:
+  `uvx --with "mcp<2" no-human mcp-serve`.
+- **The gate that missed it now exists.** CI's wheel job installs with
+  `uv tool install`, which resolves from PyPI rather than `uv.lock` — the only
+  lane that sees what a user sees — and now imports the bridge in that env.
+  `tests/test_mcp_dependency_bound.py` fails if the declared bound ever admits
+  an SDK without the module the bridge imports, 2.x pre-releases included.
+- **What actually changed underneath.** 2.0.0 shipping was not the trigger:
+  the locked `claude-agent-sdk` 0.2.121 requires `mcp<2.0.0` and its latest
+  0.2.143 relaxed that to `mcp<3.0.0`, so a transitive cap had been holding
+  this package up by accident. Porting the bridge to the 2.x API
+  (`mcp.server.MCPServer`) is tracked as its own issue.
+
 - The PyPI project page links back to the site, source, docs, changelog,
   issues and release notes (`[project.urls]`); the package had no project
   links before.
@@ -161,7 +185,8 @@ evidence it works. A human approves and merges.
   2026-08-18, built by the public repository's CI. `SHA256SUMS-linux.txt`
   ships alongside.
 
-[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/no-human-ai/no_human/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/no-human-ai/no_human/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/no-human-ai/no_human/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/no-human-ai/no_human/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/no-human-ai/no_human/compare/v0.1.0...v0.1.1
