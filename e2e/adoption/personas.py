@@ -125,6 +125,68 @@ DANA = dict(
     ),
 )
 
+_NH_INIT_PLACEHOLDER_TOKEN = "sk-ant-oat01-ADOPTION-HARNESS-PLACEHOLDER"
+
+
+def _nh_init_scriptable(ctx, run: PersonaRun, product: Path) -> None:
+    """Run the install path `nh init --help`/docs/quickstart.md document for
+    scripting, and raise a finding only if THAT fails — never for plain
+    `nh init` needing a terminal, which it always will.
+
+    Two things a naive version of this check gets wrong, both worth stating:
+
+      * Running plain `nh init` with stdin closed and reading a clean abort as
+        "there is no non-interactive mode" tests a form nobody who read the
+        docs would run: `nh init --help` documents `--non-interactive
+        --token-stdin --no-repo` for exactly this. That plain form is still
+        exercised below (a real no-TTY environment should get a clean abort,
+        not a hang or a traceback) but a clean abort there is CORRECT and is
+        never, by itself, a finding.
+      * In `full` mode the persona's own ``ctx.env`` carries a real credential
+        (the one deliberate exception the harness makes, so full-mode task
+        runs can actually call the model) — and `nh init` correctly REFUSES a
+        stdin token that differs from one already present. Feeding it that
+        real credential and reading the refusal as "scripting is broken"
+        reproduces the exact false-finding shape this check exists to catch.
+        The scripted install therefore runs against a copy of the environment
+        with that credential stripped, matching the machine the docs describe:
+        one with nothing on it yet.
+    """
+    init_env = {k: v for k, v in ctx.env.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+    r = ctx.shell(
+        run, "nh-init-scriptable",
+        "Script the setup so the rest of the team can repeat it, following "
+        "the non-interactive example from `nh init --help`.",
+        "nh init --help; docs/quickstart.md",
+        "uv run nh init --non-interactive --token-stdin --no-repo",
+        cwd=product, env=init_env, input=_NH_INIT_PLACEHOLDER_TOKEN + "\n",
+        allow_fail=True)
+    if not r.ok:
+        run.findings.append(Finding(
+            run.name, "nh-init-scriptable", "high",
+            ("The scripted install documented by `nh init --help` and "
+             "docs/quickstart.md — `nh init --non-interactive --token-stdin "
+             f"--no-repo` with a token piped on stdin — fails (exit "
+             f"{r.exit_code}): {(r.stderr or r.stdout).strip()[-500:]}"),
+            "nh init --help; docs/quickstart.md", (r.stdout + r.stderr)[-1500:],
+            ticket="ADOPT-3"))
+    else:
+        # Proved it works; undo its writes so the rest of this run — and
+        # `seed_config()` right after — still see the one known-good
+        # ~/.no_human the other personas are written against, rather than
+        # whatever defaults `nh init --no-repo` happens to pick today.
+        (ctx.home / ".no_human" / "config.yaml").unlink(missing_ok=True)
+        (ctx.home / ".no_human" / ".env").unlink(missing_ok=True)
+
+    # Plain `nh init`, stdin closed: what a real no-TTY environment gets. A
+    # clean abort here is CORRECT — the interactive wizard has no terminal to
+    # prompt on — and must not, by itself, produce a finding; the scripted
+    # form above is the one the docs actually recommend for this case.
+    ctx.shell(run, "nh-init-interactive-no-tty",
+              "Try the bare command first, the way the README shows it.",
+              "README.md#install", "uv run nh init", cwd=product,
+              stdin_devnull=True, allow_fail=True)
+
 
 def persona_dana(ctx) -> PersonaRun:
     """The first-install walk, following README 'Install' then quickstart §1-3."""
@@ -203,27 +265,17 @@ def persona_dana(ctx) -> PersonaRun:
             workaround="Prefix with `uv run`, or activate .venv.",
             ticket="ADOPT-2"))
 
-    # -- README: "uv run nh init" ------------------------------------------ #
-    # Run it with stdin closed. A CTO doing this over ssh in a script, or any
-    # cron/provisioning path, gets exactly this.
-    r = sh(run, "nh-init-noninteractive",
-           "Try to script the setup so the rest of the team can repeat it.",
-           "README.md#install", "uv run nh init", cwd=product,
-           stdin_devnull=True, allow_fail=True)
-    if "Aborted" in (r.stdout + r.stderr) or not r.ok:
-        run.findings.append(Finding(
-            run.name, "nh-init-noninteractive", "medium",
-            ("`nh init` is interactive-only — there is no --yes/--non-interactive "
-             "flag and no documented way to produce a working ~/.no_human "
-             "without a TTY. A team that wants every developer's machine set up "
-             "the same way has to reverse-engineer config.yaml from the source."),
-            "README.md#install", (r.stdout + r.stderr)[-1500:],
-            workaround="Write ~/.no_human/config.yaml and .env by hand.",
-            ticket="ADOPT-3"))
+    # -- `nh init --help` / docs/quickstart.md: the DOCUMENTED scripted path -- #
+    # A team scripting setup does not run bare `nh init` with stdin closed and
+    # call that a verdict on scriptability — it reads `nh init --help` (or the
+    # quickstart), finds the two lines that exist for exactly this, and runs
+    # them. Only if THAT fails is scriptability actually broken.
+    _nh_init_scriptable(ctx, run, product)
 
-    # Dana gives up on scripting and sets the two files up by hand, which is
-    # what the wizard would have produced. From here the harness is no longer
-    # measuring Dana; it is unblocking the personas behind her.
+    # Dana finishes setup with whatever the scripted step above produced (or,
+    # if it failed, by hand — the same files the wizard would have written).
+    # From here the harness is no longer measuring Dana; it is unblocking the
+    # personas behind her.
     ctx.seed_config()
 
     # -- README says nothing about verifying the install; quickstart doesn't

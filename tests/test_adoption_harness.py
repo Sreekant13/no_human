@@ -197,6 +197,107 @@ def test_bare_ticket_key_detector_ignores_quoted_titles_but_catches_bare_keys(tm
     assert len(hits) == 1, f"expected only the bare key to be flagged, got {hits}"
 
 
+def test_nh_init_scriptable_reports_failures_it_actually_saw(tmp_path):
+    """ADOPT-3 regression: the harness used to assert `nh init` has no
+    non-interactive mode from a run of the WRONG command (plain `nh init`,
+    stdin closed) — a form that always cleanly aborts, whether or not the
+    documented scripted form (`--non-interactive --token-stdin --no-repo`,
+    from `nh init --help`/docs/quickstart.md) works.
+
+    Drives `personas._nh_init_scriptable` directly against a stub `ctx.shell`,
+    independent of the real CLI, in two shapes:
+
+      * the scripted form SUCCEEDS -> no finding, and the plain no-TTY form's
+        clean abort must not add one either.
+      * the scripted form FAILS -> exactly one finding, on the
+        "nh-init-scriptable" step, naming the actual failure text rather than
+        asserting the flag does not exist.
+
+    Mutation this catches: reverting `_nh_init_scriptable` to raise a finding
+    whenever the PLAIN no-TTY step aborts (the pre-fix behaviour) fails the
+    first assertion below, because the stub's plain step always exits
+    non-zero while its scripted step succeeds. It also catches full mode's
+    real defect directly: the stub asserts the env handed to the scripted
+    step has the (stubbed) real credential stripped, which is what made the
+    fixed check re-raise the same false finding in full mode.
+    """
+    import adoption_run
+    import personas
+
+    class _StubCtx:
+        def __init__(self, home, scripted_ok, scripted_stderr=""):
+            # A full-mode-shaped env: a real credential present, the way
+            # `build_ctx`/`run_full_mode` set one up for real task execution.
+            self.env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-REAL-FULL-MODE-TOKEN",
+                        "PATH": "/usr/bin"}
+            self.home = home
+            self.calls = []
+            self._scripted_ok = scripted_ok
+            self._scripted_stderr = scripted_stderr
+
+        def shell(self, run, step, intent, doc_ref, command, *, cwd,
+                  env=None, input=None, allow_fail=False, stdin_devnull=False,
+                  timeout=300, quiet=False):
+            self.calls.append({"step": step, "env": env, "input": input})
+            if step == "nh-init-scriptable":
+                assert env is not None and "CLAUDE_CODE_OAUTH_TOKEN" not in env, (
+                    "the real full-mode credential must be stripped before "
+                    "the scripted install is exercised, or a correct refusal "
+                    "of a conflicting stdin token looks like a scriptability "
+                    "defect")
+                assert input == personas._NH_INIT_PLACEHOLDER_TOKEN + "\n"
+                ok = self._scripted_ok
+                res = adoption_run.StepResult(
+                    run.name, step, intent, doc_ref, command,
+                    0 if ok else 1, ok,
+                    stdout="", stderr="" if ok else self._scripted_stderr)
+                if ok:
+                    (self.home / ".no_human").mkdir(parents=True, exist_ok=True)
+                    (self.home / ".no_human" / ".env").write_text("x")
+                    (self.home / ".no_human" / "config.yaml").write_text("x")
+            elif step == "nh-init-interactive-no-tty":
+                # A real no-TTY environment: always a clean abort.
+                res = adoption_run.StepResult(
+                    run.name, step, intent, doc_ref, command, 1, False,
+                    stdout="", stderr="Aborted!")
+            else:
+                raise AssertionError(f"unexpected step {step}")
+            run.steps.append(res)
+            return res
+
+    run_ok = personas.PersonaRun(**personas.DANA)
+    home_ok = tmp_path / "home_ok"
+    home_ok.mkdir()
+    ctx_ok = _StubCtx(home_ok, scripted_ok=True)
+    personas._nh_init_scriptable(ctx_ok, run_ok, tmp_path / "product")
+    assert run_ok.findings == [], (
+        f"a working scripted install must raise no finding, got {run_ok.findings}")
+    assert not (home_ok / ".no_human" / ".env").exists(), (
+        "the scripted install's writes must be cleaned up so seed_config() "
+        "still produces the one known-good ~/.no_human the rest of the run "
+        "is written against")
+
+    run_fail = personas.PersonaRun(**personas.DANA)
+    home_fail = tmp_path / "home_fail"
+    home_fail.mkdir()
+    ctx_fail = _StubCtx(
+        home_fail, scripted_ok=False,
+        scripted_stderr=("CLAUDE_CODE_OAUTH_TOKEN is already set in the "
+                          "environment and the value on stdin is a different "
+                          "one. Nothing was written."))
+    personas._nh_init_scriptable(ctx_fail, run_fail, tmp_path / "product")
+    findings = [f for f in run_fail.findings if f.step == "nh-init-scriptable"]
+    assert len(findings) == 1, f"expected exactly one finding, got {run_fail.findings}"
+    finding = findings[0]
+    assert finding.severity == "high"
+    assert finding.ticket == "ADOPT-3"
+    assert "already set" in finding.summary, (
+        f"the finding must name the ACTUAL failure, got: {finding.summary!r}")
+    assert "no --non-interactive" not in finding.summary, (
+        "must not re-assert the false claim that the flag does not exist")
+    assert "no --yes" not in finding.summary
+
+
 def test_fakes_are_labelled_as_fakes():
     """A mocked pass must never be reportable as a live one."""
     import fakes

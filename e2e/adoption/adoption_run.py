@@ -134,22 +134,38 @@ class Ctx:
     def shell(self, run: PersonaRun, step: str, intent: str, doc_ref: str,
               command, *, cwd: Path, allow_fail: bool = False,
               timeout: int = 300, stdin_devnull: bool = False,
-              quiet: bool = False) -> StepResult:
+              quiet: bool = False, env: dict[str, str] | None = None,
+              input: str | None = None) -> StepResult:
         """Run one persona action in the persona's environment.
 
         ``command`` is a string (run through a shell, the way a person types it)
         or a list (run directly, for arguments containing newlines/quotes that a
         person would have pasted from a ticket).
+
+        ``env`` overrides the persona's own ``self.env`` for this one step —
+        for the rare step that has to prove something about an environment
+        *unlike* the ambient one (e.g. a machine with no credential exported
+        yet). ``input`` pipes text to stdin, the way a person piping a token
+        into a scripted command would; it is mutually exclusive with
+        ``stdin_devnull`` and wins if both are given.
         """
         shown = command if isinstance(command, str) else shlex.join(command)
         t0 = time.time()
-        stdin = subprocess.DEVNULL if stdin_devnull else subprocess.DEVNULL
+        run_env = self.env if env is None else env
         try:
-            proc = subprocess.run(
-                command if isinstance(command, list) else ["/bin/sh", "-c", command],
-                cwd=str(cwd), env=self.env, capture_output=True, text=True,
-                timeout=timeout, stdin=stdin,
-            )
+            if input is not None:
+                proc = subprocess.run(
+                    command if isinstance(command, list) else ["/bin/sh", "-c", command],
+                    cwd=str(cwd), env=run_env, capture_output=True, text=True,
+                    timeout=timeout, input=input,
+                )
+            else:
+                stdin = subprocess.DEVNULL if stdin_devnull else subprocess.DEVNULL
+                proc = subprocess.run(
+                    command if isinstance(command, list) else ["/bin/sh", "-c", command],
+                    cwd=str(cwd), env=run_env, capture_output=True, text=True,
+                    timeout=timeout, stdin=stdin,
+                )
             code, out, err = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             code, out, err = None, (exc.stdout or b"").decode("utf-8", "replace"), \

@@ -14,14 +14,6 @@
       "tracked_as": "docs/KNOWN_ISSUES.md KI-5 — accepted deliberately: the silence is fixed (advisory + nh doctor), and whether this should ESCALATE is its own review"
     },
     {
-      "ticket": "ADOPT-3",
-      "severity": "medium",
-      "persona": "Dana",
-      "step": "nh-init-noninteractive",
-      "summary": "`nh init` is interactive-only — there is no --yes/--non-interactive flag and no documented way to produce a working ~/.no_human without a TTY. A team that wants every developer's machine set up the same way has to reverse-engineer config.yaml from the source.",
-      "tracked_as": "docs/KNOWN_ISSUES.md KI-2"
-    },
-    {
       "ticket": "ADOPT-17",
       "severity": "medium",
       "persona": "Sam",
