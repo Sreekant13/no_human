@@ -123,7 +123,7 @@ def _make_runner(path: Path, monkeypatch) -> CliRunner:
     # box. Default it to "no server" so these tests read a fixed number; the
     # tests that are ABOUT that width stub the HTTP call itself. Same reason
     # test_task_lifecycle stubs `_server_owns_worker`.
-    monkeypatch.setattr(cmd_mod, "_running_pool_width", lambda _cfg: None)
+    monkeypatch.setattr(cmd_mod, "_running_pool_stats", lambda _cfg: None)
     return CliRunner()
 
 
@@ -1112,7 +1112,7 @@ def test_status_prints_the_running_pool_width_not_the_configured_one(tmp_path, m
     wrong for exactly the override a saturation question depends on. `nh start`
     is the path this fixes: it is the one that puts the pool behind an HTTP
     server there is something to ask. `nh serve` binds no socket, so it stays
-    on the labelled config fallback (known gap, see `_running_pool_width`)."""
+    on the labelled config fallback (known gap, see `_running_pool_stats`)."""
     db = tmp_path / "test.db"
     _seed_task(db, TaskStatus.IMPLEMENTING)
     runner = _status_runner_with_config_width(db, monkeypatch, 2)
@@ -1166,6 +1166,93 @@ def test_status_json_is_unchanged_by_the_live_width(tmp_path, monkeypatch):
     assert set(out) == {"needs you", "queued", "working", "waiting", "failed",
                         "done", "unattributed_usage"}
     assert out["working"] == 1
+
+
+def test_status_working_numerator_comes_from_workers_busy(tmp_path, monkeypatch):
+    """The `working` numerator is the live `workers_busy` count, not a count of
+    worker-owned status rows: a row can be IMPLEMENTING while stranded
+    (claimable, not running) after a restart."""
+    db = tmp_path / "test.db"
+    for _ in range(3):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    _seed_task(db, TaskStatus.REVIEWING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 4, "workers_busy": 2})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 2/4" in out, out
+    assert "working 4/4" not in out, out
+
+
+def test_status_never_prints_an_over_capacity_ratio(tmp_path, monkeypatch):
+    """Reproduces the live 2026-08-20 shape: 8 worker-owned rows (4 stranded
+    IMPLEMENTING after a restart, 4 genuinely running) against a 4-wide pool.
+    The line must never claim more in-flight than there are slots to run
+    them."""
+    db = tmp_path / "test.db"
+    for _ in range(8):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 4, "workers_busy": 4})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 4/4" in out, out
+    assert "working 8/4" not in out, out
+
+
+def test_status_reports_unclaimed_implementing_rows_as_queued(tmp_path, monkeypatch):
+    """The 4 stranded IMPLEMENTING rows in excess of `workers_busy` don't
+    disappear from the line — they move to `queued`, matching how
+    `/api/queue/health` itself counts an unclaimed IMPLEMENTING row toward
+    `queue_depth`. No task vanishes: working + queued accounts for all 14."""
+    db = tmp_path / "test.db"
+    for _ in range(8):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    for _ in range(6):
+        _seed_task(db, TaskStatus.PENDING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 4, "workers_busy": 4,
+                                "queue_depth": 10})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "queued 10" in out, out
+    assert "working 4/4" in out, out
+
+
+def test_status_still_prints_a_saturated_pool_as_saturated(tmp_path, monkeypatch):
+    """Negative control: the fix must not make a genuinely busy pool look
+    idle. Exactly 4 IMPLEMENTING rows against a 4-wide, fully-busy pool is
+    real saturation, not a stranded-row artifact."""
+    db = tmp_path / "test.db"
+    for _ in range(4):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 4, "workers_busy": 4})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 4/4" in out, out
+    assert "configured" not in out, out
+    assert "working 0/4" not in out, out
+
+
+def test_status_keeps_counting_rows_when_health_omits_workers_busy(tmp_path, monkeypatch):
+    """An older server build (or any payload missing `workers_busy`) still
+    answers with a live `max_workers`. `busy=None` must not print a false
+    `working 0/N` on a busy pool — the caller falls back to counting rows for
+    the numerator while still trusting the observed denominator."""
+    db = tmp_path / "test.db"
+    for _ in range(3):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 8})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 3/8" in out, out
 
 
 def test_status_json_bucket_counts(tmp_path, monkeypatch):

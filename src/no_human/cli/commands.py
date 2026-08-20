@@ -121,20 +121,38 @@ def _pidfile_owner_alive() -> bool:
     return _probe_pid(pid) is True
 
 
-def _running_pool_width(config) -> int | None:
-    """The width of the pool that is actually draining the queue, or None.
+def _running_pool_stats(config) -> tuple[int | None, int] | None:
+    """The (busy, width) of the pool that is actually draining the queue, or
+    None when there is nothing to ask.
 
     `nh status` used to print `working N/{config max_workers}`. Under
     `nh start --workers N` — a flag that deliberately leaves the config on disk
     untouched — that denominator was the number nobody was running, and
-    saturation is the one thing an operator reads this line for.
+    saturation is the one thing an operator reads this line for. It also used
+    to take the NUMERATOR from a count of worker-owned status rows
+    (IMPLEMENTING among them), which is not evidence of a running worker: a
+    row can sit in IMPLEMENTING after a restart strands it, claimable and
+    waiting, with nothing spending on it — `scheduler._ORPHANABLE` deliberately
+    excludes IMPLEMENTING for exactly that reason. That printed impossible
+    ratios like `working 8/4`.
 
-    `/api/queue/health` reports the live `Scheduler.max_workers`, so it is the
-    only honest source while a server is up. Same discipline as
-    `_server_owns_worker` above: any failure to reach it, any non-JSON answer,
-    and a reported width below 1 (a server with no scheduler attached, which
-    is not a running pool) all mean "no live width" — the caller then says so
-    instead of passing a config number off as an observation.
+    `/api/queue/health` reports the live `Scheduler.max_workers` AND
+    `workers_busy` (`core/health.py`'s `len(inflight_ids)`, the scheduler's
+    actual in-flight set, which cannot exceed `max_workers`), so it is the
+    only honest source for both numbers while a server is up. Same discipline
+    as `_server_owns_worker` above: any failure to reach it, any non-JSON
+    answer, and a reported width below 1 (a server with no scheduler attached,
+    which is not a running pool) all mean "no live stats" — the caller then
+    says so instead of passing a config number off as an observation.
+
+    Returns `(busy, width)` when reachable, where `busy` is
+    `int(payload["workers_busy"])` when that key is present and parses to a
+    non-negative int, and `None` when the key is absent or unparseable —
+    `busy is None` means "the endpoint answered but did not report a
+    numerator" (an older build, say), not "unreachable": the caller keeps
+    counting rows for the numerator in that case, while still trusting the
+    observed denominator, so a partial payload doesn't print a false
+    `working 0/N` on a busy pool.
 
     KNOWN GAP — this covers the app/api server case only. `nh start` is what
     puts a scheduler behind an HTTP server; `serve()` below runs the scheduler
@@ -159,8 +177,15 @@ def _running_pool_width(config) -> int | None:
         ) as resp:
             if resp.status != 200:
                 return None
-            width = int((_json.loads(resp.read() or b"{}") or {}).get("max_workers", 0))
-            return width if width >= 1 else None
+            payload = _json.loads(resp.read() or b"{}") or {}
+            width = int(payload.get("max_workers", 0))
+            if width < 1:
+                return None
+            busy_raw = payload.get("workers_busy")
+            busy = int(busy_raw) if busy_raw is not None else None
+            if busy is not None and busy < 0:
+                busy = None
+            return busy, width
     except (urllib.error.URLError, OSError, ValueError, TypeError, TimeoutError):
         return None
 
@@ -3567,17 +3592,32 @@ def status(as_json):
             # `nh start --workers N` overrides the config without writing it,
             # so the config number is a guess about a process this command can
             # simply ask. When it can't ask — including under `nh serve`, which
-            # binds no socket at all (see `_running_pool_width`'s KNOWN GAP) —
+            # binds no socket at all (see `_running_pool_stats`'s KNOWN GAP) —
             # it says which number it is printing rather than implying it
-            # observed one.
-            live = _running_pool_width(config)
-            mw = live if live is not None else config.data.get(
-                "concurrency", {}).get("max_workers", 1)
-            mw_note = "" if live is not None else " [dim](configured; server not running)[/]"
+            # observed one. Same discipline for the NUMERATOR: a worker-owned
+            # status row (IMPLEMENTING among them) is not evidence of a
+            # running worker — it can be stranded, claimable and waiting,
+            # after a restart. The live `workers_busy` count is what's honest;
+            # any row in excess of it is reclassified into `queued`, which is
+            # where `/api/queue/health`'s own `queue_depth` already counts an
+            # unclaimed IMPLEMENTING row.
+            stats = _running_pool_stats(config)
+            if stats is None:
+                mw = config.data.get("concurrency", {}).get("max_workers", 1)
+                mw_note = " [dim](configured; server not running)[/]"
+                working_n, queued_n = buckets["working"], buckets["queued"]
+            else:
+                busy, mw = stats
+                mw_note = ""
+                if busy is None:
+                    working_n, queued_n = buckets["working"], buckets["queued"]
+                else:
+                    working_n = busy
+                    queued_n = buckets["queued"] + max(0, buckets["working"] - busy)
             console.print(
                 f"[yellow]needs you[/] {buckets['needs you']}  "
-                f"[dim]queued[/] {buckets['queued']}  "
-                f"[bold]working[/] {buckets['working']}/{mw}{mw_note}  "
+                f"[dim]queued[/] {queued_n}  "
+                f"[bold]working[/] {working_n}/{mw}{mw_note}  "
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {buckets['failed']}  "
                 f"[green]done[/] {buckets['done']}")

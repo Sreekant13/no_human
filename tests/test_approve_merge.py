@@ -1106,7 +1106,7 @@ def _make_cli_runner(db_path, config_data, monkeypatch) -> CliRunner:
 
     monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg(config_data, db_path))
     monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
-    monkeypatch.setattr(cmd_mod, "_running_pool_width", lambda _cfg: None)
+    monkeypatch.setattr(cmd_mod, "_running_pool_stats", lambda _cfg: None)
     return CliRunner()
 
 
