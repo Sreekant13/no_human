@@ -18,6 +18,8 @@
 
 </div>
 
+The AI coding factory you <ins>**can trust**</ins>:
+
 - **A plan before any code**, from the ticket plus what it finds in your repo.
 - **An adversarial review.** A different model, fresh context, read-only tools,
   told to refute "done". You get a pass/fail checklist citing file and line —
