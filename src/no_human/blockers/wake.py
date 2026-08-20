@@ -792,6 +792,13 @@ class WakeWatcher:
         await self._emit(task, "resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
 
+    async def resume_now(self, task: Task, *, now: datetime | None = None) -> str:
+        """Public entry to the one `_resume` chokepoint, for callers outside
+        the wake rungs (the scheduler's quota-park sweep) that need to force
+        a resume decision without re-implementing checkpoint/provenance/
+        dead-resume semantics. Same return contract as `_resume`."""
+        return await self._resume(task, now=now)
+
     async def _dead_resume_verdict(
         self, task: Task, *, now: datetime,
     ) -> tuple[str, int, list[str]]:

@@ -55,7 +55,27 @@ log = logging.getLogger("no_human.scheduler")
 # dispatched at all (live, 2026-08-12) — including the repro-gate fix that
 # was blocking an escalated task. WIP-first (across statuses) and FIFO
 # (within a status) are independent and both hold.
+#
+# Within PENDING specifically, prior-work tasks (a burned attempt, or a
+# context marker left by an open draft PR / a prior resume) are claimed
+# ahead of never-started ones, still oldest-first within each group
+# (`_claimable`'s pending split, live 2026-08-20): a newcomer ticket and a
+# task carrying sunk context/an open PR both land in PENDING between
+# attempts, and without this a restart's fresh claim can fill every slot
+# with newcomers while the sunk-cost task waits behind them.
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
+
+# Context keys that mark a PENDING task as carrying prior work rather than
+# being a fresh ticket: the exact keys `Orchestrator` writes at PR open
+# (orchestrator.py:5818-5827) and `wake._resume` writes on resume.
+_PRIOR_WORK_CONTEXT_KEYS = ("pr_branch", "pr_delivered_url", "pr_watch", "resume_from")
+
+
+def _has_prior_work(task, attempt_counts: dict) -> bool:
+    ctx = task.context if isinstance(task.context, dict) else {}
+    if any(ctx.get(key) for key in _PRIOR_WORK_CONTEXT_KEYS):
+        return True
+    return attempt_counts.get(task.id, 0) > 0
 
 #: Default for `concurrency.stop_grace_s`: how long a stopping server waits
 #: for in-flight attempts to checkpoint and unwind before exiting anyway.
@@ -350,6 +370,22 @@ class Scheduler:
         # knows to clear the breaker's streak when THIS cooldown lapses,
         # without also clearing it on every tick a park-driven cooldown ends.
         self._infra_cooldown_active: bool = False
+        # The reset time of the most recent quota wall this process knows
+        # about, kept AFTER it lapses — unlike `_quota_cooldown_until`, which
+        # only tracks a wall while it is still armed. Without this a restarted
+        # process (or one whose cooldown just ended) cannot tell "no wall
+        # ever" from "the wall passed minutes ago and parks are still sitting
+        # behind it" (INCIDENT 2026-08-20 — see `_resume_quota_parks`).
+        self._quota_wall: datetime | None = None
+        self._quota_wall_profile: str | None = None
+        # True on the FIRST tick of any process (so a restart sweeps parked
+        # quota tasks before claiming pending) and re-armed whenever a
+        # cooldown this process was holding lapses (see `_was_cooling` below).
+        self._resume_parks_pending: bool = True
+        # Edge detector for "the cooldown just ended", so the resume sweep
+        # above is triggered once per lapse, not on every tick the pool
+        # happens to be idle.
+        self._was_cooling: bool = False
         self.reanalysis = reanalysis_job
         self.wiki_refresh = wiki_refresh_job
         self.retirement = retirement_job
@@ -470,6 +506,12 @@ class Scheduler:
                       or datetime.min.replace(tzinfo=timezone.utc))
             if newest_raised is None or raised > newest_raised:
                 newest_raised, newest, newest_profile = raised, resets, theirs
+        if newest is not None:
+            # Remembered even when it has already passed — a lapsed wall is
+            # exactly what `_resume_quota_parks` needs to sweep the parks
+            # behind it, and this is the only place that knows it.
+            self._quota_wall = newest
+            self._quota_wall_profile = newest_profile
         if newest is None or newest <= now:
             return None
         if self._quota_cooldown_until is not None and self._quota_cooldown_until >= newest:
@@ -482,12 +524,91 @@ class Scheduler:
                        "process; `nh auth use <other>` + restart clears it)")
         return newest
 
+    def _park_wall_passed(self, task, blocker: dict, *, now: datetime) -> bool:
+        """Whether a PAUSED_QUOTA task's wall has passed — the resumability
+        gate `_resume_quota_parks` uses.
+
+        Primary: the wall THIS process has resolved (`_quota_wall`, kept even
+        after it lapses — see `recover_quota_cooldown` and the live arming in
+        `_run`). If it has passed and the park was raised no later than it,
+        the park is behind THAT wall regardless of its own fixed
+        `wake_check_at` — this is the 2026-08-20 incident: a park's own clock
+        (raise time + a fixed hour) can still read minutes in the future
+        while the pool's wall has already reset.
+
+        Fallback, when this process has never resolved a wall: the park's
+        own `wake_check_at`, due or due within one poll interval.
+        Deliberately does NOT parse the free-text `root_cause_hypothesis` —
+        `bounds.py`'s decision not to trust that phrasing is out of scope
+        here and stays exactly as it is.
+        """
+        wall = self._quota_wall
+        if wall is not None and wall <= now:
+            raised = (_parse_iso(blocker.get("raised_at"))
+                      or _parse_iso(getattr(task, "updated_at", None)))
+            if raised is None or raised <= wall:
+                return True
+        wake = _parse_iso(getattr(task, "wake_check_at", None))
+        if wake is not None and wake <= now + timedelta(seconds=self._poll_interval):
+            return True
+        return False
+
+    async def _resume_quota_parks(self, *, now: datetime) -> list[str]:
+        """Resume every quota-parked task whose wall has passed, before the
+        next claim.
+
+        INCIDENT (2026-08-20): the server restarted at 14:25:32 UTC while
+        four tasks sat ``paused_quota`` with their own fixed
+        ``wake_check_at`` at 14:29 (each park's raise-time-plus-an-hour
+        clock — the wall itself had reset at 14:20). The fresh scheduler
+        filled all four worker slots with brand-new PENDING tasks at
+        14:25:43; the parks — two carrying open draft PRs — then sat
+        ``implementing`` with zero events for 26-47 minutes behind four
+        fresh attempts. Neither startup nor a cooldown lapse used to
+        consult ``PAUSED_QUOTA`` at all: `_CLAIMABLE` only orders
+        IMPLEMENTING/PENDING, and a park is neither until the WakeWatcher's
+        own timer flips it — which was still four minutes away.
+
+        Returns the ids actually resumed (flipped to IMPLEMENTING). A live
+        wall (`_in_quota_cooldown`) or no wake mechanism wired both mean
+        "nothing to do" and this returns ``[]`` without touching a row.
+        """
+        if self._in_quota_cooldown(now) or self.wake is None:
+            return []
+        resumed: list[str] = []
+        mine = active_auth_profile()
+        for task in await self.store.list_tasks(TaskStatus.PAUSED_QUOTA):
+            try:
+                blocker = task.blocker if isinstance(task.blocker, dict) else {}
+                if (blocker.get("category") or "").upper() != "QUOTA":
+                    continue
+                theirs = blocker.get("auth_profile")
+                if theirs and mine and theirs != mine:
+                    continue                  # another profile's wall
+                if (theirs and self._quota_wall_profile
+                        and theirs != self._quota_wall_profile):
+                    continue                  # behind a DIFFERENT wall
+                if not self._park_wall_passed(task, blocker, now=now):
+                    continue
+                action = await self.wake.resume_now(task, now=now)
+                if action == "resumed":
+                    resumed.append(task.id)
+            except Exception as exc:  # noqa: BLE001 — sweep must not kill the pool
+                log.warning("quota-park resume failed for %s: %s", task.id[:8], exc)
+        if resumed:
+            self._on_event(
+                "quota_resume",
+                f"resumed {len(resumed)} quota-parked task(s) — wall passed")
+        return resumed
+
     async def _claimable(self) -> list:
         out = []
         for status in _CLAIMABLE:
-            for t in await self.store.list_claimable_tasks(status):
-                if t.id not in self._inflight:
-                    out.append(t)
+            rows = [t for t in await self.store.list_claimable_tasks(status)
+                    if t.id not in self._inflight]
+            if status is TaskStatus.PENDING and rows:
+                rows = await self._rank_pending(rows)
+            out.extend(rows)
         # A plan-approval correction resumes into PLANNING, not IMPLEMENTING —
         # it must be re-planned before a token is spent implementing it. That
         # status is otherwise mid-run-only, so it is claimed here on the one
@@ -500,6 +621,27 @@ class Scheduler:
             if t.id not in self._inflight and plan_gate.correcting(t):
                 out.append(t)
         return out
+
+    async def _rank_pending(self, rows: list) -> list:
+        """Split an oldest-first PENDING batch into prior-work tasks (a
+        burned attempt, or a PR/resume marker in context — `_has_prior_work`)
+        ahead of never-started ones, FIFO preserved within each group.
+
+        `attempt_counts()` is one grouped query, fetched here (only when the
+        pending group is non-empty) rather than N per-task lookups. Any
+        failure falls back to ranking by context markers alone — the sweep
+        must never break the claim path over a ranking nicety.
+        """
+        try:
+            attempt_counts = await self.store.attempt_counts()
+        except Exception as exc:  # noqa: BLE001 — ranking must never break claim
+            log.warning("attempt_counts() failed, ranking pending by context "
+                        "markers only: %s", exc)
+            attempt_counts = {}
+        prior, fresh = [], []
+        for t in rows:
+            (prior if _has_prior_work(t, attempt_counts) else fresh).append(t)
+        return prior + fresh
 
     # Mid-run statuses only a live worker can hold. A task found in one of
     # these at STARTUP (this process's _inflight is empty by definition) was
@@ -1111,8 +1253,23 @@ class Scheduler:
             self._infra_cooldown_active = True
             self._on_event("quota_pause", f"fleet paused — {infra_reason}")
 
-        if self._in_quota_cooldown(now):
+        # Edge-detect "the cooldown just ended" (or "this is the very first
+        # tick", since `_was_cooling`/`_resume_parks_pending` both start
+        # False/True respectively) so the resume sweep below runs exactly
+        # once per lapse, not on every idle tick.
+        cooling = self._in_quota_cooldown(now)
+        if self._was_cooling and not cooling:
+            self._resume_parks_pending = True   # first tick after a cooldown ended
+        self._was_cooling = cooling
+        if cooling:
             return []  # 7.4: pool-wide pause until the subscription resets
+
+        if self._resume_parks_pending:
+            self._resume_parks_pending = False
+            try:
+                await self._resume_quota_parks(now=now)
+            except Exception as exc:  # noqa: BLE001 — sweep must not kill the pool
+                log.warning("quota-park resume sweep failed: %s", exc)
 
         slots = self.max_workers - len(self._inflight)
         started: list[str] = []
@@ -1233,6 +1390,8 @@ class Scheduler:
                 resets = _parse_iso(getattr(outcome.task, "wake_check_at", None))
                 if resets is not None:
                     self._quota_cooldown_until = resets
+                    self._quota_wall = resets
+                    self._quota_wall_profile = active_auth_profile()
                     self._on_event("quota_pause",
                                    f"pool paused until {resets.isoformat()}")
         except Exception as exc:  # noqa: BLE001 — one task must not kill the pool

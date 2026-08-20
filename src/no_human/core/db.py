@@ -2069,6 +2069,18 @@ class Store:
         )
         return int(row["n"]) if row else 0
 
+    async def attempt_counts(self) -> dict[str, int]:
+        """`task_id -> number of attempt rows`, in ONE grouped query.
+
+        For the claim-ranking check ("has this pending task been tried
+        before?") — avoids either an N-query loop over every pending task or
+        hydrating the full `attempts_by_task()` payload just to count rows.
+        """
+        rows = await self._fetchall(
+            "SELECT task_id, COUNT(*) AS n FROM attempts GROUP BY task_id"
+        )
+        return {str(r["task_id"]): int(r["n"]) for r in rows}
+
     # The named roles the attempts table meters, and the three token columns
     # each one carries. `eval/northstar.py` already sums exactly this set to
     # report cost; the budget gate below matches it, so the two can no longer
