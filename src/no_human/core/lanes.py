@@ -21,6 +21,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .task import TaskStatus
+
 # Status -> lane, in the order routing consults it. Mirrors the `statuses`
 # arrays in web/src/boardLanes.js LANES; the labels/colours/order-on-screen stay
 # in the JS because they are presentation.
@@ -108,3 +110,55 @@ def is_waiting(task: Any) -> bool:
     if status == _PAUSED_QUOTA:
         return True
     return status == _BLOCKED and bool(_wake_condition(task))
+
+
+# `nh status`'s bucketing loop (`cli/commands.py:status`), extracted so it has
+# a unit test of its own. Distinct from `LANE_STATUSES`/`lane_for` above: this
+# is the CLI's six-bucket summary, not the board's lane routing, and the two
+# must not be conflated — `lane_for` and its JS conformance twin stay
+# untouched by this function.
+_NEEDS_YOU = {TaskStatus.AWAITING_APPROVAL, TaskStatus.AWAITING_INPUT,
+              TaskStatus.ESCALATED}
+# PENDING is QUEUED, not working: the scheduler's `_CLAIMABLE` treats it as a
+# task waiting to be picked up, and no worker is spending on it. Counting it
+# as working made `working N/max_workers` print impossible ratios like
+# `working 5/4` — more in-flight than there are slots to run them.
+_QUEUED = {TaskStatus.PENDING}
+_WORKING = {TaskStatus.CONTEXT, TaskStatus.PLANNING, TaskStatus.IMPLEMENTING,
+            TaskStatus.REVIEWING, TaskStatus.TESTING}
+_WAITING = {TaskStatus.PAUSED_QUOTA}
+
+
+def status_buckets(tasks: Any, waiting_for_slot_ids: Any = ()) -> dict[str, int]:
+    """Bucket ``tasks`` into the six `nh status` counts.
+
+    ``waiting_for_slot_ids`` is the set of ids a resumed-but-unclaimed task's
+    events say are waiting on a full pool (`Store.tasks_waiting_for_slot`) — a
+    task in that set counts as ``waiting``, never ``working``, the same class
+    of lie the PENDING comment above already documents: a worker-attached
+    count that includes a task with no worker attached.
+    """
+    waiting_ids = set(waiting_for_slot_ids)
+    buckets = {"needs you": 0, "queued": 0, "working": 0, "waiting": 0,
+               "failed": 0, "done": 0}
+    for t in tasks:
+        if t.id in waiting_ids and t.status in _WORKING:
+            buckets["waiting"] += 1
+        elif t.status == TaskStatus.BLOCKED:
+            # Match the board: a blocked task auto-resolves (→ waiting) only
+            # with a wake condition; without one a human must act.
+            wake = (t.blocker or {}).get("wake_condition")
+            buckets["waiting" if wake else "needs you"] += 1
+        elif t.status in _NEEDS_YOU:
+            buckets["needs you"] += 1
+        elif t.status in _QUEUED:
+            buckets["queued"] += 1
+        elif t.status in _WORKING:
+            buckets["working"] += 1
+        elif t.status in _WAITING:
+            buckets["waiting"] += 1
+        elif t.status == TaskStatus.FAILED:
+            buckets["failed"] += 1
+        elif t.status == TaskStatus.DONE:
+            buckets["done"] += 1
+    return buckets

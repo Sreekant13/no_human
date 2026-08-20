@@ -1534,3 +1534,174 @@ async def test_bare_run_forever_still_runs_forever_on_an_empty_queue(store):
         await asyncio.wait_for(
             sched.run_forever(stop=stop, poll_interval=0.01), 0.4)
     assert not stop.is_set()
+
+
+async def test_a_task_left_unclaimed_by_a_full_pool_says_so_once(store):
+    """A resumed task (`wake._resume`) is written IMPLEMENTING before any
+    worker is attached; with the pool full the scheduler deliberately leaves
+    it unclaimed rather than mislabel it — but the task's own record must say
+    so, once, not sit silent (dc3b72f7)."""
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    pending = Task.new("fresh pending", repo_path="/tmp/x")
+    await store.create_task(pending)
+    resumed = Task.new("resumed WIP", repo_path="/tmp/x")
+    await store.create_task(resumed)
+    await store.set_status(resumed, TaskStatus.IMPLEMENTING, validate=False)
+
+    started = await sched.tick()
+    assert len(started) == 1
+    inflight_id = started[0]
+    waiting_id = pending.id if inflight_id == resumed.id else resumed.id
+
+    for _ in range(5):
+        await sched.tick()
+
+    waits = [e for e in await store.list_events(waiting_id)
+              if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1, f"expected exactly one wait event, got {waits}"
+    assert waits[0]["text"].startswith("waiting for a worker slot")
+    assert "1/1 busy" in waits[0]["text"]
+
+    inflight_waits = [e for e in await store.list_events(inflight_id)
+                        if e["kind"] == "waiting_for_slot"]
+    assert inflight_waits == [], "the inflight task got a wait event too"
+
+    hold.set()
+    await asyncio.sleep(0.05)
+    resumed_started = await sched.tick()
+    assert waiting_id in resumed_started
+
+    waits_after = [e for e in await store.list_events(waiting_id)
+                    if e["kind"] == "waiting_for_slot"]
+    assert len(waits_after) == 1, (
+        f"expected no re-emit once the slot freed, got {waits_after}")
+
+
+async def test_a_second_wait_after_running_gets_its_own_event(store):
+    """A distinct later waiting period gets a second event — the dedupe is
+    per continuous wait, not per task lifetime (intake Q&A)."""
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    pending = Task.new("fresh pending", repo_path="/tmp/x")
+    await store.create_task(pending)
+    resumed = Task.new("resumed WIP", repo_path="/tmp/x")
+    await store.create_task(resumed)
+    await store.set_status(resumed, TaskStatus.IMPLEMENTING, validate=False)
+
+    started = await sched.tick()
+    inflight_id = started[0]
+    waiting_id = pending.id if inflight_id == resumed.id else resumed.id
+
+    await sched.tick()
+    waits = [e for e in await store.list_events(waiting_id)
+              if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1
+
+    # The first task finishes and frees the slot.
+    hold.set()
+    await asyncio.sleep(0.05)
+    freed = await sched.tick()
+    assert waiting_id in freed
+
+    # The pool fills back up immediately with a fresh hold, and the OTHER
+    # task (now claimable again) is left waiting a second, distinct period.
+    fake.hold = asyncio.Event()
+    await store.set_status(
+        await store.get_task(inflight_id), TaskStatus.IMPLEMENTING,
+        validate=False)
+
+    await sched.tick()
+    waits_second = [e for e in await store.list_events(inflight_id)
+                     if e["kind"] == "waiting_for_slot"]
+    assert len(waits_second) == 1, (
+        f"expected a fresh wait event for the second period, got {waits_second}")
+
+
+async def test_a_resumed_task_waiting_behind_a_running_task_says_so(store):
+    """Review round 2 of PR #525: the earlier acceptance test let whichever
+    task the scheduler picked first become the inflight one — and because
+    `_claimable` iterates IMPLEMENTING before PENDING, it was always the
+    RESUMED task that ran and the PENDING one that waited. This pins the
+    named scenario: a task already running, then a RESUMED task arrives and
+    must wait — and say so."""
+    hold = asyncio.Event()
+
+    class _EmittingOrch(FakeOrch):
+        """The real orchestrator's first act on a claimed task is an event
+        (`repo_config`, `state: context`, ...) — that first run-sourced event
+        is what ends a wait on the record. The bare FakeOrch emits nothing."""
+
+        async def run_task(self, task):
+            await self.store.save_events(task.id, [{
+                "source": "orchestrator", "kind": "repo_config",
+                "text": "applying the repo's .no_human.yml", "ts": time.time(),
+            }])
+            return await super().run_task(task)
+
+    fake = _EmittingOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    first = Task.new("already running", repo_path="/tmp/x")
+    await store.create_task(first)
+    started = await sched.tick()
+    assert started == [first.id]
+
+    resumed = Task.new("resumed WIP", repo_path="/tmp/x")
+    await store.create_task(resumed)
+    await store.set_status(resumed, TaskStatus.IMPLEMENTING, validate=False)
+
+    for _ in range(3):
+        await sched.tick()
+
+    waits = [e for e in await store.list_events(resumed.id)
+             if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1, waits
+    assert "1/1 busy" in waits[0]["text"]
+    assert await store.tasks_waiting_for_slot() == {resumed.id}
+
+    hold.set()
+    await asyncio.sleep(0.05)
+    assert resumed.id in await sched.tick()
+    # Dispatched: the worker's first event ends the wait on the record,
+    # without any attempt_start. Wait for that observable, bounded.
+    for _ in range(200):
+        if any(e["kind"] == "repo_config"
+               for e in await store.list_events(resumed.id)):
+            break
+        await asyncio.sleep(0.01)
+    assert resumed.id not in await store.tasks_waiting_for_slot()
+
+
+async def test_a_free_slot_does_not_forget_tasks_that_are_still_waiting(store):
+    """Review round 2 of PR #525 (defect 3): the bookkeeping cleared the whole
+    dedupe set whenever the pool was not full, so a tick that left a slot
+    free while a task still waited (a `_shipped_before_dispatch` skip) made
+    the NEXT full tick emit a second event for the same, continuous wait."""
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    running = Task.new("running", repo_path="/tmp/x")
+    await store.create_task(running)
+    assert await sched.tick() == [running.id]
+    waiter = Task.new("still waiting", repo_path="/tmp/x")
+    await store.create_task(waiter)
+    await store.set_status(waiter, TaskStatus.IMPLEMENTING, validate=False)
+    await sched.tick()
+    assert len([e for e in await store.list_events(waiter.id)
+                if e["kind"] == "waiting_for_slot"]) == 1
+
+    # Simulate a tick that observed a free slot but did not start the waiter
+    # (the skip shape): the bookkeeping must keep the waiter's open wait.
+    sched._inflight.discard(running.id)
+    await sched._note_slot_waits([waiter], started=[])
+    sched._inflight.add(running.id)
+    await sched.tick()
+    waits = [e for e in await store.list_events(waiter.id)
+             if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1, f"a continuous wait must stay one event, got {waits}"

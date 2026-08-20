@@ -35,8 +35,10 @@ from ..config import (
 from ..context import ContextGatherer, build_default_sources
 from ..core.db import USAGE_ROLES, Store
 from ..core.events import EventPersister
+from ..core.lanes import status_buckets
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.runtime import build_orchestrator
+from ..core.slot_wait import is_waiting_for_slot
 from ..core.task import Task, TaskStatus
 from ..intake import (
     classify_kind,
@@ -1393,6 +1395,10 @@ def task_show(task_id):
                 print_no_task_matching(task_id)
                 return
             console.print(f"[bold]{t.id}[/]  [blue]{t.status.value}[/]  [magenta]{t.kind}[/]")
+            events = await store.list_events(t.id)
+            if is_waiting_for_slot(events, status=t.status.value):
+                waits = [e for e in events if e.get("kind") == "waiting_for_slot"]
+                console.print(f"[blue]waiting for a worker slot[/] {waits[-1]['text']}")
             console.print(f"title: {t.title}")
             if t.description:
                 console.print(f"description: {t.description}")
@@ -3537,19 +3543,6 @@ def status(as_json):
     """Show task counts by lane: queued (pending), running (in-flight stages),
     parked, and terminal. A quick portfolio read across all projects."""
     config, _ = _bootstrap(require_auth=False)
-    needs_you = {TaskStatus.AWAITING_APPROVAL, TaskStatus.AWAITING_INPUT,
-                  TaskStatus.ESCALATED}
-    # PENDING is QUEUED, not working: the scheduler's `_CLAIMABLE` treats it as
-    # a task waiting to be picked up, and no worker is spending on it. Counting
-    # it as working made `working N/max_workers` print impossible ratios like
-    # `working 5/4` — more in-flight than there are slots to run them — which is
-    # the one number in this line an operator uses to decide whether the pool is
-    # saturated. The docstring above has always described a "queued (pending)"
-    # lane; only the buckets disagreed.
-    queued = {TaskStatus.PENDING}
-    working = {TaskStatus.CONTEXT, TaskStatus.PLANNING,
-               TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING, TaskStatus.TESTING}
-    waiting = {TaskStatus.PAUSED_QUOTA}
 
     async def _go():
         # Lazy: keeps `commands.py`'s import graph from pulling in the API
@@ -3562,29 +3555,13 @@ def status(as_json):
         from ..api.models import _operator_cancelled
         async with Store(config.db_path) as store:
             tasks = await store.list_tasks()
-            buckets = {"needs you": 0, "queued": 0, "working": 0, "waiting": 0,
-                       "failed": 0, "done": 0}
-            cancelled_failed = 0
-            for t in tasks:
-                if t.status == TaskStatus.BLOCKED:
-                    # Match the board: a blocked task auto-resolves (→ waiting)
-                    # only with a wake condition; without one a human must act.
-                    wake = (t.blocker or {}).get("wake_condition")
-                    buckets["waiting" if wake else "needs you"] += 1
-                elif t.status in needs_you:
-                    buckets["needs you"] += 1
-                elif t.status in queued:
-                    buckets["queued"] += 1
-                elif t.status in working:
-                    buckets["working"] += 1
-                elif t.status in waiting:
-                    buckets["waiting"] += 1
-                elif t.status == TaskStatus.FAILED:
-                    buckets["failed"] += 1
-                    if _operator_cancelled(t):
-                        cancelled_failed += 1
-                elif t.status == TaskStatus.DONE:
-                    buckets["done"] += 1
+            waiting_ids = await store.tasks_waiting_for_slot()
+            buckets = status_buckets(tasks, waiting_ids)
+            # The cancelled split (#551) rides beside the bucket counts: a
+            # cancelled task ends FAILED but is not a capability failure.
+            cancelled_failed = sum(
+                1 for t in tasks
+                if t.status == TaskStatus.FAILED and _operator_cancelled(t))
             # The intake spend no task owns (interactive grill rounds run
             # before a task exists; pre-attempt intake on tasks that never
             # reached an attempt). Read BEFORE the --json return, not after:

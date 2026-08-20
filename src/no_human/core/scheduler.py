@@ -35,6 +35,7 @@ from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
 from . import plan_gate
+from . import slot_wait
 from .events import EventPersister
 from .infra_breaker import infra_breaker
 from .task import TaskStatus
@@ -303,6 +304,8 @@ def _summarize_event(event: dict) -> str | None:
         return "reviewing code"
     if kind == "attempt_start":
         return text  # e.g. "attempt 1/3"
+    if kind == slot_wait.KIND:
+        return "waiting for a worker slot"
     if kind == "context_gather" or kind == "context":
         return "gathering context"
     if kind == "supervisor":
@@ -331,6 +334,11 @@ class Scheduler:
         self.max_workers = max(1, int(max_workers))
         self.wake = wake_watcher
         self._inflight: set[str] = set()
+        # Ids this process has already emitted an unended `waiting_for_slot`
+        # event for — in-memory dedupe so a continuous wait produces exactly
+        # one event, not one per tick. In-memory is correct and sufficient: a
+        # process restart re-emits once, which is honest (a new wait period).
+        self._waiting_for_slot: set[str] = set()
         # Every id this process has dispatched, kept after it finishes: the
         # drain's exit code is about what THIS run did, not about whatever
         # else is in the database.
@@ -1011,6 +1019,47 @@ class Scheduler:
             "db": store_liveness,
         }
 
+    async def _note_slot_waits(self, claimable: list, started: list[str]) -> None:
+        """Persist one `waiting_for_slot` event per continuous wait, for every
+        claimable task this tick left behind because the pool is full.
+
+        A resumed task (`wake._resume`) is written IMPLEMENTING before any
+        worker is attached; when `max_workers` are all busy the scheduler
+        deliberately leaves it unclaimed rather than mislabel it. That
+        silence is by design — the task's RECORD staying silent about it is
+        not. Best-effort: a bookkeeping failure here must never take down
+        the pool.
+        """
+        try:
+            waiting = [t for t in claimable
+                       if t.id not in started and t.id not in self._inflight]
+            waiting_ids = {t.id for t in waiting}
+            if len(self._inflight) < self.max_workers:
+                # The pool is not full, so nothing new is slot-blocked — but a
+                # task still unclaimed (a `_shipped_before_dispatch` skip left
+                # a free slot while others wait) keeps its open wait, or the
+                # next full tick would emit a SECOND event for the same wait.
+                self._waiting_for_slot &= waiting_ids
+                return
+            for t in waiting:
+                if t.id in self._waiting_for_slot:
+                    continue
+                self._waiting_for_slot.add(t.id)
+                text = slot_wait.waiting_text(
+                    len(self._inflight), self.max_workers,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                await self.store.save_events(t.id, [{
+                    "source": "orchestrator", "kind": slot_wait.KIND,
+                    "text": text, "ts": time.time(),
+                }])
+                self._on_event(slot_wait.KIND, f"{t.id[:8]} {text}")
+            # An id that started, finished, or left the claimable set drops
+            # out, so a LATER wait produces a second event (one per distinct
+            # waiting period), while a continuous wait produces exactly one.
+            self._waiting_for_slot &= waiting_ids
+        except Exception as exc:  # noqa: BLE001 — must not kill the pool
+            log.warning("slot-wait bookkeeping failed: %s", exc)
+
     async def tick(self, *, now: datetime | None = None) -> list[str]:
         """One scheduling pass: resume parked tasks, then dispatch up to the free
         slots. Returns the task ids started this tick."""
@@ -1060,22 +1109,24 @@ class Scheduler:
             return []  # 7.4: pool-wide pause until the subscription resets
 
         slots = self.max_workers - len(self._inflight)
-        if slots <= 0:
-            return []
         started: list[str] = []
         claimable = await self._claimable()
         self._last_claimable_count = len(claimable)
-        for task in claimable[:slots]:
-            if await self._shipped_before_dispatch(task):
-                continue                          # completed; no attempt starts
-            self._inflight.add(task.id)          # reserve BEFORE scheduling
-            asyncio.ensure_future(self._run(task))
-            started.append(task.id)
-        if started:
-            self._dispatched.update(started)
-            self._last_dispatch_at = time.time()
-            self._on_event("dispatch", f"started {len(started)} task(s); "
-                           f"{len(self._inflight)}/{self.max_workers} busy")
+        if slots > 0:
+            for task in claimable[:slots]:
+                if await self._shipped_before_dispatch(task):
+                    continue                      # completed; no attempt starts
+                self._inflight.add(task.id)      # reserve BEFORE scheduling
+                asyncio.ensure_future(self._run(task))
+                started.append(task.id)
+            if started:
+                self._dispatched.update(started)
+                self._last_dispatch_at = time.time()
+                self._on_event("dispatch", f"started {len(started)} task(s); "
+                               f"{len(self._inflight)}/{self.max_workers} busy")
+        await self._note_slot_waits(claimable, started)
+        if not started and slots <= 0:
+            return []
         # PR-E: periodic re-analysis (best-effort, never blocks task dispatch).
         if self.reanalysis is not None:
             try:

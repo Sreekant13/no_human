@@ -18,6 +18,7 @@ from typing import (
 
 import aiosqlite
 
+from . import slot_wait
 from .task import Task, TaskStatus, assert_transition
 
 log = logging.getLogger("no_human.db")
@@ -3624,6 +3625,29 @@ class Store:
             (task_id,),
         )
         return [json.loads(r["data"]) for r in rows]
+
+    async def tasks_waiting_for_slot(self) -> set[str]:
+        """Ids whose newest ``waiting_for_slot``/``attempt_start`` event is the
+        wait — read-only, mirrors `slot_wait.is_waiting_for_slot` but computed
+        in SQL so `nh status` doesn't hydrate every task's full event log."""
+        # Mirrors `slot_wait.is_waiting_for_slot`: the wait, or ANY event from
+        # a run source (a worker acting on the task), whichever is newest —
+        # and only for tasks the scheduler could still claim.
+        sources = ",".join(f"'{s}'" for s in sorted(slot_wait.RUN_SOURCES))
+        statuses = ",".join(f"'{s}'" for s in sorted(slot_wait.CLAIMABLE_STATUSES))
+        rows = await self._fetchall(
+            "SELECT e.task_id, json_extract(e.data, '$.kind') AS kind "
+            "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            f"WHERE t.status IN ({statuses}) AND ("
+            "json_extract(e.data, '$.kind') = ? "
+            f"OR json_extract(e.data, '$.source') IN ({sources})"
+            ") ORDER BY e.ts ASC, e.id ASC",
+            (slot_wait.KIND,),
+        )
+        latest: dict[str, str] = {}
+        for r in rows:
+            latest[r["task_id"]] = "wait" if r["kind"] == slot_wait.KIND else "run"
+        return {tid for tid, k in latest.items() if k == "wait"}
 
     async def list_supervisor_corrections(
         self, *, project: str | None = None, limit: int = 5000,
