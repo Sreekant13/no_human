@@ -6872,8 +6872,12 @@ async def test_a_repair_before_a_second_refusal_is_still_on_the_record(
         assert "1 stale pin(s)" in repaired_event["text"]
 
     assert "commit_refused" in kinds, kinds
-    # The checkpoint's own refusal must not be silently swallowed either.
-    assert "checkpoint_failed" in kinds, kinds
+    # The checkpoint's own refusal must not be silently swallowed either —
+    # and (this ticket) a checkpoint is a safety net, not a publish gate: an
+    # unrepairable refusal on a `[WIP-*]` commit is bypassed (`--no-verify`)
+    # rather than dropping the WIP, so this is `checkpoint_unverified`, not
+    # `checkpoint_failed`.
+    assert "checkpoint_unverified" in kinds, kinds
 
     attempts = await store.list_attempts(t.id)
     assert attempts, "no attempt was recorded"
@@ -6974,7 +6978,20 @@ async def test_a_checkpoint_repair_before_a_second_refusal_is_still_recorded(
     followed by a second refusal must still surface `manifest_repaired` —
     the mutation already happened in the working tree, same
     drain-on-every-exit-path rule as the normal commit path's `finally`
-    (orchestrator.py:4728)."""
+    (orchestrator.py:4728).
+
+    POLICY CORRECTED (this ticket): PR #541 pinned `sha == ""` and
+    `checkpoint_failed` here, treating an unrepairable second refusal on the
+    checkpoint exactly like a lost commit. That was the wrong policy — a
+    checkpoint is a safety net, not a publish gate. The pre-commit
+    manifest/export gate protects what SHIPS; a `[WIP-*]` checkpoint on a
+    task branch ships nothing (review/approve re-run the gate on the FINAL
+    tree before anything merges). So when repair still cannot reconcile the
+    refusal, `_checkpoint_wip` now commits the WIP anyway with the gate
+    bypassed (`GitRepo.commit_all(..., bypass_gate=True)`) and reports
+    `checkpoint_unverified` — committed, but unverified — instead of losing
+    the work.
+    """
     from no_human.core import orchestrator as orch_mod
     from no_human.vcs import GitError
 
@@ -6999,10 +7016,12 @@ async def test_a_checkpoint_repair_before_a_second_refusal_is_still_recorded(
 
     sha = orch._checkpoint_wip(repo, t)
 
-    assert sha == "", "an unrepairable second refusal must not fabricate a sha"
+    assert _SHA_RE.match(sha), (
+        "an unrepairable second refusal on a [WIP-*] checkpoint must still "
+        f"be committed (gate bypassed), never lost: got {sha!r}")
     kinds = [e["kind"] for e in events]
     assert kinds.count("manifest_repaired") == 1, kinds
-    assert "checkpoint_failed" in kinds, kinds
+    assert "checkpoint_unverified" in kinds, kinds
 
 
 async def test_an_unrepairable_checkpoint_refusal_never_crashes_routing(
@@ -7043,12 +7062,60 @@ async def test_an_unrepairable_checkpoint_refusal_never_crashes_routing(
         assert sha == "", f"{exc.__class__.__name__} must not produce a sha"
         assert "checkpoint_failed" in [e["kind"] for e in events]
 
+    # A THIRD case: the refusal IS a gate refusal (bypass is attempted), but
+    # the bypass commit itself also fails. This must still fall through to
+    # the original loss path (`checkpoint_failed`, sha == ""), naming BOTH
+    # the original gate refusal and the bypass failure — never fabricate a
+    # sha when neither commit attempt actually succeeded.
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/checkpoint-crash-guard-bypass-also-fails")
+    (bare_repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b  # bypass-also-fails\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        raise GitError(_MANIFEST_REFUSAL)
+
+    def fake_commit_all(self, message, *, bypass_gate=False):
+        raise GitError("disk full: cannot write commit object")
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+    monkeypatch.setattr(GitRepo, "commit_all", fake_commit_all)
+
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("checkpoint crash guard bypass-also-fails test",
+                repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)  # must not raise
+
+    assert sha == "", "a bypass commit that itself fails must not fabricate a sha"
+    kinds = [e["kind"] for e in events]
+    assert "checkpoint_failed" in kinds, kinds
+    assert "checkpoint_unverified" not in kinds, kinds
+    failed_texts = [e["text"] for e in events if e["kind"] == "checkpoint_failed"]
+    assert any("REFUSED" in t_ and "disk full" in t_ for t_ in failed_texts), failed_texts
+
 
 async def test_a_lost_checkpoint_reaches_the_task_not_just_the_log(
         bare_repo, tmp_path, store, monkeypatch):
-    """Criterion #4: a lost checkpoint must reach the TASK — both an event
-    AND a blocker (intake resolution "(c) both") — not just `log.warning`.
-    Drives `_raise_blocker` directly with a seam that always refuses."""
+    """Criterion #4: a checkpoint's outcome must reach the TASK — both an
+    event AND the blocker (intake resolution "(c) both") — not just
+    `log.warning`. Drives `_raise_blocker` directly with a seam that always
+    refuses.
+
+    POLICY CORRECTED (this ticket): PR #541 pinned this as a LOST checkpoint
+    (`resume_commit == ""`, "NO resume commit" in evidence) for an
+    unrepairable gate refusal. That was the wrong policy — a checkpoint is a
+    safety net, not a publish gate: the gate protects what SHIPS, and a
+    `[WIP-*]` checkpoint ships nothing. So the WIP is now committed with the
+    gate bypassed and `resume_commit` is the real (bypass) sha; what now
+    travels to the task is the UNVERIFIED fact — the gate refused, but the
+    work was not lost — via `checkpoint_unverified` and a `blocker.evidence`
+    note naming the refusal.
+    """
     from no_human.blockers import Blocker, BlockerCategory
     from no_human.core import orchestrator as orch_mod
     from no_human.vcs import GitError
@@ -7078,12 +7145,76 @@ async def test_a_lost_checkpoint_reaches_the_task_not_just_the_log(
     await orch._raise_blocker(t, blocker, repo=repo)
 
     kinds = [e["kind"] for e in events]
-    assert "checkpoint_failed" in kinds, kinds
+    assert "checkpoint_unverified" in kinds, kinds
+    assert "checkpoint_failed" not in kinds, kinds
 
     done = await store.get_task(t.id)
     assert done.blocker is not None
-    assert done.blocker["resume_commit"] == ""
-    assert "NO resume commit" in done.blocker["evidence"], done.blocker["evidence"]
+    assert _SHA_RE.match(done.blocker["resume_commit"] or ""), done.blocker
+    assert "REFUSED" in done.blocker["evidence"], done.blocker["evidence"]
+    assert "NO resume commit" not in done.blocker["evidence"], done.blocker["evidence"]
+
+
+async def test_a_gate_refused_checkpoint_is_committed_unverified_not_lost(
+        bare_repo, tmp_path, store, monkeypatch):
+    """AC1 (this ticket): "A checkpoint is a safety net, not a publish gate:
+    when manifest repair cannot make the pre-commit gate pass, the WIP must
+    still be committed (with the refusal recorded), never dropped."
+
+    Real `GitRepo` on `bare_repo`; only `commit_with_manifest_repair` is
+    mocked to raise the gate's own refusal shape — `_checkpoint_wip` itself
+    must fall back to `repo.commit_all(msg, bypass_gate=True)` and actually
+    create the commit. Fails on unfixed code: today `resume_commit == ""`
+    and the dirty file is never committed at all.
+    """
+    from no_human.blockers import Blocker, BlockerCategory
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/gate-refused-checkpoint-committed")
+    (bare_repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b + 4  # gate-refused checkpoint\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        raise GitError(_MANIFEST_REFUSAL)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("gate-refused checkpoint test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    blocker = Blocker(
+        category=BlockerCategory.NOVEL_UNKNOWN, transient=False, confidence=0.5,
+        goal="implement the feature", root_cause_hypothesis="unknown",
+    )
+
+    await orch._raise_blocker(t, blocker, repo=repo)
+
+    done = await store.get_task(t.id)
+    assert done.blocker is not None
+    sha = done.blocker["resume_commit"]
+    assert _SHA_RE.match(sha or ""), (
+        f"the WIP must still be committed even though the gate refused: {done.blocker!r}")
+
+    # The sha is real HEAD, and the commit is the [WIP-BLOCKED] checkpoint —
+    # not some unrelated commit that happened to exist already.
+    assert repo.head_sha() == sha
+    subject = _git_out(bare_repo, "log", "-1", "--format=%s", sha)
+    assert subject.startswith("[WIP-BLOCKED] "), subject
+
+    kinds = [e["kind"] for e in events]
+    assert "checkpoint_unverified" in kinds, kinds
+    unverified_events = [e for e in events if e["kind"] == "checkpoint_unverified"]
+    assert any("REFUSED" in e.get("refusal", "") for e in unverified_events), unverified_events
+
+    assert "REFUSED" in done.blocker["evidence"], done.blocker["evidence"]
+    assert "NO resume commit" not in done.blocker["evidence"], done.blocker["evidence"]
 
 
 async def test_a_clean_park_returns_head_and_creates_no_commit(

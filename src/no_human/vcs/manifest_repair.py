@@ -224,6 +224,32 @@ def parse_manifest_refusal(text: str) -> list[str] | None:
     return _REFUSED_PIN_RE.findall(text) or None
 
 
+# Substrings this module raises when its OWN reactive repair could not
+# reconcile a refusal (`commit_with_manifest_repair`, below) — distinct from
+# the pre-commit gate's own refusal header, but still the export/manifest
+# gate declining a commit, not an unrelated hook failure.
+_REAPPROVE_FAILURE_MARKERS = (
+    "manifest re-approve failed",
+    "manifest re-approve timed out",
+)
+
+
+def is_gate_refusal(text: str) -> bool:
+    """True when *text* is the export/manifest gate declining a commit —
+    either the pre-commit gate's own refusal header, or this module's
+    re-approve failure raised when the repair could not reconcile it.
+
+    A checkpoint caller uses this to decide whether an unrepairable refusal
+    is safe to bypass for a `[WIP-*]` commit (the gate protects what SHIPS;
+    a WIP checkpoint ships nothing). Anything else — a merge conflict, a
+    permission error, an unrelated hook failure — returns False so those
+    keep failing the checkpoint exactly as before.
+    """
+    if _MANIFEST_REFUSAL_MARKER in text:
+        return True
+    return any(marker in text for marker in _REAPPROVE_FAILURE_MARKERS)
+
+
 def commit_with_manifest_repair(
     repo: GitRepo,
     paths: list[str] | None,

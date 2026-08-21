@@ -8,7 +8,11 @@ from pathlib import Path
 from . import github, gitlab
 from .approve_merge import LandResult, land_task
 from .git import CommitResult, GitError, GitRepo, ProtectedBranch, PushBehindRemote
-from .manifest_repair import commit_with_manifest_repair, parse_manifest_refusal
+from .manifest_repair import (
+    commit_with_manifest_repair,
+    is_gate_refusal,
+    parse_manifest_refusal,
+)
 from .outbound_scrub import scrub_outbound
 
 __all__ = [
@@ -21,6 +25,7 @@ __all__ = [
     "open_pr",
     "promote_draft_pr",
     "commit_with_manifest_repair",
+    "is_gate_refusal",
     "parse_manifest_refusal",
     "land_task",
     "LandResult",

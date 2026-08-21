@@ -106,6 +106,7 @@ from ..vcs import (
     ProtectedBranch,
     PushBehindRemote,
     commit_with_manifest_repair,
+    is_gate_refusal,
     open_pr,
     promote_draft_pr,
 )
@@ -1197,6 +1198,13 @@ class Orchestrator:
         # the persisted blocker's evidence — a `log.warning` alone is
         # invisible to the operator (criterion #4).
         self._last_checkpoint_error: str = ""
+        # Set by `_checkpoint_wip` alongside `_last_checkpoint_error`: "" on a
+        # clean commit (or no checkpoint at all), the gate's refusal text when
+        # the WIP was committed with the gate BYPASSED (an unrepairable
+        # export/manifest refusal on a `[WIP-*]` commit, which ships nothing).
+        # `_raise_blocker` reads this to add the caveat to the persisted
+        # blocker's evidence — the checkpoint succeeded, but unverified.
+        self._last_checkpoint_unverified: str = ""
 
     # ----------------------------- events ---------------------------------- #
 
@@ -7783,6 +7791,15 @@ class Orchestrator:
             sha = self._checkpoint_wip(repo, task)
             if sha:
                 blocker.resume_commit = sha
+                if self._last_checkpoint_unverified:
+                    # Committed, but the gate was bypassed to do it — the
+                    # refusal must reach the persisted blocker, not just the
+                    # `checkpoint_unverified` event stream.
+                    note = self._last_checkpoint_unverified
+                    blocker.evidence = (
+                        f"{blocker.evidence}\n\n--- Checkpoint ---\n{note}"
+                        if blocker.evidence else note
+                    )
             else:
                 # A lost checkpoint must reach the TASK, not just the log —
                 # `_checkpoint_wip` already emitted `checkpoint_failed` on
@@ -8015,6 +8032,19 @@ class Orchestrator:
         checkpoint that touches a pinned file must survive the gate's own
         refusal exactly like a real commit does, instead of being the one
         path that bypasses the seam and silently loses the work.
+
+        POLICY (checkpoint-is-a-safety-net, not a publish gate): the
+        pre-commit manifest/export gate protects what SHIPS. A `[WIP-*]`
+        checkpoint on a task branch ships nothing — review/approve re-run
+        the gate on the FINAL tree before anything can merge. So when the
+        repair seam still cannot reconcile an export/manifest gate refusal
+        (`is_gate_refusal`), the checkpoint commits the WIP anyway with the
+        gate bypassed (`GitRepo.commit_all(..., bypass_gate=True)`, which
+        itself refuses any message not starting `[WIP-`) and records the
+        refusal as `checkpoint_unverified` — committed but unverified —
+        instead of losing the work as `checkpoint_failed`. Anything else — an
+        unrelated hook failure, `ProtectedBranch`, or a failure in the bypass
+        commit itself — still falls through to the original loss path.
         """
         repaired: list[tuple[list[str], str]] = []
         try:
@@ -8040,13 +8070,44 @@ class Orchestrator:
                         )
                 self.emit("checkpoint", f"WIP-BLOCKED {commit.sha[:8]}")
                 self._last_checkpoint_error = ""
+                self._last_checkpoint_unverified = ""
                 return commit.sha
             self._last_checkpoint_error = ""
+            self._last_checkpoint_unverified = ""
             return repo.head_sha()
         except Exception as exc:  # noqa: BLE001 — checkpoint must never crash routing
+            if (isinstance(exc, GitError) and not isinstance(exc, ProtectedBranch)
+                    and is_gate_refusal(str(exc))):
+                refusal = str(exc).strip()[:800]
+                msg = f"[WIP-BLOCKED] {self._commit_message(task)}"
+                try:
+                    commit = repo.commit_all(msg, bypass_gate=True)
+                except Exception as exc2:  # noqa: BLE001 — still must not crash routing
+                    detail = (
+                        "WIP checkpoint failed: gate refused "
+                        f"({refusal}) and the bypass commit itself failed: "
+                        f"{str(exc2).strip()[:800]}"
+                    )
+                    log.warning("%s", detail)
+                    self._last_checkpoint_error = detail
+                    self._last_checkpoint_unverified = ""
+                    self.emit("checkpoint_failed", detail[:500])
+                    return ""
+                self._last_checkpoint_error = ""
+                self._last_checkpoint_unverified = (
+                    "WIP committed with the export/manifest gate bypassed "
+                    f"(--no-verify) — the gate refused: {refusal}"
+                )
+                self.emit(
+                    "checkpoint_unverified",
+                    f"WIP-BLOCKED {commit.sha[:8]} — gate refused: {refusal}"[:500],
+                    refusal=refusal,
+                )
+                return commit.sha
             detail = f"WIP checkpoint failed: {str(exc).strip()[:800]}"
             log.warning("%s", detail)
             self._last_checkpoint_error = detail
+            self._last_checkpoint_unverified = ""
             self.emit("checkpoint_failed", detail[:500])
             return ""
 

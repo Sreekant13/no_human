@@ -2,7 +2,76 @@
 
 import subprocess
 
-from no_human.vcs import GitRepo
+import pytest
+
+from no_human.vcs import GitError, GitRepo
+
+
+def _rev_count(path) -> str:
+    return subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=path,
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _git_repo(path) -> GitRepo:
+    """A minimal real repo with one commit, checked out on a non-protected
+    branch (`commit_all` refuses to commit on `main`/`master`/`release/*`) —
+    the shared fixture for the bypass_gate contract tests below.
+
+    The bootstrap commit is made via raw `git commit`, not `GitRepo.commit_all`:
+    on a brand-new repo HEAD is unborn (no commit yet), and `commit_all` calls
+    `current_branch()` (`git rev-parse --abbrev-ref HEAD`), which git itself
+    refuses to resolve before the first commit exists. Making that first
+    commit directly sidesteps the chicken-and-egg case; every commit after it
+    goes through the real `GitRepo` API being tested.
+    """
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    (path / "a.txt").write_text("1\n")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.name=no_human",
+         "-c", "user.email=no-human@acme.com", "commit", "-m", "init"],
+        check=True,
+    )
+    repo = GitRepo(path)
+    repo.create_branch("wip/git-test")
+    return repo
+
+
+def test_bypass_gate_is_refused_for_a_non_wip_commit_message(tmp_path):
+    """AC2: `bypass_gate` is the ONE contract that lets a commit skip the
+    pre-commit gate — it exists solely for a `[WIP-*]` checkpoint, which
+    ships nothing. Any other message must be refused, and refused BEFORE any
+    commit is created."""
+    repo = _git_repo(tmp_path)
+    before = _rev_count(tmp_path)
+
+    (tmp_path / "a.txt").write_text("2\n")
+    with pytest.raises(GitError):
+        repo.commit_all("feat: ship it", bypass_gate=True)
+
+    assert _rev_count(tmp_path) == before, (
+        "a refused bypass_gate call must not create a commit")
+
+
+def test_bypass_gate_skips_the_pre_commit_hook_only_for_wip(tmp_path):
+    """AC2: a real pre-commit hook that always refuses must still block the
+    normal (non-bypass) path — proving the hook is actually wired up — while
+    a `[WIP-*]` commit with `bypass_gate=True` skips it via `--no-verify`."""
+    repo = _git_repo(tmp_path)
+    hooks_dir = tmp_path / ".git" / "hooks"
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+
+    (tmp_path / "a.txt").write_text("3\n")
+    with pytest.raises(GitError):
+        repo.commit_all("feat: normal change")
+
+    (tmp_path / "a.txt").write_text("4\n")
+    commit = repo.commit_all("[WIP-BLOCKED] x", bypass_gate=True)
+    assert commit.sha, "the bypassed WIP commit must succeed despite the hook"
+    assert repo.head_sha() == commit.sha
+
 
 def test_default_branch_local_only_never_touches_the_network(tmp_path, monkeypatch):
     """PR-001's GUI half needs the default branch while a person types in the

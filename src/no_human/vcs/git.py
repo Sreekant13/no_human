@@ -37,6 +37,28 @@ class GitError(RuntimeError):
     pass
 
 
+# The one message class allowed to bypass the pre-commit gate: a WIP
+# checkpoint on a task branch, which ships nothing (review/approve re-run the
+# gate on the FINAL tree before anything merges). Anything else must still go
+# through the gate — this prefix is the entire contract.
+WIP_MESSAGE_PREFIX = "[WIP-"
+
+
+def _assert_wip_bypass(message: str) -> None:
+    """The gate bypass exists for ONE act: a WIP checkpoint on a task
+    branch, which ships nothing. Anything else must fail closed.
+
+    Checked against the RAW (unsanitized) message — sanitization only strips
+    AI-attribution trailers, which can neither create nor destroy a leading
+    ``[WIP-`` prefix, so asserting first keeps the check simple and honest.
+    """
+    if not message.startswith(WIP_MESSAGE_PREFIX):
+        raise GitError(
+            "bypass_gate is only permitted for a [WIP-* checkpoint commit; "
+            f"refusing message: {message[:120]!r}"
+        )
+
+
 #: Stderr signatures of git LOCK CONTENTION — another process (the coder's own
 #: git subprocess, an IDE, a parallel bench worker on the same volume) briefly
 #: holds a lock this invocation needs. Transient by definition, so the ONLY
@@ -436,14 +458,19 @@ class GitRepo:
             return dirs  # root commit: no HEAD^, so all of HEAD's dirs are new
         return {d for d in dirs if self._dir_absent_from_tree(d, "HEAD^")}
 
-    def commit_all(self, message: str) -> CommitResult:
+    def commit_all(self, message: str, *, bypass_gate: bool = False) -> CommitResult:
         branch = self.current_branch()
         if _branch_protected(branch, self.never_push_to):
             raise ProtectedBranch(
                 f"refusing to commit on protected branch: {branch}"
             )
+        if bypass_gate:
+            _assert_wip_bypass(message)
         self.stage_all()
-        self._run("commit", "-m", _sanitize_commit_message(message))
+        args = ["commit", "-m", _sanitize_commit_message(message)]
+        if bypass_gate:
+            args.append("--no-verify")
+        self._run(*args)
         return CommitResult(branch=branch, sha=self.head_sha(), **self._diffstat())
 
     # Code-only extensions safe to auto-stage for *untracked* files.
