@@ -1054,6 +1054,128 @@ async def test_the_review_gate_stamps_the_commit_it_judged(store, tmp_path):
         "PR will now say no review has run against its head")
 
 
+async def test_the_gate_prompt_names_the_same_sha_the_round_stamps(store, tmp_path):
+    """WIRING. `_run_review` must hand the reviewer the SAME sha it later
+    stamps onto `review_history` — otherwise the prompt and the record can
+    (and did) cite different commits. Remove `reviewed_sha=reviewed_sha,
+    reviewed_branch=reviewed_branch` from `_run_review`'s `_run_reviewer(...)`
+    call and this goes red at the first assertion with a KeyError."""
+    from .test_e2e_orchestrator import FakeBackend, _config
+    from no_human.review.reviewer import ReviewDecision as RD, _build_review_prompt
+    from no_human.review.selfcheck import ChecklistItem as CI
+
+    work = _repo_with_two_commits(tmp_path)
+    repo = GitRepo(work)
+
+    cfg = _config(tmp_path)
+    cfg.data["reviewer"]["allow_advisory"] = False
+    cfg.data.setdefault("tests", {})["command"] = "true"   # keep the gate cheap
+
+    captured = {}
+
+    class StubReviewer:
+        _on_event = None
+
+        async def review(self, task, **kw):
+            captured.update(kw)
+            return RD(passed=True, checklist=[CI("it holds", True, "evidence")])
+
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), reviewer=StubReviewer())
+    task = Task.new("t", repo_path=str(work))
+    await store.create_task(task)
+
+    await orch._run_review(task, repo, "attempt-1", base="main")
+
+    assert captured["reviewed_sha"] == repo.head_sha(), (
+        "the reviewer was never told which commit it was judging")
+
+    (round_1,) = task.context["review_history"]
+    assert round_1["sha"] == captured["reviewed_sha"], (
+        "the prompt and the stamped round cite different commits")
+
+    prompt = _build_review_prompt(
+        task, "diff", "", "",
+        reviewed_sha=captured["reviewed_sha"],
+        reviewed_branch=captured.get("reviewed_branch", ""),
+    )
+    head7 = repo.head_sha()[:7]
+    assert len(repo.head_sha()) >= 7
+    assert f"You are reviewing {head7}" in prompt
+
+
+async def test_the_already_satisfied_gate_prompt_names_the_same_sha_the_round_stamps(
+    store, tmp_path, bare_repo
+):
+    """WIRING — the already_satisfied twin of the test above.
+    `_gate_already_satisfied` builds NO diff (the claim is that HEAD already
+    satisfies every criterion), but it still resolves `reviewed_sha` once at
+    review start and stamps `commit_sha=reviewed_sha` on the round it PASSES
+    — the exact same contract `_run_review` upholds for a diff round. Before
+    this fix `_build_already_satisfied_prompt` accepted no
+    `reviewed_sha`/`reviewed_branch` params at all, so the round record cited
+    a commit the prompt never named. Remove `reviewed_sha=reviewed_sha,
+    reviewed_branch=reviewed_branch` from `_build_already_satisfied_prompt`'s
+    call inside `AdversarialReviewer.review()`'s `already_satisfied` branch
+    and this goes red at the final assertion."""
+    from no_human.review.reviewer import ReviewDecision as RD
+    from no_human.review.reviewer import _build_already_satisfied_prompt
+    from no_human.review.selfcheck import ChecklistItem as CI
+
+    from .test_e2e_orchestrator import _config
+
+    repo = GitRepo(bare_repo)
+
+    cfg = _config(tmp_path)
+    cfg.data["reviewer"]["allow_advisory"] = False
+
+    captured = {}
+
+    class StubReviewer:
+        _on_event = None
+
+        async def review(self, task, **kw):
+            captured.update(kw)
+            return RD(passed=True, checklist=[CI("it holds", True, "evidence")])
+
+    orch = Orchestrator(store, cfg.data, _Backend(),
+                        SlackNotifier(None), reviewer=StubReviewer())
+    task = Task.new("t", repo_path=str(bare_repo))
+    task.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    claim = (
+        "Verified every criterion against the existing code.\n"
+        "ALREADY-SATISFIED\n"
+        "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:4\n"
+    )
+
+    outcome = await orch._gate_already_satisfied(
+        task, repo, attempt_id, claim, branch="main",
+    )
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+
+    assert captured["reviewed_sha"] == repo.head_sha(), (
+        "the reviewer was never told which commit it was judging")
+
+    (round_1,) = task.context["review_history"]
+    assert round_1["sha"] == captured["reviewed_sha"], (
+        "the prompt and the stamped round cite different commits")
+
+    prompt = _build_already_satisfied_prompt(
+        task, claim,
+        reviewed_sha=captured["reviewed_sha"],
+        reviewed_branch=captured.get("reviewed_branch", ""),
+    )
+    head7 = repo.head_sha()[:7]
+    assert len(repo.head_sha()) >= 7
+    assert f"You are reviewing {head7}" in prompt, (
+        "_build_already_satisfied_prompt is not rendering the reviewed sha "
+        "even though the round it stamps cites one")
+
+
 async def test_a_reviewed_passing_pr_shows_its_review_evidence(store, tmp_path):
     """The consequence a human sees, driven through BOTH real call sites: the
     gate records the round, and the body renders it instead of disowning it."""

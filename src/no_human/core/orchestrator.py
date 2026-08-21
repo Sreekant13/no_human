@@ -7580,6 +7580,18 @@ class Orchestrator:
             "zero-diff ALREADY-SATISFIED claim — verifying every citation "
             "against the code",
         )
+        # Resolved ONCE, before the gate runs, and reused for the post-review
+        # stamp below (:7652) — the same string the reviewer chokepoint is
+        # handed is what `_append_review_history` records, so the two can
+        # never cite different commits (same contract as `_run_review`, C4).
+        try:
+            reviewed_sha = repo.head_sha()
+        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
+            reviewed_sha = ""
+        try:
+            reviewed_branch = repo.current_branch()
+        except Exception:  # noqa: BLE001 — advisory label only
+            reviewed_branch = ""
         advisory_pass = False
         if self.reviewer is None:
             if not (self.config.get("reviewer") or {}).get("allow_advisory", False):
@@ -7616,6 +7628,7 @@ class Orchestrator:
                 decision = await self._run_reviewer(
                     task, repo_path=repo.path, mode="already_satisfied",
                     claim_report=claim, profile_context=profile_ctx,
+                    reviewed_sha=reviewed_sha, reviewed_branch=reviewed_branch,
                 )
             except ReviewerUnavailable as exc:
                 # As above: the no-verdict rounds' spend rides on the exception.
@@ -7656,10 +7669,6 @@ class Orchestrator:
         # forever (f27f3b73). Fail closed: an unresolvable head stamps an empty
         # sha, which `_rounds_for_head` already skips, so the round stays
         # unmatched rather than lying about what it reviewed.
-        try:
-            reviewed_sha = repo.head_sha()
-        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
-            reviewed_sha = ""
         await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         await self.store.update_attempt(
             attempt_id, review_checklist=decision.as_dict(), review_passed=1,
@@ -9960,6 +9969,20 @@ class Orchestrator:
                 lr_before = "HEAD~1"
             linked_for_review.append((lp, lr_before))
 
+        # Resolve the head ONCE, before the gate runs: the same string is what the
+        # reviewer is told it is judging and what the round record stamps, so the
+        # prompt, `review_history` and the PR comment cannot cite different commits.
+        # (The review is read-only, so pre- and post-resolution are the same head;
+        # resolving first is what makes the two uses provably identical.)
+        try:
+            reviewed_sha = repo.head_sha() if repo is not None else ""
+        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
+            reviewed_sha = ""
+        try:
+            reviewed_branch = repo.current_branch() if repo is not None else ""
+        except Exception:  # noqa: BLE001 — advisory label only
+            reviewed_branch = ""
+
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
             # Single reviewer chokepoint; confirmed_rules is set inside it from
@@ -9978,6 +10001,8 @@ class Orchestrator:
                 # fails HONESTLY rather than impossibly.
                 draft_pr=draft_pr,
                 draft_pr_absent=draft_pr_absent,
+                reviewed_sha=reviewed_sha,
+                reviewed_branch=reviewed_branch,
             )
         except ReviewerUnavailable:
             # The gate could not run. Escalate (the caller's handler) rather than
@@ -9993,12 +10018,8 @@ class Orchestrator:
             )
 
         verdict = "PASS" if decision.passed else "FAIL"
-        # The head the reviewer just read — captured here, where the review ran,
-        # not re-resolved later when HEAD may have moved on (C4).
-        try:
-            reviewed_sha = repo.head_sha()
-        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
-            reviewed_sha = ""
+        # The head the reviewer was told it was reviewing — resolved before the
+        # gate ran (above), not re-resolved here where HEAD may have moved on (C4).
         await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         # The citation rule fired: hallucinated locations tried to block the
         # gate and were demoted. Loud on the board — this is the reviewer-FP

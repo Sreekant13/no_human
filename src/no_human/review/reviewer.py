@@ -791,6 +791,27 @@ def _build_angle_prompt(task: Task, diff: str, focus: str,
     )
 
 
+def _reviewed_target_section(reviewed_sha: str, reviewed_branch: str) -> str:
+    """Render the "You are reviewing <sha7>" header line shared by every gate
+    prompt builder. The verdict is scoped to a COMMIT — `_review_continuity`
+    already renders prior rounds as "round N [FAIL @ abc1234]", but nothing
+    told the reviewer which sha IT is judging; it had to infer "current" from
+    the diff/HEAD (or, for the already-satisfied path, from nothing at all).
+    Empty/whitespace sha ⇒ empty string ⇒ no line at all (fail-quiet, same
+    contract as `lint_section`/`pr_section`), so every existing caller that
+    does not pass these stays byte-identical.
+    """
+    sha7 = (reviewed_sha or "").strip()[:7]
+    if not sha7:
+        return ""
+    branch = (reviewed_branch or "").strip()
+    return (
+        f"You are reviewing {sha7}"
+        + (f" (branch {branch})" if branch else "")
+        + " — every verdict below is scoped to THIS commit.\n\n"
+    )
+
+
 def _build_review_prompt(
     task: Task,
     diff: str,
@@ -809,6 +830,8 @@ def _build_review_prompt(
     wiring_evidence: str = "",
     draft_pr: str = "",
     draft_pr_absent: str = "",
+    reviewed_sha: str = "",
+    reviewed_branch: str = "",
 ) -> str:
     # Bound the auxiliary sections AT THIS BOUNDARY (see `_AUX_CAP`). The diff,
     # the acceptance criteria and the test output are deliberately not routed
@@ -986,6 +1009,11 @@ def _build_review_prompt(
         if diff.count("\n") > 150 else ""
     )
 
+    # Placed in the volatile section (not the stable protocol prefix) because
+    # the sha changes every round — a per-round token in the stable prefix
+    # would invalidate the prompt cache for the whole thing (Phase 2a).
+    target_section = _reviewed_target_section(reviewed_sha, reviewed_branch)
+
     return (
         # ── stable prefix (review protocol, rules, output format) ──
         "You are a Staff Software Engineer performing an independent code review.\n"
@@ -1066,6 +1094,7 @@ def _build_review_prompt(
         f"{rules_section}"
         f"{continuity_section}\n"
         # ── volatile task-specific content ──
+        f"{target_section}"
         f"{pr_section}"
         f"Task: {task.title}\n"
         + request_section
@@ -1112,11 +1141,20 @@ def _build_already_satisfied_prompt(
     *,
     profile_context: str = "",
     confirmed_rules: str = "",
+    reviewed_sha: str = "",
+    reviewed_branch: str = "",
 ) -> str:
     """The implementer made ZERO edits and claims every acceptance criterion is
     already met by the existing code, citing file:line per criterion. The
     artifact under review is that claim — there is no diff. Same trust chain as
-    a code diff: the fresh-context reviewer verifies, or the claim dies."""
+    a code diff: the fresh-context reviewer verifies, or the claim dies.
+
+    `_gate_already_satisfied` stamps `commit_sha=reviewed_sha` on this round's
+    record even though there is no diff — HEAD is still the commit the claim
+    is judged against. Rendering the same header here (via
+    `_reviewed_target_section`, shared with `_build_review_prompt`) keeps the
+    round record and the prompt citing the same string on this path too."""
+    target_section = _reviewed_target_section(reviewed_sha, reviewed_branch)
     # Same boundary defence as `_build_review_prompt` (`_AUX_CAP`): this is the
     # OTHER prompt builder that takes these two, and leaving one of two covered
     # is how a bound quietly stops applying. `claim_report` keeps its own
@@ -1159,6 +1197,7 @@ def _build_already_satisfied_prompt(
         + _VERDICT_FORMAT_CLAIM
         + f"{profile_section}"
         f"{rules_section}\n"
+        f"{target_section}"
         f"Task: {task.title}\n"
         f"Acceptance criteria:\n{criteria}\n\n"
         "The implementer's ALREADY-SATISFIED claim (the artifact under review):\n"
@@ -2101,6 +2140,8 @@ class AdversarialReviewer:
         linked_repos: list[tuple[Path, str]] | None = None,
         tamper_findings: str = "",
         single_turn: bool = False,
+        reviewed_sha: str = "",
+        reviewed_branch: str = "",
     ) -> ReviewDecision:
         # Tamper-adjudication mode: the tamper guard fired and something has to
         # decide whether the TICKET required those test changes (see
@@ -2167,6 +2208,8 @@ class AdversarialReviewer:
                 task, claim_report,
                 profile_context=profile_context,
                 confirmed_rules=confirmed_rules,
+                reviewed_sha=reviewed_sha,
+                reviewed_branch=reviewed_branch,
             )
             return await self._agent_review(
                 prompt, repo_path, before_ref="HEAD", verify_citations=False)
@@ -2249,6 +2292,8 @@ class AdversarialReviewer:
             allow_tools=not diff_override and not route_single_turn,
             draft_pr=draft_pr,
             draft_pr_absent=draft_pr_absent,
+            reviewed_sha=reviewed_sha,
+            reviewed_branch=reviewed_branch,
         )
 
         # When the diff is already provided (or routed single-turn), use a

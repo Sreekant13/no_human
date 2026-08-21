@@ -88,6 +88,34 @@ def test_existing_continuity_rules_survive_verbatim():
     assert "New findings in code untouched by prior rounds are always fair." in prompt
 
 
+def test_prompt_names_the_sha_this_round_judges():
+    t = Task.new("x")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        reviewed_sha="abc1234def5678", reviewed_branch="feat/x",
+    )
+    assert "You are reviewing abc1234 (branch feat/x)" in prompt
+    assert "abc1234def5678" not in prompt
+    assert "abc1234def" not in prompt
+    assert prompt.index("You are reviewing abc1234") < prompt.index("Task: ")
+
+
+def test_prompt_omits_the_target_line_without_a_sha():
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    assert "You are reviewing" not in prompt
+
+
+def test_prompt_target_line_tolerates_a_missing_branch():
+    t = Task.new("x")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        reviewed_sha="abc1234def", reviewed_branch="",
+    )
+    assert "You are reviewing abc1234" in prompt
+    assert "(branch " not in prompt
+
+
 # ── orchestrator side ─────────────────────────────────────────────────────── #
 
 @pytest.fixture
