@@ -1809,6 +1809,47 @@ async def test_queue_health_endpoint_reports_quota_pause(client, store):
     assert body["stuck"] is False, "a quota wall is a deliberate pause, not a wedge"
 
 
+async def test_queue_health_endpoint_reports_infra_pause_without_profile(client, store):
+    """Independent review of PR #553 (2026-08-21): the infra breaker (3
+    consecutive zero-token/auth SDK failures) arms the same cooldown clock a
+    quota park does. The endpoint must read `sched.infra_cooldown_until` and
+    report `paused_reason == "infra"` with no profile attribution — even
+    though a stale, unrelated `paused_quota` row exists and would otherwise
+    be misattributed as the cause."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    from no_human.core.task import Task, TaskStatus
+
+    for i in range(7):
+        t = Task.new(f"queued-{i}", repo_path="/r")
+        await store.create_task(t)
+
+    # Stale, unrelated park — must NOT be blamed for the breaker trip.
+    parked = Task.new("parked one", repo_path="/r")
+    await store.create_task(parked)
+    await store.set_status(parked, TaskStatus.PAUSED_QUOTA, validate=False)
+    parked.blocker = {"auth_profile": "personal2"}
+    await store.update_task(parked)
+
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    fastapi_app.state.scheduler = SimpleNamespace(
+        inflight=set(), max_workers=4,
+        quota_cooldown_until=None, infra_cooldown_until=reset_at)
+    try:
+        r = await client.get("/api/queue/health")
+    finally:
+        del fastapi_app.state.scheduler
+
+    body = r.json()
+    assert body["paused"] is True
+    assert body["paused_reason"] == "infra"
+    assert body["paused_until"] == reset_at.isoformat()
+    assert body["paused_profile"] is None
+    assert body["stuck"] is False, "a breaker cooldown is a deliberate pause, not a wedge"
+
+
 async def test_board_query_is_not_n_plus_1(client, store, monkeypatch):
     """B2 #16: the board issued one attempts query PER TASK, every 2s, per
     socket. It must now use a single grouped query regardless of task count."""

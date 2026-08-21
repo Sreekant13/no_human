@@ -47,7 +47,7 @@ class QueueHealth:
     # the reset. Reporting `stuck: false, workers_busy: 0` with no other field
     # naming why is the defect this exists to close (2026-08-20 evidence).
     paused: bool = False
-    paused_reason: str | None = None   # "quota" | None
+    paused_reason: str | None = None   # "quota" | "infra" | None
     paused_until: str | None = None    # ISO, the wall's reset time
     paused_profile: str | None = None  # which auth profile hit the wall
 
@@ -95,7 +95,9 @@ async def _quota_profile(store: Any) -> str | None:
     ``paused_quota`` park's ``auth_profile`` stamp — the same field
     ``Scheduler.recover_quota_cooldown`` reads to attribute a remembered
     wall. No park, or one written before this field existed, reports
-    ``None`` rather than guessing."""
+    ``None`` rather than guessing. Quota-only: an infra-breaker cooldown
+    must never call this — a stale unrelated park would be misattributed
+    as the cause of an SDK/auth failure."""
     row = await store.query_one(
         "SELECT blocker FROM tasks WHERE status = 'paused_quota' "
         "AND blocker IS NOT NULL ORDER BY updated_at DESC LIMIT 1", ())
@@ -113,6 +115,7 @@ async def queue_health(
     store: Any, *, stuck_after_minutes: int = 30, window_minutes: int = 30,
     now: datetime | None = None, inflight_ids: Any = None, max_workers: int = 0,
     attempt_sample: int = 20, quota_cooldown_until: datetime | None = None,
+    infra_cooldown_until: datetime | None = None,
 ) -> QueueHealth:
     # `store.query`/`query_one`, never `store.db`. This runs on the board's
     # live store while the pool writes through the same connection, and an
@@ -163,16 +166,25 @@ async def queue_health(
         return h  # nothing owed → never stuck, ETA 0 is meaningless
 
     now_dt = now or datetime.now(timezone.utc)
-    if quota_cooldown_until is not None and quota_cooldown_until > now_dt:
-        # A pool-wide quota wall, not a wedge: workers are idle on purpose.
+    # Infra wins if both are somehow non-None (defence in depth — the
+    # scheduler guarantees only one clock is armed at a time).
+    cooldown, reason = None, None
+    if infra_cooldown_until is not None and infra_cooldown_until > now_dt:
+        cooldown, reason = infra_cooldown_until, "infra"
+    elif quota_cooldown_until is not None and quota_cooldown_until > now_dt:
+        cooldown, reason = quota_cooldown_until, "quota"
+    if cooldown is not None:
+        # A pool-wide cooldown, not a wedge: workers are idle on purpose.
         # `stuck` stays false — the reason nothing moves lives in the
         # `paused_*` fields instead, and the drain estimate is measured from
         # the reset (nothing can dispatch before then) rather than from now.
         h.paused = True
-        h.paused_reason = "quota"
-        h.paused_until = quota_cooldown_until.isoformat()
-        h.paused_profile = await _quota_profile(store)
-        resume_in = (quota_cooldown_until - now_dt).total_seconds()
+        h.paused_reason = reason
+        h.paused_until = cooldown.isoformat()
+        # A stale unrelated `paused_quota` row must never be blamed for an
+        # SDK/auth breaker trip — profile attribution is quota-only.
+        h.paused_profile = await _quota_profile(store) if reason == "quota" else None
+        resume_in = (cooldown - now_dt).total_seconds()
         if h.est_drain_seconds is not None:
             h.est_drain_seconds += resume_in
             h.eta_minutes = h.est_drain_seconds / 60.0

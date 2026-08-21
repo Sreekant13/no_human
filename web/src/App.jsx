@@ -1099,7 +1099,16 @@ export default function App() {
               wall — every field individually true, the picture false. A
               pause is deliberate, not a wedge (`stuck` stays false), so it
               gets its own line rather than piggybacking on the alarm. */}
-          {!queueHealth?.stuck && queueHealth?.paused && (
+          {!queueHealth?.stuck && queueHealth?.paused && queueHealth?.paused_reason === "infra" && (
+            <div className="nh-status-indicator" role="status"
+                 title="Pool-wide pause — repeated SDK/auth failures">
+              <div className="nh-ws-dot" />
+              <span className="nh-status-label">
+                Paused — SDK/auth failures, resumes {formatPausedUntil(queueHealth.paused_until)}
+              </span>
+            </div>
+          )}
+          {!queueHealth?.stuck && queueHealth?.paused && queueHealth?.paused_reason !== "infra" && (
             <div className="nh-status-indicator" role="status"
                  title={queueHealth.paused_profile ? `${queueHealth.paused_profile} profile hit its quota` : "Pool-wide quota cooldown"}>
               <div className="nh-ws-dot" />

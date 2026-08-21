@@ -61,6 +61,24 @@ test("quota pause wins over a missing paused_until (falls back to unknown time, 
   assert.equal(chip.text, "Paused — quota resets unknown time");
 });
 
+test("infra-breaker pause reports SDK/auth failures, not quota (independent review of PR #553, 2026-08-21)", () => {
+  // The infra breaker (3 consecutive zero-token/auth SDK failures) arms the
+  // same cooldown clock a quota park does; paused_reason distinguishes them
+  // so the chip never blames a profile for an SDK/auth outage.
+  const chip = drainChip({
+    workers_busy: 0,
+    max_workers: 4,
+    queue_depth: 7,
+    est_drain_seconds: 12600,
+    paused: true,
+    paused_reason: "infra",
+    paused_until: "2026-08-20T17:20:00+00:00",
+  });
+  assert.ok(chip.text.startsWith("Paused — SDK/auth failures, resumes "));
+  assert.ok(!chip.text.includes("quota"), "must not also claim it was quota");
+  assert.equal(chip.tone, "warn");
+});
+
 test("formatPausedUntil formats an ISO timestamp as local HH:MM, and never fabricates a time", () => {
   const formatted = formatPausedUntil("2026-08-20T17:20:00+00:00");
   assert.match(formatted, /^\d{2}:\d{2}$/);

@@ -212,6 +212,75 @@ async def test_quota_pause_reports_paused_state_with_eta_from_reset(store):
     assert h.eta_minutes == pytest.approx(h.est_drain_seconds / 60.0, rel=0.01)
 
 
+async def test_infra_breaker_cooldown_reports_paused_reason_infra_without_profile(store):
+    """Independent review of PR #553 (2026-08-21): the infra breaker arms the
+    SAME clock a quota park uses, so every cooldown was labelled "quota" and
+    attributed to whichever `paused_quota` row happened to be newest — even
+    an hours-old, unrelated park. An infra-breaker cooldown must report
+    `paused_reason == "infra"` and skip profile attribution entirely."""
+    for _ in range(7):
+        await _task(store, TaskStatus.PENDING)
+    done_task = await _task(store, TaskStatus.DONE)
+    await _attempt(store, done_task.id, duration_seconds=60)
+
+    # Stale, unrelated park — must NOT be blamed for the breaker trip.
+    parked = await _task(store, TaskStatus.PAUSED_QUOTA)
+    parked.blocker = {"auth_profile": "personal2"}
+    await store.update_task(parked)
+
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    h = await queue_health(store, max_workers=4, infra_cooldown_until=reset_at)
+
+    assert h.paused is True
+    assert h.paused_reason == "infra"
+    assert h.paused_profile is None
+    assert h.paused_until == reset_at.isoformat()
+    assert h.stuck is False
+
+    expected_normal_drain = 60.0 * 7 / 4
+    resume_in = (reset_at - datetime.now(timezone.utc)).total_seconds()
+    assert h.est_drain_seconds == pytest.approx(
+        expected_normal_drain + resume_in, abs=2)
+
+
+async def test_infra_cooldown_wins_when_both_clocks_are_set(store):
+    """Defence in depth: the scheduler guarantees only one clock is armed at
+    a time, but health.py must not silently prefer quota if both are somehow
+    non-None."""
+    await _task(store, TaskStatus.PENDING)
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    h = await queue_health(
+        store, max_workers=2,
+        infra_cooldown_until=reset_at, quota_cooldown_until=reset_at)
+    assert h.paused_reason == "infra"
+    assert h.paused_profile is None
+
+
+async def test_paused_pool_is_not_stuck_even_with_stale_tasks(store):
+    """Branch-order pin: the pause check must run BEFORE the stuck check, or
+    a pool idling on purpose behind a cooldown reports `stuck: true` next to
+    `paused: true` — a contradictory payload."""
+    for i in range(9):
+        await _task(store, TaskStatus.IMPLEMENTING, updated_min_ago=60)
+
+    cooldown_at = datetime.now(timezone.utc) + timedelta(minutes=20)
+    h = await queue_health(
+        store, max_workers=4, stuck_after_minutes=30,
+        quota_cooldown_until=cooldown_at)
+    assert h.stuck is False
+    assert h.stuck_reason == ""
+
+    h_infra = await queue_health(
+        store, max_workers=4, stuck_after_minutes=30,
+        infra_cooldown_until=cooldown_at)
+    assert h_infra.stuck is False
+    assert h_infra.stuck_reason == ""
+
+    h_unpaused = await queue_health(store, max_workers=4, stuck_after_minutes=30)
+    assert h_unpaused.stuck is True
+    assert h_unpaused.stuck_reason != ""
+
+
 async def test_expired_quota_cooldown_is_not_a_pause(store):
     """A cooldown timestamp already in the past must not report paused —
     the scheduler would have already resumed dispatch."""

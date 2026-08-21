@@ -258,6 +258,29 @@ async def test_quota_pause_gates_the_whole_pool(store):
     assert len(after) == 1                         # resumes once quota is back
 
 
+async def test_infra_breaker_cooldown_is_exposed_as_infra_not_quota(store):
+    """Independent review of PR #553 (2026-08-21): the infra breaker arms the
+    SAME `_quota_cooldown_until` clock a quota park uses, so the public
+    `quota_cooldown_until` property labelled every cooldown "quota" even
+    when it was really an SDK/auth breaker trip. `infra_cooldown_until` must
+    expose the breaker case, and `quota_cooldown_until` must go quiet while
+    it is the active cause — one clock, one kind flag, exactly one property
+    non-None at a time."""
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+    sched._quota_cooldown_until = now + timedelta(hours=1)
+    sched._infra_cooldown_active = True
+
+    assert sched.infra_cooldown_until == sched._quota_cooldown_until
+    assert sched.quota_cooldown_until is None
+    assert sched.health_snapshot()["infra_cooldown"] is True
+
+    sched._infra_cooldown_active = False
+    assert sched.infra_cooldown_until is None
+    assert sched.quota_cooldown_until == sched._quota_cooldown_until
+    assert sched.health_snapshot()["infra_cooldown"] is False
+
+
 @pytest.fixture
 def _infra_breaker():
     """The breaker is a process-wide singleton (`core/infra_breaker.py`) —

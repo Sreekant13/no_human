@@ -203,6 +203,24 @@ def _running_pool_stats(config) -> tuple[int | None, int, dict | None] | None:
         return None
 
 
+def _local_hhmm(iso: str | None) -> str:
+    """ISO timestamp -> local 24-hour `HH:MM`, mirroring `formatPausedUntil`
+    in `web/src/drainChip.js` so the CLI and the board print the same resume
+    time. A naive (no-tzinfo) ISO string is assumed UTC before converting to
+    local time. Unparseable or absent input returns "unknown time" — the
+    same words the board uses for the same case."""
+    from datetime import datetime, timezone
+    if not iso:
+        return "unknown time"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return "unknown time"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%H:%M")
+
+
 def _bootstrap(*, require_auth: bool = True):
     """Load config + enforce subscription mode. Returns (config, scrub_report)."""
     config = load_config()
@@ -3694,9 +3712,13 @@ def status(as_json):
             # a quota-paused pool prints WHY nothing is moving instead of a
             # bare `working 0/N` next to a ETA computed as if work were
             # flowing (2026-08-20 evidence: "not stuck, 0 busy, ETA 210 min").
-            if pause and pause.get("reason") == "quota":
+            if pause and pause.get("reason") == "infra":
+                until = _local_hhmm(pause.get("until"))
+                console.print(
+                    f"[magenta]paused[/] — SDK/auth failures, resumes {until}")
+            elif pause and pause.get("reason") == "quota":
                 who = f" ({pause['profile']} profile)" if pause.get("profile") else ""
-                until = pause.get("until") or "unknown"
+                until = _local_hhmm(pause.get("until"))
                 console.print(
                     f"[magenta]paused[/] — quota cooldown{who}, resumes {until}")
             # Printed only when there IS a residual (whole-ledger total, same

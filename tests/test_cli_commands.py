@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1243,7 +1244,43 @@ def test_status_prints_the_quota_pause_line_from_the_same_fields(tmp_path, monke
     assert "paused" in out, out
     assert "quota cooldown" in out, out
     assert "personal2 profile" in out, out
-    assert "2026-08-20T17:20:00+00:00" in out, out
+    # 2026-08-21 amendment: the resume time renders in the user's local
+    # 24-hour HH:MM (mirroring the board's formatPausedUntil()), not the raw
+    # UTC ISO string — computed here, not hardcoded, so the assertion holds
+    # under any machine's local timezone.
+    expected_hhmm = datetime.fromisoformat(
+        "2026-08-20T17:20:00+00:00").astimezone().strftime("%H:%M")
+    assert f"resumes {expected_hhmm}" in out, out
+    assert "2026-08-20T17:20:00+00:00" not in out, out
+
+
+def test_status_prints_infra_pause_line(tmp_path, monkeypatch):
+    """Independent review of PR #553 (2026-08-21): the infra breaker (3
+    consecutive zero-token/auth SDK failures) arms the same cooldown clock a
+    quota park does, so `nh status` must not blame a profile that had nothing
+    to do with it. `paused_reason: "infra"` must print an SDK/auth-specific
+    line with no profile mention, even though the stub still carries a
+    `paused_profile` (the field an infra cooldown must ignore)."""
+    db = tmp_path / "test.db"
+    for _ in range(7):
+        _seed_task(db, TaskStatus.PENDING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {
+        "max_workers": 4, "workers_busy": 0, "queue_depth": 7,
+        "paused": True, "paused_reason": "infra",
+        "paused_until": "2026-08-20T17:20:00+00:00",
+        "paused_profile": "personal2",
+    })
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "paused" in out, out
+    assert "SDK/auth failures" in out, out
+    expected_hhmm = datetime.fromisoformat(
+        "2026-08-20T17:20:00+00:00").astimezone().strftime("%H:%M")
+    assert f"resumes {expected_hhmm}" in out, out
+    assert "personal2" not in out, out
+    assert "quota" not in out, out
 
 
 def test_status_prints_no_pause_line_when_not_paused(tmp_path, monkeypatch):

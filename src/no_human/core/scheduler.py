@@ -476,9 +476,21 @@ class Scheduler:
 
     @property
     def quota_cooldown_until(self) -> datetime | None:
-        """The pool-wide quota wall's reset time, or None if not paused.
-        Read by `/api/queue/health` — the single clock, never re-derived."""
-        return self._quota_cooldown_until
+        """The pool-wide cooldown's reset time when the CURRENT cooldown was
+        armed by an ordinary quota park, or None if not paused or paused by
+        the infra breaker instead. One clock (`_quota_cooldown_until`), two
+        causes; this and `infra_cooldown_until` are never both non-None —
+        the reader names the cause by which property answers. Read by
+        `/api/queue/health` — the single clock, never re-derived."""
+        return None if self._infra_cooldown_active else self._quota_cooldown_until
+
+    @property
+    def infra_cooldown_until(self) -> datetime | None:
+        """The pool-wide cooldown's reset time when it was armed by the fleet
+        infra breaker (3 consecutive zero-token/auth SDK failures), else
+        None. Read by `/api/queue/health` to label the pause "infra" instead
+        of misattributing it to a stale quota park."""
+        return self._quota_cooldown_until if self._infra_cooldown_active else None
 
     def get_live_status(self, task_id: str) -> str | None:
         """Return the latest live status summary for a task, or None."""
@@ -1210,6 +1222,7 @@ class Scheduler:
             "last_status_write_error": self._last_status_write_error,
             "quota_cooldown_until": (self._quota_cooldown_until.isoformat()
                                      if self._quota_cooldown_until else None),
+            "infra_cooldown": self._infra_cooldown_active,
             "db": store_liveness,
         }
 
@@ -1436,6 +1449,7 @@ class Scheduler:
                 resets = _parse_iso(getattr(outcome.task, "wake_check_at", None))
                 if resets is not None:
                     self._quota_cooldown_until = resets
+                    self._infra_cooldown_active = False
                     self._quota_wall = resets
                     self._quota_wall_profile = active_auth_profile()
                     self._on_event("quota_pause",

@@ -48,9 +48,15 @@ export function drainChip({
   error = null,
   paused = false,
   paused_until = null,
+  paused_reason = null,
 } = {}) {
   if (error) return { text: "server unreachable", tone: "error" };
-  if (paused) return { text: `Paused — quota resets ${formatPausedUntil(paused_until)}`, tone: "warn" };
+  if (paused) {
+    const at = formatPausedUntil(paused_until);
+    return paused_reason === "infra"
+      ? { text: `Paused — SDK/auth failures, resumes ${at}`, tone: "warn" }
+      : { text: `Paused — quota resets ${at}`, tone: "warn" };
+  }
 
   const parts = [`${workers_busy}/${max_workers} workers busy`, `${queue_depth} queued`];
   if (queue_depth > 0) parts.push(formatDrainEta(est_drain_seconds));
