@@ -40,6 +40,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from .approve_merge import COUNT_DRIFT_RE, reconcile_commit_count_drift
 from .git import CommitResult, GitError, GitRepo, _branch_protected
 
 _logger = logging.getLogger(__name__)
@@ -274,10 +275,73 @@ def commit_with_manifest_repair(
                 f"manifest re-approve timed out after {_APPROVE_TIMEOUT_S}s"
             ) from exc
         if proc.returncode != 0:
+            reconciled, reconciled_note = _try_reconcile_count_drift(repo, proc.stderr)
+            if reconciled:
+                try:
+                    retry = subprocess.run(
+                        [sys.executable, str(guard), "approve", *pinned],
+                        cwd=repo.path, capture_output=True, text=True,
+                        timeout=_APPROVE_TIMEOUT_S,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise GitError(
+                        f"manifest re-approve timed out after {_APPROVE_TIMEOUT_S}s "
+                        "(after a count-drift reconciliation)"
+                    ) from exc
+                if retry.returncode == 0:
+                    if on_repair is not None:
+                        on_repair(
+                            list(pinned),
+                            f"count drift reconciled: {reconciled_note}; "
+                            + retry.stderr.strip(),
+                        )
+                    return _commit()
+                raise GitError(
+                    "manifest re-approve failed "
+                    f"({retry.returncode}) even after reconciling the attempt's own "
+                    f"count drift ({reconciled_note}): {retry.stderr.strip()[:500]}"
+                ) from exc
+            # The reconciler's refusal (when it ran) travels with the guard's:
+            # a human reading the failed attempt must see that the safety net
+            # ran and the arithmetic it declined on, not only the stale number.
+            why_not = (
+                f"; count-drift reconciliation declined: {reconciled_note}"
+                if reconciled_note else ""
+            )
             raise GitError(
                 "manifest re-approve failed "
-                f"({proc.returncode}): {proc.stderr.strip()[:500]}"
+                f"({proc.returncode}): {proc.stderr.strip()[:500]}{why_not}"
             ) from exc
         if on_repair is not None:
             on_repair(list(pinned), proc.stderr.strip())
         return _commit()
+
+
+def _try_reconcile_count_drift(
+        repo: GitRepo, refusal_text: str) -> tuple[bool, str | None]:
+    """When `export_guard.py approve`'s reactive re-scan refuses (2) with a
+    win-COUNT that drifted, and that drift is fully explained by THIS
+    ATTEMPT's own diff (one added/removed file, not a hand decision),
+    rewrite the declared count and return the reconciliation note.
+
+    Reuses `approve_merge.reconcile_commit_count_drift` — the same refusal
+    parser, in-place rewriter and staging step as the merge-time reconciler
+    (`reconcile_merge_count_drift`, PR #511) — for the commit-time
+    arithmetic: `real - declared == added - removed` in `git diff
+    --name-status HEAD`, not base+branch-ancestor arithmetic. ``HEAD`` is
+    this attempt's own base: this reactive path only runs while creating a
+    brand-new commit for the current round, so HEAD is the tip immediately
+    before the round's changes.
+
+    Returns ``(True, note)`` when the count was rewritten and staged.
+    Returns ``(False, None)`` when the refusal names no count drift at all
+    (nothing attempted), and ``(False, note)`` when the reconciler ran and
+    declined — an unexplained drift, a duplicated rule, a rule the diff
+    never touched, or any other hand decision — with ``note`` carrying its
+    arithmetic. The caller raises the guard's own refusal and appends that
+    note, so the failed attempt shows WHY the safety net did not apply.
+    """
+    if not COUNT_DRIFT_RE.search(refusal_text):
+        return False, None
+    ok, note = reconcile_commit_count_drift(Path(repo.path), "HEAD", refusal_text)
+    return (True, note) if ok else (False, note)

@@ -26,6 +26,7 @@ mocked one.
 """
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +36,11 @@ import pytest
 from no_human.blockers.wake import WakeWatcher
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
+from no_human.vcs import GitError, GitRepo, commit_with_manifest_repair
+from no_human.vcs import approve_merge
 from no_human.vcs import derived_conflict as dc
+from no_human.vcs.approve_merge import reconcile_commit_count_drift
+from tests.test_vcs import _HOOK_CHECK_SRC
 
 
 # ---------------------------------------------------------------------------
@@ -77,43 +82,60 @@ RELEASE_MANIFEST_NAME = "RELEASE_MANIFEST.txt"
 
 @dataclass
 class Rule:
-    verdict: str
+    # Field names/order mirror the REAL scripts/build_public_export.py Rule
+    # exactly (verb, declared, pattern, lineno) -- `approve_merge.
+    # reconcile_commit_count_drift` dynamically imports this module (or the
+    # real one) and reads those attribute names plus `Classification.wins`,
+    # so a test stub with different names would AttributeError instead of
+    # exercising the reconciler.
+    verb: str
+    declared: int | None
     pattern: str
-    count: int | None = None
+    lineno: int
 
 
 @dataclass
 class Classification:
     shipped: list = field(default_factory=list)
     dropped: list = field(default_factory=list)
+    unclassified: list = field(default_factory=list)
+    wins: dict = field(default_factory=dict)   # rule.lineno -> real count
 
 
 def parse_classification(text: str) -> list:
     rules = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        s = line.strip()
+        if not s or s.startswith("#"):
             continue
-        parts = line.split()
+        parts = s.split()
         if len(parts) < 2 or parts[0] not in ("ship", "drop"):
             continue
-        verdict = parts[0]
+        verb = parts[0]
         if len(parts) >= 3 and parts[1].isdigit():
-            rules.append(Rule(verdict=verdict, pattern=parts[2], count=int(parts[1])))
+            rules.append(Rule(verb=verb, declared=int(parts[1]), pattern=parts[2], lineno=lineno))
         else:
-            rules.append(Rule(verdict=verdict, pattern=parts[1]))
+            # Uncounted rule (no hand-maintained tally) -- declared is None
+            # and never checked/rewritten.
+            rules.append(Rule(verb=verb, declared=None, pattern=parts[1], lineno=lineno))
     return rules
 
 
 def classify(rules, paths):
-    shipped, dropped = [], []
+    out = Classification(wins={rule.lineno: 0 for rule in rules})
     for path in paths:
-        verdict = "drop"
+        winner = None
         for rule in rules:
             if fnmatch.fnmatch(path, rule.pattern):
-                verdict = rule.verdict
-        (shipped if verdict == "ship" else dropped).append(path)
-    return Classification(shipped=sorted(shipped), dropped=sorted(dropped))
+                winner = rule
+        if winner is None:
+            out.unclassified.append(path)
+            continue
+        out.wins[winner.lineno] += 1
+        (out.shipped if winner.verb == "ship" else out.dropped).append(path)
+    out.shipped.sort()
+    out.dropped.sort()
+    return out
 
 
 def check_counts(rules, paths) -> list:
@@ -121,22 +143,15 @@ def check_counts(rules, paths) -> list:
     matching rule wins" from `classify()`) and report every rule whose
     declared count doesn't match the tree. This never rewrites a count --
     there is no regenerator, by design (see module docstring)."""
-    winner_idx: dict = {}
-    for path in paths:
-        idx = None
-        for i, rule in enumerate(rules):
-            if fnmatch.fnmatch(path, rule.pattern):
-                idx = i
-        if idx is not None:
-            winner_idx[path] = idx
+    cls = classify(rules, paths)
     problems = []
-    for i, rule in enumerate(rules):
-        if rule.count is None:
+    for rule in rules:
+        if rule.declared is None:
             continue
-        actual = sum(1 for wi in winner_idx.values() if wi == i)
-        if actual != rule.count:
+        actual = cls.wins.get(rule.lineno, 0)
+        if actual != rule.declared:
             problems.append(
-                f"EXPORT_CLASSIFICATION.txt:{i + 1}: `{rule.verdict} {rule.count}  "
+                f"EXPORT_CLASSIFICATION.txt:{rule.lineno}: `{rule.verb} {rule.declared}  "
                 f"{rule.pattern}` actually wins {actual} file(s)."
             )
     return problems
@@ -208,14 +223,16 @@ def _cmd_approve(args) -> int:
     # that drifted refuses BEFORE any pin is written, rc 2.
     drift = builder.check_counts(_rules(root), _tracked(root))
     if drift:
-        sys.stdout.write("approve: REFUSED -- fix EXPORT_CLASSIFICATION.txt first -- "
+        # Real export_guard.py writes refusals to STDERR (manifest_repair.py's
+        # reactive path reads `proc.stderr` to find the count-drift message).
+        sys.stderr.write("approve: REFUSED -- fix EXPORT_CLASSIFICATION.txt first -- "
                          "approvals on top of a wrong classification pin the wrong review:\\n"
                          + "\\n".join(f"  {d}" for d in drift) + "\\n")
         return 2
     cls = _classification(root)
     bad = [p for p in args.paths if p not in cls.shipped]
     if bad:
-        sys.stdout.write(
+        sys.stderr.write(
             "approve: REFUSED -- not ship-classified (classify each in "
             f"{builder.CLASSIFICATION_NAME} first):\\n"
             + "\\n".join(f"  {p}" for p in bad) + "\\n"
@@ -1165,6 +1182,191 @@ def test_reconcile_refuses_without_a_merge_base(tmp_path):
     ok, note = reconcile(work, sha, "0" * 40,
                          "EXPORT_CLASSIFICATION.txt:2: `ship 1  src/base*.py` actually wins 2 file(s).")
     assert not ok and "no merge base" in note
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT-time reconciliation: an attempt's own diff moved a declared count.   #
+# `reconcile_commit_count_drift` shares its refusal parser, rewrite-only-the- #
+# number writer and "refuse with arithmetic" reporting with the merge-time    #
+# `reconcile_merge_count_drift` above -- only the arithmetic differs (base    #
+# diff adds/removes vs. base/branch/merge-base declared counts).              #
+# --------------------------------------------------------------------------- #
+
+
+def _commit_time_repo(tmp_path: Path) -> Path:
+    """`_repo` plus a REAL git pre-commit hook wired via `_HOOK_CHECK_SRC`
+    (the same stub `tests/test_vcs.py` uses for its realistic manifest gate),
+    so committing a pinned-file change without a matching manifest re-pin
+    takes the REACTIVE path in `commit_with_manifest_repair`: hook refusal ->
+    parse -> re-approve subprocess -> `_try_reconcile_count_drift` ->
+    `reconcile_commit_count_drift(repo, "HEAD", ...)` -> retry -> commit."""
+    work = _repo(tmp_path)
+    hook_py = work / ".git" / "hooks" / "_check_manifest.py"
+    hook_py.write_text(_HOOK_CHECK_SRC, encoding="utf-8")
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.write_text('#!/bin/sh\nexec python3 "$(dirname "$0")/_check_manifest.py"\n', encoding="utf-8")
+    hook.chmod(0o755)
+    return work
+
+
+def test_commit_time_count_drift_reconciles_and_the_attempt_proceeds(tmp_path):
+    """AC1 (positive repro): the attempt's diff adds exactly one drop-
+    classified `tests/*.py` file and leaves the declared count untouched.
+    Committing a pinned-file change triggers the real pre-commit hook's
+    refusal (staged content != pin), which forces the reactive path; that
+    path must reconcile the incidental `tests/**` count drift instead of
+    failing the whole attempt. RED on unfixed code (reconcile wiring removed
+    or stub schema mismatched): `commit_with_manifest_repair` raises
+    `GitError` with 'actually wins' instead of returning a commit sha."""
+    work = _commit_time_repo(tmp_path)
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y", never_push_to=[])
+    repo.create_branch("no-human/commit-time-drift", base="main")
+
+    # A normal coder edit to the already-pinned file (forces the hook to
+    # refuse: staged content no longer matches RELEASE_MANIFEST.txt's pin).
+    (work / "src" / "base.py").write_text("base\nchanged\n", encoding="utf-8")
+    # The incidental new test file: bumps the REAL drop-tests/** count from
+    # 1 to 2 without anyone touching EXPORT_CLASSIFICATION.txt.
+    (work / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+
+    repairs = []
+    result = commit_with_manifest_repair(
+        repo, ["src/base.py", "tests/test_y.py"], "fix: y",
+        on_repair=lambda paths, note: repairs.append((paths, note)),
+    )
+    assert result.sha, result
+    assert repairs, "on_repair was never called -- reconciliation did not run"
+    assert "count drift reconciled" in repairs[-1][1], repairs[-1]
+
+    cls_text = _git(work, "show", "HEAD:EXPORT_CLASSIFICATION.txt").stdout
+    assert "drop   2  tests/**" in cls_text, cls_text
+    changed = _git(work, "show", "--name-only", "--format=", "HEAD").stdout
+    assert "EXPORT_CLASSIFICATION.txt" in changed, changed
+
+
+def test_commit_time_unexplained_drift_fails_with_the_reconcilers_arithmetic(tmp_path):
+    """Refusal path, end to end: the drift at the named rule is +2 but the
+    attempt's own diff explains only one file of it, so the safety net must
+    DECLINE -- and the failed attempt must show that it ran and why
+    (the reconciler's arithmetic), not only the guard's stale number.
+    RED on the first cut, which computed the arithmetic and threw it away."""
+    work = _commit_time_repo(tmp_path)
+    # Pre-existing drift the attempt did not cause: a second tests/** file
+    # already on main with the declared count left at 1.
+    (work / "tests" / "test_pre.py").write_text("pre\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "pre-existing drift, not this attempt")
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y", never_push_to=[])
+    repo.create_branch("no-human/commit-time-unexplained", base="main")
+
+    (work / "src" / "base.py").write_text("base\nchanged\n", encoding="utf-8")
+    (work / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+    before = (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+
+    with pytest.raises(GitError) as err:
+        commit_with_manifest_repair(repo, ["src/base.py", "tests/test_y.py"], "fix: y")
+    msg = str(err.value)
+    assert "manifest re-approve failed" in msg, msg
+    assert "count-drift reconciliation declined" in msg, msg
+    assert "not explained by this attempt's own changes" in msg, msg
+    # Nothing was rewritten: the number is a hand decision here.
+    assert (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8") == before
+
+
+def test_reconcile_commit_count_drift_explains_an_added_file(tmp_path):
+    """AC (unit): a single added file the attempt's own diff introduced
+    fully explains a ship rule's 1 -> 2 drift."""
+    work = _repo(tmp_path)
+    base_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(work, "add", "src/base_two.py")
+    _git(work, "commit", "-qm", "add base_two.py, count not bumped")
+
+    ok, note = reconcile_commit_count_drift(
+        work, base_sha,
+        "EXPORT_CLASSIFICATION.txt:2: `ship 1  src/base*.py` actually wins 2 file(s).",
+    )
+    assert ok and "1 -> 2" in note, note
+    assert "ship   2  src/base*.py" in (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+
+
+def test_reconcile_commit_count_drift_explains_a_removed_file(tmp_path):
+    """AC (negative-shaped positive): a removed file reconciles to N-1."""
+    work = _repo(tmp_path)
+    base_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _git(work, "rm", "-q", "tests/test_x.py")
+    _git(work, "commit", "-qm", "remove tests/test_x.py, count not bumped")
+
+    ok, note = reconcile_commit_count_drift(
+        work, base_sha,
+        "EXPORT_CLASSIFICATION.txt:3: `drop 1  tests/**` actually wins 0 file(s).",
+    )
+    assert ok and "1 -> 0" in note, note
+    assert "drop   0  tests/**" in (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+
+
+def test_reconcile_commit_count_drift_refuses_unexplained_drift(tmp_path):
+    """AC (negative): drift is +2 at the named rule, but the attempt's own
+    diff (base_sha..worktree) only added ONE matching file -- one file of
+    drift predates the attempt and is not this reconciler's to explain.
+    Refuses exactly as today, with the unexplained amount named; no rewrite."""
+    work = _repo(tmp_path)
+    # Pre-existing drift the attempt did not cause.
+    (work / "tests" / "test_pre.py").write_text("pre\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "pre-existing drift, not this attempt")
+    base_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    (work / "tests" / "test_new.py").write_text("new\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "attempt adds one more drop file, count not bumped")
+
+    before = (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    ok, note = reconcile_commit_count_drift(
+        work, base_sha,
+        "EXPORT_CLASSIFICATION.txt:3: `drop 1  tests/**` actually wins 3 file(s).",
+    )
+    assert not ok and "not explained by this attempt's own changes" in note, note
+    assert (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8") == before
+
+
+def test_reconcile_commit_count_drift_ignores_a_non_matching_added_file(tmp_path):
+    """AC (negative): a drop-classified added file must not explain a SHIP
+    rule's drift -- the winner lookup (`cls.wins`), not mere presence in the
+    diff, decides which rule a path counts against."""
+    work = _repo(tmp_path)
+    (work / "src" / "base_extra.py").write_text("extra\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "pre-existing ship drift, not this attempt")
+    base_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    (work / "tests" / "test_new2.py").write_text("new2\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "attempt adds only a drop-classified file")
+
+    before = (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    ok, note = reconcile_commit_count_drift(
+        work, base_sha,
+        "EXPORT_CLASSIFICATION.txt:2: `ship 1  src/base*.py` actually wins 2 file(s).",
+    )
+    assert not ok and "not explained by this attempt's own changes" in note, note
+    assert (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8") == before
+
+
+def test_reconcile_commit_count_drift_reuses_the_merge_reconcilers_shared_code():
+    """The parser, number-writer and refusal reporting are the SAME code as
+    `reconcile_merge_count_drift` -- imported, not re-implemented -- and the
+    only win-count source is `cls.wins` (no second glob matcher)."""
+    src = inspect.getsource(approve_merge)
+    assert src.count("def _rewrite_declared_count(") == 1
+    assert src.count("def _write_classification_lines(") == 1
+    assert src.count("COUNT_DRIFT_RE = ") == 1
+
+    fn_src = inspect.getsource(reconcile_commit_count_drift)
+    assert "_rewrite_declared_count(" in fn_src
+    assert "_write_classification_lines(" in fn_src
+    assert "COUNT_DRIFT_RE" in fn_src
+    assert "fnmatch" not in fn_src, "a second glob matcher would defeat cls.wins as the single win-count source"
 
 
 # --------------------------------------------------------------------------- #

@@ -235,6 +235,48 @@ def _declared_counts(worktree_path: Path, sha: str) -> tuple[dict[tuple[str, str
     return out, dups
 
 
+def _rewrite_declared_count(lines: list[str], verb: str, pattern: str,
+                            declared: int, real: int) -> int:
+    """Rewrite ONE classification line's declared count to *real* in place,
+    preserving column alignment (counts are right-aligned, so a width change
+    is absorbed into the leading pad when there is room). Shared by every
+    reconciler in this module — this is the only place a count is ever
+    written, mechanical or not.
+
+    Returns the number of lines matched. The caller must treat anything
+    other than 1 as a refusal: 0 means the file does not say what the
+    refusal claims (nothing to rewrite — guessing is exactly what is
+    forbidden), and >1 means the pattern is ambiguous.
+    """
+    hits = 0
+    for i, line in enumerate(lines):
+        lm = _RULE_LINE_RE.match(line.strip())
+        if lm and (lm["verb"], lm["pattern"]) == (verb, pattern) and int(lm["count"]) == declared:
+            sp1 = lm["sp1"]
+            delta = len(str(real)) - len(str(declared))
+            if 0 < delta < len(sp1):
+                sp1 = sp1[delta:]
+            elif delta < 0:
+                sp1 = sp1 + " " * (-delta)
+            lines[i] = line.replace(f"{lm['verb']}{lm['sp1']}{declared}{lm['sp2']}",
+                                    f"{lm['verb']}{sp1}{real}{lm['sp2']}", 1)
+            hits += 1
+    return hits
+
+
+def _write_classification_lines(worktree_path: Path, lines: list[str]) -> tuple[bool, str]:
+    """Persist the rewritten classification lines and stage the file —
+    shared by every reconciler in this module so a rewritten count is always
+    staged the same way. Returns ``(True, "")`` on success, or ``(False,
+    <stderr>)`` if `git add` itself fails."""
+    path = worktree_path / CLASSIFICATION_NAME
+    path.write_text("".join(lines), encoding="utf-8")
+    add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
+    if add.returncode != 0:
+        return False, _cap(add.stderr)
+    return True, ""
+
+
 def reconcile_merge_count_drift(worktree_path: Path, base_ref: str, branch_ref: str,
                                 refusal_text: str) -> tuple[bool, str]:
     """Repair a win-COUNT that is stale ONLY because two reviewed counts met.
@@ -290,29 +332,139 @@ def reconcile_merge_count_drift(worktree_path: Path, base_ref: str, branch_ref: 
             return False, (f"rule `{m['verb']} {m['pattern']}`: real {real} != base {base[key]} "
                            f"+ (branch {branch[key]} - merge-base {anc[key]}) = {expected} — "
                            "not a mechanical merge of two reviewed counts")
-        hits = 0
-        for i, line in enumerate(lines):
-            lm = _RULE_LINE_RE.match(line.strip())
-            if lm and (lm["verb"], lm["pattern"]) == key and int(lm["count"]) == declared:
-                # keep the column: counts are right-aligned, so absorb a
-                # width change into the leading pad when there is room.
-                sp1 = lm["sp1"]
-                delta = len(str(real)) - len(str(declared))
-                if 0 < delta < len(sp1):
-                    sp1 = sp1[delta:]
-                elif delta < 0:
-                    sp1 = sp1 + " " * (-delta)
-                lines[i] = line.replace(f"{lm['verb']}{lm['sp1']}{declared}{lm['sp2']}",
-                                        f"{lm['verb']}{sp1}{real}{lm['sp2']}", 1)
-                hits += 1
+        hits = _rewrite_declared_count(lines, m["verb"], m["pattern"], declared, real)
         if hits != 1:
             return False, f"rule `{m['verb']} {m['pattern']}` matched {hits} line(s), expected 1"
         notes.append(f"{m['verb']} {m['pattern']}: {declared} -> {real} "
                      f"(base {base[key]} + branch {branch[key]} - merge-base {anc[key]})")
-    path.write_text("".join(lines), encoding="utf-8")
-    add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
-    if add.returncode != 0:
-        return False, _cap(add.stderr)
+    ok, err = _write_classification_lines(worktree_path, lines)
+    if not ok:
+        return False, err
+    return True, "; ".join(notes)
+
+
+def reconcile_commit_count_drift(worktree_path: Path, base_ref: str,
+                                 refusal_text: str) -> tuple[bool, str]:
+    """Repair a win-COUNT that is stale ONLY because THIS ATTEMPT's own diff
+    added or removed files a declared rule wins.
+
+    Sibling of `reconcile_merge_count_drift` for the commit-time case: there
+    is no merge here — one attempt, one base, one worktree — so the sound
+    condition is not base+branch-ancestor arithmetic but
+
+        real - declared == (files this attempt's diff ADDED under the rule)
+                          - (files this attempt's diff REMOVED under the rule)
+
+    computed from ``git diff --no-renames --name-status <base_ref>`` against
+    the worktree. Each changed path is resolved through
+    `build_public_export.classify`'s LAST-matching-rule winner (`cls.wins`)
+    — never a bare `rule.matcher()` check — because a later, more specific
+    `drop` rule for one file can override an earlier broad `ship` glob for
+    that same file (EXPORT_CLASSIFICATION.txt carries exactly this shape:
+    `ship tests/*.py` followed by individual `drop tests/test_*.py`
+    carve-outs), and only the winning rule may have its count moved.
+
+    A modified (not added/removed) file can never move a win-COUNT — the
+    file still wins (or still doesn't win) whatever rule it did before — so
+    the diff's ``M`` rows are ignored.
+
+    Shares `COUNT_DRIFT_RE` (the refusal parser), `_rewrite_declared_count`
+    (the writer) and `_write_classification_lines` (the persist/stage step)
+    with `reconcile_merge_count_drift` — the same refusal grammar, the same
+    in-place rewrite, the same staging, for a different arithmetic. Anything
+    the attempt's own diff does not explain still refuses, with the
+    arithmetic and the unexplained drift shown, exactly like the merge case.
+    """
+    drifts = list(COUNT_DRIFT_RE.finditer(refusal_text))
+    if not drifts:
+        return False, "no count drift in the refusal"
+
+    diff = _sh(["git", "diff", "--no-renames", "--name-status", base_ref],
+              cwd=worktree_path)
+    if diff.returncode != 0:
+        return False, f"could not diff against {base_ref}: {_cap(diff.stderr)}"
+
+    added_paths: list[str] = []
+    removed_paths: list[str] = []
+    for line in diff.stdout.splitlines():
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("A") and len(parts) >= 2:
+            added_paths.append(parts[-1])
+        elif status.startswith("D") and len(parts) >= 2:
+            removed_paths.append(parts[-1])
+        # M (modified) and anything else never moves a win-COUNT: the file
+        # already won (or didn't win) whatever rule it wins today.
+
+    builder = _load_export_builder(worktree_path)
+    if builder is None:
+        return False, f"could not load {CLASSIFICATION_NAME}'s rule engine"
+    cls_path = worktree_path / CLASSIFICATION_NAME
+    if not cls_path.exists():
+        return False, f"{CLASSIFICATION_NAME} missing"
+    try:
+        rules = builder.parse_classification(cls_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — surfaced as a refusal, not a crash
+        return False, f"could not parse {CLASSIFICATION_NAME}: {exc}"
+
+    rules_by_key: dict[tuple[str, str], object] = {}
+    dupes: set = set()
+    for rule in rules:
+        key = (rule.verb, rule.pattern)
+        if key in rules_by_key:
+            dupes.add(key)
+        rules_by_key[key] = rule
+
+    def _winner_lineno(path: str) -> int | None:
+        # `classify` is the ONE win-count source in this module (`cls.wins`)
+        # — reused per-path here instead of a second glob matcher, so a
+        # later carve-out rule always overrides an earlier broad one exactly
+        # as the real gate would score the whole tree.
+        c = builder.classify(rules, [path])
+        for lineno, count in c.wins.items():
+            if count:
+                return lineno
+        return None
+
+    added_winner = {p: _winner_lineno(p) for p in added_paths}
+    removed_winner = {p: _winner_lineno(p) for p in removed_paths}
+
+    lines = cls_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    notes: list[str] = []
+    for m in drifts:
+        key = (m["verb"], m["pattern"])
+        declared, real = int(m["declared"]), int(m["real"])
+        if key in dupes:
+            return False, (f"rule `{m['verb']} {m['pattern']}` appears more than "
+                           "once — ambiguous, a hand decision")
+        rule = rules_by_key.get(key)
+        if rule is None:
+            return False, (f"rule `{m['verb']} {m['pattern']}` is not present in "
+                           f"{CLASSIFICATION_NAME} — a hand decision, not diff arithmetic")
+        added_matching = sorted(p for p, ln in added_winner.items() if ln == rule.lineno)
+        removed_matching = sorted(p for p, ln in removed_winner.items() if ln == rule.lineno)
+        expected = declared + len(added_matching) - len(removed_matching)
+        if real != expected:
+            unexplained = real - expected
+            return False, (
+                f"rule `{m['verb']} {m['pattern']}`: real {real} != declared {declared} "
+                f"+ (added {len(added_matching)} - removed {len(removed_matching)} in this "
+                f"attempt's diff) = {expected} — {abs(unexplained)} file(s) of drift not "
+                "explained by this attempt's own changes"
+            )
+        hits = _rewrite_declared_count(lines, m["verb"], m["pattern"], declared, real)
+        if hits != 1:
+            return False, f"rule `{m['verb']} {m['pattern']}` matched {hits} line(s), expected 1"
+        notes.append(
+            f"{m['verb']} {m['pattern']}: {declared} -> {real} (added "
+            f"{len(added_matching)} - removed {len(removed_matching)} in this attempt's diff)"
+        )
+    ok, err = _write_classification_lines(worktree_path, lines)
+    if not ok:
+        return False, err
     return True, "; ".join(notes)
 
 
