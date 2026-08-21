@@ -4,7 +4,9 @@ scheduling logic is tested in isolation (the real run_task is covered elsewhere)
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import pathlib
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -65,6 +67,93 @@ async def _mk_tasks(store, n):
     return ids
 
 
+async def _wait_until(cond, *, timeout: float = 5.0, poll: float = 0.0):
+    """Poll ``cond()`` until it is truthy, instead of guessing how long some
+    scheduler-internal background step "usually" takes (the guesses are what
+    flaked this file twice — 2026-08-12 and 2026-08-20).
+
+    ``cond`` may be sync (return a bool) or async (return a coroutine that
+    resolves to a bool). It is re-evaluated on every event-loop tick
+    (``poll=0`` is a bare ``asyncio.sleep(0)`` yield, not a real delay), so a
+    passing run resolves the instant the real condition holds, independent of
+    machine speed or load. ``timeout`` is a safety net for a genuine hang,
+    never the synchronisation mechanism itself — it raises, so a stall shows
+    up as a clear failure instead of a flake.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        result = cond()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result:
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(f"condition not met within {timeout}s")
+        await asyncio.sleep(poll)
+
+
+async def _event_count_at_least(store, task_id: str, n: int) -> bool:
+    return len(await store.list_events(task_id)) >= n
+
+
+async def _has_event_kind(store, task_id: str, kind: str) -> bool:
+    return any(e["kind"] == kind for e in await store.list_events(task_id))
+
+
+def test_no_sleep_as_synchronisation_wait():
+    """Acceptance gate: every ``asyncio.sleep(...)`` call site in *this* file
+    is either gone (replaced by ``_wait_until`` on a real condition) or
+    explicitly allow-listed below by the name of its outermost enclosing
+    top-level function, with the reason recorded — not a silent exemption.
+    A blind sleep guessing how long scheduler-internal work "usually" takes
+    is exactly what flaked this file twice (2026-08-12, 2026-08-20)."""
+    ALLOWED: dict[str, str] = {
+        "_wait_until": (
+            "the shared poll primitive itself: sleeps 0s between re-checks "
+            "of a caller-supplied real condition (a bare event-loop tick), "
+            "never a guessed completion duration — the thing every other "
+            "site in this file used to do and no longer does."
+        ),
+    }
+
+    source = pathlib.Path(__file__).read_text()
+    tree = ast.parse(source, filename=__file__)
+
+    violations: list[str] = []
+    stack: list[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def _enter(self, node):
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+
+        def visit_FunctionDef(self, node):
+            self._enter(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self._enter(node)
+
+        def visit_Call(self, node):
+            func = node.func
+            if (isinstance(func, ast.Attribute) and func.attr == "sleep"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "asyncio"):
+                owner = stack[0] if stack else "<module>"
+                if owner not in ALLOWED:
+                    violations.append(f"{owner} (line {node.lineno})")
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    assert violations == [], (
+        "asyncio.sleep used as a sleep-as-synchronisation wait outside the "
+        f"allow-list: {violations}. Replace it with a deterministic "
+        "_wait_until(...) condition, or add it to ALLOWED above with a "
+        "reason if the wait is genuinely time-based."
+    )
+
+
 async def test_pool_cap_and_no_double_dispatch(store):
     hold = asyncio.Event()
     fake = FakeOrch(store, hold=hold)
@@ -80,13 +169,56 @@ async def test_pool_cap_and_no_double_dispatch(store):
     assert len(sched.inflight) == 2            # no double-dispatch
 
     hold.set()
-    await asyncio.sleep(0.05)                   # let the 2 finish
+    await sched.wait_idle()   # let the 2 finish
     assert len(sched.inflight) == 0
 
     started3 = await sched.tick()
     assert len(started3) == 1                   # the third task now runs
-    await asyncio.sleep(0.05)
+    await sched.wait_idle()
+
     assert fake.max_concurrent == 2             # never exceeded the cap
+
+
+async def test_wait_idle_timeout_leaves_the_live_runs_untouched(store):
+    """A waiter that gives up must not cancel what it was watching: the
+    first cut used wait_for(gather(...)), and a timed-out wait_for cancels
+    the gather, which cancels its children — the scheduler's live runs."""
+    hold = asyncio.Event()                      # never released: run stays live
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+    await _mk_tasks(store, 1)
+    await sched.tick()
+    (run,) = [t for t in sched._run_tasks.values()]
+
+    with pytest.raises(TimeoutError):
+        await sched.wait_idle(timeout=0.01)
+
+    assert not run.done() and not run.cancelled()
+    assert len(sched.inflight) == 1             # still running, still tracked
+    hold.set()
+    await sched.wait_idle()
+    assert run.done() and not run.cancelled()
+
+
+async def test_run_is_untracked_even_when_the_final_flush_raises(
+        store, monkeypatch):
+    """`_run_tasks.pop` sits after `persister.aclose()` in the finally; a
+    raising flush must not leave the finished run tracked for the
+    scheduler's lifetime."""
+    from no_human.core import events as events_mod
+
+    async def _boom(self):
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(events_mod.EventPersister, "aclose", _boom)
+    fake = FakeOrch(store)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+    await _mk_tasks(store, 1)
+    await sched.tick()
+    await sched.wait_idle()
+
+    assert sched._run_tasks == {}
+    assert len(sched.inflight) == 0
 
 
 async def test_inflight_task_not_reclaimed(store):
@@ -110,7 +242,8 @@ async def test_quota_pause_gates_the_whole_pool(store):
     await _mk_tasks(store, 1)
 
     await sched.tick(now=now)
-    await asyncio.sleep(0.05)                    # first task parks PAUSED_QUOTA
+    await sched.wait_idle()
+
     assert sched._quota_cooldown_until is not None
     # public property (consumed by /api/queue/health) mirrors the internal
     # cooldown clock exactly — no second clock, no drift between the two.
@@ -647,7 +780,6 @@ async def test_live_status_populated_via_sink(store):
                 "text": "Read test.py",
             })
             hold.set()
-            await asyncio.sleep(0.01)
             await store.set_status(task, TaskStatus.DONE, validate=False,
                                    event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
@@ -661,7 +793,7 @@ async def test_live_status_populated_via_sink(store):
     await hold.wait()
     assert sched.get_live_status(t.id) == "reading test.py"
 
-    await asyncio.sleep(0.05)  # let run finish
+    await sched.wait_idle()   # let run finish
     # After task finishes, live_status should be cleared.
     assert sched.get_live_status(t.id) is None
 
@@ -689,7 +821,7 @@ async def test_events_persisted_to_store_on_task_finish(store):
 
     await sched.tick()
     await hold.wait()
-    await asyncio.sleep(0.05)  # let the finally block's save_events land
+    await sched.wait_idle()  # let the finally block's save_events land
 
     persisted = await store.list_events(t.id)
     # 3, not 2: `set_status(..., DONE, event=...)` now persists its own
@@ -755,8 +887,10 @@ async def test_events_are_persisted_mid_run(store):
         async def run_task(self, task):
             for i in range(5):
                 self._sink({"kind": "tool_use", "tool_name": f"Read{i}"})
-            # Give the flusher a chance to run while we are still "in" the task.
-            await asyncio.sleep(0.05)
+            # Give the flusher a chance to run while we are still "in" the
+            # task — deterministic: poll the actual persisted rows instead of
+            # guessing how many 0.01s flush intervals five events need.
+            await _wait_until(lambda: _event_count_at_least(store, task.id, 5))
             mid_run_rows.append(len(await store.list_events(task.id)))
             await store.set_status(task, TaskStatus.DONE, validate=False,
                                    event={"source": "test", "kind": "test_seed"})
@@ -769,8 +903,8 @@ async def test_events_are_persisted_mid_run(store):
     await store.create_task(t)
 
     await sched.tick()
-    while sched.inflight:
-        await asyncio.sleep(0.01)
+    await sched.wait_idle()
+
 
     assert mid_run_rows == [5], "events must reach SQLite before the run ends"
     # 6, not 5: the final flush must not re-insert what was already written,
@@ -788,7 +922,12 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
         async def run_task(self, task):
             for i in range(3):
                 self._sink({"kind": "tool_use", "tool_name": f"Read{i}"})
-                await asyncio.sleep(0.03)   # several flush intervals elapse
+                # Wait for THIS event to actually land before emitting the
+                # next one, so the real flush cycle (interval 0.01s) runs
+                # several times across the loop instead of guessing how many
+                # 0.03s sleeps that takes.
+                await _wait_until(
+                    lambda i=i: _event_count_at_least(store, task.id, i + 1))
             await store.set_status(task, TaskStatus.DONE, validate=False,
                                    event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
@@ -799,8 +938,8 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
     await store.create_task(t)
 
     await sched.tick()
-    while sched.inflight:
-        await asyncio.sleep(0.01)
+    await sched.wait_idle()
+
 
     persisted = await store.list_events(t.id)
     # 4, not 3: `set_status(..., DONE, event=...)` persists its own
@@ -1399,7 +1538,8 @@ async def test_a_pool_crash_records_a_durable_reason(store):
     ids = await _mk_tasks(store, 1)
 
     await sched.tick()
-    await asyncio.sleep(0.05)
+    await sched.wait_idle()
+
 
     t = await store.find_task(ids[0])
     assert t.status is TaskStatus.FAILED, "the crash must still terminate the task"
@@ -1519,7 +1659,7 @@ async def test_until_empty_does_not_stop_while_a_task_is_still_running(store):
     run = asyncio.ensure_future(
         sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True))
 
-    await asyncio.sleep(0.2)
+    await _wait_until(lambda: bool(sched.inflight))
     assert not run.done(), "exited while a task was still in flight"
     assert not await sched.queue_is_drained()
 
@@ -1573,7 +1713,8 @@ async def test_a_task_left_unclaimed_by_a_full_pool_says_so_once(store):
     assert inflight_waits == [], "the inflight task got a wait event too"
 
     hold.set()
-    await asyncio.sleep(0.05)
+    await sched.wait_idle()
+
     resumed_started = await sched.tick()
     assert waiting_id in resumed_started
 
@@ -1607,7 +1748,8 @@ async def test_a_second_wait_after_running_gets_its_own_event(store):
 
     # The first task finishes and frees the slot.
     hold.set()
-    await asyncio.sleep(0.05)
+    await sched.wait_idle()
+
     freed = await sched.tick()
     assert waiting_id in freed
 
@@ -1668,15 +1810,12 @@ async def test_a_resumed_task_waiting_behind_a_running_task_says_so(store):
     assert await store.tasks_waiting_for_slot() == {resumed.id}
 
     hold.set()
-    await asyncio.sleep(0.05)
+    await sched.wait_idle()
+
     assert resumed.id in await sched.tick()
     # Dispatched: the worker's first event ends the wait on the record,
     # without any attempt_start. Wait for that observable, bounded.
-    for _ in range(200):
-        if any(e["kind"] == "repo_config"
-               for e in await store.list_events(resumed.id)):
-            break
-        await asyncio.sleep(0.01)
+    await _wait_until(lambda: _has_event_kind(store, resumed.id, "repo_config"))
     assert resumed.id not in await store.tasks_waiting_for_slot()
 
 

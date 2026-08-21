@@ -396,6 +396,14 @@ class Scheduler:
         # Distinct from `_inflight` (ids reserved synchronously at dispatch):
         # this holds the OBJECT, and only for the span of the await.
         self._running: dict[str, object] = {}
+        # The actual dispatched asyncio.Task per run, kept until `_run()`'s
+        # `finally` block fully unwinds (including the final event-flush
+        # teardown). Distinct from `_inflight`, which the finally block clears
+        # ONE STEP EARLIER, before `persister.aclose()` runs — so `not
+        # inflight` is not a safe "this run is truly done" signal. Test-only
+        # seam (`wait_idle()` below); nothing in the running process needs to
+        # await a sibling run's completion.
+        self._run_tasks: dict[str, asyncio.Task] = {}
         # How long `drain()` waits after a stop before the process exits with
         # attempts still running. A stop asks every session to unwind at its
         # next tool boundary, so the drain normally returns in seconds; the
@@ -444,6 +452,27 @@ class Scheduler:
     @property
     def inflight(self) -> set[str]:
         return set(self._inflight)
+
+    async def wait_idle(self, timeout: float = 5.0) -> None:
+        """Await every currently-tracked dispatched run to actually finish —
+        including its background event-flush teardown — not just the moment
+        `_inflight` empties (which fires one tick earlier, before the final
+        `EventPersister.aclose()` flush; a caller that only waited for that
+        can race the store's own teardown, e.g. seeing an intermittent
+        "Cannot operate on a closed database" failure). Test-only seam: no
+        production caller needs this, since nothing in the running process
+        blocks on a sibling task's flush."""
+        tasks = [t for t in self._run_tasks.values() if not t.done()]
+        if not tasks:
+            return
+        # `asyncio.wait`, not `wait_for(gather(...))`: a timed-out wait_for
+        # cancels the gather and the gather cancels its children — i.e. the
+        # scheduler's live `_run` tasks. A waiter that gives up must leave
+        # the runs it was watching untouched.
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            raise TimeoutError(
+                f"{len(pending)} dispatched run(s) still live after {timeout}s")
 
     @property
     def quota_cooldown_until(self) -> datetime | None:
@@ -1297,7 +1326,7 @@ class Scheduler:
                 if await self._shipped_before_dispatch(task):
                     continue                      # completed; no attempt starts
                 self._inflight.add(task.id)      # reserve BEFORE scheduling
-                asyncio.ensure_future(self._run(task))
+                self._run_tasks[task.id] = asyncio.ensure_future(self._run(task))
                 started.append(task.id)
             if started:
                 self._dispatched.update(started)
@@ -1484,7 +1513,11 @@ class Scheduler:
                 # The SSE endpoint checks inflight and closes after idle ticks.
 
             # Stop the periodic flusher, then write whatever it hasn't taken.
-            await persister.aclose()
+            # The run is untracked whether or not that flush raises.
+            try:
+                await persister.aclose()
+            finally:
+                self._run_tasks.pop(task.id, None)
 
     async def run_forever(
         self, *, stop: asyncio.Event, poll_interval: float = 10.0,
