@@ -951,6 +951,13 @@ async def test_open_conflicting_pr_with_content_absent_still_rebases(tmp_path, s
     starts exactly as before. Without this, the guard could be 'fixed' by
     always reporting shipped."""
     repo = _stale_local_base_repo(tmp_path, land=False)
+    # A forge CONFLICTING means main and the branch really do disagree: give
+    # main its own edit to a.txt so the local merge names a conflicting path
+    # (855f1263: an EMPTY local enumeration under a forge CONFLICTING is a
+    # stale-flag contradiction that now defers instead of opening a round).
+    (repo / "a.txt").write_text("main's own change\n")
+    _git(repo, "commit", "-am", "main: also change a.txt")
+    _git(repo, "push", "origin", "main:main")
     t = await _approval_task(store, repo)
     w = await _conflicting_watcher(store)
 
@@ -972,11 +979,18 @@ async def test_a_half_landed_branch_on_a_conflicting_pr_still_rebases(tmp_path, 
     _git(repo, "commit", "-m", "add old")
     _git(repo, "checkout", "-b", "feature")
     _git(repo, "mv", "old.py", "new.py")
-    _git(repo, "commit", "-m", "move old -> new")
+    # The real conflict lives ELSEWHERE (a.txt, edited on both sides) so the
+    # forge's CONFLICTING is backed by a locally conflicting path (855f1263)
+    # while the rename stays exactly half-landed: destination identical on
+    # both sides, source deletion forgotten on main.
+    (repo / "a.txt").write_text("feature's a\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "move old -> new; edit a.txt")
     _git(repo, "checkout", "main")
     (repo / "new.py").write_text("value = 1\n")
+    (repo / "a.txt").write_text("main's a\n")
     _git(repo, "add", "-A")
-    _git(repo, "commit", "-m", "add new, forget to delete old")
+    _git(repo, "commit", "-m", "add new, forget to delete old; edit a.txt")
 
     t = await _approval_task(store, repo)
     w = await _conflicting_watcher(store)

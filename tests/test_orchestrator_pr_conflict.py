@@ -1746,3 +1746,146 @@ async def test_reconcile_repins_a_shipped_classification_file(store, tmp_path, m
     assert "ship   3  src/base*.py" in (wt_check / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
     v = _verify(wt_check)
     assert v.returncode == 0, v.stdout + v.stderr   # the re-pinned classification verifies
+
+
+# ---------------------------------------------------------------------------
+# 855f1263: the forge says CONFLICTING, the local merge finds NO conflicting
+# path. An empty set is a contradiction, not a conflict — it must never open
+# a paid coder round.
+# ---------------------------------------------------------------------------
+
+def _clean_feature(tmp_path):
+    """A branch that merges cleanly into main (no overlap): the local
+    enumeration is EMPTY while the fixture's forge keeps saying DIRTY."""
+    work = _repo(tmp_path)
+    wt = tmp_path / "wt_feature"
+    _worktree(work, wt, "feature")
+    (wt / "src" / "feature_only.py").write_text("feature\n", encoding="utf-8")
+    _git(wt, "add", "src/feature_only.py")
+    _git(wt, "commit", "-qm", "feature adds its own file")
+    _push_branch(work, wt, "feature")
+    (work / "src" / "base.py").write_text("base\nmain change\n", encoding="utf-8")
+    _git(work, "commit", "-qam", "main edits base.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+    return work
+
+
+async def test_a_forge_conflict_with_no_local_conflicting_path_defers_instead_of_a_coder_round(
+        store, tmp_path, monkeypatch):
+    """2026-08-21 06:02Z, tasks 265a9e06 and b404b872: every landing moved
+    RELEASE_MANIFEST.txt, the forge flipped both open PRs to CONFLICTING, the
+    watcher's local merge (against refs it had already fetched past the
+    conflict) found nothing — and each task was resumed into a paid coder
+    round labelled "could not enumerate". RED on main: result == "resumed"."""
+    _use_stub_export_guard(monkeypatch)
+    work = _clean_feature(tmp_path)
+    assert await dc.conflicting_paths(str(work), "main", "feature") == set()
+
+    fetches = []
+    real_fetch = dc.fetch_conflict_refs
+
+    async def spy_fetch(repo_path, base, branch):
+        fetches.append((base, branch))
+        return await real_fetch(repo_path, base, branch)
+
+    monkeypatch.setattr(dc, "fetch_conflict_refs", spy_fetch)
+    events = []
+    resolver_calls = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events,
+                 derived_resolver=lambda *a, **k: resolver_calls.append((a, k)))
+
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/40", "DIRTY", branch="feature")
+
+    assert result == "deferred_pr_conflict", result
+    assert fetches == [("main", "feature")]      # it asked again on fresh refs
+    assert resolver_calls == []
+    kinds = [k for k, _ in events]
+    assert "pr_conflict_deferred" in kinds
+    assert "resumed" not in kinds and "pr_conflict" not in kinds
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL   # untouched
+    ctx = stored.context or {}
+    assert ctx.get("pr_conflict_rounds", 0) == 0, "a deferral is not a rebase round"
+    assert ctx.get("pr_conflict_stale_flags") == 1
+
+
+async def test_a_conflict_that_appears_after_the_fetch_opens_the_coder_round_as_today(
+        store, tmp_path, monkeypatch):
+    """The stale side was the watcher's refs: the first enumeration is empty,
+    the one after `git fetch` names a source path — exactly today's coder
+    round, with the recovery recorded."""
+    _use_stub_export_guard(monkeypatch)
+    work = _clean_feature(tmp_path)
+    real_paths = dc.conflicting_paths
+    calls = {"n": 0}
+
+    async def stale_then_fresh(repo_path, base, branch):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return set()
+        return {"src/base.py"}
+
+    monkeypatch.setattr(dc, "conflicting_paths", stale_then_fresh)
+    events = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events,
+                 derived_resolver=lambda *a, **k: None)
+
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/41", "DIRTY", branch="feature")
+
+    assert result == "resumed", result
+    kinds = [k for k, _ in events]
+    assert "pr_conflict" in kinds and "pr_conflict_deferred" not in kinds
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.IMPLEMENTING
+    assert "names 1 path(s)" in (stored.context or {}).get("pr_conflict_enumerate_error", "")
+    assert calls["n"] == 2
+    del real_paths
+
+
+async def test_persistent_forge_local_disagreement_escalates_with_both_facts(
+        store, tmp_path, monkeypatch):
+    """Bounded like the rebase rounds: after max_pr_conflict_rounds + 1
+    consecutive empty checks the watcher stops deferring and escalates,
+    naming both the forge's state and the local merge's — never a coder
+    round, never forever."""
+    _use_stub_export_guard(monkeypatch)
+    work = _clean_feature(tmp_path)
+    events = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events,
+                 derived_resolver=lambda *a, **k: None)
+    url = "https://code.example.com/dev/x/pull/42"
+
+    results = []
+    for _ in range(w.max_pr_conflict_rounds):
+        results.append(await w._check_pr_conflict(t, url, "DIRTY", branch="feature"))
+        t = await store.get_task(t.id)
+    assert results == ["deferred_pr_conflict"] * w.max_pr_conflict_rounds
+
+    final = await w._check_pr_conflict(t, url, "DIRTY", branch="feature")
+    assert final == "escalated_pr_conflict", final
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    assert "no conflicting path" in stored.blocker["evidence"]
+    assert "CONFLICTING" in stored.blocker["evidence"]
+    assert "resumed" not in [k for k, _ in events]
+
+
+async def test_a_definite_mergeable_clears_the_disagreement_streak(
+        store, tmp_path, monkeypatch):
+    _use_stub_export_guard(monkeypatch)
+    work = _clean_feature(tmp_path)
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=[], derived_resolver=lambda *a, **k: None)
+    await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/43", "DIRTY", branch="feature")
+    t = await store.get_task(t.id)
+    assert (t.context or {}).get("pr_conflict_stale_flags") == 1
+
+    w_ok = _watcher(store, mergeable="MERGEABLE", merge_state="CLEAN", events=[])
+    assert await w_ok._check_pr_conflict(t, "https://code.example.com/dev/x/pull/43", "CLEAN", branch="feature") is None
+    t = await store.get_task(t.id)
+    assert (t.context or {}).get("pr_conflict_stale_flags") == 0

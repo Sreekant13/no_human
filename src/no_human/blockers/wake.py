@@ -1575,9 +1575,10 @@ class WakeWatcher:
 
         if mergeable == "MERGEABLE":
             ctx = task.context or {}
-            if ctx.get("pr_conflict_rounds"):
+            if ctx.get("pr_conflict_rounds") or ctx.get("pr_conflict_stale_flags"):
                 task.context = await self.store.merge_context(
-                    task.id, {"pr_conflict_rounds": 0})
+                    task.id, {"pr_conflict_rounds": 0,
+                              "pr_conflict_stale_flags": 0})
             return None
         if mergeable != "CONFLICTING":
             # UNKNOWN, "", or anything else GitHub hasn't settled yet: no-op,
@@ -1692,6 +1693,100 @@ class WakeWatcher:
                     enumerate_error = (
                         f"{first_reason}; retry after git fetch "
                         f"(fetch_ok={fetched}) also failed: {retry_reason}")
+
+        # GitHub says CONFLICTING but the local three-way merge reports NO
+        # conflicting path: a contradiction, not a conflict. The usual cause
+        # is a stale side — the watcher's refs predate the push that made
+        # the forge flip (every landing moves RELEASE_MANIFEST.txt under
+        # every open PR), or the forge's asynchronous `mergeable` predates a
+        # fix already pushed. An EMPTY set is not something a coder can
+        # rebase against, and it used to fall through to a paid coder round
+        # labelled "could not enumerate" (task 855f1263: 2026-08-21, one
+        # round per open PR per landing). Fetch, ask again; if fresh refs
+        # still see nothing, defer to the next tick (the forge re-computes
+        # within seconds) — bounded like the rebase rounds, then escalate
+        # with both facts rather than guess.
+        stale_flags = 0
+        if (conflict_paths is not None and not conflict_paths
+                and not enumerate_error):
+            try:
+                fetched = await fetch_conflict_refs(
+                    task.repo_path, base_branch, branch_name)
+            except Exception as fexc:  # noqa: BLE001 — best-effort precondition
+                fetched = False
+                log.warning(
+                    "ref fetch before the empty-enumeration retry failed "
+                    "for %s: %s", task.id[:8], fexc)
+            try:
+                again = await conflicting_paths(
+                    task.repo_path, base_branch, branch_name)
+            except Exception as exc3:  # noqa: BLE001
+                again = None
+                enumerate_error = (
+                    "enumeration found no conflicting path although the forge "
+                    f"reports CONFLICTING; retry after git fetch (fetch_ok="
+                    f"{fetched}) failed: {exc3.__class__.__name__}: {exc3}")
+            else:
+                if again is None:
+                    enumerate_error = (
+                        "enumeration found no conflicting path although the "
+                        "forge reports CONFLICTING; retry after git fetch "
+                        f"(fetch_ok={fetched}) returned no result")
+            if again:
+                conflict_paths = again
+                recovered_error = (
+                    "first enumeration found no conflicting path; after git "
+                    f"fetch (fetch_ok={fetched}) it names "
+                    f"{len(again)} path(s)")
+            elif again is not None:
+                stale_flags = int(ctx.get("pr_conflict_stale_flags") or 0) + 1
+                # Not a round: nothing was dispatched. Give the increment
+                # above back so deferrals never count toward the rebase bound.
+                task.context = await self.store.merge_context(
+                    task.id, {"pr_conflict_stale_flags": stale_flags,
+                              "pr_conflict_rounds": rounds - 1})
+                if stale_flags > self.max_pr_conflict_rounds:
+                    if await self._is_terminal(task):
+                        return None
+                    data = task.blocker or {}
+                    data["category"] = "NOVEL_UNKNOWN"
+                    data["question"] = (
+                        f"PR {url} is reported CONFLICTING by the forge, but "
+                        f"a local merge of freshly fetched {base_branch} and "
+                        f"{branch_name} finds no conflicting path — "
+                        f"{stale_flags} consecutive checks disagree. Advise, "
+                        "or take over?")
+                    data["root_cause_hypothesis"] = (
+                        f"forge/local disagreement on PR conflict state: {url}")
+                    data["evidence"] = (
+                        f"gh pr view -> CONFLICTING / {merge_state or 'UNKNOWN'}; "
+                        f"git merge-tree after fetch (fetch_ok={fetched}) -> "
+                        f"no conflicting paths, {stale_flags} time(s) in a row")
+                    task.blocker = data
+                    await self.store.update_task_columns(task)
+                    await self.store.set_status(
+                        task, TaskStatus.ESCALATED, validate=False)
+                    await self._emit(
+                        task, "escalated_pr_conflict",
+                        f"{task.id[:8]} PR {url} CONFLICTING per the forge but "
+                        f"clean locally {stale_flags} checks in a row — no "
+                        "coder round opened",
+                    )
+                    return "escalated_pr_conflict"
+                await self._emit(
+                    task, "pr_conflict_deferred",
+                    f"{task.id[:8]} PR {url} CONFLICTING per the forge "
+                    f"(mergeStateStatus={merge_state or 'UNKNOWN'}) but a "
+                    f"local merge after git fetch (fetch_ok={fetched}) finds "
+                    f"no conflicting path — check {stale_flags}/"
+                    f"{self.max_pr_conflict_rounds + 1}; deferring to the next "
+                    "tick, no coder round opened",
+                )
+                return "deferred_pr_conflict"
+        if conflict_paths and ctx.get("pr_conflict_stale_flags"):
+            # A real conflict set ends the disagreement streak.
+            task.context = await self.store.merge_context(
+                task.id, {"pr_conflict_stale_flags": 0})
 
         if enumerate_error or recovered_error:
             task.context = await self.store.merge_context(
