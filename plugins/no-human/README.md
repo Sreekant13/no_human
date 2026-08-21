@@ -1,5 +1,21 @@
 # no_human plugin for Claude Code
 
+## Install
+
+This repository is its own plugin marketplace, so Claude Code can install the
+plugin straight from it:
+
+```
+/plugin marketplace add no-human-ai/no_human
+/plugin install no-human@no-human-ai
+```
+
+Nothing is registered by cloning or opening the repo — a marketplace exists for
+you only after you add it. The plugin needs no_human installed and running
+(`uv tool install no-human`, then `nh start`); the two tools talk to that local
+server and nothing else.
+
+
 Two MCP tools, so you can hand work to no_human without leaving Claude Code:
 
 | Tool | What it does |
@@ -17,20 +33,16 @@ localhost, the same trust domain as the board itself.
   see the [README](../../README.md#install)).
 - The server running: `nh start` (the desktop app starts it for you).
 
-## Install
-
-Load it straight from a checkout:
+## Develop against a checkout
 
 ```bash
 claude --plugin-dir ./plugins/no-human
 ```
 
-or add it to a marketplace as a `github` source with `path: plugins/no-human`
-(see Claude Code's plugin docs). The plugin lives in its own directory on
-purpose: a `.mcp.json` at the repository root would also be read as the
-project's own MCP config by anyone who opens this repo in Claude Code —
-including no_human's coder sessions working in this repo — and that is not what
-this is for.
+The plugin lives in its own directory on purpose: a `.mcp.json` at the
+repository root would also be read as the project's own MCP config by anyone who
+opens this repo in Claude Code — including no_human's coder sessions working in
+this repo — and that is not what this is for.
 
 ## The skill
 

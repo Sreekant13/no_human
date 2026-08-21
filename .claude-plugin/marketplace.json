@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "no-human-ai",
+  "description": "The no_human plugin for Claude Code: hand a task to your local no_human and check on it without leaving the session.",
+  "owner": {
+    "name": "eyalgolan",
+    "url": "https://getnohuman.com"
+  },
+  "plugins": [
+    {
+      "name": "no-human",
+      "source": "./plugins/no-human",
+      "displayName": "no_human",
+      "description": "File a task with no_human and check on it without leaving Claude Code: task_add and task_status over your local no_human server (127.0.0.1:8420). no_human plans, codes, tests and has the work reviewed by a second model, then opens the pull request and stops.",
+      "homepage": "https://getnohuman.com",
+      "repository": "https://github.com/no-human-ai/no_human",
+      "license": "MIT",
+      "category": "development",
+      "keywords": [
+        "mcp",
+        "coding-agent",
+        "pull-request",
+        "code-review",
+        "jira",
+        "linear",
+        "sdlc"
+      ],
+      "author": {
+        "name": "eyalgolan",
+        "url": "https://getnohuman.com"
+      }
+    }
+  ]
+}

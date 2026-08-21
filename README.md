@@ -139,9 +139,15 @@ Two tools, and no more:
 
 It talks to your own no_human at `http://127.0.0.1:8420` and nothing else: no
 auth, because that address is localhost, and no service of ours in between. For
-Claude Code, the same server ships as a plugin — point it at
-[`plugins/no-human/`](plugins/no-human/) and the two tools appear in your
-session.
+Claude Code, the same server ships as a plugin — this repository is its own
+plugin marketplace, so the two tools appear in your session after:
+
+```
+/plugin marketplace add no-human-ai/no_human
+/plugin install no-human@no-human-ai
+```
+
+Any other MCP client takes the usual stdio entry:
 
 ```jsonc
 // .mcp.json
