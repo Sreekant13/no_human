@@ -556,6 +556,18 @@ def _launch_shell(repo: str | None = None) -> int:
     return shell_mod.run_shell(config=config, repo_path=repo)
 
 
+def mark_machine_output() -> None:
+    """Declare that this command's stdout is machine-readable (JSON), so the
+    advisory update notice must stay silent — a notice appended to a JSON body
+    corrupts `nh … --json | jq`."""
+    try:
+        root = click.get_current_context().find_root()
+        if isinstance(root.obj, dict):
+            root.obj["machine_output"] = True
+    except Exception:  # noqa: BLE001 — advisory only
+        pass
+
+
 def _schedule_update_notice(ctx: click.Context) -> None:
     """Arrange for a one-line "newer version available" notice after the command.
 
@@ -577,7 +589,19 @@ def _schedule_update_notice(ctx: click.Context) -> None:
 
         def _print() -> None:
             try:
-                console.print(f"[yellow]{escape(notice)}[/]")
+                # Piped/redirected stdout: a log consumer or `| jq`, never the
+                # right audience for an advisory line, and printing it on
+                # stderr there still risks a machine-output command that
+                # writes JSON to stdout only (checked next) reading as
+                # corrupted by a caller that merges streams.
+                if not sys.stdout.isatty():
+                    return
+                # The command emitted (or was about to emit) JSON on stdout —
+                # `--json`/`--json-out` — so even on an interactive TTY the
+                # notice must not appear, since callers pipe interactively too.
+                if isinstance(ctx.obj, dict) and ctx.obj.get("machine_output"):
+                    return
+                click.echo(notice, err=True)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -618,7 +642,7 @@ def cli(ctx: click.Context, repo: str | None) -> None:
     # `nh shell --repo X` both read naturally — and the group-level one used to
     # be silently dropped the moment a subcommand followed it. Park it where
     # the subcommand can find it.
-    ctx.obj = {"repo": repo}
+    ctx.obj = {"repo": repo, "machine_output": False}
     # An update notice, printed AFTER the command's own output so it never
     # displaces what the operator ran nh for. `--version` is a click eager
     # option and has already exited by this point, so the fastest path stays
@@ -2251,6 +2275,8 @@ def memories_scan(apply_, as_json):
     ``needle-1``, ``needle-2``, ...) — the only form of this inventory safe to
     quote on a forge-visible surface (PR body, commit message). Class labels
     stay local to this console/JSON output and never leave the machine."""
+    if as_json:
+        mark_machine_output()
     config, _ = _bootstrap(require_auth=False)
 
     async def _go():
@@ -3587,6 +3613,8 @@ def serve(max_workers, until_empty):
 def status(as_json):
     """Show task counts by lane: queued (pending), running (in-flight stages),
     parked, and terminal. A quick portfolio read across all projects."""
+    if as_json:
+        mark_machine_output()
     config, _ = _bootstrap(require_auth=False)
 
     async def _go():
@@ -5310,6 +5338,9 @@ def history(days, output, analyze, json_out, roots):
         extract_transcripts,
         write_transcripts,
     )
+
+    if json_out:
+        mark_machine_output()
 
     # In --json-out mode stdout must be pure JSON (pipeable to jq); status
     # lines go to stderr instead.

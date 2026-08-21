@@ -110,9 +110,13 @@ Two independent halves, because they have different constraints.
 `src/no_human/updates.py`. On every `nh <subcommand>` invocation:
 
 1. Read `~/.no_human/cache/update-check.json`.
-2. If a newer version is cached, print one yellow line **after** the command's
-   own output. `nh --version` is a click eager option and exits first, so the
-   fastest path is untouched.
+2. If a newer version is cached, print one line **after** the command's own
+   output — on **stderr only**, and only when stdout is an interactive TTY.
+   It is suppressed entirely for machine output (`--json` / `--json-out`
+   commands mark themselves) and whenever stdout is piped, so scripts and
+   parsers never see it (it corrupted `--json` output and failed eight tests
+   the day 0.1.3 reached PyPI). `nh --version` is a click eager option and
+   exits first, so the fastest path is untouched.
 3. If the cache is older than 24 h, start a **daemon thread** to refresh it and
    return immediately. The notice always comes from the *previous* run's cache.
 

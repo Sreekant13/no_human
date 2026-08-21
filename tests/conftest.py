@@ -7,7 +7,11 @@ constants precisely so this file can zero them for every test — a test that
 WANTS to observe a delay can set it back explicitly.
 """
 
+import os
+
 import pytest
+
+from no_human.updates import DISABLE_ENV_VAR
 
 # Fail-CLOSED, not detect-after. `no_human.testing.pytest_isolated_home` is
 # meant to redirect HOME before `no_human.config` can bind DB_PATH/CONFIG_PATH
@@ -38,6 +42,16 @@ if _isolated_home.ISOLATED_HOME is None:
         "returned None), or NH_TEST_HOME_ISOLATION=0 was set on purpose. "
         "Fix the cause or run from the repo root; do not bypass this check."
     )
+
+# Hermetic: the update check must never depend on what PyPI holds. When
+# 0.1.3 published while branches still carried 0.1.2, the notice appended
+# after the JSON body of `nh status --json` and failed 8 tests across four
+# modules. Module scope (not an autouse fixture) is load-bearing: it also
+# covers tests that spawn `nh` as a subprocess, which inherits os.environ.
+# Imported by name rather than hardcoding the string so a rename cannot
+# silently un-guard the suite. tests/test_updates.py — the module that tests
+# the check itself — undoes this locally via its own autouse fixture.
+os.environ[DISABLE_ENV_VAR] = "1"
 
 
 @pytest.fixture(autouse=True)

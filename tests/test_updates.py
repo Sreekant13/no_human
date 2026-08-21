@@ -18,6 +18,16 @@ import pytest
 from no_human import updates
 
 
+@pytest.fixture(autouse=True)
+def _update_check_enabled_for_this_module(monkeypatch):
+    """conftest.py disables the check suite-wide (NH_NO_UPDATE_CHECK=1) so no
+    other module's assertions depend on what PyPI holds. This module is the
+    one that tests the check itself, so undo the suite-wide default here —
+    and only here; `monkeypatch` restores it after each test, so nothing
+    leaks into any other module."""
+    monkeypatch.delenv(updates.DISABLE_ENV_VAR, raising=False)
+
+
 # --------------------------------------------------------------------------- #
 # version comparison
 # --------------------------------------------------------------------------- #
