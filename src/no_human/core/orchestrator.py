@@ -8031,8 +8031,10 @@ class Orchestrator:
         lines: list[str] = []
         for rec in (ctx.get("review_history") or [])[-self._REVIEW_HISTORY_ROUNDS:]:
             verdict = "PASS" if rec.get("passed") else "FAIL"
+            sha = str(rec.get("sha") or "").strip()
+            stamp = f"{verdict} @ {sha[:7]}" if sha else verdict
             found = "; ".join(rec.get("blocking") or []) or "no blocking findings"
-            lines.append(f"  - round {rec.get('round', '?')} [{verdict}]: {found}")
+            lines.append(f"  - round {rec.get('round', '?')} [{stamp}]: {found}")
             for adv in (rec.get("advisory") or [])[:3]:
                 lines.append(f"      (advisory: {adv})")
         replies = [

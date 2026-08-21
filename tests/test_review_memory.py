@@ -51,6 +51,43 @@ def test_prompt_has_no_continuity_section_on_round_one():
     assert "REVIEW CONTINUITY" not in prompt
 
 
+def test_prompt_requires_the_diff_to_prove_a_fix():
+    t = Task.new("x")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        prior_rounds="  - round 1 [FAIL @ abc1234]: parser drift",
+    )
+    assert "claim, not evidence" in prompt
+    assert "ADDRESSED only when the CURRENT diff" in prompt
+
+
+def test_claims_clause_absent_without_prior_rounds():
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    assert "claim, not evidence" not in prompt
+
+
+def test_existing_continuity_rules_survive_verbatim():
+    t = Task.new("x")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        prior_rounds="  - round 1 [FAIL @ abc1234]: parser drift",
+    )
+    assert (
+        "Do NOT re-litigate a finding a prior round raised and the coder\n"
+        "    addressed"
+    ) in prompt
+    assert (
+        "do NOT reverse a prior round's request, unless you\n"
+        "    cite NEW evidence (file:line)"
+    ) in prompt
+    assert (
+        "Operator answers above are binding. A scope question they settle\n"
+        "    is settled — it is not a finding of any severity."
+    ) in prompt
+    assert "New findings in code untouched by prior rounds are always fair." in prompt
+
+
 # ── orchestrator side ─────────────────────────────────────────────────────── #
 
 @pytest.fixture
@@ -74,6 +111,42 @@ async def test_history_accumulates_and_feeds_the_next_round(store):
     assert "round 1 [FAIL]: image pinning" in text
     assert "round 2 [FAIL]: comment pagination" in text
     assert "(advisory: naming)" in text
+
+
+async def test_continuity_renders_the_round_sha(store):
+    t = Task.new("ci_gate", repo_path="/tmp/x")
+    await store.create_task(t)
+    o = _orch(store)
+
+    await o._append_review_history(
+        t, _decision(False, blocking=["image pinning"]), commit_sha="abc1234def5678")
+
+    text = o._review_continuity(t)
+    assert "round 1 [FAIL @ abc1234]:" in text
+    assert "abc1234def5678" not in text
+
+
+async def test_continuity_tolerates_a_record_without_a_sha(store):
+    t = Task.new("ci_gate", repo_path="/tmp/x")
+    await store.create_task(t)
+    o = _orch(store)
+
+    await o._append_review_history(t, _decision(False, blocking=["image pinning"]))
+    ctx = t.context or {}
+    history = list(ctx.get("review_history") or [])
+    history.append({
+        "round": len(history) + 1,
+        "passed": False,
+        "blocking": ["comment pagination"],
+        "advisory": [],
+    })
+    ctx["review_history"] = history
+    t.context = ctx
+
+    text = o._review_continuity(t)
+    assert "round 1 [FAIL]: image pinning" in text
+    assert "round 2 [FAIL]: comment pagination" in text
+    assert "@" not in text
 
 
 async def test_operator_answers_are_injected_as_binding(store):

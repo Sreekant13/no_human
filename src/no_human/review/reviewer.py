@@ -889,6 +889,11 @@ def _build_review_prompt(
         "  - Operator answers above are binding. A scope question they settle\n"
         "    is settled — it is not a finding of any severity.\n"
         "  - New findings in code untouched by prior rounds are always fair.\n"
+        "  - A prior finding counts as ADDRESSED only when the CURRENT diff\n"
+        "    demonstrably resolves it. The coder's assertion that it is fixed is a\n"
+        "    claim, not evidence — verify it in the diff before treating it as\n"
+        "    settled. This narrows what counts as addressed; it does NOT reopen a\n"
+        "    scope question an operator answer settled.\n"
         if prior_rounds else ""
     )
     # Prompt ordering: STABLE protocol first → VOLATILE task/diff last (Phase 2a).
