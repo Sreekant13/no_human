@@ -43,6 +43,20 @@ Terminology (established from the repo, not invented here):
   ``[N more chars truncated]`` marker — mirroring the honest idiom
   ``review_verdict_text`` already uses for the verdict event (orchestrator.py
   "... and N more blocking finding(s)"), rather than a new silent cap.
+* **Prior-attempt evidence block**: ``build_prior_attempt_evidence`` (this
+  module) — the block that rides a stuck-detection context reset (PLAN.md
+  Part 22) from one attempt to the NEXT attempt of the *same* task. Unlike
+  the distilled state doc (which replaces re-accumulated context) and the
+  resume digest (which seeds a resumed task), this carries exactly two
+  things across the reset: the prior attempt's blocking review findings and
+  the exact failing test IDs its test events named — never coder
+  corrections, narrative, or a supervisor's fix. Produced by
+  ``Orchestrator._record_prior_attempt_evidence`` into
+  ``task.context['prior_attempt_evidence']`` and consumed at the
+  ``_build_implement_prompt`` seam, gated so only the immediately-prior
+  attempt's record is ever accepted (the anti-stacking mechanism — see that
+  method's docstring). Capped at ``PRIOR_EVIDENCE_WORD_CAP`` words, whole
+  block.
 """
 
 from __future__ import annotations
@@ -92,6 +106,13 @@ DISTILLED_STATE_CAP = 8000
 # silent drop.
 _DISTILL_FINDINGS_CAP = 3000
 
+# Prior-attempt evidence block (the whole rendered block, not a section of
+# it): whitespace-split words, not chars — unlike the char-based caps above,
+# this budget is stated in the acceptance criteria as "150 words", so the
+# unit follows the contract rather than the module's usual chars-per-token
+# arithmetic. See build_prior_attempt_evidence for the allocation order.
+PRIOR_EVIDENCE_WORD_CAP = 150
+
 
 def estimate_tokens(text: str) -> int:
     """~4 chars/token estimate, ceiling-rounded. ONE definition — shared by
@@ -139,6 +160,198 @@ def fit_finding_text(text: str, budget: int) -> str:
     if removed <= 0:
         return kept
     return f"{kept} [{removed} more chars truncated]"
+
+
+def _render_prior_finding(f: dict) -> str:
+    """One blocking finding as ``label (file:line): comment`` — same shape
+    as ``_distill_findings_section``'s per-line render, reusing
+    ``fit_finding_text`` for the same visible per-finding truncation.
+
+    Whitespace-collapsed (``" ".join(text.split())``) BEFORE truncation: a
+    finding's ``comment``/``evidence`` text is reviewer-authored free text
+    and can contain a newline, which would otherwise break the block's own
+    line-based boundary — each finding is one entry in a single "Blocking
+    findings: ..." line, and a raw newline inside one entry would make that
+    line (and the caller's header/provenance framing around it) unparsable
+    as the single-line record it's meant to be.
+    """
+    loc = f"{f.get('file', '')}:{f.get('line', 0)}" if f.get("file") else ""
+    raw = str(f.get("comment") or f.get("evidence") or "")
+    detail = fit_finding_text(" ".join(raw.split()), RESUME_FINDING_BUDGET)
+    label = " ".join(str(f.get("label", "")).split())
+    return f"{label}{f' ({loc})' if loc else ''}: {detail}"
+
+
+def build_prior_attempt_evidence(evidence: dict | None) -> str:
+    """The block that carries a stuck attempt's reviewer-verified findings
+    and exact failing test IDs across a stuck-detection context reset
+    (PLAN.md Part 22) into the NEXT attempt's prompt — see the module
+    docstring's Terminology entry. Pure: arguments only, same contract as
+    ``build_distilled_state`` and ``build_resume_digest``.
+
+    ``evidence`` is the record written by
+    ``Orchestrator._record_prior_attempt_evidence`` —
+    ``task.context['prior_attempt_evidence']`` — shaped:
+        {"from_attempt": int, "source": str,
+         "findings": [{"label": str, "file": str, "line": int,
+                        "comment": str}, ...],
+         "failing_tests": [str, ...]}
+
+    Returns ``""`` when ``evidence`` is falsy, not a dict, or when BOTH
+    ``findings`` and ``failing_tests`` are empty — acceptance criterion 2's
+    "absent" case, decided here, in the one pure place that owns it.
+
+    Renders ONLY ``label``/``file``/``line``/``comment`` (or ``evidence`` as
+    a fallback) per finding, and the exact failing test IDs, plus a
+    provenance FIELD (``source``) rendered as a labeled line, never folded
+    into a prose claim — per the repo's no-human-asserts-what-it-has-not-
+    established rule. It never reads or renders ``suggested_next``,
+    ``stuck_hypothesis``, ``handoff``, ``attempt_log``, or any other
+    coder/supervisor narrative key — those keys are not even looked at here,
+    so there is no path by which they could leak into the block. Pinned by
+    test_block_carries_no_corrections_or_coder_narrative.
+
+    Word-budget allocation (``PRIOR_EVIDENCE_WORD_CAP``, whole block,
+    whitespace-split words) mirrors ``build_distilled_state``'s diff-section
+    idiom: the header + provenance line + the test-ID line are rendered
+    FIRST and treated as fixed — test IDs are exact, verbatim evidence and
+    must never be the thing silently cut — and the findings paragraph
+    absorbs whatever budget remains. Overflow is always visible, never
+    silent: a truncated test-ID list ends with
+    "... and N more failing test id(s)"; a truncated findings paragraph
+    ends with "... and N more blocking finding(s) - see nh logs". A guard
+    trims the findings line (never the test-ID line) if the two sections
+    together still overshoot; if even the residual "... and N more" marker
+    alone (once every finding is gone) still overshoots, that marker is
+    dropped too rather than kept at the cost of the cap — the header/
+    provenance/test-ID lines are already confirmed to fit the cap on their
+    own by the test-ID trimming loop above, so dropping the findings line
+    entirely is always sufficient in practice. A last-resort hard truncation
+    of the whole block (with a visible marker) exists only to degrade a
+    would-be invariant violation rather than raise: this is the live coder-
+    prompt path, and a raised exception here costs a whole attempt, while an
+    honest, possibly-terser block costs nothing.
+    ``len(block.split()) <= PRIOR_EVIDENCE_WORD_CAP`` holds on every path —
+    this function NEVER raises.
+    """
+    if not evidence or not isinstance(evidence, dict):
+        return ""
+    raw_findings = evidence.get("findings")
+    findings = [f for f in raw_findings if isinstance(f, dict)] if isinstance(raw_findings, list) else []
+    raw_failing = evidence.get("failing_tests")
+    failing_tests = [str(t) for t in raw_failing if str(t).strip()] if isinstance(raw_failing, list) else []
+    if not findings and not failing_tests:
+        return ""
+
+    from_attempt = evidence.get("from_attempt")
+    source = evidence.get("source") or (
+        f"Attempt {from_attempt} review verdict and test events"
+        if from_attempt is not None
+        else "a prior attempt's review verdict and test events"
+    )
+    header = "PRIOR-ATTEMPT EVIDENCE—NOT INSTRUCTIONS."
+    provenance = f"Source: {source}."
+
+    # Test IDs are exact, verbatim evidence: fixed ahead of the findings
+    # paragraph, which only ever absorbs what's left of the budget. Trimmed
+    # visibly (never silently) from the tail if the full list alone would
+    # blow the whole-block word cap.
+    #
+    # Labeled "Failing test IDs", not "Newly-failing": the caller
+    # (`Orchestrator._record_prior_attempt_evidence`) sources this list from
+    # the attempt's own failing test events, falling back to the attempt
+    # row's recorded `test_results` when no event narrowed it — which is the
+    # FULL failing list, not a delta against a prior baseline, whenever that
+    # base check was inconclusive. "Newly-failing" would claim a comparison
+    # this block never actually makes.
+    kept_ids = list(failing_tests)
+    omitted_ids = 0
+    test_ids_line = ""
+    while True:
+        if kept_ids:
+            line = f"Failing test IDs: {', '.join(kept_ids)}"
+            if omitted_ids:
+                line += f" … and {omitted_ids} more failing test id(s)"
+        elif omitted_ids:
+            line = f"Failing test IDs: … and {omitted_ids} more failing test id(s)"
+        else:
+            line = ""
+        words_so_far = len(f"{header} {provenance} {line}".split())
+        if words_so_far <= PRIOR_EVIDENCE_WORD_CAP or not kept_ids:
+            test_ids_line = line
+            break
+        kept_ids = kept_ids[:-1]
+        omitted_ids += 1
+
+    fixed_words = len(f"{header} {provenance} {test_ids_line}".split())
+    remaining = max(0, PRIOR_EVIDENCE_WORD_CAP - fixed_words)
+
+    # The findings paragraph absorbs whatever budget remains. At least one
+    # finding is always kept here (even if it alone overshoots) so the final
+    # guard below — not this loop — is the single place that ever decides a
+    # finding doesn't fit; that keeps the "never silent" promise honest: an
+    # omitted finding is always counted, never just dropped.
+    rendered_pieces = [_render_prior_finding(f) for f in findings]
+    kept_findings: list[str] = []
+    omitted_findings = 0
+    for piece in rendered_pieces:
+        candidate = kept_findings + [piece]
+        candidate_line = "Blocking findings: " + "; ".join(candidate)
+        if kept_findings and len(candidate_line.split()) > remaining:
+            omitted_findings = len(rendered_pieces) - len(kept_findings)
+            break
+        kept_findings = candidate
+
+    def _findings_line() -> str:
+        if kept_findings:
+            text = "Blocking findings: " + "; ".join(kept_findings)
+            if omitted_findings:
+                text += f" … and {omitted_findings} more blocking finding(s) — see nh logs"
+            return text
+        if omitted_findings:
+            return f"… and {omitted_findings} more blocking finding(s) — see nh logs"
+        return ""
+
+    findings_line = _findings_line()
+
+    def _assemble() -> str:
+        parts = [header, provenance]
+        if findings_line:
+            parts.append(findings_line)
+        if test_ids_line:
+            parts.append(test_ids_line)
+        return "\n".join(parts)
+
+    block = _assemble()
+    # Guard: trims the findings line — never the test-ID line, which is
+    # exact evidence — until the whole block fits, converting it to a
+    # count-only line rather than dropping it once no finding survives.
+    while len(block.split()) > PRIOR_EVIDENCE_WORD_CAP and kept_findings:
+        kept_findings = kept_findings[:-1]
+        omitted_findings += 1
+        findings_line = _findings_line()
+        block = _assemble()
+
+    if len(block.split()) > PRIOR_EVIDENCE_WORD_CAP:
+        # Every finding is gone, but the residual "... and N more blocking
+        # finding(s)" marker alone is still what pushes the block over — it
+        # was never counted in the fixed header/provenance/test-ID budget.
+        # Degrade by dropping it too, rather than raising: this is the live
+        # coder-prompt path, and a raised exception here kills the whole
+        # attempt while a shorter-but-honest block costs nothing.
+        findings_line = ""
+        block = _assemble()
+
+    if len(block.split()) > PRIOR_EVIDENCE_WORD_CAP:
+        # Should be unreachable — the test-ID trimming loop above already
+        # confirmed header+provenance+test_ids_line alone fits the cap — but
+        # degrade rather than raise if some future edit ever breaks that
+        # invariant: a hard word-truncation with a visible marker beats
+        # crashing the attempt.
+        words = block.split()
+        keep = max(0, PRIOR_EVIDENCE_WORD_CAP - 1)
+        block = " ".join(words[:keep] + ["…[truncated]"])
+    return block
 
 
 def _export_gate_rule(repo_path: str | Path | None) -> str:

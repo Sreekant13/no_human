@@ -79,6 +79,7 @@ from ..review.reviewer import (
     AdversarialReviewer,
     ReviewDecision,
     ReviewerUnavailable,
+    findings_from_checklist,
 )
 from ..review.selfcheck import ChecklistItem
 from ..testing import ownership, runner
@@ -92,6 +93,7 @@ from .prompt_blocks import (
     build_intake_qa_block,
     build_memories_block,
     build_playbook_block,
+    build_prior_attempt_evidence,
     build_profile_block,
     build_repo_hints_block,
     build_resume_digest,
@@ -2759,7 +2761,11 @@ class Orchestrator:
             ctx = task.context or {}
             had_state = ctx.pop("distilled_state", None) is not None
             had_attempt = ctx.pop("distilled_state_attempt", None) is not None
-            if had_state or had_attempt:
+            # Same defect class as distilled_state above: a resumed attempt 1
+            # must not inherit a PRIOR run's prior-attempt evidence either —
+            # it belongs to an attempt that no longer exists in this run.
+            had_evidence = ctx.pop("prior_attempt_evidence", None) is not None
+            if had_state or had_attempt or had_evidence:
                 task.context = ctx
                 await self.store.update_task(task)
                 self.emit(
@@ -3378,6 +3384,17 @@ class Orchestrator:
             await self._record_and_lookup_fix_pair(
                 task, outcome.detail or "unknown")
 
+            # Prior-attempt evidence (this task): distill THIS attempt's
+            # reviewer-verified blocking findings and exact failing test IDs
+            # into context so the NEXT attempt's prompt carries them across
+            # the stuck-detection context reset — as evidence, never as an
+            # instruction. The reset itself (fresh session, no stacked
+            # corrections) is unchanged; this only widens what rides across
+            # it. Best-effort, same posture as the fix-pair ledger above.
+            await self._record_prior_attempt_evidence(
+                task, attempt_n,
+                attempt_id=getattr(self, "_active_attempt_id", None))
+
             # A3: an attempt that edits nothing leaves the repo byte-identical, so
             # a third try re-runs the same agent against the same state and gets
             # the same answer — d9d458b5 burned 54 turns proving it. One retry (it
@@ -3754,6 +3771,15 @@ class Orchestrator:
         # `_agent_sink` stamps this on every `cache_burn` event so a reader
         # can tell which attempt a live (not-yet-persisted) figure belongs to.
         self._active_attempt_number = attempt_seq
+        # Unique row id for THIS attempt, distinct from `attempt_seq` above.
+        # `attempt_seq`/`attempt_number` is task-lifetime and can repeat or
+        # go out of order across a `nh reply` resume (see
+        # `Store.latest_open_attempt`'s docstring — duplicate 1s, a lower
+        # number written after a higher one); `attempt_id` is the row's
+        # primary key and is never ambiguous. `_record_prior_attempt_evidence`
+        # uses this to find the row it just wrote, instead of guessing by
+        # number.
+        self._active_attempt_id = attempt_id
         # B3: (repo, commit, command) -> TestRunResult, for this attempt only.
         # Never spans attempts: attempt N+1 has a different commit anyway, and a
         # stale entry feeding the review gate would be a false pass. The key also
@@ -13746,6 +13772,23 @@ class Orchestrator:
         )
         if distilled:
             digest = ""
+        # Prior-attempt evidence (this task): the same fail-closed shape as
+        # the distilled-state guard above, but with a DIFFERENT lineage rule
+        # — this record is stamped by the attempt that PRODUCED it
+        # (`_record_prior_attempt_evidence`), so only the immediately-prior
+        # attempt's record is trusted (`from_attempt == attempt_n - 1`), not
+        # `== attempt_n` as distilled_state uses. That mismatch guard IS the
+        # anti-stacking mechanism: only one attempt's evidence can ever be in
+        # the prompt at once, and each producer run overwrites the single
+        # key, so corrections never accumulate across a reset. An unknown
+        # attempt_n, a missing/malformed stamp, or any older stamp ⇒ "".
+        _prior_evidence = (task.context or {}).get("prior_attempt_evidence") or {}
+        prior_evidence_block = (
+            build_prior_attempt_evidence(_prior_evidence) + "\n\n"
+            if (_prior_evidence and attempt_n is not None and attempt_n >= 2
+                and _prior_evidence.get("from_attempt") == attempt_n - 1)
+            else ""
+        )
         # Multi-repo context (Phase D / WS-E).
         from .multi_repo import cross_repo_context
         multi_ctx = cross_repo_context(task, task.repo_path or "")
@@ -13950,6 +13993,11 @@ class Orchestrator:
             "map_chars": len(map_block),
             "digest_chars": len(digest),
             "distilled_chars": len(distilled),
+            # Measured, not assumed — and deliberately NOT folded into
+            # reaccumulated_chars/tokens below: this block is single-attempt
+            # evidence, not re-accumulated retry cost, so mixing it into that
+            # ratio would understate the saving distilled_state measures.
+            "prior_evidence_chars": len(prior_evidence_block),
         }
         breakdown["reaccumulated_chars"] = (
             breakdown["map_chars"] + breakdown["digest_chars"]
@@ -13989,6 +14037,7 @@ class Orchestrator:
             + blocker_prompt_suffix()
             + "\n\n"
             # ── volatile task-specific content ──
+            + f"{prior_evidence_block}"
             + f"{zero_diff_preamble}"
             + f"{debug_preamble}"
             + f"{staleness_preamble}"
@@ -14236,6 +14285,205 @@ class Orchestrator:
             await self.store.update_task(task)
         except Exception as exc:  # noqa: BLE001
             self._advisory(f"fix-pair ledger failed: {exc}")
+
+    @staticmethod
+    def _find_attempt_row(
+        rows: list[dict], attempt_n: int, attempt_id: str | None,
+    ) -> dict | None:
+        """Locate the row for THIS attempt, unambiguously when possible.
+
+        ``attempt_number`` is a task-lifetime counter (every creation site
+        computes ``len(list_attempts)+1``) while ``attempt_n`` is the bounded
+        loop's local counter, which resets to 1 on every `nh reply` resume —
+        so matching by number alone can hand back a PRIOR run's row on a
+        resumed task (see `Store.latest_open_attempt`'s docstring: duplicate
+        attempt_number 1s, a lower number written after a higher one — ties
+        and out-of-order numbers are real in production, not hypothetical).
+
+        When the caller supplies the row's own unique ``id`` (the normal
+        case — `_run_attempt` stamps `self._active_attempt_id` the moment it
+        creates the row), match on that and nothing else: if no row has that
+        id, the row is gone/unreadable and this returns None rather than
+        silently falling back to the ambiguous number match, which would
+        reintroduce the same bug it exists to close. The number-based match
+        is kept ONLY for callers that predate `attempt_id` (none in this
+        codebase — kept for defensive back-compat, not exercised in the
+        normal path).
+        """
+        if attempt_id is not None:
+            return next((r for r in rows if r.get("id") == attempt_id), None)
+        return next(
+            (r for r in rows if r.get("attempt_number") == attempt_n), None
+        )
+
+    async def _record_prior_attempt_evidence(
+        self, task: Task, attempt_n: int, *, attempt_id: str | None = None,
+    ) -> None:
+        """Distill THIS just-failed attempt's reviewer-verified findings and
+        exact failing test IDs into ``task.context['prior_attempt_evidence']``
+        so the next attempt's prompt can carry them across the stuck-
+        detection context reset (PLAN.md Part 22) — as evidence, never as an
+        instruction. Same posture as `_record_and_lookup_fix_pair` immediately
+        above (a method, not an inline block, so the seam is testable), and
+        the same fail-open discipline as `_check_attempt_startup_floor`: a
+        locked db or a malformed row must degrade to "no evidence", never
+        crash a retryable attempt.
+
+        ``attempt_id`` is the row's own unique id (see `_find_attempt_row`)
+        — the caller passes `self._active_attempt_id`, stamped the moment
+        `_run_attempt` created the row this method needs to read back.
+
+        Two sources, each best-effort on its own:
+
+        1. Blocking findings — the just-recorded attempt row's
+           ``review_checklist``, run through
+           ``no_human.review.reviewer.findings_from_checklist`` (the ONE
+           place that decides blocking vs advisory; never re-derived here).
+           Falls back to ``ctx['review_feedback']`` (already blocking-only,
+           written by `_record_review_feedback`) ONLY when the located row
+           carries NO checklist at all — i.e. review never produced a
+           verdict for this attempt. A row that has a checklist but zero
+           BLOCKING items (a genuine review PASS) must never fall through to
+           this branch: `ctx['review_feedback']` is a bare, unstamped list
+           that `_record_review_feedback` writes on a review FAIL and never
+           clears on a later PASS, so trusting it whenever `findings` came
+           out empty — rather than whenever the row had no checklist —
+           re-presents an EARLIER attempt's already-addressed findings under
+           this attempt's "Attempt N review verdict" provenance the moment
+           review passes and tests fail afterward. Both `_record_review_
+           feedback` call sites write `review_checklist` in the same branch
+           that writes `review_feedback`, so whenever `review_feedback` is
+           genuinely fresh for this row, the checklist path above already
+           captured it — this fallback exists only for the row-truly-has-no-
+           checklist edge case (attempt failed before/without reaching a
+           review verdict at all).
+        2. Failing test IDs — this attempt's own `"tests"` events (sliced by
+           resetting a buffer at every `"attempt_start"` event and keeping
+           the trailing one), taking `failing_tests` from every event whose
+           `ok` is falsy and excluding anything that event also lists under
+           `flaky_excused`. An `ok=True` event (pre-existing/flaky-excused
+           paths) is structurally skipped by the `ok` filter — that is by
+           design: an excused id is not evidence of anything. Falls back to
+           the attempt row's `test_results['failing_tests']` if the event
+           read raises or the slice yields nothing.
+
+        Writes the combined record only when there is something to carry;
+        otherwise clears any stale key — a clean attempt must never leave a
+        PRIOR failure's evidence sitting in context for a later attempt to
+        inherit. Emits exactly one event either way, so a zero has exactly
+        one meaning.
+        """
+        try:
+            findings: list[dict] = []
+            # True only when the findings above are genuinely THIS attempt's
+            # own reviewer verdict (a checklist row_n produced). False in the
+            # `review_feedback` fallback branch and on a read failure — in
+            # both cases the findings, if any, cannot honestly be attributed
+            # to "attempt N's review verdict" (see the provenance stamp
+            # below and B2 in the PR review this closes).
+            review_verdict_this_round = True
+            try:
+                rows = await self.store.list_attempts(task.id)
+                row = self._find_attempt_row(rows, attempt_n, attempt_id)
+                checklist = row.get("review_checklist") if row else None
+                if checklist:
+                    blocking, _advisory_items = findings_from_checklist(checklist)
+                    findings = [
+                        {
+                            "label": i.label, "file": i.file,
+                            "line": i.line, "comment": i.comment or i.evidence,
+                        }
+                        for i in blocking
+                    ]
+                else:
+                    # No checklist recorded for this attempt at all — review
+                    # never produced a verdict this round, so whatever
+                    # `ctx['review_feedback']` holds cannot be stamped as
+                    # THIS attempt's verdict (see the honest `source` below).
+                    review_verdict_this_round = False
+                    ctx = task.context or {}
+                    findings = list(ctx.get("review_feedback") or [])
+            except Exception as exc:  # noqa: BLE001
+                review_verdict_this_round = False
+                self._advisory(f"prior-attempt findings read failed: {exc}")
+
+            failing: list[str] = []
+            try:
+                events = await self.store.list_events(task.id)
+                this_attempt: list[dict] = []
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    if ev.get("kind") == "attempt_start":
+                        this_attempt = []
+                        continue
+                    this_attempt.append(ev)
+                seen: set[str] = set()
+                for ev in this_attempt:
+                    if ev.get("kind") != "tests" or ev.get("ok"):
+                        continue
+                    excused = set(ev.get("flaky_excused") or [])
+                    for tid in ev.get("failing_tests") or []:
+                        tid = str(tid)
+                        if tid in excused or tid in seen:
+                            continue
+                        seen.add(tid)
+                        failing.append(tid)
+            except Exception as exc:  # noqa: BLE001
+                self._advisory(f"prior-attempt test events read failed: {exc}")
+            if not failing:
+                try:
+                    rows = await self.store.list_attempts(task.id)
+                    row = self._find_attempt_row(rows, attempt_n, attempt_id)
+                    tr = row.get("test_results") if row else None
+                    if isinstance(tr, str):
+                        tr = json.loads(tr) if tr else None
+                    if isinstance(tr, dict):
+                        failing = [str(t) for t in (tr.get("failing_tests") or [])]
+                except Exception as exc:  # noqa: BLE001
+                    self._advisory(f"prior-attempt test_results fallback failed: {exc}")
+
+            ctx = task.context or {}
+            if findings or failing:
+                source = (
+                    f"Attempt {attempt_n} review verdict and test events"
+                    if review_verdict_this_round
+                    else (
+                        f"a prior attempt's review verdict (attempt "
+                        f"{attempt_n} produced none) and test events"
+                    )
+                )
+                ctx["prior_attempt_evidence"] = {
+                    "from_attempt": attempt_n,
+                    "source": source,
+                    "findings": findings,
+                    "failing_tests": failing,
+                }
+                task.context = ctx
+                await self.store.update_task(task)
+                self.emit(
+                    "prior_evidence_recorded",
+                    f"attempt {attempt_n}: {len(findings)} blocking finding(s), "
+                    f"{len(failing)} failing test id(s) carried to the next attempt",
+                    findings=len(findings), failing_tests=len(failing),
+                    attempt=attempt_n,
+                )
+            else:
+                # A clean attempt must never leave a PRIOR attempt's stale
+                # evidence sitting in context for a later attempt to inherit.
+                had = ctx.pop("prior_attempt_evidence", None) is not None
+                if had:
+                    task.context = ctx
+                    await self.store.update_task(task)
+                self.emit(
+                    "prior_evidence_none",
+                    f"attempt {attempt_n}: no blocking findings and no "
+                    "failing test ids to carry",
+                    reason="no_blocking_findings_and_no_failing_tests",
+                    attempt=attempt_n,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._advisory(f"prior-attempt evidence recording failed: {exc}")
 
     def _fix_pair_holds_terms(self, text: str) -> list[str]:
         """Banned terms in a remembered fix's resolution, if any.
