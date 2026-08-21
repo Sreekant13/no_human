@@ -618,6 +618,11 @@ _BARE_SDK_RESULT_MARKER = "returned an error result: success"
 #: hour-old, already-resolved park corroborates an unrelated new crash.
 _QUOTA_CORROBORATION_WINDOW = timedelta(minutes=10)
 
+#: The "remaining lifetime budget" handed to the mid-attempt watch when the
+#: lifetime gate is frozen by an independent-review PASS: large enough that
+#: the per-attempt cap is always the smaller ceiling, never a real number.
+_NO_LIFETIME_CEILING = 1 << 62
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     """Parse an ISO timestamp column (`wake_check_at`, `blocker["raised_at"]`,
@@ -11297,13 +11302,39 @@ class Orchestrator:
         It was the one enforcement point with no coverage: a mutation swapping
         the weighted read for the raw one left every budget test green.
         """
+        remaining = await self._attempt_spendable_tokens(task)
+        self._begin_attempt_accounting(
+            task.id, remaining_tokens=remaining,
+            attempt_cap=self._attempt_token_cap(task),
+        )
+
+    async def _attempt_spendable_tokens(self, task: Task) -> int:
+        """What the attempt about to run may spend from the LIFETIME budget —
+        the ONE answer both the loop-head gate (`_check_lifetime_budget`) and
+        the mid-attempt watch (`_arm_attempt_budget`) must agree on.
+
+        INCIDENT (2026-08-21, tasks 5bc9e2b4 and 2c8f23ff, filed be71aad2):
+        a task past its lifetime cap whose review had PASSED was resumed for
+        a PR-conflict rebase round. The loop head correctly said "frozen by
+        PASS — allowed" (`_budget_frozen_by_pass`), but this arming computed
+        `max(cap - used, 1)` unconditionally: negative, clamped to a ONE-token
+        ceiling, so the first usage event budget-aborted the round — three
+        times in two minutes, then a false escalation of a task whose PR was
+        already reviewed and open. Two predicates about the same budget
+        disagreed; this is where they now agree.
+
+        Frozen → the lifetime axis does not apply to this round
+        (`_NO_LIFETIME_CEILING`); the per-attempt cap (`BudgetAbort` on
+        `attempt_tokens`) is then the only ceiling, so a runaway round still
+        ends. Not frozen → exactly the weighted remainder as before, clamped
+        at 1 (the loop head has already parked anything at or below zero).
+        """
+        if await self._budget_frozen_by_pass(task):
+            return _NO_LIFETIME_CEILING
         used_life = _weighted_tokens(
             **(await self.store.lifetime_usage_by_class(task.id))[1])
         cap_life = self._lifetime_limits(task)[1]
-        self._begin_attempt_accounting(
-            task.id, remaining_tokens=max(cap_life - used_life, 1),
-            attempt_cap=self._attempt_token_cap(task),
-        )
+        return max(cap_life - used_life, 1)
 
     def _begin_attempt_accounting(
         self, task_id: str, *, remaining_tokens: int,

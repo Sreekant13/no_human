@@ -1055,6 +1055,94 @@ async def test_the_armed_mid_attempt_ceiling_is_in_the_weighted_unit(store):
     assert weighted_tokens(**(await store.lifetime_usage_by_class(t.id))[1]) == 3_386_434
 
 
+async def test_a_frozen_budget_arms_the_per_attempt_cap_not_a_one_token_ceiling(store):
+    """be71aad2 (2026-08-21, tasks 5bc9e2b4 / 2c8f23ff): a task PAST its
+    lifetime cap whose review PASSED is resumed for a rebase round. The loop
+    head says "frozen — allowed"; the mid-attempt arming computed
+    `max(cap - used, 1)` regardless and handed the round a ONE-token ceiling,
+    so its first usage event budget-aborted it — three dead attempts in two
+    minutes, then a false escalation. RED on main: ceiling == (id, 1, ...)."""
+    t = Task.new("frozen", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 4_000_000, "attempt_tokens": 2_500_000, **_MARKED}
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, **D6E4B72A_LEDGER)   # 16,527,553 raw — far past the cap
+
+    from no_human.core.orchestrator import Orchestrator
+    o = Orchestrator.__new__(Orchestrator)
+    o.store = store
+    o.bounds = Bounds()
+    o._sink = lambda e: None
+
+    async def _frozen(task):
+        return True
+    o._budget_frozen_by_pass = _frozen
+
+    await o._arm_attempt_budget(t)
+
+    assert o._token_ceiling == (t.id, 2_500_000, "the per-attempt cap"), o._token_ceiling
+
+
+async def test_an_unfrozen_budget_still_arms_the_weighted_remainder(store):
+    """Negative control for the freeze: with the gate NOT frozen, the arming
+    is byte-for-byte what it was — the weighted remainder, clamped at 1."""
+    t = Task.new("unfrozen", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 4_000_000, **_MARKED}
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, **D6E4B72A_LEDGER)
+
+    from no_human.core.orchestrator import Orchestrator
+    o = Orchestrator.__new__(Orchestrator)
+    o.store = store
+    o.bounds = Bounds()
+    o._sink = lambda e: None
+
+    async def _not_frozen(task):
+        return False
+    o._budget_frozen_by_pass = _not_frozen
+
+    await o._arm_attempt_budget(t)
+    assert o._token_ceiling == (t.id, 613_566, "the task's remaining lifetime budget")
+
+    # And past the cap, unfrozen, the clamp still yields 1 — the loop head
+    # is what parks that task; this arming never lies about headroom.
+    t2 = Task.new("exhausted", repo_path="/tmp/x")
+    t2.config = {"lifetime_tokens": 1_000_000, **_MARKED}
+    await store.create_task(t2)
+    aid2 = await store.create_attempt(t2.id, 1)
+    await store.update_attempt(aid2, **D6E4B72A_LEDGER)
+    await o._arm_attempt_budget(t2)
+    assert o._token_ceiling[1] == 1
+
+
+async def test_the_loop_head_gate_and_the_arming_cannot_disagree(store):
+    """The two enforcement points read ONE predicate: whenever the loop head
+    lets a round start under a frozen budget, the arming never hands that
+    round a ceiling below its per-attempt cap — for any ledger state."""
+    from no_human.core.orchestrator import Orchestrator
+
+    for raw_used in (0, 3_000_000, 16_527_553):
+        t = Task.new(f"agree-{raw_used}", repo_path="/tmp/x")
+        t.config = {"lifetime_tokens": 4_000_000, "attempt_tokens": 2_000_000, **_MARKED}
+        await store.create_task(t)
+        aid = await store.create_attempt(t.id, 1)
+        await store.update_attempt(aid, tokens_used=raw_used)
+        o = Orchestrator.__new__(Orchestrator)
+        o.store = store
+        o.bounds = Bounds()
+        o._sink = lambda e: None
+        o.emit = lambda *a, **k: None
+
+        async def _frozen(task):
+            return True
+        o._budget_frozen_by_pass = _frozen
+
+        assert await o._check_lifetime_budget(t) is None      # loop head: allowed
+        await o._arm_attempt_budget(t)
+        assert o._token_ceiling[1] >= 2_000_000, (raw_used, o._token_ceiling)
+
+
 async def test_a_partial_write_cannot_promote_the_key_it_did_not_touch(store):
     """A TWO-KEY stale config — the shape the earlier marker tests all missed
     by starting from `Task.new()`, whose config is empty, so nothing
