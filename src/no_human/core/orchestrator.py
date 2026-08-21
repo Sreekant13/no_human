@@ -60,6 +60,7 @@ from ..blockers import (
     render_report,
     reuse_record,
     triage,
+    user_pause_blocker,
 )
 from ..ci.base import CIResult, HumanGatedCI
 from ..config import active_auth_profile
@@ -2372,14 +2373,12 @@ class Orchestrator:
             sha, branch = prior["sha"], (prior.get("branch") or "")
             kept_prior = True
         prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
-        task.blocker = {
-            "category": "USER_PAUSED",
-            "question": reason,
-            "root_cause_hypothesis": reason,
-            "resume_commit": sha,
-            "resume_branch": branch or "",
-        }
-        if prior_blocker and prior_blocker.get("category") not in (None, "USER_PAUSED"):
+        task.blocker = user_pause_blocker(
+            reason, checkpoint={"sha": sha, "branch": branch or ""},
+            paused_by="orchestrator",
+        )
+        if prior_blocker and prior_blocker.get("category") not in (
+                None, BlockerCategory.USER_PAUSED.value):
             # The record of what the pause landed on; the wake condition is
             # deliberately NOT re-armed — a human's stop is not a timer's to undo.
             task.blocker["paused_over"] = {

@@ -200,9 +200,9 @@ def _b(category, **kw):
 
 
 def test_only_budget_exhausted_moved():
-    """USER_PAUSED has no blocker category of its own — pausing is a status, not
-    a blocker — so the guard that matters is that every OTHER category in the
-    taxonomy routes identically with the flag on and off."""
+    """The `budget_exhaustion_terminal` flag is scoped to BUDGET_EXHAUSTED alone
+    — the guard that matters is that every OTHER category in the taxonomy,
+    including USER_PAUSED, routes identically with the flag on and off."""
     for cat in BlockerCategory:
         on = triage(_b(cat), budget_exhaustion_terminal=True)
         off = triage(_b(cat), budget_exhaustion_terminal=False)

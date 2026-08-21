@@ -7,6 +7,19 @@ expands scope, edits acceptance criteria, or fakes "done".
 
 This module is pure data + routing logic (no I/O), so it is trivially testable
 and the orchestrator stays the only place that touches the DB / git / SDK.
+
+Typed-stop matrix (a PAUSE and a HOLD are mutually exclusive stop shapes):
+
+* **PAUSE** — ``category=USER_PAUSED`` (see `user_pause_blocker`), no
+  ``human_stopped``. Written by `_honor_cancel`, `nh task pause`, and
+  `POST /pause`'s direct-park branch. The wake sweep's ``max_park`` timeout
+  ESCALATES it like any other parked blocker (a forgotten pause should not
+  block work indefinitely; 48h is ample time for an intentional one).
+  Resumes in ONE step: `nh task resume` / `POST /resume`.
+* **HOLD** — ``human_stopped=True`` stamped over any EXISTING blocker
+  (`POST /pause`'s hold branch). Never swept by ``max_park``. Resumes by
+  releasing the hold only; the task stays parked on its original blocker.
+  Refused over an existing PAUSE — see `api.pause_task`.
 """
 
 from __future__ import annotations
@@ -34,6 +47,12 @@ class BlockerCategory(str, Enum):
     # The task's lifetime budget (attempts or tokens, resumes included) is
     # spent. Raised by the harness, never the agent.
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    # A human deliberately paused the task (`_honor_cancel`, `nh task pause`,
+    # `POST /pause`). Written by the harness only, never the agent — see
+    # HARNESS_ONLY_CATEGORIES and `report.parse_blocker`'s demotion of an
+    # agent-claimed one. The typed-stop matrix in this module's docstring
+    # spells out the write/sweep/resume contract.
+    USER_PAUSED = "USER_PAUSED"
 
     @classmethod
     def coerce(cls, value: str | "BlockerCategory") -> "BlockerCategory":
@@ -102,7 +121,21 @@ _ROUTING: dict[BlockerCategory, Route] = {
     # raised KeyError on the one path the stuck detector exists to serve.
     BlockerCategory.STAGNATION: Route(
         TaskStatus.ESCALATED, notify_now=True, parked=False),
+    # A deliberate human pause. Parked and silent like TRANSIENT_INFRA/
+    # DEPENDENCY_WAIT — no auto-retry, since nothing should touch the task
+    # until a human resumes it — but see `triage`'s explicit branch: the
+    # writers record `confidence=0.0` (there is nothing to be confident
+    # ABOUT — it isn't a diagnosis), so this entry alone is not enough; the
+    # generic low-confidence-forces-escalation override must not apply here.
+    BlockerCategory.USER_PAUSED: Route(
+        TaskStatus.BLOCKED, notify_now=False, parked=True),
 }
+
+#: Categories the harness alone may raise — never accepted from the agent's
+#: own report. `report.parse_blocker` demotes a claimed one to NOVEL_UNKNOWN
+#: (unclassified, not a false "the agent asked to be paused") and
+#: `blocker_prompt_suffix` never advertises them as an option to declare.
+HARNESS_ONLY_CATEGORIES = frozenset({BlockerCategory.USER_PAUSED})
 
 
 #: BUDGET_EXHAUSTED under `budget.exhaustion_terminal` (the default). The task
@@ -248,6 +281,37 @@ def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, A
     return {"sha": cp.get("sha") or None,
             "branch": cp.get("branch") or None,
             "by": by}
+
+
+def user_pause_blocker(
+    reason: str, *, checkpoint: dict[str, str] | None, paused_by: str,
+) -> dict[str, Any]:
+    """The ONE blocker-dict shape all three pause writers (`_honor_cancel`,
+    `nh task pause`, `POST /pause`'s direct-park branch) must produce.
+
+    Before this, each inlined its own dict — same ``category`` string, but no
+    ``raised_at`` (so the wake sweep dated the park from ``task.updated_at``,
+    and an unrelated column write silently restarted the 48h max_park clock)
+    and no record of who paused it. ``paused_by`` lets `_escalate_timeout`
+    write an honest "paused by X and not resumed" reason instead of the
+    generic "parked past max duration" a timed-out diagnosis-based blocker
+    gets.
+
+    Deliberately does NOT set ``human_stopped`` — that is the HOLD shape
+    (any category, never swept, resumed only by releasing the hold) and is
+    mutually exclusive with a PAUSE (USER_PAUSED, swept, resumes in one
+    step). Mixing them is refused at the write end, in `api.pause_task`.
+    """
+    cp = checkpoint or {}
+    return {
+        "category": BlockerCategory.USER_PAUSED.value,
+        "question": reason,
+        "root_cause_hypothesis": reason,
+        "resume_commit": cp.get("sha", ""),
+        "resume_branch": cp.get("branch", ""),
+        "raised_at": _now(),
+        "paused_by": paused_by,
+    }
 
 
 #: The cooperative-stop reason a SERVER SHUTDOWN hands a running attempt.
@@ -412,6 +476,12 @@ def triage(
     if (budget_exhaustion_terminal
             and blocker.category is BlockerCategory.BUDGET_EXHAUSTED):
         return BUDGET_TERMINAL_ROUTE
+    if blocker.category is BlockerCategory.USER_PAUSED:
+        # Explicit, ahead of the low-confidence override below: a pause's
+        # confidence is always 0.0 (there is no hypothesis to be confident
+        # about), which would otherwise trip "unsure → escalate" and turn a
+        # deliberate pause into an immediate escalation.
+        return _ROUTING[BlockerCategory.USER_PAUSED]
     route = blocker.route
     if route.parked and blocker.confidence < escalate_below_confidence:
         # Unsure → don't thrash silently; ask a human.

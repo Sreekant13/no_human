@@ -29,7 +29,7 @@ from ..core.task import Task, TaskStatus
 from ..vcs.pr_outcome import observe_pr
 from ..vcs.task_pr import resolve_task_pr
 from .shipped import _TICK_ABORTED, complete_if_content_landed as _complete_landed
-from .taxonomy import Blocker, resume_checkpoint, resume_provenance
+from .taxonomy import BlockerCategory, Blocker, resume_checkpoint, resume_provenance
 
 log = logging.getLogger("no_human.wake")
 
@@ -615,10 +615,18 @@ class WakeWatcher:
             or _parse_iso(task.updated_at) or now
         wake_check_at = _parse_iso(task.wake_check_at)
 
+        # A typed PAUSE (see taxonomy.py's module docstring) resumes in one
+        # step — `nh task resume` / `POST /resume` — never by a machine
+        # condition. Nothing SHOULD carry a `wake_condition` on a pause, but
+        # a stale one surviving on a `paused_over` record must not silently
+        # resume a deliberately-parked task; it still times out below, same
+        # as every other parked blocker.
+        paused = blocker is not None and blocker.category is BlockerCategory.USER_PAUSED
+
         # AWAITING_INPUT only ever resumes on a human reply — but it still
         # times out so a forgotten question doesn't sit forever.
         condition = blocker.wake_condition if blocker else None
-        if task.status != TaskStatus.AWAITING_INPUT:
+        if task.status != TaskStatus.AWAITING_INPUT and not paused:
             satisfied = await self.condition_satisfied(
                 condition, raised_at=raised_at, now=now, wake_check_at=wake_check_at,
             )
@@ -2188,10 +2196,21 @@ class WakeWatcher:
         data = task.blocker or {}
         data["timed_out"] = True
         data["category"] = "NOVEL_UNKNOWN" if blocker is None else data.get("category")
-        data["root_cause_hypothesis"] = (
-            f"parked past max duration ({self.max_park}); "
-            + data.get("root_cause_hypothesis", "")
-        ).strip()
+        paused = blocker is not None and blocker.category is BlockerCategory.USER_PAUSED
+        if paused:
+            # Honest reason: this was a deliberate human pause, not a stuck
+            # diagnosis — say who paused it and for how long, not the generic
+            # "parked past max duration" a real blocker's timeout gets.
+            data["root_cause_hypothesis"] = (
+                f"paused by {data.get('paused_by') or 'a human'} and not "
+                f"resumed within {self.max_park}; "
+                + data.get("root_cause_hypothesis", "")
+            ).strip()
+        else:
+            data["root_cause_hypothesis"] = (
+                f"parked past max duration ({self.max_park}); "
+                + data.get("root_cause_hypothesis", "")
+            ).strip()
         task.blocker = data
         await self.store.update_task_columns(task)
         if task.status != TaskStatus.ESCALATED:

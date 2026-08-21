@@ -17,6 +17,7 @@
 | `SCOPE_EXPLOSION` | escalate with a proposed smaller scope | **now** |
 | `IMPOSSIBLE` | escalate with evidence | **now** |
 | `NOVEL_UNKNOWN` | escalate with the full report | **now** |
+| `USER_PAUSED` | `blocked`, parked; a forgotten pause escalates at `max_park` (48h default) — `nh task resume` / `POST /resume` still resume in one step within that window. Harness-only: the agent can never self-declare this category | silent until `max_park` |
 
 Low confidence (`< escalate_on_low_confidence_below`, default 0.6) on an
 otherwise-parkable blocker **escalates instead** — unsure what's wrong means ask

@@ -1429,11 +1429,23 @@ async def pause_task(
     window — this instead stamps a durable human hold (blocker.human_stopped)
     on the existing blocker without touching status; the wake sweep already
     skips human_stopped tasks (SCRUM-22)."""
+    from ..blockers import BlockerCategory
+
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status in _HOLDABLE_STATUSES:
-        blocker_data = dict(task.blocker or {})
-        blocker_data.setdefault("category", "USER_PAUSED")
+        existing = task.blocker or {}
+        if existing.get("category") == BlockerCategory.USER_PAUSED.value:
+            # A PAUSE and a HOLD are mutually exclusive stop shapes (see
+            # taxonomy.py's module docstring): a PAUSE already resumes in one
+            # step and the wake sweep already treats it correctly at
+            # max_park. Stamping `human_stopped` on top would make it a HOLD
+            # too — never swept, resumed only by releasing the hold — so
+            # `nh task resume` / `POST /resume` would no longer be the whole
+            # story. Refuse, idempotently: it is already paused.
+            return {"ok": True, "message": f"Already paused {task_id[:8]}"}
+        blocker_data = dict(existing)
+        blocker_data.setdefault("category", BlockerCategory.USER_PAUSED.value)
         blocker_data.setdefault("question", "Paused from board")
         blocker_data["human_stopped"] = True
         task.blocker = blocker_data
@@ -1480,12 +1492,10 @@ async def pause_task(
     # Carry the checkpoint the task already had (a crashed worker's park is
     # exactly where it is worth keeping) — `carried_checkpoint` honours a
     # human's sha-less `resume_from` as a veto, like `_honor_cancel`.
-    from ..blockers import carried_checkpoint
+    from ..blockers import carried_checkpoint, user_pause_blocker
     prior = carried_checkpoint(task) or {}
-    task.blocker = {"category": "USER_PAUSED", "question": "Paused from board",
-                    "root_cause_hypothesis": "Paused by operator via web board",
-                    "resume_commit": prior.get("sha", ""),
-                    "resume_branch": prior.get("branch", "")}
+    task.blocker = user_pause_blocker(
+        "Paused by operator via web board", checkpoint=prior, paused_by="board")
     await store.update_task_columns(task)
     await store.set_status(task, TaskStatus.BLOCKED, validate=False)
     await store.clear_cancel_request(task.id)

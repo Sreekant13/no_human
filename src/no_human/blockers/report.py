@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any
 
-from .taxonomy import Blocker, BlockerCategory, BlockerOption
+from .taxonomy import HARNESS_ONLY_CATEGORIES, Blocker, BlockerCategory, BlockerOption
 
 # The agent is asked to emit its blocker report between these markers.
 _BLOCKER_JSON = re.compile(
@@ -52,6 +52,13 @@ def parse_blocker(text: str) -> Blocker | None:
     # SCOPE_EXPLOSION, which routes to a human with the scope story intact.
     if blocker.category is BlockerCategory.BUDGET_EXHAUSTED:
         blocker.category = BlockerCategory.SCOPE_EXPLOSION
+    # Same boundary: USER_PAUSED is stamped by the harness's own pause writers
+    # (`user_pause_blocker`), never something the agent diagnosed. An
+    # agent-claimed one is demoted to NOVEL_UNKNOWN — unclassified, not a
+    # false "a human paused this" the board would render as if a human had
+    # acted.
+    if blocker.category in HARNESS_ONLY_CATEGORIES:
+        blocker.category = BlockerCategory.NOVEL_UNKNOWN
     # Same boundary, third field. THIS is the one function in the codebase that
     # produces a Blocker whose prose the MODEL wrote, so it is the one place
     # that may set the flag — and it sets it unconditionally, AFTER `from_dict`,
@@ -213,7 +220,9 @@ def blocker_prompt_suffix() -> str:
 
     The agent emits this ONLY when it genuinely cannot proceed without lowering
     the bar — never as a way to avoid finishing a doable task."""
-    cats = ", ".join(c.value for c in BlockerCategory)
+    cats = ", ".join(
+        c.value for c in BlockerCategory if c not in HARNESS_ONLY_CATEGORIES
+    )
     return (
         "\n\nIf — and only if — you cannot make verifiable progress without "
         "weakening a test, expanding scope, editing the acceptance criteria, or "

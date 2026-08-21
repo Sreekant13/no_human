@@ -24,6 +24,7 @@ from .actions import (
     is_terminal_action,
 )
 from .taxonomy import (
+    HARNESS_ONLY_CATEGORIES,
     MACHINE_REQUEUE_PROVENANCE,
     SERVER_STOP_REASON,
     Blocker,
@@ -35,10 +36,12 @@ from .taxonomy import (
     resume_provenance,
     route_for,
     triage,
+    user_pause_blocker,
 )
 from .wake import WakeWatcher, parse_duration
 
 __all__ = [
+    "HARNESS_ONLY_CATEGORIES",
     "MACHINE_REQUEUE_PROVENANCE",
     "SERVER_STOP_REASON",
     "ActionError",
@@ -59,6 +62,7 @@ __all__ = [
     "resume_provenance",
     "route_for",
     "triage",
+    "user_pause_blocker",
     "parse_blocker",
     "render_report",
     "notification_line",

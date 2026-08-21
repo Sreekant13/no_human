@@ -86,8 +86,8 @@ in a loop, or the same agent-error signature seen again, trips stuck detection �
 instead of stacking more corrections on a confused session.
 
 When it runs out, it does not invent a plausible diff. It classifies the blocker
-into one of ten categories — `MISSING_ACCESS`, `AMBIGUITY`, `SCOPE_EXPLOSION`,
-`IMPOSSIBLE`, `QUOTA`, `BUDGET_EXHAUSTED` and four more
+into one of eleven categories — `MISSING_ACCESS`, `AMBIGUITY`, `SCOPE_EXPLOSION`,
+`IMPOSSIBLE`, `QUOTA`, `BUDGET_EXHAUSTED` and five more
 ([`src/no_human/blockers/taxonomy.py`](../src/no_human/blockers/taxonomy.py)) —
 and either parks with a wake condition or escalates with a structured report and
 one specific question. `nh blocked` lists what is parked; `nh reply <id>
