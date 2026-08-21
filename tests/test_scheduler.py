@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from no_human.core.db import Store
+from no_human.core import scheduler as scheduler_mod
+from no_human.core import slot_wait
 from no_human.core.scheduler import Scheduler
 from no_human.core.task import Task, TaskStatus
 
@@ -1911,3 +1913,102 @@ async def test_a_free_slot_does_not_forget_tasks_that_are_still_waiting(store):
     waits = [e for e in await store.list_events(waiter.id)
              if e["kind"] == "waiting_for_slot"]
     assert len(waits) == 1, f"a continuous wait must stay one event, got {waits}"
+
+
+async def test_the_scheduler_claim_statuses_are_the_slot_wait_set():
+    """The scheduler's own claim-status set and `slot_wait`'s copy must be the
+    same set of runtime VALUES, not merely typed to look alike by eye (review
+    follow-up on PR #525's `CLAIMABLE_STATUSES` widening)."""
+    assert scheduler_mod.CLAIM_STATUS_VALUES == slot_wait.CLAIMABLE_STATUSES
+
+
+async def test_a_correcting_planning_task_gets_a_wait_event_behind_a_full_pool(store):
+    """A plan-approval correction resumes into PLANNING, not IMPLEMENTING
+    (`_CORRECTION_CLAIMABLE`) — behind a full pool it gets the same
+    'waiting for a worker slot' treatment as a resumed IMPLEMENTING task, and
+    `Store.tasks_waiting_for_slot()` counts it, while a genuinely live (non-
+    correcting) PLANNING run is never claimed/waited on at all."""
+    from no_human.core import plan_gate
+
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    running = Task.new("running", repo_path="/tmp/x")
+    await store.create_task(running)
+    assert await sched.tick() == [running.id]
+
+    corrected = Task.new("plan correction", repo_path="/tmp/x")
+    corrected.context = {plan_gate.CONTEXT_KEY: {
+        "state": plan_gate.STATE_CORRECTING,
+        "correction": "fix the config path",
+        "corrected_at": "2026-08-20T00:00:00+00:00",
+        "approved_at": None,
+    }}
+    await store.create_task(corrected)
+    await store.set_status(corrected, TaskStatus.PLANNING, validate=False)
+    assert plan_gate.correcting(corrected)
+
+    live_planning = Task.new("live plan run", repo_path="/tmp/x")
+    await store.create_task(live_planning)
+    await store.set_status(live_planning, TaskStatus.PLANNING, validate=False)
+
+    for _ in range(3):
+        await sched.tick()
+
+    waits = [e for e in await store.list_events(corrected.id)
+             if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1, f"expected one wait event, got {waits}"
+    assert corrected.id in await store.tasks_waiting_for_slot()
+    assert await store.list_events(live_planning.id) == [], (
+        "a live (non-correcting) PLANNING task must not be claimed/waited on")
+
+    hold.set()
+    await sched.wait_idle()
+
+    started = await sched.tick()
+    assert corrected.id in started
+    assert corrected.id not in sched._waiting_for_slot
+
+
+async def test_a_cooldown_does_not_carry_the_open_wait_across_the_pause(store):
+    """A wait open when a quota cooldown starts must not silently persist
+    across the pause: the in-process dedupe set is cleared so the first
+    post-pause tick re-emits a fresh wait event, not silence (review follow-up
+    on PR #525's cooldown early-return)."""
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    running = Task.new("running", repo_path="/tmp/x")
+    await store.create_task(running)
+    t0 = datetime(2026, 8, 20, 12, 0, 0, tzinfo=timezone.utc)
+    assert await sched.tick(now=t0) == [running.id]
+
+    waiter = Task.new("waiter", repo_path="/tmp/x")
+    await store.create_task(waiter)
+    await store.set_status(waiter, TaskStatus.IMPLEMENTING, validate=False)
+    await sched.tick(now=t0)
+    waits = [e for e in await store.list_events(waiter.id)
+             if e["kind"] == "waiting_for_slot"]
+    assert len(waits) == 1
+    assert waiter.id in sched._waiting_for_slot
+
+    sched._quota_cooldown_until = t0 + timedelta(minutes=5)
+    t1 = t0 + timedelta(minutes=1)
+    result = await sched.tick(now=t1)
+    assert result == []
+    assert waiter.id not in sched._waiting_for_slot
+    waits_during = [e for e in await store.list_events(waiter.id)
+                    if e["kind"] == "waiting_for_slot"]
+    assert len(waits_during) == 1, "no new wait event while paused"
+
+    t2 = t0 + timedelta(minutes=6)
+    await sched.tick(now=t2)
+    waits_after = [e for e in await store.list_events(waiter.id)
+                   if e["kind"] == "waiting_for_slot"]
+    assert len(waits_after) == 2, (
+        f"expected a fresh wait event once the pause lapsed, got {waits_after}")
+
+    hold.set()
+    await sched.wait_idle()

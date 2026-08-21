@@ -38,6 +38,7 @@ from ..core.events import EventPersister
 from ..core.lanes import status_buckets
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.runtime import build_orchestrator
+from ..core import slot_wait
 from ..core.slot_wait import is_waiting_for_slot
 from ..core.task import Task, TaskStatus
 from ..intake import (
@@ -1450,8 +1451,17 @@ def task_show(task_id):
             console.print(f"[bold]{t.id}[/]  [blue]{t.status.value}[/]  [magenta]{t.kind}[/]")
             events = await store.list_events(t.id)
             if is_waiting_for_slot(events, status=t.status.value):
-                waits = [e for e in events if e.get("kind") == "waiting_for_slot"]
-                console.print(f"[blue]waiting for a worker slot[/] {waits[-1]['text']}")
+                waits = [e for e in events if e.get("kind") == slot_wait.KIND]
+                stats = _running_pool_stats(config)
+                pause = stats[2] if stats else None
+                if pause:
+                    console.print(f"[magenta]{slot_wait.pool_paused_text(pause)}[/]")
+                elif stats is None:
+                    console.print(
+                        f"[blue]{waits[-1]['text']}[/] "
+                        f"[dim]({slot_wait.STALE_POOL_NOTE})[/]")
+                else:
+                    console.print(f"[blue]{waits[-1]['text']}[/]")
             console.print(f"title: {t.title}")
             if t.description:
                 console.print(f"description: {t.description}")
@@ -3665,6 +3675,48 @@ def status(as_json):
         async with Store(config.db_path) as store:
             tasks = await store.list_tasks()
             waiting_ids = await store.tasks_waiting_for_slot()
+            # The denominator is the RUNNING pool when one is reachable —
+            # `nh start --workers N` overrides the config without writing it,
+            # so the config number is a guess about a process this command can
+            # simply ask. When it can't ask — including under `nh serve`, which
+            # binds no socket at all (see `_running_pool_stats`'s KNOWN GAP) —
+            # it says which number it is printing rather than implying it
+            # observed one. Same discipline for the NUMERATOR: a worker-owned
+            # status row (IMPLEMENTING among them) is not evidence of a
+            # running worker — it can be stranded, claimable and waiting,
+            # after a restart. The live `workers_busy` count is what's honest;
+            # any row in excess of it is reclassified into `queued`, which is
+            # where `/api/queue/health`'s own `queue_depth` already counts an
+            # unclaimed IMPLEMENTING row.
+            #
+            # Computed ONCE, before the `--json` branch (review finding F1):
+            # the JSON branch used to return its own bucket counts BEFORE this
+            # pause/reachability check ran, so `nh status` and
+            # `nh status --json` could disagree about `waiting` for the exact
+            # same DB state at the exact same moment (human-readable said 0
+            # while paused; `--json` still said 1). There is no DB-persisted
+            # substitute for this signal — `_quota_cooldown_until` lives only
+            # in the running Scheduler's memory — so both branches now share
+            # one HTTP probe and one bucket computation. This knowingly
+            # supersedes PLAN.md's OOS note that `--json` must avoid an HTTP
+            # call and stay byte-identical; the no-users rule licenses the
+            # break, and the alternative (reverting AC3's already-landed,
+            # already-tested human-readable fix) would mean weakening a
+            # passing test, which is not allowed.
+            stats = _running_pool_stats(config)
+            pause = stats[2] if stats is not None else None
+            # While the pool is paused nothing is competing for a slot, so
+            # calling a recorded wait a *live* slot wait is the same class of
+            # lie the module docstring already names — the waiter falls out
+            # of `waiting` and back into the ordinary working/queued split
+            # below, same as any other unclaimed row. `reachable=False` when
+            # the pool couldn't be asked at all (review finding F2): otherwise
+            # `waits_are_live(None)` reads "no pause reported" and "couldn't
+            # find out" as the same thing, so an unreachable pool's stale wait
+            # was being printed with the same confidence as a live one. Fail
+            # closed instead — an unknown pool state is not a live wait.
+            if not slot_wait.waits_are_live(pause, reachable=stats is not None):
+                waiting_ids = set()
             buckets = status_buckets(tasks, waiting_ids)
             # The cancelled split (#551) rides beside the bucket counts: a
             # cancelled task ends FAILED but is not a capability failure.
@@ -3682,24 +3734,12 @@ def status(as_json):
             if as_json:
                 # Nested under its own key so the existing bucket keys keep
                 # their shape — a consumer that ignores it sees no change, and
-                # it is NOT summed into any per-task figure.
+                # it is NOT summed into any per-task figure. `buckets` here is
+                # the SAME pause/reachability-aware computation the
+                # human-readable branch below uses (see F1 comment above) —
+                # no second, disagreeing bucket count.
                 click.echo(json.dumps({**buckets, "unattributed_usage": resid}))
                 return
-            # The denominator is the RUNNING pool when one is reachable —
-            # `nh start --workers N` overrides the config without writing it,
-            # so the config number is a guess about a process this command can
-            # simply ask. When it can't ask — including under `nh serve`, which
-            # binds no socket at all (see `_running_pool_stats`'s KNOWN GAP) —
-            # it says which number it is printing rather than implying it
-            # observed one. Same discipline for the NUMERATOR: a worker-owned
-            # status row (IMPLEMENTING among them) is not evidence of a
-            # running worker — it can be stranded, claimable and waiting,
-            # after a restart. The live `workers_busy` count is what's honest;
-            # any row in excess of it is reclassified into `queued`, which is
-            # where `/api/queue/health`'s own `queue_depth` already counts an
-            # unclaimed IMPLEMENTING row.
-            stats = _running_pool_stats(config)
-            pause = None
             if stats is None:
                 mw = config.data.get("concurrency", {}).get("max_workers", 1)
                 mw_note = " [dim](configured; server not running)[/]"

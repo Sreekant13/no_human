@@ -129,10 +129,18 @@ def test_watcher_ticks_and_human_verbs_do_not_end_a_wait():
 def test_a_task_that_waited_then_parked_or_ended_is_not_waiting():
     """RED before the fix: `nh show` printed the waiting line forever on a
     task that waited, was dispatched, and then parked at the approval gate or
-    ended before any attempt — the newest wait-relevant event was the wait."""
+    ended before any attempt — the newest wait-relevant event was the wait.
+
+    "planning" is deliberately NOT in this list (slot-wait follow-ups,
+    PR #525 review round 3): `Scheduler._claimable()` claims a PLANNING row
+    carrying `plan_gate.correcting`, so a PLANNING task genuinely CAN be
+    waiting — see `test_slot_wait_followups.py`'s
+    `test_a_correcting_planning_task_behind_a_full_pool_is_counted_and_shown`.
+    "testing" replaces it here as an off-the-happy-path status that stays
+    non-claimable."""
     events = [_ev("waiting_for_slot")]
     for status in ("awaiting_approval", "failed", "done", "blocked",
-                   "escalated", "context", "planning", "reviewing"):
+                   "escalated", "context", "testing", "reviewing"):
         assert is_waiting_for_slot(events, status=status) is False, status
 
 

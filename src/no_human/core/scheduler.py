@@ -66,6 +66,19 @@ log = logging.getLogger("no_human.scheduler")
 # with newcomers while the sunk-cost task waits behind them.
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
 
+# PLANNING is claimed too, but only for a plan-approval correction resumed
+# into it (see `_claimable`'s `plan_gate.correcting` branch below) — never
+# for a fresh/live planning run, which reaches PLANNING through dispatch,
+# not through the claim loop.
+_CORRECTION_CLAIMABLE = (TaskStatus.PLANNING,)
+
+#: The runtime twin of `slot_wait.CLAIMABLE_STATUSES` — same set of statuses,
+#: expressed as the scheduler's own claim tuples rather than re-typed string
+#: literals, so the two can be compared as real objects (`test_scheduler.py`)
+#: instead of trusted to stay in sync by eye.
+CLAIM_STATUS_VALUES = frozenset(
+    s.value for s in _CLAIMABLE + _CORRECTION_CLAIMABLE)
+
 # Context keys that mark a PENDING task as carrying prior work rather than
 # being a fresh ticket: the exact keys `Orchestrator` writes at PR open
 # (orchestrator.py:5818-5827) and `wake._resume` writes on resume.
@@ -689,9 +702,10 @@ class Scheduler:
         # never on the correction text: a blank answer used to write the state
         # with empty text, which this claim missed and the orphan sweep below
         # then turned into a gate bypass).
-        for t in await self.store.list_claimable_tasks(TaskStatus.PLANNING):
-            if t.id not in self._inflight and plan_gate.correcting(t):
-                out.append(t)
+        for status in _CORRECTION_CLAIMABLE:
+            for t in await self.store.list_claimable_tasks(status):
+                if t.id not in self._inflight and plan_gate.correcting(t):
+                    out.append(t)
         return out
 
     async def _rank_pending(self, rows: list) -> list:
@@ -1467,6 +1481,16 @@ class Scheduler:
             self._resume_parks_pending = True   # first tick after a cooldown ended
         self._was_cooling = cooling
         if cooling:
+            # Nothing is dispatched during a pause, so no NEW wait is emitted
+            # (already true) — but the in-process dedupe set must not carry a
+            # pre-pause wait across the pause, or the first post-pause full
+            # tick stays silent (`_note_slot_waits` sees the id already in
+            # the set) and the task's newest event keeps a stale, pre-pause
+            # timestamp for as long as the pause lasts. Clearing this set
+            # does not touch persisted events — the record stays
+            # append-only; a wait that survives the pause simply gets a
+            # fresh event once dispatch resumes.
+            self._waiting_for_slot.clear()
             return []  # 7.4: pool-wide pause until the subscription resets
 
         if self._resume_parks_pending:

@@ -30,13 +30,56 @@ KIND = "waiting_for_slot"
 #: any of these, of any kind other than the wait itself, ends the wait.
 RUN_SOURCES = frozenset({"orchestrator", "agent", "reviewer", "scheduler"})
 
-#: The statuses the scheduler claims from (`Scheduler._CLAIMABLE`). A wait can
-#: only be open while the task sits in one of them.
-CLAIMABLE_STATUSES = frozenset({"implementing", "pending"})
+#: The statuses the scheduler claims from: `Scheduler._CLAIMABLE`
+#: (IMPLEMENTING, PENDING) plus `Scheduler._CORRECTION_CLAIMABLE` (PLANNING,
+#: claimed only when `plan_gate.correcting(t)` is true — a plan-approval
+#: correction resumes into PLANNING, not IMPLEMENTING). A wait can only be
+#: open while the task sits in one of them. Widening this to include
+#: "planning" does NOT make a genuinely dispatched planning run read as
+#: waiting: `ends_wait` already closes the wait on the run's first
+#: run-sourced event (`repo_config`, `state: context`, ...), regardless of
+#: which status that event lands the task in.
+CLAIMABLE_STATUSES = frozenset({"implementing", "pending", "planning"})
 
 
 def waiting_text(busy: int, total: int, since_iso: str) -> str:
     return f"waiting for a worker slot ({busy}/{total} busy) since {since_iso}"
+
+
+def waits_are_live(pause: Mapping | None, *, reachable: bool = True) -> bool:
+    """False while the pool is paused — nothing is competing for a slot, so a
+    recorded wait event is not a *live* slot wait (`_running_pool_stats`'s
+    ``pause`` element: truthy exactly when `/api/queue/health` reports
+    ``paused``).
+
+    Also False when the pool couldn't be asked at all (``reachable=False``,
+    i.e. `_running_pool_stats` returned `None` — server not running or
+    unreachable): `pause is None` is what a genuinely un-paused pool ALSO
+    looks like, so without this the two were indistinguishable and an
+    unreachable pool's stale wait was confidently reported as a live one
+    (review finding F2) — unlike `nh task show`, which already hedges with
+    `STALE_POOL_NOTE` in that same case. Fail closed: an unknown pool state is
+    not evidence of a live wait."""
+    return reachable and not pause
+
+
+def pool_paused_text(pause: Mapping) -> str:
+    """Render the same pause a task is behind, using only the fields
+    `_running_pool_stats` already exposes (`/api/queue/health`'s
+    ``paused_*``) — no second derivation of the wall clock."""
+    reason = pause.get("reason") or "unknown"
+    label = "quota cooldown" if reason == "quota" else f"{reason} cooldown"
+    until = pause.get("until") or "unknown"
+    text = f"pool paused — {label}, resumes {until}"
+    profile = pause.get("profile")
+    if profile:
+        text += f" ({profile} profile)"
+    return text
+
+
+#: Printed alongside a stale wait line when the pool's live state cannot be
+#: read at all (server not running / unreachable) — labelled, not silent.
+STALE_POOL_NOTE = "pool not reachable — this may be stale"
 
 
 def ends_wait(event: Mapping) -> bool:
