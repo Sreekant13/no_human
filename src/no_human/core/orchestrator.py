@@ -27,7 +27,7 @@ import unicodedata
 import shutil
 import subprocess
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -587,6 +587,49 @@ _MAX_REVIEW_INFRA_PARKS = 3
 #: counter held in memory would reset on every resume — which is precisely an
 #: unbounded loop wearing a cap's clothes.
 _REVIEW_INFRA_PARKS_KEY = "review_infra_parks"
+
+# INCIDENT (2026-08-20 16:54 UTC, personal2 profile): three reviewer sessions
+# — 365b7868, 624c3184, 5ca0e5d8 — died within eleven seconds of each other
+# with the bare, causeless "Claude Code returned an error result: success"
+# (the SDK's own wrapper exception, `claude_agent_sdk/_internal/query.py`),
+# in the SAME minute a fourth task (53d5eae1) parked `paused_quota` on the
+# CLI's own banner. Byte-for-byte the 2026-08-13 coder-path incident
+# `_infra_sdk_failure` documents above: the account wall killed the session
+# before the CLI's explanation ever reached `final_text`, so `_quota_signal`
+# — correctly — had no prose to match. All three were classified
+# TRANSIENT_INFRA and woke on `after:30m` into a pool still on the same wall,
+# where the scheduler's cooldown refused to dispatch them: wrong category,
+# wrong status, wrong wake clock.
+#
+# This is the coder path's OWN incident text, `_infra_sdk_failure` above —
+# reused here rather than re-derived, because it is the same shape. Matched
+# ONLY when corroborated (`_corroborated_quota_wall` below): the identical
+# phrase is also a genuine SDK crash with nothing to do with quota, which is
+# exactly why `_quota_signal` is never widened to catch it on its own.
+_BARE_SDK_RESULT_MARKER = "returned an error result: success"
+
+#: How recently a sibling task must have parked `paused_quota` on the SAME
+#: auth profile for its reset time to still corroborate a fresh bare-shape
+#: reviewer death as the SAME wall, not a stale or coincidental one. Matches
+#: the FIX SHAPE's own "~10 minutes"; the incident above landed inside 11
+#: seconds, so this has wide margin without reaching so far back that an
+#: hour-old, already-resolved park corroborates an unrelated new crash.
+_QUOTA_CORROBORATION_WINDOW = timedelta(minutes=10)
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp column (`wake_check_at`, `blocker["raised_at"]`,
+    `updated_at`) defensively — missing/malformed values are None, not a raise,
+    the same private-per-module convention `scheduler.py` and `blockers/wake.py`
+    each already use for the same columns."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
 
 #: A retry that reuses its branch meets whatever base it was cut from, forever
 #: — measured, not guessed: incident `db9da7f7` was 5 commits behind main and
@@ -6035,6 +6078,55 @@ class Orchestrator:
             review_cache_creation_tokens=getattr(source, "cache_creation_tokens", 0) or 0,
         )
 
+    async def _corroborated_quota_wall(self) -> tuple[str, str] | None:
+        """Is some OTHER task already parked `paused_quota` on the same auth
+        profile recently enough to be the SAME wall a bare-shape reviewer
+        death might also be?
+
+        `Orchestrator` has no live handle on `Scheduler`'s in-memory
+        cooldown clock (no `self.scheduler`) — this asks the store the same
+        question `Scheduler.recover_quota_cooldown` asks the store, because
+        the DB is the one place both sides already agree on: a task the
+        CLI's own banner parked, on my profile (or one that recorded none),
+        whose recorded reset still lies ahead, or that was raised within
+        `_QUOTA_CORROBORATION_WINDOW`.
+
+        Returns `(resets_at, sibling_task_id)` for the most recently raised
+        matching park, or None if nothing corroborates.
+        """
+        mine = active_auth_profile()
+        now = datetime.now(timezone.utc)
+        newest_raised: datetime | None = None
+        newest: tuple[str, str] | None = None
+        for sibling in await self.store.list_tasks(TaskStatus.PAUSED_QUOTA):
+            resets_at = getattr(sibling, "wake_check_at", None)
+            if not resets_at:
+                continue
+            blocker = sibling.blocker if isinstance(sibling.blocker, dict) else {}
+            theirs = blocker.get("auth_profile")
+            if theirs and mine and theirs != mine:
+                continue  # a DIFFERENT profile's wall — not corroboration for mine
+            raised = _parse_iso(blocker.get("raised_at")) or _parse_iso(
+                getattr(sibling, "updated_at", None)
+            )
+            if raised is None:
+                continue  # un-timestamped: cannot be placed on any wall
+            # Two ways a park corroborates: its wall is still CLOSED (the
+            # reset it recorded lies ahead — the same "pool is in quota
+            # cooldown" predicate `Scheduler.recover_quota_cooldown` arms
+            # from), or it was raised within the window (a park whose
+            # reset stamp is unparseable still says the wall was up just
+            # now). A park whose reset has passed and was raised long ago
+            # is history, not corroboration.
+            resets = _parse_iso(resets_at)
+            still_closed = resets is not None and resets > now
+            if not still_closed and now - raised > _QUOTA_CORROBORATION_WINDOW:
+                continue  # too stale to be the SAME wall
+            if newest_raised is None or raised > newest_raised:
+                newest_raised = raised
+                newest = (resets_at, sibling.id)
+        return newest
+
     async def _escalate_reviewer_unavailable(
         self, task: Task, detail: str, *, repo: GitRepo | None = None,
         branch: str | None = None,
@@ -6130,6 +6222,29 @@ class Orchestrator:
         task.context = ctx
         spent = parks > _MAX_REVIEW_INFRA_PARKS
 
+        # `_wake_check_at` (below, via `_raise_blocker`) gives `quota_refreshed`
+        # a generic poll — right when the only clock IS a generic poll, wrong
+        # once corroboration hands us the wall's own reset time. Set only by
+        # the corroborated branch below; applied, if the outcome actually
+        # parked, after `_raise_blocker` returns.
+        quota_wake_override: str | None = None
+
+        # 2026-08-20 16:54 UTC incident (constant block above): the bare
+        # "error result: success" the account wall leaves behind has no prose
+        # `_quota_signal` can match — and must not learn to, since the same
+        # phrase is also a genuine, quota-unrelated SDK crash (2026-08-13).
+        # What tells the two apart is corroboration: is some OTHER task
+        # already parked on the SAME wall, recently enough to be it? Checked
+        # here, once, rather than inside the branch below, so a session that
+        # already matched `_quota_signal` never pays for a redundant query.
+        corroboration: tuple[str, str] | None = None
+        if (
+            session_error
+            and not _quota_signal(detail)
+            and _BARE_SDK_RESULT_MARKER in detail.lower()
+        ):
+            corroboration = await self._corroborated_quota_wall()
+
         if session_error and _quota_signal(detail):
             blocker = Blocker(
                 category=BlockerCategory.QUOTA,
@@ -6153,6 +6268,40 @@ class Orchestrator:
                     "Nothing is needed from you — the task resumes and re-runs "
                     "the gate once the window refreshes; `nh auth use <profile>` "
                     "moves it to another profile sooner."
+                ),
+            )
+        elif session_error and corroboration is not None:
+            resets_at, sibling_task_id = corroboration
+            quota_wake_override = resets_at
+            window_minutes = int(_QUOTA_CORROBORATION_WINDOW.total_seconds() // 60)
+            blocker = Blocker(
+                category=BlockerCategory.QUOTA,
+                transient=True,
+                confidence=0.85,
+                wake_condition="quota_refreshed",
+                goal=task.title,
+                root_cause_hypothesis=(
+                    "The reviewer's Agent SDK session died with the bare "
+                    "'error result: success' the account wall leaves when it "
+                    "kills a session before the CLI's own explanation reaches "
+                    f"it — corroborated by task {sibling_task_id}, already "
+                    "parked on the same auth profile's quota wall (its "
+                    "recorded reset still lies ahead, or it was raised within "
+                    f"the last {window_minutes} minutes). Nothing about the "
+                    "diff was judged — it is unreviewed, not rejected."
+                ),
+                tried=["reviewer session", "reviewer session (retried once)"],
+                evidence=(
+                    f"{detail}\n\ncorroborating park: task {sibling_task_id} "
+                    f"parked paused_quota, resets_at={resets_at}"
+                ),
+                question=(
+                    "The subscription paying for the review is out of quota "
+                    f"(corroborated by task {sibling_task_id}'s park on the "
+                    "same wall). Nothing is needed from you — the task "
+                    "resumes and re-runs the gate once the window refreshes; "
+                    "`nh auth use <profile>` moves it to another profile "
+                    "sooner."
                 ),
             )
         elif session_error:
@@ -6235,8 +6384,31 @@ class Orchestrator:
             blocker.wake_condition = None
             return await self._raise_blocker(
                 task, blocker, repo=repo, branch=branch, escalate_now=True)
-        return await self._raise_blocker(
+        outcome = await self._raise_blocker(
             task, blocker, repo=repo, branch=branch, notify_override=True)
+        # `_raise_blocker` -> `_wake_check_at` already computed a generic
+        # `quota_refreshed` poll above; the corroborated branch has a BETTER
+        # clock — the wall's own reset time — and patches it in now, as a
+        # column update rather than a second trip through `_raise_blocker`,
+        # so the spent-cap check above still ran unconditionally and this
+        # never bypasses it (the prior review round's finding). Gated on the
+        # outcome actually landing in PAUSED_QUOTA: `spent` already returned
+        # above, but a future off-ramp (answer-reuse, WIP checkpoint) inside
+        # `_raise_blocker` could in principle route elsewhere, and a wake
+        # clock only means something on a parked task.
+        if outcome.status == TaskStatus.PAUSED_QUOTA:
+            if quota_wake_override:
+                task.wake_check_at = quota_wake_override
+            # Whose wall this is, as a FIELD — the `_park_quota` contract.
+            # `Scheduler.recover_quota_cooldown` honours an UNSTAMPED park
+            # for every profile, so a reviewer-side park left unstamped would
+            # idle the next profile behind this one's wall after `nh auth use
+            # <other>` + restart, and `_corroborated_quota_wall` could not
+            # tell it from another profile's.
+            if isinstance(task.blocker, dict):
+                task.blocker["auth_profile"] = active_auth_profile()
+            await self.store.update_task_columns(task)
+        return outcome
 
     async def _clear_review_infra_parks(self, task: Task) -> None:
         """The gate produced a verdict, so the consecutive-park streak is over.
@@ -7806,7 +7978,6 @@ class Orchestrator:
         """Compute the next watcher re-check stamp for a parked task. Time-based
         conditions resolve against this; richer conditions just get re-polled."""
         from ..blockers.wake import parse_duration
-        from datetime import timedelta
 
         now = datetime.now(timezone.utc)
         cond = (blocker.wake_condition or "").lower()

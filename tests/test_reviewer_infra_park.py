@@ -20,7 +20,7 @@ REVIEW_JSON, no reviewer configured) still escalates to a person, and the diff
 never passes unreviewed either way.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -43,6 +43,32 @@ _GENERIC_ERROR_TEXT = (
     "Traceback (most recent call last):\n"
     "  File \"cli.py\", line 1, in <module>\n"
     "RuntimeError: subprocess exited with code 1\n"
+)
+
+# The 2026-08-20 16:54 UTC incident shape: the account wall kills the SDK
+# session before the CLI's own banner ever reaches `final_text`, so what
+# lands here is the SDK's OWN wrapper exception and ITS OWN internal
+# traceback frames — never the CLI's prose, and never a traceback naming
+# user code or a missing binary.
+_BARE_SDK_SUCCESS_TEXT = (
+    "Claude Code returned an error result: success\n\n"
+    "Traceback (most recent call last):\n"
+    "  File \".venv/lib/python3.12/site-packages/claude_agent_sdk/_internal/"
+    "query.py\", line 852, in _read_messages\n"
+    "    raise Exception(\n"
+    "Exception: Claude Code returned an error result: success\n"
+)
+
+# A genuinely different crash that happens to share nothing with the bare
+# shape above except also being a session death — a missing binary, not the
+# SDK's own wrapper exception. Corroboration alone must never be sufficient
+# to reclassify this as quota.
+_MISSING_BINARY_TEXT = (
+    "Error: the agent session ended abnormally\n"
+    "Traceback (most recent call last):\n"
+    "  File \"claude_backend.py\", line 512, in run\n"
+    "    proc = await asyncio.create_subprocess_exec(\"claude\", ...)\n"
+    "FileNotFoundError: [Errno 2] No such file or directory: 'claude'\n"
 )
 
 
@@ -113,6 +139,38 @@ async def _new_task(store) -> Task:
     return task
 
 
+async def _seed_paused_quota_sibling(
+    store, *, wake_check_at: str, raised_at: str, auth_profile: str | None = None,
+) -> Task:
+    """A sibling task already parked `paused_quota` — the exact blocker shape
+    `Orchestrator._park_quota` itself writes (category, wake_condition,
+    raised_at, auth_profile), built directly against the store rather than
+    through a live `QuotaExhausted` exception so the fixture stays a pure DB
+    fact, independent of the coder path this task does not touch.
+
+    `auth_profile=None` on purpose by default: the corroboration this task
+    fixes only excludes a sibling when BOTH sides name a profile and they
+    differ (`_corroborated_quota_wall`, mirroring
+    `Scheduler.recover_quota_cooldown`) — an unattributed park, like a real
+    single-profile install's, must still corroborate.
+    """
+    sibling = Task.new("some other reviewer task", repo_path="/tmp/y")
+    await store.create_task(sibling)
+    await store.set_status(sibling, TaskStatus.CONTEXT)
+    sibling.wake_check_at = wake_check_at
+    sibling.blocker = {
+        "category": "QUOTA",
+        "wake_condition": "quota_refreshed",
+        "raised_at": raised_at,
+        "root_cause_hypothesis": "subscription quota exhausted",
+        "confidence": 1.0,
+        "auth_profile": auth_profile,
+    }
+    await store.update_task_columns(sibling)
+    await store.set_status(sibling, TaskStatus.PAUSED_QUOTA)
+    return sibling
+
+
 # --------------------------------------------------------------------------- #
 # (a) the quota family                                                         #
 # --------------------------------------------------------------------------- #
@@ -140,6 +198,169 @@ async def test_a_quota_killed_review_gate_parks_on_quota_and_never_escalates(
         "an outage was proposed to the human as a durable code lesson")
     # The evidence a human reads still says the gate did not run.
     assert "unreviewed" in parked.blocker["evidence"]
+
+
+# --------------------------------------------------------------------------- #
+# (a2) the bare-shape death — quota only when the POOL corroborates it         #
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_corroborated_bare_shape_death_parks_on_the_walls_own_clock(
+        store, tmp_path):
+    """2026-08-20 16:54 UTC: three reviewer sessions died with the bare,
+    causeless "error result: success" in the SAME minute a sibling task
+    parked `paused_quota` with the CLI's own banner. The dead session has no
+    prose of its own to match — the pool already holds the answer. FAILS on
+    unfixed code: the corroborated branch does not exist, so this death still
+    falls through to TRANSIENT_INFRA/after:30m."""
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    wall_resets_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+    sibling_raised_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=2)
+    ).isoformat()
+    sibling = await _seed_paused_quota_sibling(
+        store, wake_check_at=wall_resets_at, raised_at=sibling_raised_at)
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.PAUSED_QUOTA, (
+        "a corroborated bare-shape death still burned TRANSIENT_INFRA/after:30m")
+    assert parked.blocker["category"] == BlockerCategory.QUOTA.value
+    assert parked.blocker["wake_condition"] == "quota_refreshed"
+    assert parked.wake_check_at == wall_resets_at, (
+        "the corroborated park must wake on the WALL's own clock, not a "
+        "generic poll")
+    assert sibling.id in parked.blocker["root_cause_hypothesis"], (
+        "the blocker must name the corroborating park")
+    assert parked.blocker["category"] in NON_LEARNABLE_CATEGORIES
+
+
+async def test_a_reviewer_side_quota_park_is_stamped_with_the_paying_profile(
+        store, tmp_path, monkeypatch):
+    """The `_park_quota` contract: a park carries `auth_profile` as a FIELD
+    so `Scheduler.recover_quota_cooldown` can tell whose wall it is after
+    `nh auth use <other>` + restart. The reviewer-side park left it
+    unstamped (review finding on PR #565), which the scheduler honours for
+    EVERY profile — the next profile would idle behind this one's wall."""
+    from no_human.core import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "active_auth_profile", lambda: "personal")
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    wall_resets_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+    await _seed_paused_quota_sibling(
+        store, wake_check_at=wall_resets_at,
+        raised_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat())
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.PAUSED_QUOTA
+    assert parked.blocker["auth_profile"] == "personal", parked.blocker
+    assert parked.wake_check_at == wall_resets_at
+
+
+async def test_a_sibling_park_whose_wall_is_still_closed_corroborates_beyond_the_window(
+        store, tmp_path):
+    """The spec's first disjunct — "the pool is in quota cooldown" — is the
+    scheduler's predicate: a park whose recorded reset still lies ahead.
+    A reviewer that dies 15 minutes into a 2-hour wall is on that wall
+    even though no park was raised within the 10-minute window."""
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    wall_resets_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+    await _seed_paused_quota_sibling(
+        store, wake_check_at=wall_resets_at,
+        raised_at=(datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat())
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.PAUSED_QUOTA, (
+        "a still-closed wall must corroborate regardless of when its park was raised")
+    assert parked.wake_check_at == wall_resets_at
+
+
+async def test_a_lapsed_stale_sibling_park_is_history_not_corroboration(
+        store, tmp_path):
+    """A park whose reset has PASSED and that was raised long ago says
+    nothing about now: the bare-shape death keeps today's routing."""
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    await _seed_paused_quota_sibling(
+        store,
+        wake_check_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        raised_at=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat())
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.BLOCKED
+    assert parked.blocker["category"] == BlockerCategory.TRANSIENT_INFRA.value
+
+
+async def test_an_uncorroborated_bare_shape_death_still_parks_transient_infra(
+        store, tmp_path):
+    """The same bare-shape text, with NO sibling park and NO cooldown to
+    corroborate it, must behave exactly as it does today: TRANSIENT_INFRA,
+    after:30m. Corroboration is what changes the routing, not the marker
+    alone — the identical phrase is also a genuine, quota-unrelated SDK
+    crash (2026-08-13 incident)."""
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.BLOCKED
+    assert parked.blocker["category"] == BlockerCategory.TRANSIENT_INFRA.value
+    assert parked.blocker["wake_condition"] == "after:30m"
+
+
+async def test_a_non_quota_cause_is_never_reclassified_during_a_cooldown(
+        store, tmp_path):
+    """A reviewer death whose text names a real, non-quota cause (a missing
+    `claude` binary) must not be swept into QUOTA just because a sibling
+    task happens to be parked on the wall at the same time — corroboration
+    alone is not sufficient, the bare-shape marker must ALSO be present."""
+    notes: list = []
+    orch = _orch_with(store, notes)
+    task = await _new_task(store)
+    wall_resets_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+    sibling_raised_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=2)
+    ).isoformat()
+    await _seed_paused_quota_sibling(
+        store, wake_check_at=wall_resets_at, raised_at=sibling_raised_at)
+    detail = await _real_reason(_MISSING_BINARY_TEXT, tmp_path)
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    parked = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.BLOCKED
+    assert parked.blocker["category"] == BlockerCategory.TRANSIENT_INFRA.value
+    assert parked.blocker["wake_condition"] == "after:30m"
+    assert parked.wake_check_at != wall_resets_at
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +499,45 @@ async def test_a_quota_park_and_an_infra_park_share_one_budget(store, tmp_path):
 
     assert statuses[-1] == TaskStatus.ESCALATED
     assert TaskStatus.ESCALATED not in statuses[:-1]
+
+
+async def test_a_corroborated_bare_shape_park_is_capped_like_any_other(
+        store, tmp_path):
+    """A prior review round found the corroborated branch returning through
+    `_park_quota` BEFORE the `if spent:` escalation, so no number of
+    consecutive corroborated bare-shape deaths could ever reach a human — an
+    uncapped loop wearing `_MAX_REVIEW_INFRA_PARKS`'s clothes. Corroboration
+    stays present on every attempt (the sibling park never expires mid-test),
+    so the ONLY thing that can stop the loop is the shared park counter."""
+    from no_human.core.orchestrator import _MAX_REVIEW_INFRA_PARKS
+
+    orch = _orch_with(store, [])
+    task = await _new_task(store)
+    wall_resets_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+    sibling_raised_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=2)
+    ).isoformat()
+    await _seed_paused_quota_sibling(
+        store, wake_check_at=wall_resets_at, raised_at=sibling_raised_at)
+    detail = await _real_reason(_BARE_SDK_SUCCESS_TEXT, tmp_path)
+
+    for n in range(_MAX_REVIEW_INFRA_PARKS):
+        outcome = await orch._escalate_reviewer_unavailable(task, detail)
+        assert outcome.status == TaskStatus.PAUSED_QUOTA, (
+            f"corroborated park {n + 1} of {_MAX_REVIEW_INFRA_PARKS} should "
+            "still self-heal on the wall's clock")
+
+    outcome = await orch._escalate_reviewer_unavailable(task, detail)
+    final = await store.get_task(task.id)
+
+    assert outcome.status == TaskStatus.ESCALATED, (
+        "a corroborated bare-shape death bypassed the shared infra-park cap "
+        "and parked forever instead of ever reaching a human")
+    assert final.wake_check_at is None
+    assert not final.blocker["wake_condition"]
+    assert final.blocker["category"] in NON_LEARNABLE_CATEGORIES
 
 
 # --------------------------------------------------------------------------- #

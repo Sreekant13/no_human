@@ -525,7 +525,12 @@ async def test_a_dead_reviewer_transport_escalates_as_transient_infra():
 
     async def _raise_blocker(task, blocker, **kwargs):
         raised["blocker"] = blocker
-        return None
+        # The real `_raise_blocker` always returns a TaskOutcome (the caller
+        # reads `.status` to decide whether a quota park needs its wall clock
+        # and profile stamped); a `None` here misstates that contract.
+        from no_human.core.orchestrator import TaskOutcome
+        from no_human.core.task import TaskStatus
+        return TaskOutcome(task=task, status=TaskStatus.BLOCKED)
 
     orch._raise_blocker = _raise_blocker
 
@@ -598,7 +603,12 @@ async def test_the_transport_marker_survives_the_reviewers_tail_window(
 
     async def _raise_blocker(task, blocker, **kwargs):
         raised["blocker"] = blocker
-        return None
+        # The real `_raise_blocker` always returns a TaskOutcome (the caller
+        # reads `.status` to decide whether a quota park needs its wall clock
+        # and profile stamped); a `None` here misstates that contract.
+        from no_human.core.orchestrator import TaskOutcome
+        from no_human.core.task import TaskStatus
+        return TaskOutcome(task=task, status=TaskStatus.BLOCKED)
 
     orch._raise_blocker = _raise_blocker
     await orch._escalate_reviewer_unavailable(
@@ -626,7 +636,12 @@ async def test_a_reviewer_that_merely_reached_no_verdict_stays_novel_unknown():
 
     async def _raise_blocker(task, blocker, **kwargs):
         raised["blocker"] = blocker
-        return None
+        # The real `_raise_blocker` always returns a TaskOutcome (the caller
+        # reads `.status` to decide whether a quota park needs its wall clock
+        # and profile stamped); a `None` here misstates that contract.
+        from no_human.core.orchestrator import TaskOutcome
+        from no_human.core.task import TaskStatus
+        return TaskOutcome(task=task, status=TaskStatus.BLOCKED)
 
     orch._raise_blocker = _raise_blocker
     orch._escalate = lambda task, detail, **kw: _raise_blocker(
@@ -974,7 +989,9 @@ async def test_when_even_the_grace_runs_out_the_human_still_hears_transport(
 
     async def _raise_blocker(task, blocker, **kwargs):
         raised.update(blocker=blocker, kwargs=kwargs)
-        return None
+        from no_human.core.orchestrator import TaskOutcome
+        from no_human.core.task import TaskStatus
+        return TaskOutcome(task=task, status=TaskStatus.BLOCKED)
 
     orch._raise_blocker = _raise_blocker
     await orch._escalate_reviewer_unavailable(_Task(), detail)
