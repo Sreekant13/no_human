@@ -46,10 +46,8 @@ Git is owned by the orchestrator, never the LLM: branch, commit (as
 `no_human <no-human@acme.com>`, distinct from you), push, open PR. The
 PreToolUse guard blocks `git merge`, force-push, `rm -rf`, and writes to
 `forbidden_paths`. `never_push_to` (`main`, `master`, `release/*`) is refused at
-the git layer. During review the guard refuses the file-edit tools (Write, Edit,
-NotebookEdit, MultiEdit), every git or forge mutation, and subagents; Bash stays,
-so a shell redirection is not prevented by the guard — a change the reviewer
-leaves in the tree is a gate-integrity question, not a tool one.
+the git layer. During review the backend runs **read-only**: all write tools are
+blocked unconditionally.
 
 ## 4. Trust only verifiable signals
 
@@ -129,16 +127,90 @@ named here.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
   (`cli/commands.py:1793`). This is *your* command, not the agent's — an agent
-  session's Bash is denied it in every mode (`_MERGE_STACK_RUN` in
-  `agent/guard.py`, alongside the `gh pr merge` / `glab mr merge` denial; §2).
+  session's Bash is denied it in every mode (`_LEXICAL_MERGE_STACK` in
+  `agent/guard.py`, alongside the `gh pr merge` / `glab mr merge` denial and
+  the argv rule; §2).
   Until 2026-08-08 this sentence overstated: the guard denied the direct
   spellings but not this wrapper.
 - **`nh approve` lands the PR** — a local squash commit made as the operator
   identity, then `git push` of that commit to your default branch and a
   `gh pr close` / `glab mr close` of the PR (`vcs/approve_merge.py`). This is
-  **your** command (CLI `nh approve`, or the board's "Approve and merge"
-  button); an agent session's Bash is denied `gh pr merge` / `glab mr merge`
-  in every mode (§2) and this path never calls them.
+  **your** command (CLI `nh approve` or `no-human approve` — the same entry
+  point under both console scripts — or the board's "Approve and merge"
+  button).
+
+  An agent session's Bash is denied it in every mode (§2). The rule reads
+  **argv**, not the command line: it joins backslash-continuations, decodes
+  `$'...'` escapes, masks quoted payloads and heredocs so a `;` inside code is
+  not read as a shell separator, splits the line into commands, peels wrappers
+  (`uv run`, `uvx`, `env`, `sudo`, `sh -c`, `timeout`, `xargs` and the rest of
+  the file's runner set), and asks what each command IS.
+
+  What it covers, each measured in both session modes and most of it executed
+  in a real shell before being believed:
+
+  - the CLI under either console script, either case, with options,
+    redirections (including one glued onto the verb) or a line continuation
+    between the binary and the verb;
+  - a python interpreter — `python`, `python3.12`, `ipython`, `pypy` — that
+    imports the landing code, imports it dynamically, drives the click entry
+    point, or shells the CLI back out, however the interpreter is flagged or
+    fed;
+  - a tool that runs what it reads: `find -exec`, `awk`'s `system()`, `sed`'s
+    `/e`, `osascript`'s `do shell script`, and a shell runner nested **two**
+    deep;
+  - a command substitution inside another command's argument;
+  - a request to `/api/tasks/<id>/approve`, `/approve-landed`, `/shipped` or
+    `/finish-review` from anything that can make one — `curl`, `wget`, `gh
+    api`, `node`, `bun`, `perl`, `ruby`, a python payload, a raw socket — with
+    the argument percent-decoded and its path normalised, so neither an escaped
+    byte nor `..` padding slips past.
+
+  **Input it cannot resolve is refused, not allowed.** `shlex` handles quoting
+  and backslashes and nothing else — not a variable, not a substitution nested
+  inside another. When the command or verb position holds one of those AND the
+  command names one of these actions, the guard refuses and says so. This is
+  the polarity the `git push` rule in the same file already takes.
+
+  **Naming the act is not doing it.** A reviewer can read, grep and `git log`
+  the landing code, grep the route in the file that defines it, run its tests
+  (through `pytest`, `uv run pytest`, `subprocess`, or behind `xargs`), and
+  write a commit message or PR title that mentions the command. The exemption
+  is a property of the command that will actually run, after wrapper peeling —
+  not of `argv[0]` as typed, and not of a message-option grammar.
+
+  **WHAT THIS RULE IS, stated plainly after seven rounds of getting it wrong.**
+  It RAISES THE COST of the obvious spellings. It is not a closed door, and
+  this paragraph no longer offers a list of exceptions as if it were one —
+  that list was published three times and found incomplete three times, which
+  is worse than not publishing it. A guard that reads a command line is playing
+  a different game from a shell, which parses a grammar, expands it, and then
+  executes; the gap between those is not enumerable by inspection.
+
+  Some things it demonstrably cannot see, as illustration rather than as a
+  boundary: a command assembled at runtime (`base64 -d | sh`); a script written
+  by one tool call and run by the next, where only the path reaches Bash; shell
+  nesting past two levels; aliases, functions and `PATH` shims; and shell
+  grammar the tokeniser does not model. On the Codex backend it cannot act at
+  all before the fact — `codex exec` offers no PreToolUse veto, so the same
+  rules are evaluated on an already-executed call.
+
+  **The control that does close the door is not this.** It is a check at the
+  act: `nh approve` refusing inside an agent session, and the four gate-ending
+  routes requiring something an agent session does not have. That work is
+  tracked separately and is the thing to rely on; treat this rule as the layer
+  in front of it.
+
+  The paragraph overstated between 2026-08-12 and 2026-08-22, when `nh approve`
+  gained a real `git merge --squash` and push while neither it nor the API
+  routes were denied. Twelve reachable spellings, found by fact-checking a
+  public article rather than by an exploit. **Fix round after fix round followed, each one wrong somewhere the last
+  shape could not reach, and every miss found by an independent review**; the list above is what
+  survived the last of them. Rounds one to four were pattern-matching over the
+  command text and each was wrong somewhere the previous shape could not reach;
+  from round five the rule reads argv. The reviews stopped reasoning about
+  spellings and started EXECUTING them, which is how most of the list was
+  found.
 - **One `GET https://pypi.org/pypi/no-human/json` per day**, to notice a newer
   release (`updates.py:39`). No identifier, no repo name, no telemetry — the
   same request `pip install` makes. On by default (`updates.enabled: true`,

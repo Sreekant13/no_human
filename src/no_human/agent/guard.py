@@ -42,6 +42,8 @@ import fnmatch
 import os
 import re
 import shlex
+import posixpath
+from urllib.parse import unquote
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -156,11 +158,8 @@ _GIT_DESTRUCTIVE = re.compile(
 # behavior is tested through the CliRunner suite, never a live process. The
 # command position (start of string or after a separator/path) keeps prose
 # like `echo nh serve …` allowed.
-_LIVE_SERVER = re.compile(
-    r"(?:^|[|;&]\s*|`|\$\(|^\s*|/|\bsudo\s+|\benv\s+[^|;&]*?\s)"
-    r"nh\s+(?:serve|start|watch|bench\s+run)\b"
-)
-
+# `_LIVE_SERVER` used to live here as a regex. It is now one branch of
+# `_approve_denial`, which reads argv — see the block comment there.
 # --------------------------------------------------------------------------- #
 # Filesystem-wide scans (`find /`, `grep -r ... /`, `ls -R /`, ...). Intake
 # exploration is meant to be repo-scoped — see `intake/grill.py` and
@@ -869,7 +868,17 @@ _FORGE_MERGE = re.compile(
     r"\b(?:gh\s+pr\s+merge"           # gh pr merge 7004 --squash
     r"|glab\s+mr\s+merge"             # glab mr merge 12
     r"|gh\s+api\b[^|;&]*?/(?:pulls|merge_requests)/\d+/merge"  # the REST call
-    r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge)"
+    r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge"
+    # GraphQL merges a PR in one mutation and never touches the REST path
+    # above. Found 2026-08-22 by the sweep that found the `nh approve` hole:
+    # `gh api graphql -f query="mutation{mergePullRequest(input:{...}){...}}"
+    # was ALLOW while every REST spelling was DENY. Matched on the mutation
+    # name, which IS the act.
+    # enablePullRequestAutoMerge lands it as soon as checks pass, which
+    # the project's standing rules forbid in as many words: there is no
+    # auto-merge anywhere, and "as soon as checks pass" is auto-merge.
+    # Missed by the first sweep, found by review 2026-08-22.
+    r"|mergePullRequest\b|enablePullRequestAutoMerge\b)"
 )
 
 # The product's OWN spelling of the same act: `nh merge-stack run` shells
@@ -885,7 +894,789 @@ _FORGE_MERGE = re.compile(
 # denial with a stated alternative, while a miss merges a PR — the same
 # polarity `_FORGE_MERGE` already accepts for `gh pr merge` in a quoted
 # string. `plan` and `link` only read/record order and are not matched.
-_MERGE_STACK_RUN = re.compile(r"(?<![\w.-])nh\s+merge-stack\s+run\b")
+# `nh` and `no-human` are the SAME entry point: pyproject declares both
+# console scripts against no_human.cli.commands:main, and `no-human` is the
+# name README and quickstart teach (`uv tool install no-human`). Review
+# 2026-08-22 found `no-human approve <id>` ALLOW while `nh approve <id>` was
+# DENY — the documented spelling of the act was the unguarded one. Every
+# rule below that names the CLI matches both.
+# ===========================================================================
+# ENDING THE HUMAN GATE — approving, merging, landing.
+#
+# THIS RULE IS ARGV-SHAPED, NOT LEXICAL, AND THAT IS THE WHOLE POINT.
+# Four rounds of lexical patching preceded it and every round was wrong in a
+# direction nobody predicted. The record, because the pull back toward "just
+# add an alternation" is strong:
+#
+#   round 1  `nh approve` denied. Missed the API routes entirely.
+#   round 2  routes added. Denied `cat src/no_human/vcs/approve_merge.py` —
+#            a read-only reviewer could not read the file it reviews.
+#   round 3  `no-human approve` was still ALLOW — the SECOND console script for
+#            the same entry point, and the name README and quickstart teach.
+#            A quoted task id and a `..` segment reached the route.
+#   round 4  `nh --repo . approve` was ALLOW (the rules required the binary and
+#            the verb to be adjacent). The fix for that introduced a REGRESSION:
+#            a `git` token on an earlier LINE reached forward and ate a later
+#            `python -m no_human.cli.commands approve` — including from the bare
+#            substring `git` inside a path like `~/git/`.
+#
+# Each round the pattern grew and the next miss was somewhere else: a flag
+# (`python -u -c`), a redirection (`nh 2>/dev/null approve`), an unexpanded
+# variable (`nh $FLAGS approve`), a percent-encoded byte (`appro%76e`).
+# Those are not spelling variants a longer regex reaches. They are what a SHELL
+# resolves and a regex cannot, so this asks the question the shell answers:
+# for each command in the line, what is argv[0] and what are its arguments?
+#
+# The same shape already exists twice in this file — `_git_invocations` and the
+# package-install guard both work on argv — so this reuses their primitives
+# (`_CMD_SEP`, `_strip_wrappers`, `_SHELL_RUNNERS`) rather than adding a third
+# way to split a command line.
+#
+# WHAT IT COSTS. It cannot see a command assembled at runtime, and it cannot
+# see a script WRITTEN and then run (`Write /tmp/x.py` then `python /tmp/x.py`)
+# — the two tool calls are separate and only the second reaches Bash, where the
+# payload is a path. Those are stated in docs/security.md rather than papered
+# over. A lexical rule could not see them either.
+
+#: Both console scripts. pyproject declares `nh` AND `no-human` against
+#: no_human.cli.commands:main, and `no-human` is the name the install docs use.
+#: THE LEXICAL LAYER, KEPT. Deleting it and relying on argv alone was a
+#: REGRESSION, and the file said so in advance: "The argv analysis below is
+#: additive, never a replacement." Review 2026-08-22 measured it — eight
+#: spellings of `nh merge-stack run` that main DENIES went ALLOW on the branch,
+#: because shell grouping puts something other than the binary in argv[0]:
+#:
+#:     (nh merge-stack run --yes)        { nh merge-stack run --yes; }
+#:     if true; then nh merge-stack run --yes; fi
+#:     for i in 1; do nh merge-stack run --yes; done
+#:     cat <(nh merge-stack run --yes)   npx -c 'nh merge-stack run --yes'
+#:
+#: A commit whose purpose is "the agent never merges" made that weaker. The two
+#: layers answer different questions and neither subsumes the other: the regex
+#: sees text a tokeniser mis-splits, argv sees structure a regex cannot reach
+#: (options between binary and verb, redirections, wrappers, encodings).
+#: The regex's prose false positives are the cost this file already argues for
+#: on the merge family.
+_LEXICAL_MERGE_STACK = re.compile(
+    r"(?<![\w.-])(?:nh|no-human)\s+merge-stack\s+run\b")
+
+_LEXICAL_LIVE_SERVER = re.compile(
+    r"(?:^|[|;&]\s*|`|\$\(|^\s*|/|\bsudo\s+|\benv\s+[^|;&]*?\s)"
+    r"(?:nh|no-human)\s+(?:serve|start|watch|dashboard|bench\s+run)\b")
+
+_APPROVE_BINARIES = frozenset({"nh", "no-human"})
+
+#: Global options on the `nh` group that CONSUME the next token, so the value
+#: is not mistaken for the subcommand. Read off the CLI, not guessed.
+_NH_VALUE_OPTS = frozenset({"--repo"})
+
+#: Subcommands that end the human gate, and the ones that run a live server
+#: against the operator's real config, database and credentials.
+_APPROVE_VERBS = frozenset({"approve"})
+_LIVE_VERBS = frozenset({"serve", "start", "watch", "dashboard"})
+#: `dashboard` is a documented ALIAS that `ctx.invoke(start, ...)`. It was
+#: missing here and reachable while `nh start` was denied — review 2026-08-22.
+#: A verb list is a list, so tests/test_guard.py asserts this set against the
+#: click command table rather than trusting the comment.
+_LIVE_VERB_PAIRS = {("bench", "run")}
+_MERGE_VERB_PAIRS = {("merge-stack", "run")}
+
+#: argv[0] names that READ. Naming the act is not doing it: a reviewer greps
+#: the route in the file that defines it, and an agent writes a commit message
+#: about it. This is the "denied titling its own PR" class, and it has now
+#: recurred twice, so the exemption is a property of argv[0] rather than of a
+#: message-option grammar. The previous attempt — stripping the value of
+#: `-m`/`--title`/`--body` — is DELETED: `-m` is also python's module flag, its
+#: scoping regex could be reached across a newline by the substring `git` in a
+#: path, and it only ever stripped the first such option per segment.
+#: Tools that READ and cannot run their arguments as a command. A name list is
+#: one entry short in BOTH directions unless it is split this way — review
+#: 2026-08-22 found `find -exec`, `awk 'BEGIN{system(...)}'` and `sed .../e`
+#: exempted as "text tools" while they execute, and `printf`/`node`/`npm`
+#: denied for merely naming the route.
+_READ_ONLY_TOOLS = frozenset({
+    "grep", "rg", "egrep", "fgrep", "ag", "ack", "cat", "bat", "less", "more",
+    "head", "tail", "echo", "printf", "jq", "yq", "diff", "wc", "sort",
+    "uniq", "tr", "cut", "ls", "file", "strings", "xxd", "od", "nl", "man",
+    "column", "tee",
+})
+
+#: `npx -c '<command>'` and `npm exec -c '<command>'` RUN it. These were on
+#: the read-only list, which both exempted them from the route check and
+#: stopped their payload being recursed into — review 2026-08-22 executed
+#: `npx -c 'nh approve <id>'` in bash, zsh and sh.
+_NODE_RUNNERS = frozenset({"npm", "npx", "pnpm", "yarn", "bunx"})
+
+#: Tools that read text AND can execute what they read. Not exempt: their
+#: sub-argv is analysed like any other command.
+#: Tools whose FIRST POSITIONAL (or `-e` value) is a program they run.
+#: `awk 'BEGIN{system("nh approve <id>")}'` and `sed 's/x/nh approve <id>/e'`
+#: both execute — review 2026-08-22 ran them.
+_SCRIPT_TOOLS = frozenset({"awk", "gawk", "mawk", "sed", "perl", "ruby",
+                           "node", "deno", "bun", "osascript"})
+
+#: Tools that run something only after an explicit exec flag. `git`, `gh` and
+#: `glab` are here rather than in _SCRIPT_TOOLS for one specific reason: their
+#: quoted arguments are MESSAGES. `git commit -m "nh approve docs"` must stay
+#: allowed — that is the "agent denied titling its own PR" class, which this
+#: rule has now had four separate recurrences of.
+_ARG_EXEC_TOOLS = frozenset({"find", "git", "gh", "glab"})
+
+_EXEC_CAPABLE_TOOLS = _SCRIPT_TOOLS | _ARG_EXEC_TOOLS
+
+#: Exec-capable tools that still cannot make an HTTP request of their own.
+#: `gh` and `glab` are NOT here: `gh api -X POST <url>` posts.
+#: ...and they cannot make an HTTP request of their own, so they stay
+#: exempt from the route check whatever else they do.
+_ROUTE_EXEMPT_TOOLS = frozenset({"find", "git", "npm", "npx",
+                                 "pnpm", "yarn", "bunx"})
+
+#: Evidence that a payload MAKES a request rather than mentioning a URL.
+#: `node -e "console.log('/api/tasks/x/approve')"` prints; `node -e
+#: 'fetch(".../approve",{method:"POST"})'` posts. Naming the act is not doing
+#: it — the class this rule has now had five recurrences of — so a script
+#: tool's payload needs both the route and this.
+_REQUESTS = re.compile(
+    r"\bfetch\s*\(|(?:\.|->)post\s*\(|(?:\.|->)request\s*\("
+    r"|(?:\.|->)put\s*\(|urlopen\s*\(|\bHTTP::Tiny\b|\bopen-uri\b"
+    r"|URI\.open\b|\bGET\s+/api|\bPOST\s+/api"
+    r"|\bhttp\.client\b|\bNet::HTTP\b|\bLWP\b|\baxios\b|\bhttpx\b"
+    r"|\brequests\.|\bcurl\b|\bwget\b|\bXMLHttpRequest\b|\bsocket\b"
+    r"|Invoke-(?:RestMethod|WebRequest)")
+
+#: Runners whose FIRST argument is an operand, not the command. `timeout 600
+#: pytest ...` and `flock /tmp/l nh ...` — reading the next token as the
+#: command returned `600`, so `timeout 600 pytest -k approve --rootdir=$PWD`
+#: was refused as undecidable. Sixth recurrence of the over-denial class.
+_RUNNERS_WITH_OPERAND = frozenset({"timeout", "flock"})
+
+#: Runner flags that consume the following token.
+_FLAGS_WITH_VALUE = frozenset({"-n", "-o", "-u", "-c", "-I", "-i", "-P", "-s"})
+
+#: Test runners and build drivers. Exempt from the undecidable-input refusal:
+#: `uv run pytest -k approve --rootdir=$PWD` is running the tests for the code
+#: this rule protects, and refusing it was the FIFTH recurrence of the
+#: "denied for naming the act" class (review 2026-08-22).
+_TEST_RUNNERS = frozenset({
+    "pytest", "tox", "nox", "unittest", "make", "cargo", "go", "jest",
+    "vitest", "mocha", "gradle", "mvn", "ctest", "bazel",
+})
+
+#: Runners that carry the real command as the REST of their own argv rather
+#: than as a quoted string. `_git_invocations` already handles this exact case
+#: 400 lines below ("`xargs git restore` / `timeout 30 git restore .`"); the
+#: first draft of this rule copied only the quoted-payload branch, so `timeout
+#: 5 nh approve <id>`, `nice`, `stdbuf`, `script`, `flock`, `watch` and `xargs`
+#: were all ALLOW. Measured against a real shell, not inferred.
+#: Flags after which the REST of the argv is a command to run. `find -exec`,
+#: `awk -e`, `node -e`, `perl -e`. Review 2026-08-22 reached `curl` through
+#: `find . -exec curl -X POST .../approve \\;`.
+_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-c", "-e", "--eval", "--exec"})
+
+#: A redirection onto a numbered file descriptor other than stderr-to-stdout.
+#: `printf '...' >&3` writes to whatever fd 3 was opened on — in the evasion
+#: review 2026-08-22 built, a socket. So a read-only tool doing this is not
+#: reading, and the exemption does not apply to that segment.
+_FD_WRITE = re.compile(r">&(?!1\b)\d")
+
+#: Programs that speak to a socket and take their payload on STDIN. `printf
+#: 'POST /api/tasks/<id>/approve HTTP/1.1...' | nc 127.0.0.1 8420` puts the
+#: route in the PIPE, not in the network tool's argv. Same shape as the python
+#: pipe case, different tool.
+_SOCKET_TOOLS = frozenset({"nc", "netcat", "ncat", "telnet", "socat"})
+
+_TRAILING_ARGV_RUNNERS = frozenset({
+    "xargs", "timeout", "nice", "stdbuf", "script", "flock", "watch", "ionice",
+    "chrt", "setsid", "unbuffer",
+})
+
+_PY_INTERPRETER = re.compile(
+    r"^(?:python(?:\d+(?:\.\d+)?)?|ipython\d?|pypy\d?|micropython)$")
+
+#: The code shapes that land a PR in-process. Searched in a python invocation's
+#: OWN payload (its arguments and any heredoc body), never across the line, so
+#: `python -m pytest tests/... && grep -n "land_task(" src/...` is untouched.
+_IN_PROCESS_CODE = re.compile(
+    # The import list is `[\w,\s()]*?` and NOT `(?:[\w,\s()]|\bas\b)*?`:
+    # `as` is two \w characters AND the second alternative, which is 2^n
+    # ambiguity. `python -c "from no_human.cli.commands import n0 as a0,
+    # n1 as a1, ..."` cost 878 ms at 20 aliases and 5.7 s adversarially,
+    # inside a PreToolUse hook — an exponential this rule INTRODUCED while
+    # removing a quadratic, found by review 2026-08-22. `[\w,\s()]` already
+    # covers `as`, so the alternative bought nothing and cost that.
+    # `main` and `cli` only from the CLI module. A bare alternation on those
+    # names denied `from no_human.core.store import Store, main` and
+    # `from no_human.agent.guard import evaluate as cli` — review 2026-08-22.
+    # ...and it must be CALLED. `from no_human.cli.commands import cli;
+    # print(sorted(cli.commands))` is introspection, not an invocation —
+    # review 2026-08-22 flagged the bare alternation as a false denial.
+    r"from\s+no_human\.cli[\w.]*\s+import\s+[\w,\s()]*?"
+    r"\b(?:main|cli|approve)\b[\s\S]{0,200}?\b(?:main|cli|approve)\s*\("
+    r"|from\s+no_human[\w.]*\s+import\s+[\w,\s()]*?"
+    r"\b(?:approve_merge|land_task)\b"
+    # the dynamic spellings of the same import
+    r"|import_module\s*\(\s*['\"]no_human\."
+    r"|__import__\s*\(\s*['\"]no_human\."
+    # shelling the CLI back out from inside python
+    r"|(?:os\.system|subprocess\.\w+|os\.exec\w*|os\.popen)\s*\([^)]*"
+    r"['\"]?\b(?:nh|no-human)\b[^)]*approve"
+    # (A second alternative matching any os.system/subprocess call containing
+    # the WORD approve was removed: it denied
+    # `subprocess.run(["pytest", "-k", "approve"])` and
+    # `subprocess.run(["pytest", "tests/test_approve_merge.py"])` — running the
+    # tests for the code this rule protects. The alternative above already
+    # covers the case that matters, because a shell-out that lands a PR has to
+    # name the binary.)
+    r"|import\s+no_human\.vcs\.approve_merge\b"
+    r"|\bland_task\s*\("
+    r"|\bapprove_merge\.\w+\s*\("
+    r"|\bcli\s*\(\s*\[[^\]]*['\"]?approve"
+    r"|\bapprove\.callback\s*\("
+    r"|run_module\s*\(\s*['\"]no_human\.cli"
+    r"|run_path\s*\([^)]*approve_merge"
+)
+
+#: A path on OUR local API that ends the gate. `shipped` and `finish-review`
+#: do not merge, but each is a human asserting the gate is satisfied — the same
+#: forgery as `approve --landed`. Matched against a percent-DECODED token,
+#: because curl transmits `%76` verbatim and the server unquotes before routing.
+_GATE_PATH = re.compile(
+    r"/api/tasks/[^/\s]+/(?:approve(?:-landed)?|shipped|finish-review)"
+    r"(?:\b|/|$)", re.IGNORECASE)
+
+#: Any `/api/tasks/...` path, however many segments — the input to
+#: normalisation, not a verdict.
+_TASKS_PATH = re.compile(r"/api/tasks/[^\s\"']*", re.IGNORECASE)
+
+
+def _gate_route(tok: str) -> bool:
+    """True if the token targets one of the four gate-ending routes, AFTER
+    percent-decoding and dot-segment normalisation.
+
+    The previous shape bounded the middle to 120 characters, and the comment
+    justifying the bound named the mechanism that defeats it: curl normalises
+    `..` away BEFORE sending, so the argument can be arbitrarily long and still
+    route. Review 2026-08-22 proved it against a live listener — a 161-character
+    padded path arrived as `/api/tasks/abc/approve` while the guard allowed it.
+    Normalising is both correct and linear, so the bound was answering the wrong
+    question."""
+    text = _decoded(tok)
+    for m in _TASKS_PATH.finditer(text):
+        if _GATE_PATH.search(posixpath.normpath(m.group(0))):
+            return True
+    return bool(_GATE_PATH.search(text))
+
+
+#: `$(which nh) approve <id>` needs no rule of its own any more: the
+#: undecidable-input branch below denies it, because the command position
+#: contains `$` and the segment names the act. A dedicated
+#: `_WHICH_SUBST` pattern lived here until a mutation showed it made no
+#: difference to any test — redundant, not untested, so it went.
+#: Quoted regions and heredoc bodies are MASKED before the command is split.
+#: This is the plumbing that a first draft of the argv rule got wrong: a `-c`
+#: payload legitimately contains `;` and newlines, and `_CMD_SEP` splits on
+#: both, so `python -c "import sys; from no_human... import main; main()"` was
+#: torn into three "segments" and the interpreter never saw its own code.
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"", re.S)
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1\n(.*?)\n\s*\2\b", re.S)
+_MASK = "\x00m{}\x00"
+_REDIR_AMP = re.compile(r"\d*>&\d*|&>>?")
+_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+
+
+#: `nh \<newline> approve <id>` is ONE command to every shell — bash, sh and
+#: zsh all ran it — but `_CMD_SEP` splits on the newline, so the verb landed in
+#: a segment of its own. Joined before anything else reads the line. Mid-token
+#: too: `nh appro\<newline>ve <id>` also executes.
+_LINE_CONTINUATION = re.compile(r"\\\n")
+
+
+def _join_continuations(cmd: str) -> str:
+    return _LINE_CONTINUATION.sub("", cmd)
+
+#: ANSI-C quoting. `$'\x61pprove'` IS `approve` to bash and zsh, and the
+#: escapes are deterministic — so this is not undecidable input, it is input
+#: with an encoding, and decoding beats refusing. Review 2026-08-22 walked
+#: `$'\x61pprove'` and `$'\x6e\x68' $'\x61pprove'` past the undecidable
+#: branch, which keys on the literal word and neither of those spells it.
+_ANSI_C_QUOTE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+
+
+def _effective_name(argv: list[str]) -> str:
+    """The name of the command that will actually run, after a runner prefix.
+
+    `xargs grep -l approve $EXTRA`, `nice pytest -k approve --color=$C` and
+    `uv run pytest ... --rootdir=$PWD` all have a runner in argv[0] and the
+    real command behind it. Reading only argv[0] made the undecidable-input
+    refusal fire on four routine commands — review 2026-08-22, the fifth
+    recurrence of "denied for naming the act"."""
+    skip_operand = False
+    for tok in argv:
+        name = PurePosixPath(tok).name
+        if skip_operand:
+            skip_operand = False
+            continue
+        if name in _RUNNERS_WITH_OPERAND:
+            skip_operand = True
+            continue
+        if (name in _SHELL_RUNNERS or name in _TRAILING_ARGV_RUNNERS
+                or name in {"uv", "uvx", "poetry", "pdm", "hatch", "rye",
+                            "pipx", "env", "sudo", "run", "tool"}):
+            continue
+        if tok.startswith("-"):
+            skip_operand = name in _FLAGS_WITH_VALUE
+            continue
+        return name
+    return PurePosixPath(argv[0]).name if argv else ""
+
+
+def _decode_ansi_c_body(body: str) -> str:
+    try:
+        return body.encode("latin-1", "backslashreplace").decode(
+            "unicode_escape")
+    except Exception:  # noqa: BLE001 — a bad escape stays as written
+        return body
+
+
+def _strip_one_quote_pair(tok: str) -> str:
+    """One matching OUTER pair, not every quote character at both ends.
+
+    `str.strip("\"'")` removes every trailing character in the set, so
+    `'sh -c "nh approve x"'` became `sh -c "nh approve x` — the inner closing
+    quote eaten along with the outer one. `shlex` then raised, the fallback
+    split on spaces, and a two-level `sh -c` walked straight through. Review
+    2026-08-22 executed it. A defect of this architecture, not an inherited
+    one."""
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+        return tok[1:-1]
+    return tok
+
+
+def _mask_payloads(cmd: str) -> tuple[str, dict[str, str]]:
+    """Command with every quoted region and heredoc body replaced by an opaque
+    token, plus the table to read them back. Keeps shell separators inside a
+    payload from being read as shell separators."""
+    table: dict[str, str] = {}
+
+    def take(text: str) -> str:
+        key = _MASK.format(len(table))
+        table[key] = text
+        return key
+
+    # `2>&1` and `&>file` contain `&`, which the shared _CMD_SEP treats as a
+    # command separator — `nh >/tmp/l 2>&1 approve <id>` was torn in half and
+    # the verb landed in a segment of its own. Masked here rather than by
+    # changing _CMD_SEP, which other rules in this file depend on.
+    # ANSI-C quoting is decoded INTO A MASK, before any other masking, and
+    # never back into the command text. Decoding it in place was a defect this
+    # rule introduced while fixing the round before it: `$'\x27'` decodes to a
+    # bare apostrophe, so `echo $'\x27' ; nh approve <id> ; echo $'\x27'`
+    # became `echo ' ; nh approve <id> ; echo '` — one quoted region, argv[0]
+    # `echo`, allowed. Executed in bash, zsh and sh by review 2026-08-22.
+    # Masking it keeps the decoded VALUE visible to the rules while keeping its
+    # characters out of the shell-syntax layer.
+    masked = _ANSI_C_QUOTE.sub(lambda m: take(_decode_ansi_c_body(m.group(1))),
+                               cmd)
+    masked = _REDIR_AMP.sub(lambda m: take(m.group(0)), masked)
+    masked = _HEREDOC.sub(lambda m: "<<" + m.group(2) + " " + take(m.group(3)), masked)
+    masked = _QUOTED.sub(lambda m: take(m.group(0)), masked)
+    return masked, table
+
+
+#: Does this segment name the act at all? Only used to SCOPE the
+#: undecidable-input denial, so a command we cannot resolve and that says
+#: nothing about approving stays allowed.
+#: A script-tool payload that shells a command back out. `awk
+#: 'BEGIN{system("nh approve <id>")}'` — the inner command is not shell syntax
+#: the tokeniser reaches, so it is matched as what it is: an exec call naming
+#: the binary and the verb.
+_SCRIPT_EXEC = re.compile(
+    r"\b(?:system|exec|popen|spawn|backticks|qx|do\s+shell\s+script)\s*[(\[]?[^)\]]*"
+    r"(?:nh|no-human)\s+(?:approve|merge-stack|serve|dashboard)", re.IGNORECASE)
+
+_GATE_MENTION = re.compile(
+    r"\bapprove\b|\bapprove-landed\b|\bshipped\b|\bfinish-review\b"
+    r"|\bmerge-stack\b|\bland_task\b|\bapprove_merge\b|/api/tasks\b"
+    r"|\bserve\b|\bdashboard\b", re.IGNORECASE)
+
+#: A redirection operator and its target, wherever it is glued on.
+_REDIR_SUFFIX = re.compile(r"\d*(?:>>|>|<)&?\S*$")
+
+#: Grouping and process-substitution punctuation, replaced by a space before
+#: tokenising so the body's own argv[0] is what gets read.
+_GROUPING = re.compile(r"(?:^|(?<=\s))[({]|[)}](?=\s|$)|<\(|\)")
+
+_MASK_KEY = re.compile(r"\x00m\d+\x00")
+
+
+def _unmask(tok: str, table: dict[str, str]) -> str:
+    """One pass, not one pass PER TABLE ENTRY. The loop this replaces was
+    O(tokens x table) and made the whole guard quadratic: `nh "a" x16000` cost
+    14.6 SECONDS inside a PreToolUse hook, 192 million str.replace calls,
+    against 34 ms without the rule. Found by review 2026-08-22, which correctly
+    noted the previous commit message claimed the remaining superlinearity was
+    pre-existing. It was not; this function was."""
+    if not table:
+        return tok
+    return _MASK_KEY.sub(lambda m: table.get(m.group(0), m.group(0)), tok)
+
+
+def _dequote(tok: str) -> str:
+    """Quote characters removed ANYWHERE, not just at the ends. `appro''ve` is
+    `approve` to a shell — review 2026-08-22 spliced the verb that way and the
+    rule read it as an unknown subcommand. `.strip()` cannot see the middle."""
+    return tok.replace("'", "").replace('"', "")
+
+
+def _is_approve_verb(word: str) -> bool:
+    """Any subcommand whose name STARTS with `approve`, not only the one that
+    exists today. Deliberate: there is exactly one now (checked against the
+    click command table), and a future `nh approve-all` should be denied by
+    default and let a human notice, rather than shipping unguarded until
+    somebody re-audits. This file argues that polarity for the whole merge
+    family — a false denial costs one message with a stated alternative, a miss
+    lands a PR."""
+    return word == "approve" or word.startswith("approve-")
+
+
+def _nh_subcommand(argv: list[str],
+                   table: dict[str, str] | None = None) -> list[str]:
+    """The positional words of an `nh`/`no-human` invocation: options, their
+    values and redirections removed. `nh --repo . approve <id>` and
+    `nh 2>/dev/null approve <id>` both give ['approve', '<id>']."""
+    out: list[str] = []
+    skip = False
+    for tok in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        # A masked token is a quoted string or a redirection operator. Read it
+        # back before judging it: leaving the opaque placeholder in place made
+        # `nh >/tmp/l 2>&1 approve <id>` read the MASK as the subcommand and
+        # never see `approve`. Measured.
+        if table:
+            tok = _dequote(_unmask(tok, table))
+        # A redirection GLUED to the verb is still the verb: `nh approve>&2
+        # <id>` runs `approve`, and review 2026-08-22 executed it. The previous
+        # shape dropped any token containing `>` or `<`, which threw the verb
+        # away with the operator. Split the operator off instead, and drop the
+        # token only if nothing is left in front of it.
+        tok = _REDIR_SUFFIX.sub("", tok)
+        if not tok:
+            continue
+        if tok.startswith("-"):
+            if tok in _NH_VALUE_OPTS:
+                skip = True
+            continue
+        out.append(tok)
+    return out
+
+
+def _decoded(tok: str) -> str:
+    try:
+        return unquote(tok)
+    except Exception:  # noqa: BLE001 — a malformed escape is not a crash
+        return tok
+
+
+def _peel_runners(argv: list[str]) -> list[str]:
+    """`uv run X`, `uvx X`, `poetry run X`, `env X`, `/usr/bin/env X` peeled to
+    X. `_strip_wrappers` handles the bare-name wrappers; this also handles the
+    ones reached by an absolute path and the per-tool `run` subcommand."""
+    for _ in range(4):
+        if not argv:
+            return argv
+        name = PurePosixPath(argv[0]).name
+        if name == "env":
+            argv = argv[1:]
+            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                argv = argv[1:]
+            continue
+        if name in {"uv", "poetry", "pdm", "hatch", "rye", "pipx"} and len(argv) > 1:
+            argv = argv[2:] if argv[1] in {"run", "tool"} else argv[1:]
+            continue
+        if name == "uvx":
+            argv = argv[1:]
+            continue
+        return argv
+    return argv
+
+
+#: A URL assembled from pieces — `b = ".../api/tasks/"` then `b + tid +
+#: "/approve"`. No single token carries the whole route, so the route pattern
+#: cannot see it; the two halves in one interpreter payload can.
+_ROUTE_HALVES = (re.compile(r"/api/tasks\b"),
+                 re.compile(r"/(?:approve(?:-landed)?|shipped|finish-review)\b"))
+
+
+def _approve_denial(cmd: str, _depth: int = 0) -> str | None:
+    """One reason for every way an agent session can end the human gate.
+
+    Reads argv, not the line. See the block comment above for why, and for the
+    four lexical rounds that preceded it. Recurses into shell runners up to two
+    levels, bounded — a guard must not become a parser with unbounded work."""
+    cmd = _join_continuations(cmd)
+    masked, table = _mask_payloads(cmd)
+
+    # Unmasked ONCE, not once per segment. Doing it in the loop was quadratic
+    # — the same class this rule had already removed from `_unmask` — and cost
+    # 3.4 s against a 138 ms base on a realistic 800-line script (review
+    # 2026-08-22).
+    gate_mentioned = bool(_GATE_MENTION.search(_unmask(masked, table)))
+    parts = _CMD_SEP.split(masked)
+    seps = [""] + _CMD_SEP.findall(masked)
+    prev_raw = ""
+    for sep, raw in zip(seps, parts):
+        seg = raw.strip()
+        if not seg:
+            continue
+        # Shell GROUPING and reserved words put something other than the
+        # binary in argv[0]: `(nh approve <id>)` gives `['(nh', ...]`, and
+        # `if true; then nh approve <id>; fi` gives `['then', 'nh', ...]`.
+        # `_strip_shell_keywords` already existed in this file for exactly
+        # this and the first draft of this rule never called it. Review
+        # 2026-08-22 executed `(nh approve X)` in bash, zsh AND sh.
+        seg_body = _GROUPING.sub(" ", seg)
+        try:
+            tokens = shlex.split(seg_body)
+        except ValueError:
+            tokens = seg_body.split()
+        tokens = _strip_shell_keywords(tokens)
+        argv = _peel_runners(_strip_wrappers(
+            tokens,
+            is_extra_target=lambda n: (
+                n in _APPROVE_BINARIES or bool(_PY_INTERPRETER.match(n))
+                or n in {"uv", "uvx", "poetry", "pipx", "pdm", "hatch", "rye"}
+            ),
+        ))
+        if not argv:
+            prev_raw = seg
+            continue
+        # A quoted binary name (`"nh" approve <id>`) is masked like any other
+        # quoted region, so read argv[0] back before taking its basename.
+        # Dequoted ANYWHERE, like the verb: `n"h" approve <id>` and
+        # `n''h approve <id>` are `nh` to a shell. End-stripping caught the
+        # outer form only — `_dequote` existed for `appro''ve` and was applied
+        # to the verb but not to the binary. Review 2026-08-22 executed both.
+        argv = [_dequote(_unmask(argv[0], table))] + argv[1:]
+        name = PurePosixPath(argv[0]).name
+        # `nh\ approve` — an escaped space makes shlex produce ONE token. In a
+        # real shell that names a binary "nh approve", which does not exist, so
+        # this is not a live evasion; it is matched anyway because doing so is
+        # free and the alternative is a rule whose behaviour depends on whether
+        # a lookalike binary happens to be installed.
+        if " " in name:
+            head = name.split()[0]
+            if head in _APPROVE_BINARIES:
+                argv = name.split() + argv[1:]
+                name = head
+
+        # 0. UNDECIDABLE INPUT FAILS CLOSED. `shlex` resolves quoting and
+        #    backslashes and nothing else: not `$'...'`, not parameter
+        #    expansion, not an alias. Review 2026-08-22 walked through with
+        #    `nh $'approve' <id>`, `$'nh' approve <id>`, `B=nh; $B approve
+        #    <id>` and `$(echo $(echo nh)) approve <id>` — every one runs in a
+        #    real shell. A tokeniser that cannot resolve them must not answer
+        #    "allowed"; this file already takes that polarity for `git push`,
+        #    where `_UNRESOLVABLE` refuses an argv it cannot resolve.
+        #
+        #    Scoped to segments that MENTION the gate, because denying every
+        #    `$VENV/bin/pytest` would be a far worse rule than the hole. So:
+        #    "I cannot tell what this runs, and it names the act" -> deny.
+        eff = _effective_name(argv)
+        if (_depth < 2 and eff not in _READ_ONLY_TOOLS
+                and eff not in _TEST_RUNNERS):
+            # EVERY token, not just the command and verb positions: the
+            # unresolvable one can be the URL — `U=/api/tasks/abc/approve;
+            # curl -X POST http://127.0.0.1:8420$U`. Read-only tools are
+            # exempt, so `grep -rn "nh approve" $REPO/docs/` stays allowed:
+            # they cannot call the route whatever the variable holds.
+            unresolved = [t for t in argv if _UNRESOLVABLE.search(t)]
+            # The whole command, not just this segment: `U=/api/tasks/abc/
+            # approve; curl -X POST ...$U` puts the mention in the assignment
+            # and the unresolvable token in the call. Measured.
+            if unresolved and gate_mentioned:
+                return _UNDECIDABLE_REASON
+
+        # 0a. a command SUBSTITUTION anywhere in the segment really runs, and
+        #     it runs before the outer command does. `git commit -m "$(nh
+        #     approve <id>)"` lands the PR and then commits its output. The
+        #     outer argv[0] is irrelevant — even a text tool's argument runs.
+        # Over the SEGMENT TEXT, not per shlex token: a bare `$(nh approve
+        # <id>)` is already split into `['$(nh', 'approve', 'abc)']`, so no
+        # single token ever matched and only the QUOTED form was caught —
+        # backwards. `echo $(nh approve <id>)` executed while allowed (review
+        # 2026-08-22). argv[0] is irrelevant here for real: the substitution
+        # runs BEFORE the outer command does, so a read-only tool's argument
+        # runs too.
+        if _depth < 2:
+            for inner_text in (_unmask(seg, table),):
+                for m in _SUBSTITUTION.finditer(inner_text):
+                    reason = _approve_denial(m.group(1) or m.group(2) or "",
+                                             _depth + 1)
+                    if reason:
+                        return reason
+
+        # 0b. a runner carrying the real command. TWO shapes, and the first
+        #     draft implemented only one: a QUOTED payload (`sh -c "nh
+        #     approve"`), and the rest of THIS argv (`timeout 5 nh approve`,
+        #     `xargs nh approve`). `_git_invocations` handles both; this now
+        #     does too.
+        # A node runner only RUNS a payload behind `-c` (`npx -c '<cmd>'`,
+        # `npm exec -c '<cmd>'`). Recursing into every quoted argument denied
+        # `npm test -- --grep "/api/tasks/:id/approve"`, which is a test
+        # filter — the seventh recurrence of "denied for naming the act",
+        # caught here rather than by a review for once.
+        runs_quoted = (name in _SHELL_RUNNERS or name in _SCRIPT_TOOLS
+                       or (name in _NODE_RUNNERS and "-c" in argv))
+        runs_trailing = (name in _SHELL_RUNNERS
+                         or name in _TRAILING_ARGV_RUNNERS
+                         or name in _ARG_EXEC_TOOLS)
+        if (runs_quoted or runs_trailing) and _depth < 2:
+            for j, tok in enumerate(argv[1:], start=1):
+                inner = _unmask(tok, table)
+                stripped = _strip_one_quote_pair(inner)
+                after_exec_flag = argv[j - 1] in _EXEC_FLAGS
+                if stripped and stripped != tok and (runs_quoted
+                                                     or after_exec_flag):
+                    if name in _SCRIPT_TOOLS and _SCRIPT_EXEC.search(stripped):
+                        return _APPROVE_REASON
+                    reason = _approve_denial(stripped, _depth + 1)
+                    if reason:
+                        return reason
+                elif (PurePosixPath(inner).name.lower() in _APPROVE_BINARIES
+                      or _PY_INTERPRETER.match(PurePosixPath(inner).name)
+                      or after_exec_flag) and runs_trailing:
+                    rest = [_unmask(t, table) for t in argv[j:]
+                            if t not in {"\\;", ";", "+"}]
+                    reason = _approve_denial(" ".join(rest), _depth + 1)
+                    if reason:
+                        return reason
+
+        # 1. the product's own CLI, under either console script
+        # Case-folded: APFS is case-insensitive by default, and review
+        # 2026-08-22 ran `NH approve <id>` and `Nh approve <id>` on this
+        # machine. On a case-sensitive filesystem the name would not
+        # resolve, so folding can only deny something that cannot run.
+        if name.lower() in _APPROVE_BINARIES:
+            words = _nh_subcommand(argv, table)
+            if words and _is_approve_verb(words[0]):
+                return _APPROVE_REASON
+            if tuple(words[:2]) in _MERGE_VERB_PAIRS:
+                return _MERGE_STACK_REASON
+            if words and (words[0] in _LIVE_VERBS
+                          or tuple(words[:2]) in _LIVE_VERB_PAIRS):
+                return _LIVE_SERVER_REASON
+
+        # 2. a python interpreter. Its OWN payload — arguments, heredoc body,
+        #    and whatever was piped INTO it — never the rest of the line, so
+        #    `python -m pytest ... && grep -n "land_task(" ...` is untouched.
+        # A script tool's payload is analysed for the ROUTE the same way a
+        # python payload is — `node -e 'fetch(".../approve",{method:"POST"})'`
+        # reached a live listener while the guard allowed it, because only the
+        # python branch looked.
+        if name in _SCRIPT_TOOLS:
+            spayload = _unmask(" ".join(argv[1:]), table)
+            if _REQUESTS.search(spayload) and (
+                    _gate_route(spayload)
+                    or all(h.search(spayload) for h in _ROUTE_HALVES)):
+                return _APPROVE_REASON
+
+        if _PY_INTERPRETER.match(name):
+            payload = _unmask(" ".join(argv[1:]), table)
+            if sep == "|":
+                payload += " " + _unmask(prev_raw, table)
+            if _IN_PROCESS_CODE.search(payload):
+                return _APPROVE_REASON
+            if all(half.search(payload) for half in _ROUTE_HALVES):
+                return _APPROVE_REASON
+            if _gate_route(payload):
+                return _APPROVE_REASON
+            # `python -m no_human.cli.commands approve <id>` — the click entry
+            # point without the console script. The module IS the CLI, so the
+            # verbs are read the same way as for the binary.
+            for i, tok in enumerate(argv[1:], start=1):
+                if tok == "-m" and i + 1 < len(argv) \
+                        and argv[i + 1].startswith("no_human"):
+                    words = _nh_subcommand(argv[i + 1:], table)
+                    if words and _is_approve_verb(words[0]):
+                        return _APPROVE_REASON
+                    if tuple(words[:2]) in _MERGE_VERB_PAIRS:
+                        return _MERGE_STACK_REASON
+                    if words and (words[0] in _LIVE_VERBS
+                                  or tuple(words[:2]) in _LIVE_VERB_PAIRS):
+                        return _LIVE_SERVER_REASON
+
+        # 3. our own local API, CALLED rather than named. Skipped for tools
+        #    whose job is to read text: naming the route is not calling it.
+        # Exempting the tools that CAN EXECUTE from the route check was the
+        # opposite of the stated design, and review 2026-08-22 proved it
+        # against a live listener: `node -e 'fetch(".../approve",{method:
+        # "POST"})'` and `gh api -X POST .../approve` both reached the server
+        # while the guard allowed them. Only tools that cannot make a request
+        # are exempt now. `git` stays exempt — it cannot POST to an arbitrary
+        # URL, and `git log -S".../shipped"` must keep working — while `gh`
+        # and `glab`, which have `api`, do not.
+        # A script tool's payload is analysed by its own branch above, which
+        # requires evidence of a REQUEST as well as the route — so this rule
+        # must not also fire on the payload text, or `node -e
+        # "console.log('/api/tasks/x/approve')"` is denied for printing.
+        #
+        # `gh`/`glab` are exempt EXCEPT for their `api` subcommand: `gh api -X
+        # POST <url>` posts (proven against a live listener), while
+        # `gh pr create --title "fix /api/tasks/{id}/shipped 409"` is a title.
+        exempt = (name in _READ_ONLY_TOOLS or name in _ROUTE_EXEMPT_TOOLS
+                  or name in _SCRIPT_TOOLS
+                  or (name in {"gh", "glab"}
+                      and _nh_subcommand(argv, table)[:1] != ["api"]))
+        # against the UNMASKED text: _REDIR_AMP masks `>&3` before this runs.
+        if exempt and _FD_WRITE.search(_unmask(seg, table)):
+            exempt = False
+        if not exempt:
+            for tok in argv[1:]:
+                if _gate_route(_unmask(tok, table)):
+                    return _APPROVE_REASON
+            if (name in _SOCKET_TOOLS and sep == "|"
+                    and _gate_route(_unmask(prev_raw, table))):
+                return _APPROVE_REASON
+        prev_raw = seg
+    return None
+
+
+_APPROVE_REASON = (
+    "approving a task ends the human gate — `nh approve` (and `no-human "
+    "approve`, the same entry point) squash-lands the PR under the operator "
+    "identity and pushes to the default branch, and POST "
+    "/api/tasks/<id>/approve, /approve-landed, /shipped and /finish-review "
+    "are the same act over HTTP. The agent never merges, in any session mode, "
+    "so it never approves. Open or update your PR and stop; a human approves "
+    "it."
+)
+
+_UNDECIDABLE_REASON = (
+    "this command cannot be resolved well enough to allow it, and it names an "
+    "action that ends the human gate. A variable, a `$'...'` quote or a nested "
+    "substitution in the command or verb position means the guard cannot tell "
+    "what will actually run, and it fails closed rather than guessing. Spell "
+    "the command plainly, or — if you were reaching for `nh approve` — stop: "
+    "the agent never approves, a human does."
+)
+
+_MERGE_STACK_REASON = (
+    "`nh merge-stack run` merges PRs — it drives `gh pr merge` for every ready "
+    "PR in the stack — and the agent never merges, in any session mode. It is "
+    "the operator's command. Open or update your PR and stop; a human runs the "
+    "merge stack."
+)
+
+_LIVE_SERVER_REASON = (
+    "launching a live no_human server/runner (`nh serve`/`start`/`watch`/"
+    "`bench run`, under either console script) is blocked in agent sessions — "
+    "it runs against the operator's real ~/.no_human config, database, and "
+    "credentials regardless of checkout. Test CLI behavior through the test "
+    "suite (CliRunner), never a live process."
+)
+
 
 # Any git/forge command that mutates history or a remote. A read-only session
 # (planner, aggregator, reviewer) explores and reports; it never writes. Dropping
@@ -1513,6 +2304,9 @@ def evaluate(
         worktree_reason = _git_worktree_denial(cmd, cwd)
         if worktree_reason:
             return GuardDecision(False, worktree_reason)
+        # `_approve_denial` below covers the product's own CLI, the
+        # in-process paths and the local API — all argv-shaped. This one stays
+        # lexical: it matches forge spellings whose grammar we do not own.
         if _FORGE_MERGE.search(cmd):
             return GuardDecision(
                 False,
@@ -1520,23 +2314,16 @@ def evaluate(
                 "merges. Open the PR, push your fixes to its branch, and stop. "
                 "A human merges it (`nh approve`).",
             )
-        if _MERGE_STACK_RUN.search(cmd):
-            return GuardDecision(
-                False,
-                "`nh merge-stack run` merges PRs — it drives `gh pr merge` for "
-                "every ready PR in the stack — and the agent never merges, in "
-                "any session mode. It is the operator's command. Open or "
-                "update your PR and stop; a human runs the merge stack.",
-            )
-        if _LIVE_SERVER.search(cmd):
-            return GuardDecision(
-                False,
-                "launching a live no_human server/runner (`nh serve`/`start`/"
-                "`watch`/`bench run`) is blocked in agent sessions — it runs "
-                "against the operator's real ~/.no_human config, database, and "
-                "credentials regardless of checkout. Test CLI behavior through "
-                "the test suite (CliRunner), never a live process.",
-            )
+        # BOTH layers, argv first (its messages are more specific), then the
+        # lexical one. Additive: nothing main denies may become allowed here.
+        approve_reason = _approve_denial(cmd)
+        if approve_reason:
+            return GuardDecision(False, approve_reason)
+        lex = _join_continuations(cmd)
+        if _LEXICAL_MERGE_STACK.search(lex):
+            return GuardDecision(False, _MERGE_STACK_REASON)
+        if _LEXICAL_LIVE_SERVER.search(lex):
+            return GuardDecision(False, _LIVE_SERVER_REASON)
         # Applies to EVERY session mode, coder included — a whole-filesystem
         # sweep is never the right probe, and gating it on `readonly` would
         # leave the expensive coder path unprotected.

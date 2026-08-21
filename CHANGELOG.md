@@ -15,6 +15,88 @@ All notable changes to no_human. The format follows
   entirely: Electron 43 no longer depends on it. `tar` and `brace-expansion`
   are patched in the same lockfile pass, taking `npm audit` to zero.
 
+### Security
+
+- **The obvious routes an agent session had to ending the human gate now cost
+  it a denial — and this is a cost-raising layer, not a closed door.**
+  The known gaps are listed below — deliberately without a count, because the
+  count has gone stale twice: the review that would make it accurate always
+  happens after the commit that states it. The control that closes the door
+  has to live at the act itself and is tracked separately.
+  `nh approve` performs
+  a real `git merge --squash` and pushes to the default branch, and
+  `POST /api/tasks/<id>/approve` (plus `/approve-landed`, `/shipped` and
+  `/finish-review`) is the same act over the local server. None of them was
+  denied by the agent guard, while every forge spelling was. Twelve reachable
+  spellings in both coder and read-only mode, including `no-human approve` —
+  the second console script for the same entry point, and the name the install
+  docs teach. Found by fact-checking the claim "the merge commands are denied
+  to the agent's sessions" against the source; there is no evidence any agent
+  ever ran one.
+
+  **KNOWN GAPS, stated here rather than 45 lines down.** `case x in x) nh
+  approve <id>;; esac` and `cat <(nh approve <id>)` are not denied, and neither
+  is a script tool's `system()` payload once an option separates the binary
+  from the verb — `awk 'BEGIN{system("nh --repo . approve <id>")}'` gets
+  through where `system("nh approve <id>")` does not. That last one is round
+  four's own bug, still live one layer down, and it was found only once a
+  reviewer varied the option axis their previous sweep had held fixed — a
+  corpus that never varies the axis a rule keys on cannot measure that rule,
+  it can only report that it did not fire. They are
+  disclosed rather than chased: eight rounds of adding the next shape produced
+  a rule that still loses to shell grammar, which is the signal to stop. The
+  durable fix is a check at the ACT — `nh approve` refusing inside an agent
+  session, and the four gate-ending routes requiring something an agent
+  session structurally lacks — which makes every spelling moot in one place
+  and also covers the Codex backend, where no PreToolUse rule can act at all.
+  Two smaller asymmetries, same category: a python payload that merely PRINTS
+  the route is denied where a node one is not, and an `awk`/`perl` one-liner
+  containing `$` plus a word like `shipped` or `serve` is refused as
+  undecidable.
+
+  The rule reads **argv**, not the command line, and refuses input it cannot
+  resolve rather than allowing it. Four earlier rounds were lexical and each was
+  wrong in a direction nobody predicted — a flag
+  (`python -u -c`), a global option (`nh --repo . approve`), a redirection
+  (`nh 2>/dev/null approve`), a quoted task id, a `..` segment curl normalises
+  away, a percent-escaped byte, a `git` substring in a path reaching across a
+  newline. Those are what a shell resolves and a regex cannot, so the guard now
+  splits the line into commands, peels wrappers, and asks what each command is.
+
+  Naming the act stays allowed, which took three attempts to get right: a
+  reviewer can read, grep and `git log` the landing code, grep the route in the
+  file that defines it, run its tests, and write a commit message or PR title
+  that mentions the command. The exemption is a property of the program being
+  run rather than of a message-option grammar, so it no longer depends on which
+  option came first or on which separators a scoping regex happened to list.
+
+  Every fix round so far has been wrong somewhere new, and each miss was found
+  by an independent review rather than by me. The lexical rounds lost to shell
+  grammar the text never modelled; the reviews executed the spellings in a real
+  shell rather than reasoning about them, which is why the list kept growing.
+  The last round added: backslash-line-continuation, a redirection glued onto
+  the verb, `$'\x61pprove'` (decoded rather than refused — the escapes are
+  deterministic), two-level shell nesting, the route reached through
+  `node`/`bun`/`perl`/`ruby`/`gh api`, `osascript`'s `do shell script`, and the
+  undecidable refusal reading the command that will actually run rather than
+  `argv[0]` as typed.
+
+  Six defects the fix ITSELF introduced were found and removed along the way,
+  and they are listed rather than counted because a count is what went stale
+  here twice:
+  a quadratic in the mask lookup (14.6 s inside a PreToolUse hook);
+  an exponential in the import-list pattern (9.9 s on 24 aliases);
+  a second quadratic in the gate-mention scan (3.4 s on an 800-line script);
+  a decoder that let `$'\x27'` inject a quote and hide an arbitrary command;
+  and two over-denials — one blocking `pytest -k approve`, i.e. running the
+  tests for the code this rule protects, and one blocking a commit message
+  that mentioned the command.
+
+  `docs/security.md` no longer publishes a closed list of exceptions. It says
+  what this is: a layer that raises the cost of the obvious spellings, in front
+  of a control that has to live at the act itself. Seven rounds and six reviews
+  produced that sentence, and it is the honest one.
+
 ## [0.1.4] — 2026-08-21
 
 Fixes `nh mcp-serve` on every install that resolves dependencies from PyPI —
