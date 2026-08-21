@@ -986,6 +986,87 @@ def test_squash_conflict_leaves_no_worktree(land_env, monkeypatch):
     assert not Path(created_dirs[-1]).exists()
 
 
+def test_squash_conflict_confined_to_the_manifest_lands(land_env):
+    """RELEASE_MANIFEST.txt moves under every landing, so a branch cut before
+    the previous landing conflicts on it at the squash step — and step 4
+    then throws the squash's manifest away and re-derives it from the tip
+    anyway. Refusing at step 3 therefore made every PR older than the last
+    landing unlandable by `nh approve` (live: #582 on 2026-08-22). A conflict
+    confined to the manifest is resolved the way step 4 resolves it: the
+    tip's copy wins, the branch's pins are re-derived on top."""
+    branch, _ = land_env.cut_branch("no-human/t-manifestconflict")
+    tip_manifest = _git(land_env.origin, "show", "main:RELEASE_MANIFEST.txt").stdout
+    _push_conflicting_change(land_env, "RELEASE_MANIFEST.txt",
+                             tip_manifest + "# re-pinned by a concurrent landing\n")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, f"step={result.step}: {result.stderr}"
+    landed = _git(land_env.origin, "show",
+                  f"{result.landed_sha}:RELEASE_MANIFEST.txt").stdout
+    # The stub guard rewrites the ledger wholesale on `approve`, so the tip's
+    # comment line does not survive here the way it does under the real
+    # guard; what is pinned is the shape: a clean, re-derived manifest that
+    # carries the branch's new pin and no conflict residue. Before the fix
+    # this test fails one step earlier, at `squash`.
+    assert "src/feature.py" in landed                         # branch pin re-derived
+    assert "<<<<<<<" not in landed and "=======" not in landed
+    assert "EXPORT_CLASSIFICATION.txt" in landed               # tip's pins kept
+
+
+def test_squash_conflict_beyond_the_manifest_still_refuses(land_env):
+    """The tolerance is for the ledger file ONLY: a conflict that also
+    touches an authored file is a real conflict and still fails at
+    `squash`, with the worktree cleaned up as before."""
+    branch, _ = land_env.cut_branch(
+        "no-human/t-mixedconflict",
+        extra_files={"README.md": "branch changed this line\n"})
+    tip_manifest = _git(land_env.origin, "show", "main:RELEASE_MANIFEST.txt").stdout
+    _push_conflicting_change(land_env, "README.md", "main changed this line too\n")
+    _push_conflicting_change(land_env, "RELEASE_MANIFEST.txt",
+                             tip_manifest + "# re-pinned by a concurrent landing\n")
+    repo = GitRepo(land_env.clone, never_push_to=["main", "master", "release/*"])
+    before = repo.list_worktrees()
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert not result.ok
+    assert result.step == "squash"
+    assert "README.md" in result.stderr
+    assert repo.list_worktrees() == before
+
+
+def test_manifest_conflict_without_the_export_guard_still_refuses(land_env):
+    """The tolerance exists because step 4 re-derives the manifest — and
+    step 4 runs only where scripts/export_guard.py exists. In a repo without
+    it a manifest conflict is a real conflict: taking the tip's copy would
+    silently discard the branch's edit and push that. Refuse at `squash`."""
+    # Remove the guard on origin/main from a third clone, the way the
+    # conflicting-change helper does, so the landing worktree has no guard.
+    race = land_env.tmp_path / "noguard"
+    _git(land_env.tmp_path, "clone", "-q", str(land_env.origin), str(race))
+    _git(race, "rm", "-q", "scripts/export_guard.py")
+    _git(race, "commit", "-qm", "drop the export guard")
+    _git(race, "push", "-q", "origin", "HEAD:main")
+    _git(land_env.clone, "pull", "-q", "--ff-only", "origin", "main")
+    branch, _ = land_env.cut_branch("no-human/t-noguard")
+    tip_manifest = _git(land_env.origin, "show", "main:RELEASE_MANIFEST.txt").stdout
+    _push_conflicting_change(land_env, "RELEASE_MANIFEST.txt",
+                             tip_manifest + "# re-pinned by a concurrent landing\n")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert not result.ok
+    assert result.step == "squash"
+    assert "RELEASE_MANIFEST.txt" in result.stderr
+
+
 def test_worktree_add_failure_leaves_no_worktree(land_env, monkeypatch):
     """`add_worktree` succeeding at the git level (a REAL worktree gets
     registered) and then the wrapper raising afterward is the one failure

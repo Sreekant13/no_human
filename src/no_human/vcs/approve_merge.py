@@ -17,7 +17,12 @@ The eight-step procedure, proven by hand before this module existed:
                         must not import.)
   2. fetch + worktree — fetch the remote, resolve the CURRENT default-branch
                         tip, and create a detached temp worktree there.
-  3. squash           — `git merge --squash <branch>` into the worktree.
+  3. squash           — `git merge --squash <branch>` into the worktree. A
+                        conflict confined to RELEASE_MANIFEST.txt in an
+                        export-gated repo takes the tip's copy and continues
+                        (step 4 re-derives that file anyway); any other
+                        conflict, or that file in a repo without the guard,
+                        refuses here.
   4. manifest         — the merge-result ledger rule: reset ONLY
                         RELEASE_MANIFEST.txt to the tip's version (the
                         branch's EXPORT_CLASSIFICATION.txt, with its own
@@ -702,6 +707,17 @@ def land_task(
         _cleanup_worktree(repo, tmp_dir)
 
 
+def _unmerged_paths(worktree_path: Path) -> set[str]:
+    """Paths git still reports as unmerged after a failed squash — the
+    exact set, so a caller can tell "only the ledger file" from a real
+    conflict. Empty on any git failure (which the caller treats as a real
+    conflict, never as clean)."""
+    proc = _sh(["git", "diff", "--name-only", "--diff-filter=U"], cwd=worktree_path)
+    if proc.returncode != 0:
+        return set()
+    return {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
+
+
 def _cleanup_worktree(repo: "GitRepo", path: Path) -> None:
     """Best-effort worktree teardown, shared by every failure path (the
     `add_worktree` failure above and the `finally` around every in-worktree
@@ -728,9 +744,31 @@ def _land_in_worktree(
     _step(on_step, "squash")
     merge_proc = _sh(["git", "merge", "--squash", resolved_branch], cwd=worktree_path)
     if merge_proc.returncode != 0:
-        _sh(["git", "merge", "--abort"], cwd=worktree_path)
-        return LandResult(ok=False, step="squash", branch=branch, pr_url=pr_url,
-                           stderr=_cap(merge_proc.stdout + "\n" + merge_proc.stderr))
+        # RELEASE_MANIFEST.txt moves under every landing, so a branch cut
+        # before the previous landing conflicts on it here — and step 4
+        # discards the squash's copy of that file anyway (tip's copy wins,
+        # the branch's pins are re-derived on top). Refusing at this step
+        # made every PR older than the last landing unlandable by `nh
+        # approve` (#582, 2026-08-22). So a conflict confined to the ledger
+        # file is resolved exactly as step 4 would: take the tip's copy and
+        # carry on. Anything else unmerged is a real conflict and refuses.
+        # Only where step 4 will actually re-derive it: a repo without the
+        # export guard skips step 4, and there the tip's copy would simply
+        # replace the branch's — a real conflict silently decided, which is
+        # exactly what this tolerance must never do.
+        unmerged = _unmerged_paths(worktree_path)
+        guard_present = (worktree_path / "scripts" / "export_guard.py").exists()
+        if unmerged == {"RELEASE_MANIFEST.txt"} and guard_present:
+            co = _sh(["git", "checkout", tip_sha, "--", "RELEASE_MANIFEST.txt"],
+                      cwd=worktree_path)
+            if co.returncode != 0:
+                _sh(["git", "merge", "--abort"], cwd=worktree_path)
+                return LandResult(ok=False, step="squash", branch=branch, pr_url=pr_url,
+                                   stderr=_cap(merge_proc.stdout + "\n" + co.stderr))
+        else:
+            _sh(["git", "merge", "--abort"], cwd=worktree_path)
+            return LandResult(ok=False, step="squash", branch=branch, pr_url=pr_url,
+                               stderr=_cap(merge_proc.stdout + "\n" + merge_proc.stderr))
 
     # -- step 4: manifest merge-result ledger rule ------------------------ #
     _step(on_step, "manifest")
