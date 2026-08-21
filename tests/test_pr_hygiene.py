@@ -30,6 +30,13 @@ def _orch(store, tmp_path):
     return Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None))
 
 
+def _unfold(text: str) -> str:
+    """Strip the report fold's own markup so a length check sees the coder's
+    text alone (`Orchestrator._fold_report`, 2026-08-21)."""
+    return re.sub(r"\n\n<details><summary>Rest of the coder's report[^<]*</summary>\n\n"
+                  r"|\n\n</details>", "", text)
+
+
 class _Commit:
     files_changed = 2
     insertions = 10
@@ -123,7 +130,7 @@ def test_pr_body_all_filtered_says_no_summary_was_produced(store, tmp_path):
     UPDATED for C1. `_clean_summary` still returns its placeholder — that
     contract is asserted directly below, so the filtering itself stays pinned —
     but the placeholder was what a real PR (#104) actually shipped under
-    "## Implementation summary": a parenthetical a reader skims past. The body
+    "## Changes": a parenthetical a reader skims past. The body
     now states the absence.
     """
     orch = _orch(store, tmp_path)
@@ -239,7 +246,7 @@ def test_pr_body_blocks_harness_dialogue_WRAPPED_ACROSS_A_LINE(store, tmp_path):
 
     Pure ASCII, no trickery: "the harness" straddles a line break, which is exactly how
     wrapped LLM prose arrives, so a plain substring match never saw it. This reached the
-    ## Implementation summary section of a real PR body — an admission of skipping the
+    ## Changes section of a real PR body — an admission of skipping the
     tests — and did NOT reach it before all-paragraphs-kept removed the accidental block.
     """
     orch = _orch(store, tmp_path)
@@ -325,7 +332,7 @@ def test_pr_body_keeps_each_heading_at_the_start_of_a_line(store, tmp_path):
     motivating criterion asks for two named HEADINGS, so line position is the property.
 
     UPDATED for H13: the coder's own headings are demoted so they nest UNDER
-    "## Implementation summary" instead of becoming siblings of
+    "## Changes" instead of becoming siblings of
     "## Test evidence" and "## Stats". Still headings, still at a line start —
     the mutant this test exists to kill (`" ".join`) dies exactly as before.
 
@@ -378,7 +385,10 @@ def test_pr_body_truncation_stays_inside_its_stated_budget(store, tmp_path):
     result = _Result()
     result.final_text = "\n\n".join(["v" * 500] * 20)
     section = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), result)
-    summary = section.split("## Implementation summary\n", 1)[1].split("\n\n## ", 1)[0]
+    summary = section.split("## Changes\n", 1)[1].split("\n\n## ", 1)[0]
+    # The cap bounds the CODER'S text; the fold's own `<details>` wrapper
+    # (2026-08-21) is template markup and is not counted against it.
+    summary = _unfold(summary)
     assert len(summary) <= Orchestrator._SUMMARY_MAX_CHARS, len(summary)
 
 
@@ -501,12 +511,13 @@ def test_pr_body_truncation_respects_the_cap_even_with_a_fence(store, tmp_path):
     result = _Result()
     result.final_text = "Intro.\n\n```python\n" + ("padding line here 1234\n" * 400)
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), result)
-    summary = body.split("## Implementation summary\n", 1)[1]
+    summary = body.split("## Changes\n", 1)[1]
     # Bounded by the NEXT heading, whichever it is. Splitting on "## Stats"
     # specifically was only correct while nothing sat between the summary and
     # the stats line; the evidence sections do, and the slice then measured
     # them as if they were summary text.
     summary = re.split(r"\n\n## ", summary, maxsplit=1)[0]
+    summary = _unfold(summary)
     assert len(summary) <= Orchestrator._SUMMARY_MAX_CHARS, (
         f"summary is {len(summary)} chars for a stated cap of "
         f"{Orchestrator._SUMMARY_MAX_CHARS}")
@@ -574,3 +585,90 @@ def test_pr_body_does_not_truncate_a_summary_of_EXACTLY_the_budget(store, tmp_pa
     over = _Result(); over.final_text = "e" * (cap + 1)
     body_over = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), over)
     assert "summary truncated" in body_over, f"{cap + 1} chars must truncate"
+
+
+# ═══ 2026-08-21: the coder's report is CAPPED and FOLDED, never dropped ═════ #
+
+
+def test_a_long_report_is_folded_after_the_visible_cap():
+    paras = [f"paragraph {i} " + "x" * 200 for i in range(20)]
+    out = Orchestrator._fold_report("\n\n".join(paras))
+    visible = out.split("<details>", 1)[0]
+    assert len(visible) <= Orchestrator._REPORT_VISIBLE_CHARS
+    assert "<details><summary>Rest of the coder's report" in out
+    assert out.count("paragraph 19") == 1
+    assert "paragraph 19" in out.split("<details>", 1)[1]
+
+
+def test_a_short_report_is_not_folded_at_all():
+    out = Orchestrator._fold_report("one\n\ntwo")
+    assert out == "one\n\ntwo"
+
+
+def test_a_not_met_line_is_never_folded():
+    paras = ["p " + "x" * 300 for _ in range(10)]
+    paras.append("CRITERION: the retry is tested — NOT-MET — evidence: none yet")
+    out = Orchestrator._fold_report("\n\n".join(paras))
+    assert "NOT-MET" in out.split("<details>", 1)[0]
+
+
+def test_a_fence_is_never_split_by_the_fold():
+    fence = "```\n" + "\n".join("line " + "y" * 80 for _ in range(30)) + "\n```"
+    out = Orchestrator._fold_report("intro\n\n" + fence + "\n\nafter")
+    visible = out.split("<details>", 1)[0]
+    assert visible.count("```") % 2 == 0
+    assert out.count("```") == 2
+
+
+def test_criterion_lines_become_a_compact_list():
+    src = ("**CRITERION: `_wrap_title` measures cells — MET — evidence: "
+           "`src/x.py:217`; repro: `tests/t.py::test_a` fails before, passes after.**")
+    out = Orchestrator._compact_criterion_lines(src)
+    assert out.startswith("- **MET** — `_wrap_title` measures cells — _evidence: ")
+    assert out.endswith("passes after._")
+    assert "CRITERION" not in out
+
+
+def test_a_not_met_criterion_line_keeps_its_verdict():
+    out = Orchestrator._compact_criterion_lines(
+        "CRITERION: retries capped - NOT-MET - evidence: no test yet")
+    assert out == "- **NOT-MET** — retries capped — _evidence: no test yet_"
+
+
+def test_the_task_heading_is_gone_and_changes_replaces_summary(store, tmp_path):
+    orch = _orch(store, tmp_path)
+    t = Task.new("Fix the thing", repo_path="/r")
+    r = _Result()
+    r.final_text = "Did the thing."
+    body = orch._pr_body(t, _Commit(), r)
+    assert "## Task\n" not in body
+    assert "## Implementation summary" not in body
+    assert "## Changes\nDid the thing.\n" in body
+
+
+def test_a_tilde_fence_and_an_indented_fence_are_never_split_by_the_fold():
+    """Independent review of #576: a naive backtick tracker opened the
+    `<details>` tag INSIDE a `~~~` block and desynced on an indented fence.
+    The fold now reads the one scanner the demoter uses."""
+    tilde = "~~~\n" + "line a\n\nline b\n" * 60 + "~~~"
+    out = Orchestrator._fold_report("intro\n\n" + tilde + "\n\nafter")
+    visible = out.split("<details>", 1)[0]
+    assert visible.count("~~~") % 2 == 0, visible
+    assert "<details>" not in out.split("~~~")[1]
+    indented = "    ```\n" + "\n\n".join(f"p{i} " + "z" * 200 for i in range(12))
+    out = Orchestrator._fold_report(indented)
+    assert "more paragraphs)" in out and "(1 more paragraph)" not in out
+
+
+def test_the_mandated_bare_criterion_line_is_compacted_too(store, tmp_path):
+    """The coder is TOLD to write a bare `CRITERION: … — MET — evidence: …`
+    line; the demoter list-prefixes it before the compactor sees it. The
+    review found the compactor inert on exactly that form."""
+    orch = _orch(store, tmp_path)
+    r = _Result()
+    r.final_text = ("CRITERION: foo — MET — evidence: x\n"
+                    "CRITERION: bar — NOT-MET — evidence: none yet")
+    body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), r)
+    assert "- **MET** — foo — _evidence: x_" in body
+    assert "- **NOT-MET** — bar — _evidence: none yet_" in body
+    assert "CRITERION:" not in body

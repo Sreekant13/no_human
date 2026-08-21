@@ -437,12 +437,15 @@ def pr_body_section(entries: list[dict]) -> str:
     """
     if not entries:
         return ""
+    k = len(entries)
     lines = [
+        f"| Test-change guard | ⚠️ fired — waived as LEGITIMATE ({k}) — "
+        "see below |",
+        "",
         "### Test-change adjudication",
-        "_The automatic test-tampering guard fired on this change. An "
-        "independent fresh-context reviewer compared the test changes against "
-        "the ticket and judged them REQUIRED. Its reasoning is below — please "
-        "check it._",
+        "_The test-tampering guard fired; an independent fresh-context "
+        "reviewer judged the test changes REQUIRED by the ticket. Check its "
+        "reasoning:_",
         "",
     ]
     for e in entries:

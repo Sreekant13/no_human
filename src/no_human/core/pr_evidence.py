@@ -64,27 +64,27 @@ class PrEvidence:
         rv = self.review_verdict
         if not rv or not rv.get("rounds"):
             return None
-        return (f"independent review rounds: {rv['rounds']}; "
-                f"final verdict: **{rv['verdict']}**")
+        n = int(rv["rounds"])
+        return f"**{rv['verdict']}** — {n} round{'s' if n != 1 else ''}"
 
     def repro_count_pin(self) -> str | None:
         if self.repro is None:
             return None
         n = len(self.repro.get("receipts") or [])
-        return f"{n} verification command(s) were recorded during this attempt."
+        return f"{n} command{'s' if n != 1 else ''} recorded"
 
     def tests_summary_pin(self) -> str | None:
         t = self.tests
         if not isinstance(t, dict) or not t.get("ran"):
             return None
         verb = "PASS" if t.get("ok") else "FAIL"
-        return (f"tests: {verb} — {t.get('passed', 0)} passed, "
+        return (f"{verb} — {t.get('passed', 0)} passed, "
                 f"{t.get('failed', 0)} failed, {t.get('errors', 0)} errors")
 
     def ci_state_pin(self) -> str | None:
         if not self.ci_state:
             return None
-        return f"CI state: {self.ci_state}"
+        return f"| CI | {self.ci_state} |"
 
     def truth_pins(self) -> dict[str, str]:
         """``{backing field name: exact fact sentence}`` for every truth pin

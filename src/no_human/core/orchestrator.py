@@ -14712,23 +14712,37 @@ SIX of them read a checkpoint and TWO do not — but do
             lines.append(f"- **Q:** {q} **A:** {answer}{src}")
         for a in (ctx.get("assumptions") or []):
             lines.append(f"- {_cell(a, 400)}")
+        n_assumed = len(lines)
         orig = ctx.get("original_criteria")
         if orig:
             lines.append(
                 "- Acceptance criteria were auto-sharpened during intake; "
                 "originals: " + "; ".join(_cell(c, 400) for c in orig)
             )
+        # 2026-08-21: the decisions made on the requester's behalf are
+        # delivered FOLDED behind a one-line count — a reviewer opens them when
+        # they want to audit them — while an unresolved blocker or an open
+        # question is printed VISIBLY above the fold: it is the one thing in
+        # this section a reviewer must not miss.
+        visible: list[str] = []
         blk = task.blocker or {}
         if blk.get("root_cause_hypothesis"):
-            lines.append(f"- Unresolved: {_cell(blk['root_cause_hypothesis'], 400)}")
+            visible.append(
+                f"> ⚠️ **Unresolved:** {_cell(blk['root_cause_hypothesis'], 400)}\n\n")
         if blk.get("question"):
-            lines.append(f"- Open question: {_cell(blk['question'], 400)}")
+            visible.append(f"> ⚠️ **Open question:** {_cell(blk['question'], 400)}\n\n")
         if not lines:
-            return ""
+            return "".join(visible)
+        if n_assumed:
+            summary = (f"⚠️ {n_assumed} assumption{'s' if n_assumed != 1 else ''} "
+                       "made on your behalf — verify at review")
+        else:
+            summary = ("⚠️ acceptance criteria were auto-sharpened at intake — "
+                       "originals inside")
         return (
-            "## ⚠️ Assumptions & Open Questions\n"
-            "The agent proceeded autonomously under these assumptions — please "
-            "verify at review:\n" + "\n".join(lines) + "\n\n"
+            "".join(visible)
+            + f"<details><summary>{summary}</summary>\n\n"
+            + "\n".join(lines) + "\n\n</details>\n\n"
         )
 
     # Marker-shaped phrases only (not bare words like "harness"/"metadata"),
@@ -15801,8 +15815,8 @@ SIX of them read a checkpoint and TWO do not — but do
         """H13: make the coder's own markdown survive being embedded in ours.
 
         THE GUARANTEE, stated so it can be tested: nothing the coder writes may
-        render as an `<h1>` or an `<h2>`. The template's own sections (`## Task`,
-        `## Evidence`, `## How I verified this`) are `<h2>`, so a coder heading at that
+        render as an `<h1>` or an `<h2>`. The template's own sections (`## Evidence`,
+        `## Changes`, `## How I verified this`) are `<h2>`, so a coder heading at that
         level or above stops being part of the summary and becomes a top-level
         section of the PR — the outline then lies about what no_human is
         asserting. Consecutive `CRITERION: …` lines are the second collision:
@@ -15816,9 +15830,9 @@ SIX of them read a checkpoint and TWO do not — but do
         * `<h2>Heading</h2>` is raw HTML, which GitHub renders, and passed
           through untouched.
         * `# Heading` was demoted by exactly one, to `## Heading` — the precise
-          sibling of `## Task` and `## Evidence` the docstring promised to prevent.
+          sibling of `## Evidence` and `## Changes` the docstring promised to prevent.
           Demotion is now by TWO, so the coder's top level lands at `###`, one
-          below `## Implementation summary`, and every relative level the coder
+          below `## Changes`, and every relative level the coder
           used is preserved rather than collapsed.
         * a FOUR-SPACE-INDENTED ``` desynced the tracker: `line.lstrip()` treats
           indented-code CONTENT as a fence, so everything after it was believed
@@ -16126,11 +16140,98 @@ SIX of them read a checkpoint and TWO do not — but do
         return "\n".join(out)
 
     def _summary_section(self, result) -> str:
-        """The rendered body of `## Implementation summary` (C1 + H13)."""
+        """The rendered body of `## Changes` (C1 + H13, then the 2026-08-21
+        cap): the coder's report, cleaned, with its `CRITERION:` lines made a
+        compact list and everything past `_REPORT_VISIBLE_CHARS` folded."""
         cleaned = self._clean_summary((getattr(result, "final_text", "") or "").strip())
         if self._is_non_report_summary(cleaned):
             return self._NO_SUMMARY_BLOCK
-        return self._reformat_summary_markdown(cleaned)
+        return self._fold_report(
+            self._compact_criterion_lines(self._reformat_summary_markdown(cleaned)))
+
+    #: How much of the coder's report a reader meets WITHOUT expanding
+    #: anything. Three real PRs (#570, #571, #574) carried 740-770 visible
+    #: words before the first fold, most of it this section; the operator's
+    #: directive is "to the point". The remainder is still delivered, folded.
+    _REPORT_VISIBLE_CHARS = 1500
+
+    # `_reformat_summary_markdown` runs FIRST and list-prefixes a bare
+    # `CRITERION:` line with `- ` (the mandated final-report form, see
+    # `prompt_blocks`), so the prefix is accepted here — an independent review
+    # found the compactor inert on exactly the format the coder is told to use.
+    _CRITERION_LINE = re.compile(
+        r"^\s*(?:[-*]\s+)?\**\s*CRITERION:\s*(?P<text>.+?)\s+[—–-]+\s*(?P<verdict>MET|NOT-MET)"
+        r"\s*[—–-]+\s*evidence:\s*(?P<ev>.*?)\**\s*$")
+
+    @staticmethod
+    def _compact_criterion_lines(text: str) -> str:
+        """`CRITERION: <text> — MET — evidence: <…>` (the coder's mandated
+        final-report line, see `prompt_blocks`) becomes one list item with the
+        verdict first. The coder's own bold wrapping is dropped; the words are
+        not. A line that is not a CRITERION line is passed through untouched."""
+        out: list[str] = []
+        for line in text.splitlines():
+            m = Orchestrator._CRITERION_LINE.match(line)
+            if not m:
+                out.append(line)
+                continue
+            ev = m.group("ev").strip().rstrip("*").strip()
+            item = f"- **{m.group('verdict')}** — {m.group('text').strip()}"
+            out.append(item + (f" — _evidence: {ev}_" if ev else ""))
+        return "\n".join(out)
+
+    @staticmethod
+    def _split_paragraphs_keeping_fences(text: str) -> list[str]:
+        """Blank-line paragraphs, except that a fenced code block or an HTML
+        block is ONE paragraph however many blank lines it contains —
+        splitting inside a fence is how a `## Evidence` heading ended up
+        rendered inside a code block.
+
+        Uses `_scan_leaf_blocks`, the ONE fence/HTML scanner the demoter
+        uses, rather than a second tracker: an independent review drove a
+        naive `startswith("```")` copy with a `~~~` fence and with an indented
+        ```` ``` ```` line and got a `<details>` tag opened INSIDE the code
+        block. Two copies of the fence rules are a thing that can drift.
+        """
+        paras: list[str] = []
+        cur: list[str] = []
+        for line, in_fence, in_html, _open in Orchestrator._scan_leaf_blocks(text):
+            if not line.strip() and not in_fence and not in_html:
+                if cur:
+                    paras.append("\n".join(cur))
+                    cur = []
+                continue
+            cur.append(line)
+        if cur:
+            paras.append("\n".join(cur))
+        return paras
+
+    @staticmethod
+    def _fold_report(text: str) -> str:
+        """Keep the first `_REPORT_VISIBLE_CHARS` of the report visible and
+        fold the rest behind `<details>`. Two rules make the cap honest:
+        a paragraph carrying `NOT-MET` is always visible (a folded failure
+        would be the one thing a reader must not miss), and a fence is never
+        split (see `_split_paragraphs_keeping_fences`)."""
+        paras = Orchestrator._split_paragraphs_keeping_fences(text)
+        keep = [p for p in paras if "NOT-MET" in p]
+        rest = [p for p in paras if "NOT-MET" not in p]
+        visible: list[str] = list(keep)
+        folded: list[str] = []
+        used = sum(len(p) + 2 for p in keep)
+        for p in rest:
+            if not folded and used + len(p) + 2 <= Orchestrator._REPORT_VISIBLE_CHARS:
+                visible.append(p)
+                used += len(p) + 2
+            else:
+                folded.append(p)
+        body = "\n\n".join(visible)
+        if folded:
+            k = len(folded)
+            body += ("\n\n<details><summary>Rest of the coder's report "
+                     f"({k} more paragraph{'s' if k != 1 else ''})</summary>\n\n"
+                     + "\n\n".join(folded) + "\n\n</details>")
+        return body
 
     @staticmethod
     def _ordered_post_tool_hooks(receipt_hook, lint_hook, scope_hook) -> list:
@@ -16257,16 +16358,15 @@ SIX of them read a checkpoint and TWO do not — but do
         )
         verification = collapse_appendix(
             verification, heading="How I verified this",
-            summary="expand the full command log and its stated limits",
+            summary=self._verification_summary(evidence),
         )
         return (
             f"{self._ticket_line(task)}"
-            f"## Task\n{self._inline_cell(task.title, None)}\n\n"
+            f"{self._evidence_section(task, head_sha=head_sha, repo=repo, evidence=evidence)}"
             f"## Acceptance criteria\n{criteria}\n\n"
+            f"## Changes\n{self._summary_section(result)}\n\n"
             f"{self._assumptions_section(task)}"
             f"{self._superseded_section(task)}"
-            f"## Implementation summary\n{self._summary_section(result)}\n\n"
-            f"{self._evidence_section(task, head_sha=head_sha, repo=repo, evidence=evidence)}"
             f"{verification}"
             f"{self._merge_boundary_footer(task, branch=branch, base=base, attempt_n=attempt_n)}"
         )
@@ -16298,49 +16398,60 @@ SIX of them read a checkpoint and TWO do not — but do
         head_sha: str = "", repo=None,
         evidence: PrEvidence | None = None,
     ) -> str:
-        """The operator's "ONE area of evidence": what confirms this change works,
-        decisive-first, in rich text.
+        """The operator's "ONE area of evidence", as ONE TABLE of mechanical
+        gate results — the first thing a reviewer meets in the body.
 
-        Consolidates two channels that used to render as separate, out-of-order
-        top-level sections (`## Test evidence` BEFORE the buried `## Review
-        evidence`): the independent reviewer's verdict LEADS — it is the direct
-        answer to "does the reviewer say this works?" — followed by the
-        orchestrator's own test run. Each is a `###` sub-section, so the whole
-        thing reads as one block. The mechanical command-receipts log stays its
-        own `## How I verified this` section after this one.
+        Each row is rendered from `evidence` (gathered once by
+        `_gather_evidence`) and never from model-authored text: the
+        independent reviewer's verdict, the test-change guard when it fired,
+        the orchestrator's own test run, and the CI state when one is known.
+        Detail behind a row — findings earlier rounds raised, failing test
+        names, the tamper adjudicator's reasoning — follows the table, folded
+        where it is long. Nothing the three former `###` sub-sections said is
+        dropped; it is re-shaped so the answer to "does it work?" is on top.
 
-        Returns "" when neither channel has anything, so a body with no review
-        and no test run gains no empty heading. Reorganises existing truthful
-        content only — no new claim is made here.
-
-        ``evidence`` is the object every sub-section renders from — pass it
-        through rather than letting `_review_evidence_section` /
-        `_tamper_adjudication_section` / `_test_evidence_section` each
-        re-gather their own (they still can, standalone, for their own unit
-        tests — see their docstrings — but the production `_pr_body` path
-        gathers exactly once, in `_gather_evidence`).
+        Returns "" when there is no row at all (a body with no review, no
+        test run, no CI state and no guard fire gains no empty table).
         """
         if evidence is None:
             evidence = self._gather_evidence(
                 task, test_evidence=test_evidence, head_sha=head_sha, repo=repo)
         review = self._review_evidence_section(
             task, head_sha=head_sha, repo=repo, evidence=evidence)
-        # A waived tamper-guard fire is evidence the human MUST see. It rides in
-        # this section, not a footnote: `_handle_tamper_fire` passes the gate on
-        # a LEGITIMATE verdict, and the only thing that keeps that from being a
-        # silent weakening is the human reading the justification here, at the
-        # moment they decide to merge.
         tamper = self._tamper_adjudication_section(task, evidence=evidence)
         tests = self._test_evidence_section(evidence.tests)
-        if not review and not tamper and not tests:
+        ci = ""
+        if evidence.ci_state:
+            ci = f"| CI | {self._inline_cell(str(evidence.ci_state), None)} |\n"
+        rows, after = self._split_rows(review + tamper + tests + ci)
+        if not rows:
             return ""
-        lead = (
-            "## Evidence\n"
-            "_Decisive first: the independent reviewer's verdict, then the "
-            "orchestrator's own test run. Raw command receipts are under "
-            "**How I verified this** below._\n\n"
-        )
-        return lead + review + tamper + tests
+        return ("## Evidence\n| Check | Result |\n|---|---|\n" + rows
+                + "\n" + after)
+
+    @staticmethod
+    def _split_rows(rendered: str) -> tuple[str, str]:
+        """Separate the table rows (`| … |` lines) a section renderer emitted
+        from everything else it emitted, so several renderers can share ONE
+        table and still own their own trailing detail."""
+        rows: list[str] = []
+        rest: list[str] = []
+        for line in rendered.splitlines():
+            (rows if line.startswith("| ") and line.endswith(" |") else rest).append(line)
+        after = "\n".join(rest).strip("\n")
+        return "\n".join(rows) + ("\n" if rows else ""), (after + "\n\n" if after else "")
+
+    @staticmethod
+    def _verification_summary(evidence: PrEvidence) -> str:
+        """The one line a reader sees on the folded command log."""
+        rows = [r for r in ((evidence.repro or {}).get("receipts") or [])
+                if isinstance(r, dict)]
+        n = len(rows)
+        if not n:
+            return "command log"
+        shown = min(n, Orchestrator._VERIFICATION_MAX_OUTPUTS)
+        return (f"{n} command{'s' if n != 1 else ''} recorded "
+                f"({shown} shown with output) — and what this log cannot attest")
 
     # ------------------------- PR body: the pieces ------------------------- #
 
@@ -16484,9 +16595,8 @@ SIX of them read a checkpoint and TWO do not — but do
         where = f" ({', '.join(bits)})" if bits else ""
         return (
             "\n\n---\n"
-            f"_Opened by no_human{where}. It never merges and never approves its own "
-            f"work: review this yourself and merge it, or run `nh approve "
-            f"{task.id[:8]}`._"
+            f"_Opened by no_human{where}. It never merges: review and merge this "
+            f"yourself, or run `nh approve {task.id[:8]}`._"
         )
 
     @staticmethod
@@ -16590,16 +16700,21 @@ SIX of them read a checkpoint and TWO do not — but do
         if not rv:
             return ""
         if rv.get("unmatched"):
-            return ("### Independent review\n- (no review has run against this "
+            return ("| Independent review | ⚠️ no review has run against this "
                     "commit yet — the rounds on record judged a different "
-                    "commit of this task)\n\n")
-        lines = [f"- independent review rounds: {rv['rounds']}; final verdict: "
-                 f"**{rv['verdict']}**"]
+                    "commit of this task |\n")
+        n = int(rv["rounds"])
+        glyph = "✅" if rv["verdict"] == "PASSED" else "❌"
+        row = (f"| Independent review | {glyph} **{rv['verdict']}** — "
+               f"{n} round{'s' if n != 1 else ''} |\n")
         addressed = rv.get("addressed") or []
-        if addressed:
-            lines.append("- findings raised and addressed across rounds:")
-            lines += [f"  - {a}" for a in addressed]
-        return "### Independent review\n" + "\n".join(lines) + "\n\n"
+        if not addressed:
+            return row
+        k = len(addressed)
+        fold = (f"<details><summary>{k} finding{'s' if k != 1 else ''} raised "
+                "and addressed across review rounds</summary>\n\n"
+                + "\n".join(f"- {a}" for a in addressed) + "\n\n</details>\n")
+        return row + fold
 
     #: How many recorded commands are shown WITH their captured output, and how
     #: many are listed at all. Both are needed: 200 receipts x a 1,200-character
@@ -16627,80 +16742,62 @@ SIX of them read a checkpoint and TWO do not — but do
     #: about the code as it now stands, and `test_the_limits_list_describes_the_
     #: code_that_exists` holds each one against the module.
     _VERIFICATION_LIMITS: tuple[str, ...] = (
-        "no interactive UI check was performed. no_human never drives a browser "
-        "at your change: the only page it drives is a CI server's login form, "
-        "and the only other browser it touches it hands a URL to (the local "
-        "board, a login link) without driving. So any `e2e` entry above is "
-        "the project's own harness printing its own result, not a "
-        "human-style walkthrough",
+        # 2026-08-21: SIX sentences, was sixteen (4,552 chars on every PR, and
+        # again in the receipts comment). Every class the sixteen named is still
+        # here, merged by what it is a limit OF; each sentence still carries
+        # exactly one behavioural pin in `tests/test_verification_receipts.py`,
+        # and the sixteen originals are kept verbatim in `docs/pr-body.md`.
         "an entry shows that a command LINE was submitted to the shell and what "
         "came back - never that the check recognised inside it RAN, and never "
-        "that it was the RIGHT command. `pytest -k test_nothing` selects no "
-        "tests and prints a clean run; a type check over one file says nothing "
-        "about the rest",
-        "the text is the coder's. The session chose the command string, and "
-        "through `echo`/`printf` it can choose the output too. Both are shown as "
-        "inert text: what is attested is that this command line was submitted "
-        "to the shell and that this is what came back, not that any of it is "
-        "true",
-        "no entry ASSERTS a pass, a fail, or an exit status, and that is "
-        "deliberate. Deciding whether a zero exit belongs to the checked program "
-        "means parsing bash - `pytest -q | tail -3` exits with `tail`'s status - "
-        "and six independent reviews found a new way past every attempt. Where "
-        "the captured text below reads `Error: Exit code 1`, that is a line "
-        "IN THE OUTPUT and not a judgement this section made - and nothing "
-        "here can tell you whether the harness wrote it or the checked "
-        "program did. Read the output",
-        "nothing here checks that these commands exercise the diff; a suite that "
-        "never touches the changed files reads exactly the same, and no receipt "
-        "is compared against the files this PR changes",
+        "that it was the RIGHT command: `pytest -k test_nothing` prints a clean "
+        "run, and a recorded command line may name a check the shell never "
+        "reached yet is still counted - TEN SHAPES WERE DRIVEN against bash "
+        "3.2.57 with the check replaced by a marker-printing stub and the marker "
+        "was absent in every one: a failed `&&`, a taken `||`, an `exit`, an "
+        "`exec`, an `exit` inside a `source`d script, a syntax error that aborts "
+        "the REST of the line, a multi-line `if false`, a `case` that matches "
+        "nothing, `set -e` aborting an earlier command, and `set -u` on an "
+        "unset variable; that list is MEASURED, NOT EXHAUSTIVE, because this "
+        "module is not bash, so a kind this section does NOT list as missing is "
+        "a kind some recorded line named, which is not the same as a kind that "
+        "ran",
+        "the text is the coder's: the session chose the command string and, "
+        "through `echo`/`printf`, can choose the output too. Both are shown as "
+        "inert text, and no entry ASSERTS a pass, a fail, or an exit status - "
+        "`pytest -q | tail -3` exits with `tail`'s status, `Error: Exit code 1` "
+        "is a line IN THE OUTPUT, and where the harness reported a timeout or "
+        "an interruption instead of output that report is appended to the "
+        "captured text in square brackets. Read the output",
+        "recognition reads the command line ONLY - it never looks inside what a "
+        "command runs, so `bash -c 'uv run pytest -q'` leaves no receipt at all "
+        "while `make test` leaves one that names `make` and not the recipe it "
+        "ran; and the other way, a check merely NAMED in a heredoc body, or in "
+        "a quoted string that happens to spell a shell separator, can be "
+        "recorded as though it ran",
         "commands run inside a spawned subagent are deliberately excluded, so "
-        "work the coder delegated leaves no receipt here",
-        "only a command the HARNESS backgrounded leaves no receipt at all - it "
-        "hands back a task id instead of output, so there was nothing to "
-        "record. A trailing `&` YOU wrote is NOT that and is NOT excluded: "
-        "`pytest -q &` is recognised, recorded and headed `test` like any "
-        "other line, and bash forks it, so that entry names a check that may "
-        "still have been running when the harness returned",
-        "a command the harness refused to run (blocked, or permission denied) "
-        "leaves no receipt, because it never ran",
-        "only commands recognised as checks are recorded, and recognition reads "
-        "the command line ONLY - it never looks inside what a command runs. So "
-        "`bash -c 'uv run pytest -q'` leaves no receipt at all while `make test` "
-        "leaves one that names `make` and not the recipe it ran",
-        "recognition is also textual the other way: a check merely NAMED in a "
-        "heredoc body, or in a quoted string that happens to spell a shell "
-        "separator, can be recorded as though it ran",
-        "recognition cannot see CONTROL FLOW either: a recorded command line "
-        "may name a check the shell never reached, and it is still recorded, "
-        "still headed by that check's kind, and still counted as a recorded "
-        "command everywhere above. TEN SHAPES WERE DRIVEN against bash 3.2.57 "
-        "with the check replaced by a marker-printing stub, and the marker was "
-        "absent in every one: a failed `&&`, a taken `||`, an `exit`, an "
-        "`exec`, an `exit` inside a `source`d script, a syntax error that "
-        "aborts the REST of the line (what came BEFORE it does run), a "
-        "multi-line `if false`, a `case` that matches nothing, `set -e` "
-        "aborting an earlier command, and `set -u` on an unset variable. That "
-        "list is MEASURED, NOT EXHAUSTIVE - recognising any of it means parsing "
-        "bash, and this module is not bash. So a kind this section does NOT "
-        "list as missing is a kind some recorded line named, which is not the "
-        "same as a kind that ran",
-        "where the harness reported something instead of output - a timeout, an "
-        "interruption, its own wording of a non-zero exit - that report is "
-        "appended to the captured text in square brackets; the coder's own "
-        "output can spell the same thing, so it is text like everything else here",
+        "delegated work leaves no receipt here; a command the harness refused "
+        "to run (blocked, or permission denied) leaves none, because it never "
+        "ran; and only a command the HARNESS backgrounded leaves no receipt at "
+        "all - it hands back a task id instead of output. A trailing `&` YOU "
+        "wrote is NOT that and is NOT excluded: `pytest -q &` is recorded and "
+        "headed `test`, and may still have been running when the harness "
+        "returned",
         "the COMMAND and the output are both redacted and bounded before they "
-        "are stored, so an excerpt is not the full log, a credential-shaped "
-        "string may have been masked out of either, and a command over 400 "
-        "characters is shortened in the middle",
-        "each command is displayed on ONE line: a multi-line command has its "
-        "newlines folded to spaces, so the string shown may not re-run as "
-        "written",
-        "invisible and direction-changing characters are stripped from the "
-        "command and the output before display, so what is shown can differ by "
-        "those characters from what ran; look-alike letters are NOT detected",
-        "no_human's own test run, CI, and the independent review are separate "
-        "signals - this section covers only the coder session's own commands",
+        "are stored - an excerpt is not the full log, a credential-shaped "
+        "string may have been masked out of either, a command over 400 "
+        "characters is shortened in the middle, each command is displayed on "
+        "ONE line with its newlines folded to spaces (so it may not re-run as "
+        "written), and invisible and direction-changing characters are "
+        "stripped before display; look-alike letters are NOT detected",
+        "nothing here checks that these commands exercise the diff - no receipt "
+        "is compared against the files this PR changes; no interactive UI "
+        "check was performed (no_human never drives a browser at your change: "
+        "the only page it drives is a CI server's login form, and the local "
+        "board it opens without driving, so an `e2e` entry is the project's "
+        "own harness printing its own result, not a human-style walkthrough); "
+        "and no_human's own test run, "
+        "CI, and the independent review are separate signals - this section "
+        "covers only the coder session's own commands",
     )
 
     @staticmethod
@@ -16813,13 +16910,10 @@ SIX of them read a checkpoint and TWO do not — but do
         command_only = len(listed) - len(with_output)
 
         lines: list[str] = [
-            f"{len(rows)} verification command(s) were recorded during this "
-            f"attempt. Each entry is the command AS RECORDED and the text the "
-            f"harness returned for it - \"as recorded\" and not \"exact\", "
-            f"because a long command is shortened and a multi-line one is "
-            f"folded onto a single line (see **Not verified**). **No entry "
-            f"ASSERTS a pass or a fail:** read the output. This is not "
-            f"necessarily everything the session ran.\n"
+            f"{_cmds(len(rows))} recorded - as recorded (shortened, folded "
+            f"onto one line), grouped by kind. **No entry asserts a pass or "
+            f"a fail:** read the output. Not necessarily everything the "
+            f"session ran.\n"
         ]
         # The observer stops recording at RECEIPT_CAP. Silence past the cap read
         # as "that is everything". `>=` rather than `>` because the row count is
@@ -16949,8 +17043,8 @@ SIX of them read a checkpoint and TWO do not — but do
         if isinstance(test_evidence, dict) and (
             test_evidence.get("ran") or test_evidence.get("layers")
         ):
-            lines.append("See **Test evidence** above for the orchestrator's own "
-                         "test run.\n")
+            lines.append("See the **Evidence** table above for the orchestrator's "
+                         "own test run.\n")
 
         return header + "\n".join(lines) + "\n"
 
@@ -16986,7 +17080,7 @@ SIX of them read a checkpoint and TWO do not — but do
         counted = _n("passed") + _n("failed") + _n("errors")
 
         if isinstance(layers, list) and layers:
-            lines = [f"- {Orchestrator._inline_cell(s, None)}" for s in layers]
+            lines = [f"| Tests | {Orchestrator._inline_cell(s, None)} |" for s in layers]
         elif test_evidence.get("invocation_error") and not counted:
             # C3: THE RUNNER NEVER STARTED. This used to render as
             # "FAIL — 0 passed, 0 failed, 0 errors", which a human reads as a
@@ -16997,9 +17091,9 @@ SIX of them read a checkpoint and TWO do not — but do
             on_base = test_evidence.get("reproduces_on_base")
             says = {True: "yes", False: "no"}.get(on_base, "could not be checked")
             lines = [
-                "- tests: **NOT RUN — test invocation failed** "
-                f"(environmental; reproduces on base: {says})",
-                "- this change carries NO test evidence — do not read the "
+                "| Tests | ❌ **NOT RUN — test invocation failed** "
+                f"(environmental; reproduces on base: {says}) |",
+                "⚠️ this change carries NO test evidence — do not read the "
                 "absence of failures as a pass",
             ]
         elif test_evidence.get("ran") is False:
@@ -17009,31 +17103,34 @@ SIX of them read a checkpoint and TWO do not — but do
             # body used to print nothing for it, and nothing is what a reader
             # takes for "fine". The disclosure is the ledger entry.
             lines = [
-                "- tests: **NOT RUN — no test command detected** — this change "
+                "| Tests | ⚠️ **NOT RUN — no test command detected** — this change "
                 "carries NO test evidence; do not read the absence of failures "
-                "as a pass",
+                "as a pass |",
             ]
         # `ran` alone is the right condition and `or counted` would be dead code:
         # `ran=False` is handled above, and the layered writer always sets
         # `layers` (first branch).
         elif test_evidence.get("ran"):
             if test_evidence.get("ok"):
-                lines = [f"- tests: PASS — {test_evidence.get('passed', 0)} passed, "
+                lines = [f"| Tests | ✅ PASS — {test_evidence.get('passed', 0)} passed, "
                          f"{test_evidence.get('failed', 0)} failed, "
-                         f"{test_evidence.get('errors', 0)} errors"]
+                         f"{test_evidence.get('errors', 0)} errors |"]
             else:
-                lines = [f"- tests: FAIL — {test_evidence.get('passed', 0)} passed, "
+                lines = [f"| Tests | ❌ FAIL — {test_evidence.get('passed', 0)} passed, "
                          f"{test_evidence.get('failed', 0)} failed, "
-                         f"{test_evidence.get('errors', 0)} errors"]
+                         f"{test_evidence.get('errors', 0)} errors |"]
                 # The names are stored on the attempt row and were invisible on
                 # the artifact — a reviewer had a count and no way to act on it.
                 failing = [Orchestrator._inline_cell(f, None)
                            for f in (test_evidence.get("failing_tests") or []) if f]
                 if failing:
-                    lines.append("- failing tests:")
-                    lines += [f"  - `{f}`" for f in failing[:10]]
-                    if len(failing) > 10:
-                        lines.append(f"  - …and {len(failing) - 10} more")
+                    k = len(failing)
+                    lines.append(f"<details><summary>{k} failing test"
+                                 f"{'s' if k != 1 else ''}</summary>\n")
+                    lines += [f"- `{f}`" for f in failing[:10]]
+                    if k > 10:
+                        lines.append(f"- …and {k - 10} more")
+                    lines.append("\n</details>")
             if test_evidence.get("invocation_error"):
                 # The counts above are real and stay. But the runner ALSO hit a
                 # module-resolution/import failure, so the suite may be partial
@@ -17041,15 +17138,15 @@ SIX of them read a checkpoint and TWO do not — but do
                 on_base = test_evidence.get("reproduces_on_base")
                 says = {True: "yes", False: "no"}.get(on_base, "could not be checked")
                 lines.append(
-                    "- ⚠️ the runner also reported an invocation error "
+                    "⚠️ the runner also reported an invocation error "
                     "(import/module resolution), so this run may be PARTIAL "
                     f"— reproduces on base: {says}")
         if test_evidence.get("tamper_flag"):
             # Never silent: a net reduction in tests/assertions is the one
             # signal the whole gate exists to catch (constraint #4).
-            lines.append("- ⚠️ **tamper guard fired** on this attempt — test "
+            lines.append("⚠️ **tamper guard fired** on this attempt — test "
                          "count or assertions dropped; check the diff for "
                          "deleted or weakened tests")
         if not lines:
             return ""
-        return "### Test evidence\n" + "\n".join(lines) + "\n\n"
+        return "\n".join(lines) + "\n"

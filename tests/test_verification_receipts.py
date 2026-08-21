@@ -1091,7 +1091,7 @@ def test_the_headline_uses_the_same_verb_the_bullet_had_to_adopt():
     still said "carries" in bold above every entry - the more prominent of the
     two, and the reason for the bullet edit applies verbatim to it."""
     s = Orchestrator._verification_section(_rows())
-    assert "**No entry ASSERTS a pass or a fail:**" in s
+    assert "**No entry asserts a pass or a fail:**" in s
     assert "carries a pass" not in s
 
 
@@ -1099,7 +1099,7 @@ def test_the_headline_counts_and_never_scores():
     """A count of what was recorded is a fact. "N passed / M failed" is the
     verdict wearing a hat."""
     s = Orchestrator._verification_section(_rows())
-    assert "2 verification command(s) were recorded during this attempt" in s
+    assert "2 commands recorded - as recorded" in s
     assert "passed," not in s.split("**Not verified:**")[0].replace(
         "12 passed in 3.1s", "")
     assert "failed" not in s.split("### ")[0]
@@ -1107,7 +1107,7 @@ def test_the_headline_counts_and_never_scores():
 
 def test_the_header_does_not_claim_to_be_everything_that_ran():
     s = Orchestrator._verification_section(_rows())
-    assert "not necessarily everything the session ran" in s
+    assert "Not necessarily everything the session ran" in s
 
 
 def test_the_header_does_not_call_a_folded_command_exact():
@@ -1117,7 +1117,7 @@ def test_the_header_does_not_call_a_folded_command_exact():
     are both named in the limits."""
     s = Orchestrator._verification_section(_rows())
     assert "exact command" not in s
-    assert "AS RECORDED" in s
+    assert "as recorded" in s
     assert "folded" in s and "400 characters" in s
 
 
@@ -1165,7 +1165,7 @@ def test_a_row_of_an_unknown_kind_is_rendered_not_just_counted():
     rows = [_row(kind="fuzz", command="cargo fuzz run t", excerpt="crash")]
     s = Orchestrator._verification_section(rows)
     assert "cargo fuzz run t" in s and "crash" in s
-    assert "1 verification command(s) were recorded" in s
+    assert "1 command recorded" in s
 
 
 def test_a_command_with_no_output_says_so_rather_than_showing_nothing():
@@ -1184,7 +1184,7 @@ def test_section_states_truncation_with_the_real_total():
 def test_section_references_test_evidence_rather_than_restating_it():
     s = Orchestrator._verification_section(
         _rows(), test_evidence={"ran": True, "ok": True, "passed": 12})
-    assert "See **Test evidence** above" in s
+    assert "See the **Evidence** table above" in s
     assert "12 passed, 0 failed" not in s
 
 
@@ -1220,7 +1220,7 @@ def test_commands_past_the_entry_cap_are_dropped_and_counted():
         assert f"case{i:03d}" not in s, f"case{i:03d} was kept past the cap"
     for i in range(7, total):
         assert f"case{i:03d}" in s, f"case{i:03d} was dropped inside the cap"
-    assert f"{total} verification command(s) were recorded" in s
+    assert f"{total} commands recorded" in s
     assert f"the {n} most recent are listed below and the earliest 7 commands " \
         f"recorded are not listed at all" in s
     assert "earliest 7 commands recorded are not listed above at all" in s
@@ -1944,31 +1944,37 @@ def _pin_separate_signals(s: str, entry: str) -> None:
     assert "No verification evidence was captured" in empty
     assert "4171" not in empty, "the orchestrator's own run became evidence here"
     both = Orchestrator._verification_section(_rows(), test_evidence=own_run)
-    assert f"{len(_rows())} verification command(s) were recorded" in both, (
+    assert f"{len(_rows())} commands recorded" in both, (
         "the orchestrator's own run changed the coder's receipt count")
     assert "4171" not in both.split("**Not verified:**")[0]
     # ...cross-referenced, not merged.
-    assert "See **Test evidence** above" in both
+    assert "See the **Evidence** table above" in both
 
 
 #: fragment unique to ONE entry -> the pin that holds that entry to the code.
+def _merged(*pins):
+    """2026-08-21: one rendered sentence now carries several of the former
+    limits; its pin runs every pin those limits had, against the merged
+    sentence, so nothing a sentence used to prove stops being proven."""
+    def _pin(s: str, entry: str) -> None:
+        for p in pins:
+            p(s, entry)
+    return _pin
+
+
 _LIMIT_PINS = {
-    "no interactive UI check was performed": _pin_ui,
-    "a command LINE was submitted to the shell": _pin_submitted,
-    "the text is the coder's": _pin_untrusted_text,
-    "no entry ASSERTS a pass, a fail, or an exit status": _pin_no_verdict,
-    "nothing here checks that these commands exercise the diff": _pin_not_the_diff,
-    "spawned subagent are deliberately excluded": _pin_subagent,
-    "only a command the HARNESS backgrounded": _pin_backgrounded,
-    "blocked, or permission denied": _pin_blocked,
-    "leaves no receipt at all while `make test` leaves one": _pin_indirect,
-    "a check merely NAMED in a heredoc body": _pin_textual_the_other_way,
-    "may name a check the shell never reached": _pin_control_flow,
-    "appended to the captured text in square brackets": _pin_harness_report,
-    "the COMMAND and the output are both redacted and bounded": _pin_redacted_and_bounded,
-    "each command is displayed on ONE line": _pin_one_line,
-    "invisible and direction-changing characters": _pin_invisibles,
-    "are separate signals": _pin_separate_signals,
+    "a command LINE was submitted to the shell":
+        _merged(_pin_submitted, _pin_control_flow),
+    "the text is the coder's":
+        _merged(_pin_untrusted_text, _pin_no_verdict, _pin_harness_report),
+    "recognition reads the command line ONLY":
+        _merged(_pin_indirect, _pin_textual_the_other_way),
+    "spawned subagent are deliberately excluded":
+        _merged(_pin_subagent, _pin_backgrounded, _pin_blocked),
+    "the COMMAND and the output are both redacted and bounded":
+        _merged(_pin_redacted_and_bounded, _pin_one_line, _pin_invisibles),
+    "nothing here checks that these commands exercise the diff":
+        _merged(_pin_not_the_diff, _pin_ui, _pin_separate_signals),
 }
 
 
@@ -2640,18 +2646,15 @@ _UNOBSERVABLE = (
     "nothing was checked - it is a report that nothing could be recorded.")
 
 _INTRO_AFTER_COUNT = (
-    " verification command(s) were recorded during this attempt. Each entry is "
-    "the command AS RECORDED and the text the harness returned for it - \"as "
-    "recorded\" and not \"exact\", because a long command is shortened and a "
-    "multi-line one is folded onto a single line (see **Not verified**). **No "
-    "entry ASSERTS a pass or a fail:** read the output. This is not "
+    " recorded - as recorded (shortened, folded onto one line), grouped by "
+    "kind. **No entry asserts a pass or a fail:** read the output. Not "
     "necessarily everything the session ran.")
 
 _NOT_SHOWN_ITALIC = "  _output not shown - see the note above._"
 _NO_CAPTURE_ITALIC = "  _nothing was captured on stdout or stderr for this command._"
 _MARKER_LINE = ("**Not verified:** everything below is a limit of this section, "
                 "listed whether or not it bit this attempt.")
-_XREF = "See **Test evidence** above for the orchestrator's own test run."
+_XREF = "See the **Evidence** table above for the orchestrator's own test run."
 
 
 def _entry_lines(s: str) -> list[str]:
@@ -2729,13 +2732,15 @@ def _pin_intro(s: str, line: str, rows: list[dict]) -> None:
     not-necessarily-everything, AS RECORDED rather than exact - has its own
     tests; what is pinned here is that the line is THIS line and the count is
     the count."""
-    stated, rest = line.split(" verification command(s)", 1)
-    assert " verification command(s)" + rest == _INTRO_AFTER_COUNT, line
+    m = re.match(r"(\d+) commands?( recorded .*)$", line, re.S)
+    assert m, line
+    stated, rest = m.group(1), m.group(2)
+    assert rest == _INTRO_AFTER_COUNT, line
     assert int(stated) == len(rows), (stated, len(rows))
     # NON-VACUITY: the number varies with the rows rather than being a constant
     # this pin happens to agree with.
     assert Orchestrator._verification_section(
-        [_row(), _row()]).startswith("## How I verified this\n2 verification")
+        [_row(), _row()]).startswith("## How I verified this\n2 commands recorded")
     # "AS RECORDED and not exact" - both halves are real.
     assert md_inline_code("a\nb") == "`a b`", "a multi-line command is folded"
     assert len(_bound("x" * (COMMAND_MAX_CHARS * 2), COMMAND_MAX_CHARS)) \
@@ -2915,8 +2920,8 @@ def _pin_test_evidence_xref(s: str, line: str, rows: list[dict]) -> None:
         test_evidence={"ran": True, "ok": True, "passed": 3},
         receipts=list(rows) or [_row()])
     assert line in body, "the cross-reference does not reach the shipped body"
-    assert body.index("## Test evidence") < body.index(line), (
-        "the section says Test evidence is ABOVE it, and it is not")
+    assert body.index("| Tests |") < body.index(line), (
+        "the section says the Evidence table is ABOVE it, and it is not")
 
 
 #: fragment invariant to ONE rendered prose line -> the pin that holds it.
@@ -2927,7 +2932,7 @@ _PROSE_PINS = {
         _pin_no_evidence_headline,
     "Nothing was recorded as having been run to check it":
         _pin_no_evidence_body,
-    " verification command(s) were recorded during this attempt": _pin_intro,
+    " recorded - as recorded": _pin_intro,
     "The per-attempt limit of": _pin_receipt_cap_reached,
     "**Not everything recorded is shown:**": _pin_not_everything_shown,
     "### ": _pin_kind_heading,
@@ -2936,7 +2941,7 @@ _PROSE_PINS = {
         _pin_nothing_captured,
     "_excerpt - ": _pin_excerpt_total,
     "**Not verified:** everything below is a limit": _pin_marker,
-    "See **Test evidence** above": _pin_test_evidence_xref,
+    "See the **Evidence** table above": _pin_test_evidence_xref,
 }
 
 #: The gap scenarios reach every branch that appends to `gaps`; these reach the
@@ -3096,11 +3101,11 @@ def test_every_prose_branch_of_the_render_is_reached():
     # things. Without this the condition can be widened with nothing red.
     assert not got("unobservable-with-rows", "cannot be observed")
     assert not got("unobservable-with-rows", "No verification evidence was captured")
-    assert got("unobservable-with-rows", " verification command(s) were recorded")
+    assert got("unobservable-with-rows", " recorded - as recorded")
     for name in _PROSE_RENDERS:
         assert got(name, "## How I verified this"), name
-    assert got("two-kinds", " verification command(s) were recorded")
-    assert not got("nothing", "verification command(s) were recorded"), (
+    assert got("two-kinds", " recorded - as recorded")
+    assert not got("nothing", " recorded - as recorded"), (
         "the early return renders no intro")
     assert got("cap-reached", "The per-attempt limit of")
     assert not got("both-caps", "The per-attempt limit of"), "the cap did not bite"
@@ -3119,8 +3124,8 @@ def test_every_prose_branch_of_the_render_is_reached():
     assert got("no-output", "_nothing was captured on stdout")
     assert got("truncated", "_excerpt - ")
     assert not got("two-kinds", "_excerpt - ")
-    assert got("cross-reference", "See **Test evidence** above")
-    assert not got("two-kinds", "See **Test evidence** above")
+    assert got("cross-reference", "See the **Evidence** table above")
+    assert not got("two-kinds", "See the **Evidence** table above")
     for name in _PROSE_RENDERS:
         if name not in ("nothing", "unobservable"):
             assert got(name, "**Not verified:** everything below"), name
@@ -3308,7 +3313,9 @@ async def test_nothing_downstream_edits_the_section_it_ships(
     # fold, which is what the two assertions below hold apart.
     collapsed = collapse_appendix(
         section, heading="How I verified this",
-        summary="expand the full command log and its stated limits")
+        summary=Orchestrator._verification_summary(
+            orch._gather_evidence(Task.new("t", repo_path="/r"),
+                                  test_evidence={"ran": True}, receipts=rows)))
     assert collapsed in body, (
         "the PR body does not embed the section behind the documented "
         "collapse_appendix() transform; something else is editing it, and "
@@ -3670,3 +3677,22 @@ async def test_no_forge_text_flows_back_into_the_run(store, tmp_path, monkeypatc
     await orch._post_verification_comment(t, "https://github.com/o/r/pull/1", _rows())
     assert captured and injected not in captured[0]
     assert injected not in str(t.context or {})
+
+
+def test_the_limits_fold_is_six_sentences_under_3300_chars():
+    """2026-08-21: the sixteen-sentence list was 4,552 chars on every PR (and
+    again in the receipts comment). Six sentences carry every class it named
+    and every fragment a behavioural pin holds — the ten measured control-flow
+    shapes among them, which is why the floor is 3.2 KB and not less. The
+    ceiling pins the shrink so it cannot silently grow back."""
+    limits = Orchestrator._VERIFICATION_LIMITS
+    assert len(limits) == 6, len(limits)
+    assert sum(len(x) for x in limits) <= 3300, sum(len(x) for x in limits)
+
+
+def test_the_intro_is_one_line_that_counts_and_never_scores():
+    s = Orchestrator._verification_section(_rows())
+    intro = s.split("## How I verified this\n", 1)[1].split("\n", 1)[0]
+    assert intro.startswith(f"{len(_rows())} commands recorded - ")
+    assert "AS RECORDED" not in s
+    assert len(intro) < 220, len(intro)

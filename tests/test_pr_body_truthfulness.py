@@ -92,7 +92,7 @@ WAITING = "I'll just wait for that notification."
 
 def test_a_waiting_note_is_never_pasted_as_an_implementation_summary(store, tmp_path):
     """PR #105 (review PASSED) shipped exactly this line under
-    "## Implementation summary". It is the coder talking to itself, not a
+    "## Changes". It is the coder talking to itself, not a
     report — and rendered under that heading a human reads it as a claim about
     the change."""
     orch = _orch(store, tmp_path)
@@ -121,7 +121,7 @@ def test_the_absent_summary_block_invents_nothing(store, tmp_path):
     result = _Result()
     result.final_text = WAITING
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), result)
-    section = body.split("## Implementation summary\n", 1)[1].split("\n## ", 1)[0]
+    section = body.split("## Changes\n", 1)[1].split("\n## ", 1)[0]
     assert "read the commits and the diff" in section
     assert "Nothing was written in its place" in section
 
@@ -259,7 +259,7 @@ def test_a_missing_evidence_dict_still_renders_nothing():
 def test_a_pass_still_reads_as_pass():
     section = Orchestrator._test_evidence_section(
         {"ran": True, "ok": True, "passed": 9, "failed": 0, "errors": 0})
-    assert "tests: PASS — 9 passed, 0 failed, 0 errors" in section
+    assert "| Tests | ✅ PASS — 9 passed, 0 failed, 0 errors |" in section
     assert "NOT RUN" not in section
 
 
@@ -335,8 +335,7 @@ def test_a_round_that_judged_this_head_is_shown(store, tmp_path):
         {"round": 2, "sha": head, "passed": True, "blocking": []},
     ]}
     section = Orchestrator._review_evidence_section(t, head_sha=head, repo=repo)
-    assert "review rounds: 2" in section
-    assert "**PASSED**" in section
+    assert "**PASSED** — 2 rounds |" in section
     assert "fix the guard" in section
 
 
@@ -551,7 +550,8 @@ def test_a_url_that_is_not_a_link_destination_is_neutralised_not_dropped(
 def test_no_ticket_no_line(store, tmp_path):
     body = _orch(store, tmp_path)._pr_body(
         Task.new("t", repo_path="/r"), _Commit(), _Result())
-    assert body.startswith("## Task")
+    assert not body.startswith("**Ticket:**")
+    assert body.startswith("## ")
 
 
 # ─────────────────────────── H13: scannability ────────────────────────────── #
@@ -823,7 +823,7 @@ def test_a_message_that_is_only_deferral_is_still_not_a_summary(text):
 
 # ───── R4: reader-addressed lines, STANDING ALONE ─────────────────────────── #
 #
-# These reached the body under "## Implementation summary" as if they described
+# These reached the body under "## Changes" as if they described
 # the diff. Nothing else in `_NON_REPORT_PATTERNS` matched them, so the early
 # return fired before the residue was ever judged — and the case above does NOT
 # pin them, because its "I'm waiting…" prefix is caught by an older pattern all
@@ -1015,7 +1015,7 @@ async def test_finalize_scopes_the_review_dossier_to_the_head_it_is_shipping(
     assert "a finding about a diff that is not in front of you" not in body, (
         "a verdict on another commit rendered on this PR — `repo` is not "
         "reaching `_review_evidence_section` from `_finalize`")
-    assert "final verdict: **PASSED**" in body, (
+    assert "| Independent review | ✅ **PASSED**" in body, (
         "the real round for this head did not render — `repo` is not "
         "reaching `_review_evidence_section` from `_finalize`")
 
@@ -1084,8 +1084,7 @@ async def test_a_reviewed_passing_pr_shows_its_review_evidence(store, tmp_path):
     commit.sha = repo.head_sha()
     body = orch._pr_body(task, commit, _Result(), repo=repo, base="main")
 
-    assert "independent review rounds: 1" in body
-    assert "final verdict: **PASSED**" in body
+    assert "| Independent review | ✅ **PASSED** — 1 round |" in body
     assert "no review has run against this commit yet" not in body, (
         "a reviewed, PASSING PR told its reader no review had run against it")
 
@@ -1270,7 +1269,7 @@ async def test_a_partial_run_reaches_the_body_with_its_failing_test_names(
     # …and the renderer, fed the REAL dict, actually names them.
     section = Orchestrator._test_evidence_section(persisted)
     assert "NOT RUN" not in section
-    assert "- failing tests:" in section
+    assert "<details><summary>2 failing tests</summary>" in section
     assert "test_this_one_really_fails" in section
 
 
@@ -1398,7 +1397,7 @@ async def test_the_true_reason_is_still_carried_on_the_ci_infra_route(
 # `category`, never the prose. Rendered unescaped it lets the coder author
 # headings and verdicts on a PR no_human is simultaneously labelling
 # [ABANDONED]. Everywhere else coder prose is confined under
-# `## Implementation summary`, cleaned and demoted; this channel had none of it.
+# `## Changes`, cleaned and demoted; this channel had none of it.
 
 
 def _outside_fences(text: str) -> list[str]:
@@ -2208,10 +2207,8 @@ async def test_the_escalating_route_fixtures_are_not_attributed_either(
 # strings are no longer level-1/2 headings and leave this set. `Stats` LEFT it
 # outright: the diffstat/turns line was removed (the forge shows the diffstat;
 # the turn count is internal noise).
-_TEMPLATE_H2 = {"Task", "Acceptance criteria", "Implementation summary",
-                "Evidence", "How I verified this",
-                "Superseded PRs",
-                "⚠️ Assumptions & Open Questions"}
+_TEMPLATE_H2 = {"Evidence", "Acceptance criteria", "Changes",
+                "How I verified this", "Superseded PRs"}
 
 
 _RAW_HTML_H12 = r"<[hH][12][^>]*>(.*?)</[hH][12]>"
@@ -2904,7 +2901,7 @@ def test_the_coder_cannot_author_a_top_level_section_of_the_pr(
 ):
     """The guarantee, on the delivered-PR channel: the set of level-1/2 headings
     in the body is exactly the template's own. Anything the coder writes lands
-    strictly below `## Implementation summary`."""
+    strictly below `## Changes`."""
     orch = _orch(store, tmp_path)
     t = Task.new("Add the thing", repo_path="/r")
     t.acceptance_criteria = ["it works"]
@@ -3210,7 +3207,7 @@ def test_the_independent_parser_is_actually_reading_the_body(store, tmp_path):
     assert "How I verified this" in seen, seen
 
 
-# ── the carriers OUTSIDE `## Implementation summary` ──────────────────────── #
+# ── the carriers OUTSIDE `## Changes` ──────────────────────── #
 #
 # 🔴 `_reformat_summary_markdown` GUARDS ONE SECTION, AND THE BODY HAS EIGHT
 # OTHER CHANNELS. Every payload above enters through the coder's summary, which
@@ -3267,8 +3264,11 @@ def _carrier_channels(payload: str) -> dict:
             setattr(t, k, v)
         return t
 
+    # `task.title` LEFT this matrix on 2026-08-21: the body no longer carries
+    # the title at all (`## Task` repeated the PR title and was dropped), so
+    # the title is not a body channel — it reaches the forge as the PR title,
+    # through `scrub_outbound(..., "pr_title")`, a different surface.
     return {
-        "task.title": (_t(title=payload), None),
         "acceptance_criteria": (_t(criteria=[payload]), None),
         "external_id": (_t(external_id=payload), None),
         # 🔴 THE CHANNEL THE ENUMERATION MISSED. `_ticket_line` interpolates the
