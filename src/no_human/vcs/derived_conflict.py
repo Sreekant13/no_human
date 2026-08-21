@@ -10,6 +10,13 @@ and the PR stays CONFLICTING. This module answers the two questions the rung
 needs — "is this conflict confined to derived artefacts?" and, if so,
 "resolve it" — without a coder in the loop.
 
+The count-only shape rule below is judged against the MERGE-BASE, and against
+the hunks that actually conflict — never against main's tip wholesale. See
+`classification_count_only` and `conflict_hunks_count_only` for the incident
+(task 63928824 / PR #592) that forced the distinction: a rule line main gained
+from an unrelated landing merges cleanly and is not the branch's decision to
+make, so it must not defeat the shape.
+
 `EXPORT_CLASSIFICATION.txt` is NOT a derived artefact by this module's
 membership rule (see `DERIVED_ARTEFACTS` below) even though it sits next to
 `RELEASE_MANIFEST.txt` in the export gate: its per-rule win-COUNTs are
@@ -197,14 +204,30 @@ def _normalized_classification_lines(text: str) -> list[str]:
 
 async def classification_count_only(repo_path: str, base_tip_sha: str,
                                      branch: str) -> bool:
-    """True iff `EXPORT_CLASSIFICATION.txt` differs between `base_tip_sha`
-    and `branch` ONLY in the numeric win-count of otherwise-identical rule
-    lines — never a pattern, a verb, a comment, an added/removed/reordered
-    rule line, or a whitespace reflow. This is a conflict-SHAPE test: it says
-    nothing about whether the file is currently a git conflict (the caller,
-    `mechanically_resolvable`, combines this with the conflicting-paths set).
+    """True iff the BRANCH'S OWN edit to `EXPORT_CLASSIFICATION.txt` — its
+    change relative to the MERGE-BASE of `base_tip_sha` and `branch`, not
+    relative to the base tip — is ONLY the numeric win-count of
+    otherwise-identical rule lines: never a pattern, a verb, a comment, an
+    added/removed/reordered rule line, or a whitespace reflow. This is a
+    conflict-SHAPE test about one side; it says nothing about whether the
+    file is currently a git conflict, nor about what the conflicting hunks
+    contain (the caller, `mechanically_resolvable`, combines this with the
+    conflicting-paths set and with `conflict_hunks_count_only`).
 
-    Two independent checks must both pass:
+    WHY THE MERGE-BASE AND NOT THE BASE TIP (bugfix, live evidence: task
+    63928824 / PR #592, 2026-08-22). This used to compare the base TIP
+    against the branch wholesale. Every rule line main gained from an
+    unrelated landing after the branch forked — a clean, non-conflicting
+    addition that `git merge` takes without asking anyone — then made both
+    checks below fail, so a conflict that was PURELY the two sides' count
+    bumps meeting (321 -> 322 on the branch, 321 -> 323 on main, merging to
+    324) was declared "not count-only" and sent to a paid coder round, which
+    cannot author that number correctly anyway. Main's own decisions are
+    main's; the only question this predicate may ask is what the BRANCH
+    decided, and the merge-base is the only point that answers it.
+
+    Two independent checks must both pass, between the merge-base and the
+    branch:
       1. The DECISION sequence — `pr_watcher.classification_decisions`, which
          already elides each rule's count — is identical on both sides. Reused
          as-is, never reparsed here.
@@ -214,11 +237,17 @@ async def classification_count_only(repo_path: str, base_tip_sha: str,
          closing the hole check 1's `str.split()` leaves open for a pure
          spacing reflow.
 
-    Fails closed (`False`) on any git failure, an absent file, or an empty
-    read on either side — the same doctrine as `all_derived`'s `None`-is-
-    ineligible: an unknown conflict shape is never treated as count-only.
+    Fails closed (`False`) on any git failure, an UNRESOLVABLE MERGE-BASE
+    (unrelated histories, a missing ref), an absent file, or an empty read on
+    either side — the same doctrine as `all_derived`'s `None`-is-ineligible:
+    an unknown conflict shape is never treated as count-only.
     """
-    decisions_base = await classification_decisions(repo_path, base_tip_sha)
+    rc_mb, merge_base = await _git_rc(repo_path, "merge-base",
+                                      base_tip_sha, branch)
+    if rc_mb != 0 or not merge_base:
+        return False
+
+    decisions_base = await classification_decisions(repo_path, merge_base)
     decisions_branch = await classification_decisions(repo_path, branch)
     if decisions_base is None or decisions_branch is None:
         return False
@@ -226,7 +255,7 @@ async def classification_count_only(repo_path: str, base_tip_sha: str,
         return False
 
     rc_base, text_base = await _git_rc(repo_path, "show",
-                                        f"{base_tip_sha}:{CLASSIFICATION_NAME}")
+                                        f"{merge_base}:{CLASSIFICATION_NAME}")
     rc_branch, text_branch = await _git_rc(repo_path, "show",
                                             f"{branch}:{CLASSIFICATION_NAME}")
     if rc_base != 0 or rc_branch != 0 or not text_base or not text_branch:
@@ -234,6 +263,146 @@ async def classification_count_only(repo_path: str, base_tip_sha: str,
 
     return (_normalized_classification_lines(text_base)
             == _normalized_classification_lines(text_branch))
+
+
+#: Conflict-marker prefixes git writes into a merged blob. `|||||||` appears
+#: only under `merge.conflictStyle = diff3`/`zdiff3`, so both the 2- and
+#: 3-section shapes have to parse.
+_HUNK_START = "<<<<<<<"
+_HUNK_BASE = "|||||||"
+_HUNK_SEP = "======="
+_HUNK_END = ">>>>>>>"
+
+
+def conflict_hunks_count_only(merged_text: str) -> bool:
+    """True iff `merged_text` — a classification file as git left it, WITH
+    conflict markers — contains at least one conflict hunk and EVERY hunk's
+    sections are rule lines that differ only in their win-count digits.
+
+    The companion to `classification_count_only`, and the reason that
+    predicate may look at the branch's edit alone. `classification_count_only`
+    proves the branch decided nothing; this proves nothing was decided INSIDE
+    the conflict either. Without it, a main-side rule line that happens to
+    land beside the branch's count line (git folds adjacent edits into one
+    hunk) would be resolved by `git checkout --ours` — silently discarding
+    main's decision. With it, that hunk's two sides have different line
+    counts and the whole conflict is refused to a coder round.
+
+    Refuses (`False`), never guesses, on: no conflict markers at all (the file
+    is not conflicted — an unknown, since eligibility said it was); a marker
+    that appears outside a hunk; an unterminated or nested hunk; an empty
+    section (one side deleted the rule — a decision); any non-rule line inside
+    a hunk (a conflicting comment or blank is a hand edit); and any pair of
+    sections that are not equal under `_normalized_classification_lines`.
+    """
+    lines = merged_text.splitlines()
+    hunks = 0
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.startswith(_HUNK_START):
+            if line.startswith((_HUNK_BASE, _HUNK_SEP, _HUNK_END)):
+                return False  # a marker outside a hunk — unparseable
+            i += 1
+            continue
+        sections: list[list[str]] = [[]]
+        i += 1
+        closed = False
+        while i < n:
+            cur = lines[i]
+            if cur.startswith(_HUNK_START):
+                return False  # nested start — unparseable
+            i += 1
+            if cur.startswith((_HUNK_BASE, _HUNK_SEP)):
+                sections.append([])
+                continue
+            if cur.startswith(_HUNK_END):
+                closed = True
+                break
+            sections[-1].append(cur)
+        if not closed or len(sections) not in (2, 3):
+            return False
+        if any(not section for section in sections):
+            return False
+        if any(not _RULE_LINE_RE.match(ln) for section in sections for ln in section):
+            return False
+        normalized = [_normalized_classification_lines("\n".join(section))
+                      for section in sections]
+        if any(other != normalized[0] for other in normalized[1:]):
+            return False
+        hunks += 1
+    return hunks > 0
+
+
+def take_ours_in_conflict_hunks(merged_text: str) -> str | None:
+    """`merged_text` with every conflict hunk collapsed to its OURS section
+    (and the markers removed), or `None` when the markers do not parse or
+    there is no hunk at all.
+
+    Why this and not `git checkout --ours -- <path>`: `--ours` restores the
+    whole stage-2 BLOB — the branch's file as it was, discarding everything
+    `git merge` had already merged into it cleanly. For `RELEASE_MANIFEST.txt`
+    that is harmless (the next step regenerates every pin from the merged
+    tree), but for `EXPORT_CLASSIFICATION.txt` it silently DROPS every rule
+    line main gained since the fork, leaving files main added unclassified and
+    failing the export gate on the next landing. Only the conflicting hunks
+    may be resolved to ours; the rest of the merged text is main's, already
+    merged, and stays.
+
+    Safe only because the caller has already proved (`conflict_hunks_count_only`)
+    that every hunk differs by nothing but a win-count digit — the number that
+    survives here is then repaired by `reconcile_merge_count_drift`.
+    """
+    out: list[str] = []
+    state = "clean"  # clean | ours | other
+    hunks = 0
+    for line in merged_text.splitlines(keepends=True):
+        if line.startswith(_HUNK_START):
+            if state != "clean":
+                return None
+            state, hunks = "ours", hunks + 1
+            continue
+        if line.startswith((_HUNK_BASE, _HUNK_SEP)):
+            if state == "clean":
+                return None
+            state = "other"
+            continue
+        if line.startswith(_HUNK_END):
+            if state == "clean":
+                return None
+            state = "clean"
+            continue
+        if state != "other":
+            out.append(line)
+    if state != "clean" or not hunks:
+        return None
+    return "".join(out)
+
+
+async def classification_conflict_hunks_count_only(
+        repo_path: str, base_tip_sha: str, branch: str) -> bool:
+    """`conflict_hunks_count_only` applied to the classification file as the
+    REAL three-way merge of `base_tip_sha` into `branch` leaves it.
+
+    Reuses `pr_watcher.merge_tree_conflicts` — the same `git merge-tree
+    --write-tree` call that enumerated the conflicting paths in the first
+    place — and reads the conflicted blob out of the tree it wrote, so no
+    worktree is created and nothing is checked out to ask this question.
+    Fails closed (`False`) when the merge cannot be computed, when the
+    classification file is not among the conflicted paths after all, or when
+    the blob cannot be read.
+    """
+    result = await merge_tree_conflicts(repo_path, branch, base_tip_sha)
+    if result is None:
+        return False
+    merged_tree, conflicted = result
+    if CLASSIFICATION_NAME not in conflicted:
+        return False
+    rc, text = await _git_rc(repo_path, "show",
+                             f"{merged_tree}:{CLASSIFICATION_NAME}")
+    if rc != 0 or not text:
+        return False
+    return conflict_hunks_count_only(text)
 
 
 async def mechanically_resolvable(repo_path: str, paths: set[str] | None,
@@ -245,17 +414,25 @@ async def mechanically_resolvable(repo_path: str, paths: set[str] | None,
     git calls, exactly the same hot path as before this function existed.
     `DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}` when the conflict is confined
     to the classification file (alone, or together with the manifest) AND
-    `classification_count_only` confirms every differing rule line in it is a
-    count-only edit. `None` on anything else, including `paths` itself being
-    `None`/empty (could not enumerate) — fail closed, the caller must never
-    resolve a conflict it could not confirm is one of these two shapes."""
+    BOTH count-only checks pass: `classification_count_only` (the BRANCH's
+    own edit against the merge-base is nothing but digits) and
+    `classification_conflict_hunks_count_only` (the hunks git actually
+    conflicts on are nothing but digits either). The pair is the whole test:
+    the first alone would let a main-side decision that landed inside the
+    conflicting hunk be resolved by `--ours`, and the second alone would let
+    a branch-side decision that merged cleanly through. `None` on anything
+    else, including `paths` itself being `None`/empty (could not enumerate) —
+    fail closed, the caller must never resolve a conflict it could not
+    confirm is one of these two shapes."""
     if not paths:
         return None
     if all_derived(paths):
         return DERIVED_ARTEFACTS
     eligible = DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}
     if paths <= eligible and CLASSIFICATION_NAME in paths:
-        if await classification_count_only(repo_path, base_tip_sha, branch):
+        if (await classification_count_only(repo_path, base_tip_sha, branch)
+                and await classification_conflict_hunks_count_only(
+                    repo_path, base_tip_sha, branch)):
             return eligible
     return None
 
@@ -383,6 +560,40 @@ def resolve_derived_conflict(repo_path: str, branch: str, base_tip_sha: str,
         _cleanup_worktree(repo, tmp_dir)
 
 
+def _take_classification_hunks(worktree_path: Path) -> DerivedResolution | None:
+    """Resolve the conflicted `EXPORT_CLASSIFICATION.txt` in `worktree_path`
+    to its OURS side HUNK BY HUNK and stage it. `None` on success; a failed
+    `DerivedResolution` (which the caller returns after aborting the merge)
+    when the conflicted file cannot be read, does not parse as conflict
+    markers, or — the fail-closed re-check on the REAL merge, in case the base
+    moved between enumeration and now — carries a hunk that is not count-only.
+    """
+    path = worktree_path / CLASSIFICATION_NAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return DerivedResolution(
+            ok=False, step="merge",
+            detail=_cap(f"cannot read the conflicted {CLASSIFICATION_NAME}: {exc}"))
+    if not conflict_hunks_count_only(text):
+        return DerivedResolution(
+            ok=False, step="merge",
+            detail=_cap(f"{CLASSIFICATION_NAME} conflict is not count-only in the "
+                        "worktree merge (the base moved?) — a hand decision, "
+                        "not merge arithmetic"))
+    resolved = take_ours_in_conflict_hunks(text)
+    if resolved is None:
+        return DerivedResolution(
+            ok=False, step="merge",
+            detail=_cap(f"could not parse the conflict markers in "
+                        f"{CLASSIFICATION_NAME}"))
+    path.write_text(resolved, encoding="utf-8")
+    add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
+    if add.returncode != 0:
+        return DerivedResolution(ok=False, step="merge", detail=_cap(add.stderr))
+    return None
+
+
 def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                          branch: str, base_tip_sha: str,
                          eligible: frozenset[str] = DERIVED_ARTEFACTS,
@@ -410,10 +621,18 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     # -- step 4: take either side of the eligible files. For the manifest
     # this is always safe (it is purely regenerated below). For the
     # classification file it is safe ONLY because eligibility already proved
-    # (via `classification_count_only`) that both sides carry the identical
-    # decisions — the only thing left to differ is the win-count, and that
+    # (via `classification_count_only`) that the branch decided nothing, and
+    # only the CONFLICTING HUNKS may be taken — the rest of the merged text
+    # carries the rule lines main gained since the fork, which `--ours` would
+    # discard (see `take_ours_in_conflict_hunks`). The win-count that survives
     # gets repaired by merge arithmetic further down, never guessed here. --
     for path in sorted(unmerged & eligible):
+        if path == CLASSIFICATION_NAME:
+            failed = _take_classification_hunks(worktree_path)
+            if failed is not None:
+                _sh(["git", "merge", "--abort"], cwd=worktree_path)
+                return failed
+            continue
         co = _sh(["git", "checkout", "--ours", "--", path], cwd=worktree_path)
         if co.returncode != 0:
             _sh(["git", "merge", "--abort"], cwd=worktree_path)

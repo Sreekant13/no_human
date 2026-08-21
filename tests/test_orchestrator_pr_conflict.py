@@ -2062,3 +2062,186 @@ async def test_a_definite_mergeable_clears_the_disagreement_streak(
     assert await w_ok._check_pr_conflict(t, "https://code.example.com/dev/x/pull/43", "CLEAN", branch="feature") is None
     t = await store.get_task(t.id)
     assert (t.context or {}).get("pr_conflict_stale_flags") == 0
+
+
+# --------------------------------------------------------------------------- #
+# A rule line MAIN gained after the fork is main's decision, not the branch's  #
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_count_only_conflict_still_resolves_when_main_gained_a_rule_line(
+    store, tmp_path, monkeypatch,
+):
+    """LIVE REGRESSION (2026-08-22, task 63928824 / PR #592). Branch-a's own
+    edit to EXPORT_CLASSIFICATION.txt is nothing but the digit (1 -> 2 for
+    the one file it adds), but MAIN — besides bumping the same rule 1 -> 3 —
+    also gained a rule line from an unrelated landing. `git merge` conflicts
+    ONLY on the count line; the added rule merges cleanly. The eligibility
+    check used to compare main's TIP against the branch wholesale, so main's
+    clean addition made it say "not count-only" and a paid coder round was
+    opened for a number no coder can author. It must judge the BRANCH'S OWN
+    edit against the MERGE-BASE instead, and resolve this mechanically.
+    """
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(wt_a, "add", "src/base_two.py")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump counted rule 1 -> 2")
+    _approve(wt_a, ["src/base_two.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin base_two.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    # main: the same count bump 1 -> 3 for the two files it adds, PLUS a rule
+    # line (with the doc file it classifies) that landed from elsewhere and
+    # merges cleanly — appended at the end, far from the conflicting line.
+    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")
+    (work / "src" / "base_four.py").write_text("base four\n", encoding="utf-8")
+    (work / "docs").mkdir()
+    (work / "docs" / "note.md").write_text("note\n", encoding="utf-8")
+    _bump_count(work, "src/base*.py", 3)
+    cls = work / "EXPORT_CLASSIFICATION.txt"
+    cls.write_text(cls.read_text(encoding="utf-8") + "drop   1  docs/**\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm",
+         "add base_three.py + base_four.py (1 -> 3) and a docs/ rule from another landing")
+    _approve(work, ["src/base_three.py", "src/base_four.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin base_three.py + base_four.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert dc.CLASSIFICATION_NAME in paths
+    assert paths <= (dc.DERIVED_ARTEFACTS | {dc.CLASSIFICATION_NAME}), paths
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    eligible = await dc.mechanically_resolvable(str(work), paths, base_tip, "branch-a")
+    assert eligible == dc.DERIVED_ARTEFACTS | {dc.CLASSIFICATION_NAME}
+
+    events = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resolved_pr_conflict"
+    kinds = [k for k, _ in events]
+    assert "pr_conflict_resolved" in kinds and "resumed" not in kinds
+    assert "pr_conflict" not in kinds
+    text = next(txt for k, txt in events if k == "pr_conflict_resolved")
+    assert "resolved mechanically" in text, text
+    # The NOTE names the arithmetic, not just "reconciled": declared 2 (the
+    # branch side taken by `--ours`) -> 4, from base 3 + branch 2 - base 1.
+    assert "EXPORT_CLASSIFICATION.txt count reconciled" in text, text
+    assert "2 -> 4" in text and "(base 3 + branch 2 - merge-base 1)" in text, text
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL
+
+    wt_check = tmp_path / "wt_check"
+    _worktree(work, wt_check, "check", "branch-a")
+    merged = (wt_check / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    assert "ship   4  src/base*.py" in merged, merged
+    assert "drop   1  docs/**" in merged, merged
+    v = _verify(wt_check)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+async def test_a_main_side_rule_added_inside_the_conflicting_hunk_opens_a_coder_round(
+    store, tmp_path, monkeypatch,
+):
+    """Negative control for the case above: main's new rule line lands
+    DIRECTLY BESIDE the count line, so git folds both into ONE conflicting
+    hunk. The branch's own edit is still count-only, but the hunk carries a
+    decision — so eligibility must refuse and a coder round opens."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(wt_a, "add", "src/base_two.py")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump counted rule 1 -> 2")
+    _approve(wt_a, ["src/base_two.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin base_two.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")
+    (work / "src" / "base_four.py").write_text("base four\n", encoding="utf-8")
+    (work / "docs").mkdir()
+    (work / "docs" / "note.md").write_text("note\n", encoding="utf-8")
+    cls = work / "EXPORT_CLASSIFICATION.txt"
+    cls.write_text(
+        cls.read_text(encoding="utf-8").replace(
+            "ship   1  src/base*.py", "ship   3  src/base*.py\ndrop   1  docs/**"),
+        encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "main bumps the rule AND adds a docs/ rule on the next line")
+    _approve(work, ["src/base_three.py", "src/base_four.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin base_three.py + base_four.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert dc.CLASSIFICATION_NAME in paths
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    assert await dc.mechanically_resolvable(str(work), paths, base_tip, "branch-a") is None
+
+    events = []
+    resolver_calls = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(
+        store, events=events,
+        derived_resolver=lambda *a, **k: resolver_calls.append((a, k)),
+    )
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resumed"
+    assert resolver_calls == []
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.IMPLEMENTING
+
+
+def test_reconcile_computes_the_live_321_323_322_arithmetic(tmp_path):
+    """The exact numbers from the live incident: merge-base declares 321,
+    main declares 323, the branch declares 322 — the merged tree carries the
+    files behind both bumps, so the only correct count is 324. Proves the
+    reconciler already computes merge-base + (main - base) + (branch - base)
+    and needs no second implementation."""
+    from no_human.vcs.approve_merge import reconcile_merge_count_drift
+
+    work = _repo(tmp_path)
+    _bump_count(work, "src/base*.py", 321)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "merge-base declares 321")
+
+    _git(work, "checkout", "-qb", "branch-322")
+    _bump_count(work, "src/base*.py", 322)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "branch declares 322")
+    branch_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    _git(work, "checkout", "-q", "main")
+    _bump_count(work, "src/base*.py", 323)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "main declares 323")
+    main_sha = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    # The resolver's worktree is the BRANCH side (`git checkout --ours`), so
+    # the file on disk declares 322 and the guard refuses with real 324.
+    _bump_count(work, "src/base*.py", 322)
+    ok, note = reconcile_merge_count_drift(
+        work, main_sha, branch_sha,
+        "EXPORT_CLASSIFICATION.txt:2: `ship 322  src/base*.py` actually wins 324 file(s).")
+
+    assert ok, note
+    assert "322 -> 324" in note and "(base 323 + branch 322 - merge-base 321)" in note, note
+    assert "ship   324  src/base*.py" in (
+        work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
