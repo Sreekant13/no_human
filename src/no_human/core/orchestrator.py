@@ -29,8 +29,8 @@ import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Literal
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterable, Literal
 
 from ..agent.advisory import advisory_backend
 from ..agent.backend import AgentEvent, CodingBackend
@@ -926,6 +926,52 @@ _MECHANICAL_FEEDBACK_SOURCES = frozenset({"pr_conflict"})
 # SAME branch, when the gate WAIVED for lack of one — not a review round, so
 # it gets a small budget of its own rather than the attempt's full turn cap.
 _REPRO_CORRECTIVE_TURNS = 15
+
+# Appended to `repro_send_back_message(detail)` for the corrective round
+# ONLY — the diff under review is already committed and tamper-clean (or the
+# round would never have been reached); this round exists to supply the
+# MISSING evidence for it, not to re-open the implementation. A 15-turn,
+# effort="high" round is otherwise indistinguishable from a second coder
+# pass, standing behind only its own tamper check and the review gate.
+_REPRO_ROUND_SCOPE_NOTE = (
+    "\n\nSCOPE: this round may write ONLY the reproduction manifest "
+    f"({REPRO_MANIFEST}) and test file(s) — anything under `tests/`/`test/`, "
+    "or a `test_*.py`/`*_test.py`/`conftest.py` file, plus the manifest "
+    "itself; nothing else. The fix is already committed; do not re-implement "
+    "or edit it. "
+    "Any other path you change is discarded uncommitted and the attempt "
+    "fails."
+)
+
+
+def _repro_round_out_of_scope(paths: Iterable[str]) -> list[str]:
+    """Which of *paths* the corrective round's scope note forbids — sorted.
+
+    Module-level and pure, like `repro_send_back_message`, so it is testable
+    without an `Orchestrator`. In scope: `REPRO_MANIFEST` itself, any path
+    with a `tests`/`test` path component, and any basename matching
+    `test_*.py` / `*_test.py` / `conftest.py`. The basename rule is required,
+    not generosity — the profile's own test command finds repro tests
+    wherever they live, and this repo's own fixture keeps `test_calc.py` at
+    the worktree root, so a `tests/`-prefix-only rule would reject a
+    legitimate round in a flat repo. Everything else — notably `src/…` — is
+    out of scope.
+    """
+    bad: list[str] = []
+    for raw in paths:
+        if raw == REPRO_MANIFEST:
+            continue
+        p = PurePosixPath(raw)
+        if "tests" in p.parts or "test" in p.parts:
+            continue
+        name = p.name
+        if name == "conftest.py" or (
+            name.endswith(".py")
+            and (name.startswith("test_") or name.endswith("_test.py"))
+        ):
+            continue
+        bad.append(raw)
+    return sorted(bad)
 
 
 def _classify_error(stop_reason: str | None, text: str,
@@ -6979,10 +7025,17 @@ class Orchestrator:
         these around the call and persists/routes them exactly as the coder
         turn's own handlers do, via `_abort_during_repro_corrective`.
 
-        Unlike the nudge, this round is EXPECTED to write real files (the
-        manifest, and possibly the test(s) it names, or even a code fix), so
-        there is no worktree snapshot/revert here — only the usage delta is
-        stashed on abort, for the caller to bill.
+        Unlike the nudge, this round is EXPECTED to write real files — the
+        manifest, and possibly the test(s) it names. It is NOT licensed to
+        touch anything else: the fix under review is already committed and
+        tamper-clean, so a diff outside `REPRO_MANIFEST`/`tests/` is
+        out of scope (`_repro_round_out_of_scope`) and is reverted uncommitted
+        rather than shipped — a 15-turn, effort="high" round would otherwise
+        be a second, unreviewed implementation pass standing behind only its
+        own tamper check. A worktree snapshot IS taken (`_worktree_state`,
+        before the round runs) precisely so an out-of-scope write can be
+        reverted; the usage delta is still stashed on abort, for the caller
+        to bill.
         """
         self.emit(
             "repro_corrective_round",
@@ -7001,10 +7054,12 @@ class Orchestrator:
                           "cache_creation_tokens", "output_tokens")
             }
 
+        before = self._worktree_state(repo)
         try:
             result = await asyncio.wait_for(
                 self.backend.run(
-                    repro_send_back_message(detail), cwd=repo.path,
+                    repro_send_back_message(detail) + _REPRO_ROUND_SCOPE_NOTE,
+                    cwd=repo.path,
                     max_turns=_REPRO_CORRECTIVE_TURNS, effort="high",
                     on_event=self._agent_sink,
                 ),
@@ -7030,6 +7085,17 @@ class Orchestrator:
             cache_creation_tokens=getattr(result, "cache_creation_tokens", None),
         )
 
+        # This round is a real backend dispatch — the SAME fleet-wide breaker
+        # the coder turn feeds, on the same terms: any priced result (tokens
+        # actually spent) clears the streak, any zero-token/auth SDK failure
+        # (never a billing/auth prose wall — see the comment below) advances
+        # it toward the pause. Without this a dead round here is invisible to
+        # the breaker even though it is exactly the "fleet dispatching into a
+        # dead session" signal `infra_breaker.py` exists to catch.
+        if (getattr(result, "tokens_used", 0) or getattr(result, "cache_read_tokens", 0)
+                or getattr(result, "cache_creation_tokens", 0)):
+            infra_breaker().record_healthy()
+
         # A billing/auth wall or a dead SDK session INSIDE the corrective
         # round is infra, not the coder's failure — classified with the SAME
         # two predicates the coder turn uses (`_quota_signal`, prose; and
@@ -7050,9 +7116,42 @@ class Orchestrator:
                     infra_failure=1)
                 self.emit("agent_error", f"repro corrective round: {reason}",
                           error_class="infra")
+                # Mirror the coder turn's asymmetry exactly: only the
+                # prose-less SDK shape ("infra") bumps the fleet breaker — a
+                # billing/auth wall ("quota") is `_park_quota`'s to pause on,
+                # not a dead-dispatch signal for the breaker.
+                if infra and infra_breaker().record_infra_failure(task.id):
+                    self.emit(
+                        "quota_pause",
+                        "fleet paused — 3 consecutive zero-token/auth SDK "
+                        "failures across distinct tasks")
                 raise QuotaExhausted(reason)
 
         if not repo.has_changes():
+            return None
+
+        after = self._worktree_state(repo)
+        changed = sorted(p for p, c in after.items() if before.get(p) != c)
+        out_of_scope = _repro_round_out_of_scope(changed)
+        if out_of_scope:
+            self.emit(
+                "repro_corrective_round",
+                "out of scope — discarded, not committed: "
+                + ", ".join(out_of_scope[:10]),
+                out_of_scope=list(out_of_scope),
+            )
+            self._revert_worktree_writes(repo, before)
+            # The revert above is git-status-driven and therefore blind to
+            # REPRO_MANIFEST on purpose (`.no_human/**` is excluded from
+            # `_worktree_state` via `GitRepo._EPHEMERAL` — the gate reads the
+            # manifest straight off disk, never from git, so it is never
+            # staged/committed even on the happy path). A discarded round
+            # must not leave it behind: an unreviewed manifest surviving
+            # uncommitted would make the re-run gate read it and PASS on a
+            # round whose actual diff was just thrown away.
+            manifest_path = repo.path / REPRO_MANIFEST
+            if manifest_path.exists():
+                manifest_path.unlink()
             return None
 
         commit_msg = self._commit_message(task)
@@ -7140,10 +7239,18 @@ class Orchestrator:
         product's copied skills and instructions out from under it. Observed in
         the staged-write test, not theorised.
         """
-        out = repo._run("status", "--porcelain", "--untracked-files=all",
-                        "--", ".", *GitRepo._EPHEMERAL, check=False)
+        # `_run_porcelain_lines`, not `_run(...).splitlines()`: the latter's
+        # whole-output `.strip()` eats only the leading space off the FIRST
+        # line, silently shortening its 3-char `XY ` prefix to 2 — this
+        # method's `line[3:]` then truncated that one entry's path by a
+        # character (`"test_calc.py"` -> `"est_calc.py"`), which the revert
+        # below chased as a nonexistent file. See `_run_porcelain_lines`'s
+        # docstring for the general form of this bug.
+        lines = repo._run_porcelain_lines(
+            "status", "--porcelain", "--untracked-files=all",
+            "--", ".", *GitRepo._EPHEMERAL, check=False)
         state: dict[str, str] = {}
-        for line in out.splitlines():
+        for line in lines:
             if len(line) < 4:
                 continue
             code, rel = line[:2], line[3:].strip()

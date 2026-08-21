@@ -31,15 +31,30 @@ import pytest
 
 from no_human.agent.claude_backend import AgentEvent, AgentResult
 from no_human.config import load_config
+from no_human.core.bounds import QuotaExhausted
 from no_human.core.db import Store
 from no_human.blockers import SERVER_STOP_REASON
+from no_human.core.infra_breaker import infra_breaker
 from no_human.core.orchestrator import (
-    BudgetAbort, CancelRequested, Orchestrator, StuckAbort, repro_send_back_message,
+    BudgetAbort, CancelRequested, Orchestrator, StuckAbort,
+    _REPRO_CORRECTIVE_TURNS, _REPRO_ROUND_SCOPE_NOTE, _repro_round_out_of_scope,
+    repro_send_back_message,
 )
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 from no_human.testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from no_human.vcs import GitRepo
+
+
+@pytest.fixture(autouse=True)
+def _clean_infra_breaker_singleton():
+    """The breaker is a process-wide singleton (`infra_breaker.py`'s module
+    docstring explains why); reset it around every test in this file so one
+    test's infra failures can never leak into the next one's assertions —
+    copied from `test_infra_not_work.py`."""
+    infra_breaker().reset()
+    yield
+    infra_breaker().reset()
 
 
 def _git(cwd, *args):
@@ -487,9 +502,11 @@ async def test_a_cancel_in_the_corrective_round_parks_instead_of_failing(
 
 class _CorrectiveCommitsRealChangeBackend:
     """Coder turn: real fix, no manifest -> waived. Corrective round writes
-    the manifest AND a tracked, non-weakening change to `calc.py` — a real
-    diff `repo.has_changes()` must see, so the round commits it and runs its
-    own tamper check before the gate re-runs."""
+    the manifest AND a second, tracked, non-weakening change — a new passing
+    test appended to `test_calc.py` (in-scope: the round may add test(s), it
+    just may not touch `calc.py` itself) — a real diff `repo.has_changes()`
+    must see, so the round commits it and runs its own tamper check before
+    the gate re-runs."""
 
     def __init__(self):
         self.calls = 0
@@ -507,12 +524,15 @@ class _CorrectiveCommitsRealChangeBackend:
                                tokens_used=100, session_id="s", stop_reason="end_turn")
         cwd.joinpath(".no_human").mkdir(exist_ok=True)
         (cwd / REPRO_MANIFEST).write_text('{"tests": ["test_calc.py::test_mul"]}')
-        calc = cwd / "calc.py"
-        calc.write_text(calc.read_text() + "\n# note added by the corrective round\n")
+        test_calc = cwd / "test_calc.py"
+        test_calc.write_text(
+            test_calc.read_text()
+            + "\ndef test_mul_by_zero():\n    assert mul(5, 0) == 0\n"
+        )
         if on_event is not None:
             on_event(AgentEvent("tool_use", tool_name="Edit",
-                                tool_input={"file_path": "calc.py"}))
-        return AgentResult(final_text="wrote manifest + note", num_turns=1,
+                                tool_input={"file_path": "test_calc.py"}))
+        return AgentResult(final_text="wrote manifest + test", num_turns=1,
                            is_error=False, tokens_used=10, session_id="s2",
                            stop_reason="end_turn")
 
@@ -542,6 +562,11 @@ async def test_corrective_round_commits_a_real_change_and_runs_its_own_tamper_ch
     attempts = await store.list_attempts(task.id)
     assert len(attempts) == 1
     assert attempts[0]["commit_sha"]
+
+    # An in-scope round (manifest + a new test) must never be flagged or
+    # reverted — the retarget above would be vacuous if it were.
+    round_events = [e for e in events if e["kind"] == "repro_corrective_round"]
+    assert not any(e.get("out_of_scope") for e in round_events), round_events
 
 
 # --------------------------------------------------------------------------- #
@@ -713,3 +738,288 @@ async def test_a_server_stop_in_the_corrective_round_checkpoints_and_requeues(
     assert rows[0]["status"] == "interrupted"
     assert rows[0]["infra_failure"] == 1
     assert rows[0]["commit_sha"] == rf["sha"]
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-up (1/3): a dead corrective round feeds the SAME fleet-wide   #
+# infra breaker the coder turn does — three across distinct tasks pause it.  #
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_dead_corrective_round_feeds_the_fleet_infra_breaker(
+        bare_repo, tmp_path, store):
+    """RED before the fix: `_repro_corrective_round`'s infra path raised
+    `QuotaExhausted` without ever touching `infra_breaker()`, so a dead round
+    here was invisible to the fleet-wide breaker the coder turn itself feeds
+    (`orchestrator.py` ~4396-4402). Proven indirectly, through the breaker's
+    own public surface: the round's failure must be exactly ONE of the three
+    distinct-task failures the breaker needs to trip — two MORE distinct
+    tasks trip it here."""
+    backend = _WallInCorrectiveBackend(
+        "Claude Code returned an error result: success")
+    orch, task, repo, events = await _run_one_bugfix_attempt(
+        store, bare_repo, tmp_path, backend)
+
+    assert infra_breaker().tripped() is None
+    with pytest.raises(QuotaExhausted):
+        await orch._run_attempt(task, repo, 1, "main")
+
+    # Not yet tripped on its own — this is 1 of 3.
+    assert infra_breaker().tripped() is None
+    assert infra_breaker().record_infra_failure("other-task-2") is False
+    assert infra_breaker().record_infra_failure("other-task-3") is True
+    assert infra_breaker().tripped() is not None
+
+
+class _ZeroTokenCoderThenDeadRoundBackend:
+    """Coder turn is a real, non-erroring diff but reports ZERO tokens (so
+    its own, already-landed breaker parity at ~4404 never fires and never
+    clears the streak — `if tokens_used or cache_read_tokens or
+    cache_creation_tokens` is all-falsy); the corrective round is the dead
+    zero-token SDK shape.
+
+    `_WallInCorrectiveBackend`'s coder turn is PRICED (`tokens_used=100`),
+    which is realistic for one task in isolation but wrong for THIS test:
+    across three distinct tasks in a loop, a priced coder turn calls the
+    exact same `record_healthy()` the round's own dead dispatch is supposed
+    to feed (orchestrator.py ~4404), clearing the previous task's recorded
+    failure before this task's is appended — so `_recent_task_ids` never
+    grows past length 1 and the breaker can never trip across tasks, no
+    matter how many dead rounds run. That is not what the acceptance
+    criterion describes (three dead corrective rounds across three distinct
+    tasks trip the fleet breaker): a genuinely dead account/transport would
+    make the CODER turn zero-token too, not just the round, so nothing
+    clears the streak in between. This backend isolates exactly that shape."""
+
+    def __init__(self, final_text: str):
+        self.calls = 0
+        self._text = final_text
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        cwd = Path(cwd)
+        if self.calls == 1:
+            if on_event is not None:
+                on_event(AgentEvent("tool_use", tool_name="Edit",
+                                    tool_input={"file_path": "calc.py"}))
+            _mul_files(cwd)
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=0, session_id="s", stop_reason="end_turn")
+        return AgentResult(final_text=self._text, num_turns=0, is_error=True,
+                           tokens_used=0, session_id="s2", stop_reason="error")
+
+
+async def test_three_dead_corrective_rounds_across_distinct_tasks_pause_the_fleet(
+        bare_repo, tmp_path, store):
+    """The acceptance shape verbatim: three dead corrective rounds across
+    three DISTINCT tasks trip the fleet breaker and emit exactly one
+    `quota_pause` event, on the third.
+
+    Uses `_ZeroTokenCoderThenDeadRoundBackend`, not `_WallInCorrectiveBackend`
+    — see that class's docstring for why a priced coder turn would make this
+    unwinnable regardless of the round's own breaker parity."""
+    quota_pause_events = []
+    for _ in range(3):
+        backend = _ZeroTokenCoderThenDeadRoundBackend(
+            "Claude Code returned an error result: success")
+        orch, task, repo, events = await _run_one_bugfix_attempt(
+            store, bare_repo, tmp_path, backend)
+        with pytest.raises(QuotaExhausted):
+            await orch._run_attempt(task, repo, 1, "main")
+        quota_pause_events.extend(e for e in events if e["kind"] == "quota_pause")
+
+    assert infra_breaker().tripped() is not None
+    assert len(quota_pause_events) == 1, quota_pause_events
+
+
+class _ZeroTokenCoderThenPricedRoundBackend:
+    """Coder turn returns ZERO tokens (so its own, already-landed breaker
+    parity at ~4396 never fires — `if tokens_used or cache_read_tokens or
+    cache_creation_tokens` is all-falsy) but a real diff and no error; the
+    corrective round is priced (`tokens_used=10`) and writes the manifest ->
+    pass. Isolates the ROUND's own `record_healthy()` call from the coder
+    turn's identical, pre-existing one."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        cwd = Path(cwd)
+        if self.calls == 1:
+            if on_event is not None:
+                on_event(AgentEvent("tool_use", tool_name="Edit",
+                                    tool_input={"file_path": "calc.py"}))
+            _mul_files(cwd)
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=0, session_id="s", stop_reason="end_turn")
+        cwd.joinpath(".no_human").mkdir(exist_ok=True)
+        (cwd / REPRO_MANIFEST).write_text('{"tests": ["test_calc.py::test_mul"]}')
+        return AgentResult(final_text="wrote manifest", num_turns=1, is_error=False,
+                           tokens_used=10, session_id="s2", stop_reason="end_turn")
+
+
+async def test_a_priced_corrective_round_clears_the_infra_streak(
+        bare_repo, tmp_path, store):
+    """RED before the fix: without the round's own `record_healthy()` call,
+    a pre-existing 2-of-3 streak survives a priced round untouched, and one
+    more distinct dead task trips the breaker where it must not."""
+    infra_breaker().record_infra_failure("pre-1")
+    infra_breaker().record_infra_failure("pre-2")
+    assert infra_breaker().tripped() is None  # 2 of 3, not yet tripped
+
+    backend = _ZeroTokenCoderThenPricedRoundBackend()
+    orch, task, repo, events = await _run_one_bugfix_attempt(
+        store, bare_repo, tmp_path, backend)
+    outcome = await orch._run_attempt(task, repo, 1, "main")
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+
+    assert infra_breaker().tripped() is None
+    assert infra_breaker().record_infra_failure("post-1") is False
+    assert infra_breaker().tripped() is None
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-up (2/3): the round's backend call is pinned by test — turns, #
+# effort and the send-back prompt (+ scope note) could otherwise drift        #
+# silently.                                                                    #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingBackend:
+    """Wraps `_WaivedThenPassBackend`'s waived->pass shape, recording each
+    call's prompt/max_turns/effort so the corrective round's dispatch
+    parameters can be pinned by a test rather than trusted by inspection."""
+
+    def __init__(self):
+        self._inner = _WaivedThenPassBackend()
+        self.recorded_calls = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.recorded_calls.append(
+            {"prompt": prompt, "max_turns": max_turns, "effort": effort})
+        return await self._inner.run(
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            on_event=on_event, supervisor_hook=supervisor_hook, **kwargs)
+
+
+async def test_the_corrective_round_is_pinned_to_15_turns_high_effort_and_the_send_back_prompt(
+        bare_repo, tmp_path, store):
+    """RED before the fix: nothing pinned `max_turns`/`effort`, and
+    `_REPRO_ROUND_SCOPE_NOTE` was not appended to the prompt at all (it did
+    not exist)."""
+    backend = _RecordingBackend()
+    orch, task, repo, events = await _run_one_bugfix_attempt(
+        store, bare_repo, tmp_path, backend)
+
+    outcome = await orch._run_attempt(task, repo, 1, "main")
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(backend.recorded_calls) == 2
+
+    round_call = backend.recorded_calls[1]
+    assert round_call["max_turns"] == _REPRO_CORRECTIVE_TURNS == 15
+    assert round_call["effort"] == "high"
+
+    # Rebuild `detail` from the ACTUAL emitted `repro_gate` waived event
+    # rather than hardcoding a literal that would just duplicate
+    # `_repro_gate_step`'s own text-building logic.
+    gate_events = [e for e in events if e["kind"] == "repro_gate"]
+    waived_event = gate_events[0]
+    assert waived_event["verdict"] == "waived", waived_event
+    text = waived_event["text"]
+    assert " — " in text and " [" in text, text
+    reason = text.split(" — ", 1)[1].split(" [", 1)[0]
+    detail = f"repro gate waived: {reason}"
+
+    expected_prefix = repro_send_back_message(detail)
+    assert round_call["prompt"].startswith(expected_prefix), round_call["prompt"]
+    assert round_call["prompt"] == expected_prefix + _REPRO_ROUND_SCOPE_NOTE
+    assert REPRO_MANIFEST in round_call["prompt"]
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-up (3/3): the round is scoped to the manifest + tests only — #
+# no source edits.                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_repro_round_scope_predicate():
+    assert _repro_round_out_of_scope([
+        REPRO_MANIFEST, "tests/test_x.py", "test_calc.py", "tests/conftest.py",
+    ]) == []
+    assert _repro_round_out_of_scope([
+        "src/no_human/core/orchestrator.py", "calc.py", "README.md",
+    ]) == ["README.md", "calc.py", "src/no_human/core/orchestrator.py"]
+
+
+class _CorrectiveEditsSourceBackend:
+    """Coder turn: real fix, no manifest -> waived. Corrective round writes a
+    VALID manifest AND edits `calc.py` — the fix is already committed and
+    tamper-clean, so a further edit to it is out of scope and must be
+    discarded uncommitted rather than shipped."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        cwd = Path(cwd)
+        if self.calls == 1:
+            if on_event is not None:
+                on_event(AgentEvent("tool_use", tool_name="Edit",
+                                    tool_input={"file_path": "calc.py"}))
+            _mul_files(cwd)
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=100, session_id="s", stop_reason="end_turn")
+        cwd.joinpath(".no_human").mkdir(exist_ok=True)
+        (cwd / REPRO_MANIFEST).write_text('{"tests": ["test_calc.py::test_mul"]}')
+        calc = cwd / "calc.py"
+        calc.write_text(calc.read_text() + "\n# out of scope edit\n")
+        if on_event is not None:
+            on_event(AgentEvent("tool_use", tool_name="Edit",
+                                tool_input={"file_path": "calc.py"}))
+        return AgentResult(final_text="wrote manifest + edited calc.py", num_turns=1,
+                           is_error=False, tokens_used=10, session_id="s2",
+                           stop_reason="end_turn")
+
+
+async def test_a_corrective_round_that_edits_source_is_discarded_and_fails_waived(
+        bare_repo, tmp_path, store):
+    """RED before the fix: nothing bounded the round's scope, so this
+    unreviewed source edit — riding alongside the manifest, behind only the
+    round's own tamper check — would commit and the gate would re-run
+    `pass`."""
+    backend = _CorrectiveEditsSourceBackend()
+    orch, task, repo, events = await _run_one_bugfix_attempt(
+        store, bare_repo, tmp_path, backend)
+
+    outcome = await orch._run_attempt(task, repo, 1, "main")
+
+    assert outcome.status is TaskStatus.FAILED
+    assert (outcome.detail or "").startswith("repro gate waived"), outcome.detail
+
+    gate_events = [e for e in events if e["kind"] == "repro_gate"]
+    assert [e["verdict"] for e in gate_events] == ["waived", "waived"], gate_events
+
+    round_events = [e for e in events if e["kind"] == "repro_corrective_round"]
+    scope_events = [e for e in round_events if e.get("out_of_scope")]
+    assert len(scope_events) == 1, round_events
+    assert "calc.py" in scope_events[0]["out_of_scope"], scope_events
+
+    # Only the coder's own commit landed — the round's write never did.
+    commit_events = [e for e in events if e["kind"] == "commit"]
+    assert len(commit_events) == 1, commit_events
+
+    attempts = await store.list_attempts(task.id)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert not attempts[0]["infra_failure"]
+
+    # The revert ran: neither the manifest nor the out-of-scope edit survived
+    # uncommitted.
+    assert not (repo.path / REPRO_MANIFEST).exists()
+    assert "# out of scope edit" not in (repo.path / "calc.py").read_text()
