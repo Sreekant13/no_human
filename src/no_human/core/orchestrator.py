@@ -6113,9 +6113,16 @@ class Orchestrator:
         `set_status` validates against the in-process handle (`task.status`),
         which two production paths can silently regress to IMPLEMENTING
         between the review verdict and this call — `Store.update_task`
-        refreshing `task.status` from the row, or `WakeWatcher._resume`
-        writing IMPLEMENTING with `validate=False` (`blockers/wake.py:737`).
-        Incident 6408aba0: a fully reviewed change was discarded this way.
+        refreshing `task.status` from the row, or a SECOND process's startup
+        orphan sweep (`Scheduler._recover_orphans(startup=True)`, core/
+        scheduler.py) requeueing the row because, at startup, it had no
+        evidence of who — or whether anyone — still owned it. Incident
+        6408aba0: review PASSED, a second process's startup sweep requeued
+        the row a second later, and a fully reviewed change was discarded.
+        (`WakeWatcher._resume`, `blockers/wake.py:720`, also writes
+        IMPLEMENTING with `validate=False` at `:799` — but only when actually
+        resuming a genuine park, not as an orphan guess; it was not the
+        writer in this incident.)
 
         `IMPLEMENTING -> TESTING` is now a legal edge (`task.py`), so the
         `try` below succeeds on that path. This wrapper is the fallback for

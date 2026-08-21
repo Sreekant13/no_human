@@ -25,6 +25,38 @@ async def store(tmp_path):
     await s.close()
 
 
+async def _age_row(store: Store, task_id: str, seconds: float = 3600) -> None:
+    """Back-date a row's `updated_at` so it clears `Scheduler._row_is_live`'s
+    grace window before an orphan-recovery test calls `_recover_orphans`.
+
+    These recovery tests build their row with `set_status(..., validate=False)`
+    moments before sweeping it — a fresh `updated_at` that the STARTUP sweep
+    used to ignore entirely (any mid-run status was an orphan at startup,
+    unconditionally) but which the fix now correctly reads as "something may
+    still be live" and leaves alone. None of these tests are ABOUT that grace
+    window — they exercise checkpoint/provenance behavior on an orphan that
+    really is one — so they age the row first rather than change what they
+    assert.
+
+    Also back-dates any `task_events` rows already on this task: a PRIOR
+    `_recover_orphans()` call in the same test writes its own `orphan_
+    recovered` event with a real (not backdated) timestamp, and that event is
+    itself fresh activity `_row_is_live` correctly reads as liveness — a
+    second, later-in-the-test call to `_recover_orphans` on the "same task,
+    now further along" would otherwise see that event and (correctly, for a
+    row that really were live) leave it alone, which is not what a test
+    simulating a SECOND restart wants.
+    """
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=seconds)).isoformat()
+    await store.db.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?", (old, task_id))
+    await store.db.execute(
+        "UPDATE task_events SET ts = ? WHERE task_id = ?",
+        (time.time() - seconds, task_id))
+    await store.db.commit()
+
+
 class FakeOrch:
     """Records run_task calls; optionally blocks on a gate; sets a terminal DB
     status so finished tasks aren't re-claimed."""
@@ -1307,6 +1339,7 @@ async def test_startup_recovers_orphaned_midrun_tasks(tmp_path):
         healthy = Task.new("parked", repo_path="/r")
         await store.create_task(healthy)
         await store.set_status(healthy, TaskStatus.ESCALATED, validate=False)
+        await _age_row(store, orphan.id)
 
         events = []
         sched = Scheduler(store, lambda task=None: None,
@@ -1371,6 +1404,7 @@ async def test_orphan_recovery_resumes_from_the_dead_attempts_commit(store):
     attempt_id = await store.create_attempt(orphan.id, 1)
     sha = "a" * 40
     await store.update_attempt(attempt_id, commit_sha=sha)
+    await _age_row(store, orphan.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 
@@ -1422,6 +1456,7 @@ async def test_orphan_recovery_without_a_checkpoint_still_starts_cold(store):
     await store.create_task(orphan)
     await store.set_status(orphan, TaskStatus.CONTEXT, validate=False)
     await store.create_attempt(orphan.id, 1)          # no commit_sha
+    await _age_row(store, orphan.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 
@@ -1447,6 +1482,7 @@ async def test_orphan_recovery_never_overwrites_an_existing_provenance(store):
     await store.set_status(orphan, TaskStatus.TESTING, validate=False)
     attempt_id = await store.create_attempt(orphan.id, 1)
     await store.update_attempt(attempt_id, commit_sha="c" * 40)
+    await _age_row(store, orphan.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 
@@ -1478,6 +1514,7 @@ async def test_orphan_recovery_does_not_resurrect_a_deliberately_cleared_checkpo
     # run 2 starts (closing run 1's row) and dies before committing anything
     await store.create_attempt(t.id, 2)
     await store.set_status(t, TaskStatus.PLANNING, validate=False)
+    await _age_row(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 
@@ -1502,6 +1539,7 @@ async def test_a_second_restart_restamps_instead_of_reusing_its_own_stale_sha(st
     a1 = await store.create_attempt(t.id, 1)
     await store.update_attempt(a1, commit_sha="a" * 40)
     await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+    await _age_row(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
     assert ((await store.get_task(t.id)).context or {})["resume_from"] == {
@@ -1512,6 +1550,7 @@ async def test_a_second_restart_restamps_instead_of_reusing_its_own_stale_sha(st
     await store.update_attempt(a2, commit_sha="b" * 40)
     t = await store.get_task(t.id)
     await store.set_status(t, TaskStatus.TESTING, validate=False)
+    await _age_row(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 
@@ -1531,11 +1570,13 @@ async def test_a_machine_stamp_survives_a_restart_that_finds_nothing_newer(store
     a1 = await store.create_attempt(t.id, 1)
     await store.update_attempt(a1, commit_sha="a" * 40)
     await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+    await _age_row(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
     await store.create_attempt(t.id, 2)               # no commit_sha
     t = await store.get_task(t.id)
     await store.set_status(t, TaskStatus.TESTING, validate=False)
+    await _age_row(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
 

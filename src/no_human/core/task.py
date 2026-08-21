@@ -102,12 +102,18 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     # implementing -> testing: a review verdict can be reached while the row
     # still reads IMPLEMENTING — the review runs INSIDE the implement round
     # (_run_attempt), and the handle regresses to the row's status whenever
-    # Store.update_task refreshes it (db.py) or WakeWatcher._resume writes
-    # IMPLEMENTING with validate=False (blockers/wake.py:737). Incident
-    # 6408aba0 (2026-08-19): review PASSED at 17:35:57, this transition
-    # raised one second later, and a fully reviewed change was discarded.
-    # Skipping REVIEWING is not a skipped review here — REVIEWING is a
-    # reporting state for work that already happened.
+    # Store.update_task refreshes it (db.py) or a second process's STARTUP
+    # orphan sweep (Scheduler._recover_orphans(startup=True), core/
+    # scheduler.py) writes IMPLEMENTING with validate=False, having found the
+    # row REVIEWING with no evidence of who — or whether anyone — still owned
+    # it. Incident 6408aba0 (2026-08-19): review PASSED at 17:35:57, a second
+    # process's startup sweep requeued the row one second later, and a fully
+    # reviewed change was discarded. (`WakeWatcher._resume`, blockers/
+    # wake.py:720, also writes IMPLEMENTING with validate=False at :799, but
+    # only for a task it is actually resuming from a genuine park — it was
+    # not the writer in this incident.) Skipping REVIEWING is not a skipped
+    # review here — REVIEWING is a reporting state for work that already
+    # happened.
     table[TaskStatus.IMPLEMENTING].add(TaskStatus.TESTING)
 
     # approval gate

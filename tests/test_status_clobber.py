@@ -21,7 +21,7 @@ import pytest
 from types import SimpleNamespace
 
 from no_human.core.db import Store
-from no_human.core.scheduler import Scheduler
+from no_human.core.scheduler import Scheduler, SiblingSchedulerRunning
 from no_human.core.task import Task, TaskStatus
 from no_human.intake.jira_poll import JiraPoller
 
@@ -203,15 +203,28 @@ async def test_runtime_sweep_skips_recently_updated_tasks(store):
     assert (await store.get_task(t.id)).status is TaskStatus.REVIEWING
 
 
-async def test_startup_sweep_ignores_grace_window(store):
-    """At startup nothing is legitimately in flight: even a fresh mid-run
-    status is an orphan (the pre-existing behavior, preserved)."""
+async def test_startup_sweep_honors_the_grace_window(store):
+    """At startup a FRESH mid-run row is not an orphan — inverted from the
+    previous pinned-defect assertion here (which required this exact case to
+    be requeued unconditionally).
+
+    That old assumption — "at startup nothing is legitimately in flight, so
+    any mid-run status is an orphan of a killed process" — is true for the
+    first process ever to touch a database and false the moment a SECOND `nh
+    start`/`nh serve` shares it: the second process's own `_inflight` is
+    empty right after boot regardless of what a first, still-running process
+    is doing with that row. That gap is how incident 6408aba0 lost a
+    review-PASSED attempt (task 2cc879d5): a second process's startup sweep
+    saw the first process's live REVIEWING row, had no liveness evidence to
+    check under the old code, and requeued it out from under the worker still
+    reviewing it. See `test_startup_sweep_leaves_a_row_with_fresh_events_alone`
+    for the exact repro (a fresh EVENT, not just a fresh row stamp)."""
     t = await _stranded_task(store, age_seconds=0)
     sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
 
     await sched._recover_orphans()
 
-    assert (await store.get_task(t.id)).status is TaskStatus.IMPLEMENTING
+    assert (await store.get_task(t.id)).status is TaskStatus.REVIEWING
 
 
 # --------------------------------------------------------------------------- #
@@ -345,8 +358,12 @@ async def test_one_tasks_checkpoint_failure_does_not_abort_the_whole_sweep(store
     unguarded inside the loop — so one raise (a DB read error, a corrupt
     context) took every REMAINING task down with it, on the one code path whose
     whole job is to rescue tasks after a crash."""
-    doomed = await _stranded_task(store, age_seconds=0)
-    other = await _stranded_task(store, age_seconds=0)
+    # Aged past the grace window: this test is about checkpoint-failure
+    # resilience during the sweep, not about liveness detection — a fresh
+    # row here would just be correctly left alone under the fix and never
+    # reach the checkpoint lookup this test is exercising.
+    doomed = await _stranded_task(store, age_seconds=3600)
+    other = await _stranded_task(store, age_seconds=3600)
 
     sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
     real = sched._inherited_checkpoint
@@ -467,3 +484,197 @@ async def test_tui_run_persists_its_events():
     assert "EventPersister" in src and "_persisting(" in src, (
         "WatchApp._run no longer persists its events — the stranded sweep "
         "will read a live TUI run as silence and requeue it")
+
+
+# --------------------------------------------------------------------------- #
+# 5. A second process's startup sweep must not clobber a live sibling's row    #
+#    (incident 6408aba0: a second `nh start`/`nh serve` saw a first process's  #
+#    REVIEWING row at boot, had no liveness evidence to check under the old    #
+#    unconditional-at-startup rule, and requeued a review-PASSED attempt out   #
+#    from under the worker still reviewing it).                                #
+# --------------------------------------------------------------------------- #
+
+
+async def test_startup_sweep_leaves_a_row_with_fresh_events_alone(store):
+    """THE REPRO (AC1). A second process's startup sweep must judge liveness
+    the same way the runtime sweep does — a fresh EVENT (not just a fresh row
+    stamp) is evidence a live worker (in ANOTHER process) still owns this row,
+    and must stop the sweep from requeuing it. Fails on the pre-fix code,
+    which treated "found mid-run at startup" alone as proof of orphanhood."""
+    import time as _time
+    t = await _stranded_task(store, age_seconds=3600)
+    await store.save_events(t.id, [{
+        "source": "agent", "kind": "tool_use", "text": "",
+        "ts": _time.time() - 30,
+    }])
+    # A fresh Scheduler instance with an EMPTY `_inflight` — this is what a
+    # second process's own bookkeeping looks like right after boot,
+    # regardless of what a first, still-running process is doing with the
+    # same row in the same database.
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    await sched._recover_orphans()  # startup=True (the default)
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.REVIEWING, (
+        "the startup sweep clobbered a live sibling's row — this is incident "
+        "6408aba0 (task 2cc879d5): a review-PASSED attempt lost to a second "
+        "process's boot-time sweep")
+    events = await store.list_events(t.id)
+    assert not any(e.get("kind") == "orphan_recovered" for e in events)
+
+
+async def test_startup_sweep_still_recovers_a_row_whose_activity_is_stale(store):
+    """Control for the repro above: when the newest EVENT is also stale, the
+    row really is an orphan and the startup sweep must still recover it —
+    the fix narrows the sweep's blind spot, it does not disable it."""
+    import time as _time
+    t = await _stranded_task(store, age_seconds=3600)
+    await store.save_events(t.id, [{
+        "source": "agent", "kind": "tool_use", "text": "",
+        "ts": _time.time() - 3600,
+    }])
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    await sched._recover_orphans()
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    events = await store.list_events(t.id)
+    assert any(e.get("kind") == "orphan_recovered" for e in events)
+
+
+async def test_startup_sweep_recovers_a_row_with_no_events_and_a_stale_row_stamp(store):
+    """A row with NO events at all (nothing ever persisted for it) and a
+    stale `updated_at` is still recovered at startup — liveness evidence is
+    OPTIONAL for a row to be swept, not required for it to be left alone."""
+    t = await _stranded_task(store, age_seconds=3600)
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    await sched._recover_orphans()
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    events = await store.list_events(t.id)
+    assert any(e.get("kind") == "orphan_recovered" for e in events)
+
+
+async def test_a_second_scheduler_refuses_while_a_sibling_heartbeat_is_live(store):
+    """THE REPRO (AC2). A second scheduler's `_claim_pool_lease` must refuse
+    to boot while a fresh sibling heartbeat names a different, live process —
+    this is the primary defense: a process that never gets past this raise
+    never reaches the orphan sweep at all."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    sibling_pid = os.getppid()  # alive, and provably not ours
+    now = _time.time()
+    await store.write_scheduler_heartbeat(
+        pid=sibling_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(), ts=now)
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    with pytest.raises(SiblingSchedulerRunning) as exc_info:
+        await sched._claim_pool_lease()
+
+    assert str(sibling_pid) in str(exc_info.value)
+
+
+async def test_a_stale_sibling_heartbeat_is_taken_over(store):
+    """A heartbeat older than `_HEARTBEAT_STALE_S` (300s) is presumed dead —
+    a second scheduler must take the lease over rather than refuse forever
+    because a sibling crashed without clearing its row."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    other_pid = os.getppid()
+    await store.write_scheduler_heartbeat(
+        pid=other_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        ts=_time.time() - 600)
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    await sched._claim_pool_lease()  # must not raise
+
+    row = await store.read_scheduler_heartbeat()
+    assert row["pid"] == os.getpid()
+
+
+async def test_a_dead_sibling_pid_on_this_host_is_taken_over(store, monkeypatch):
+    """A FRESH heartbeat for a same-host pid that is provably dead (not just
+    old) is also taken over immediately — no reason to wait out the staleness
+    window when `pid_alive` already proves the sibling is gone."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    import no_human.core.scheduler as scheduler_mod
+
+    other_pid = os.getppid()
+    await store.write_scheduler_heartbeat(
+        pid=other_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(), ts=_time.time())
+    monkeypatch.setattr(scheduler_mod, "pid_alive", lambda pid: False)
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    await sched._claim_pool_lease()  # must not raise — the sibling is dead
+
+    row = await store.read_scheduler_heartbeat()
+    assert row["pid"] == os.getpid()
+
+
+async def test_the_lease_is_claimed_before_any_recovery_write(store):
+    """`_claim_pool_lease` runs BEFORE `_reconcile_terminal_task_attempts` and
+    `_recover_orphans` in `run_forever` — a process that fails the lease
+    claim must never reach either sweep. That ordering is the whole point of
+    `SiblingSchedulerRunning`: a process that never gets past the raise never
+    touches a row a live sibling still owns."""
+    import asyncio
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    calls: list[str] = []
+
+    async def _boom():
+        raise SiblingSchedulerRunning(pid=999999, host="elsewhere", age_s=1.0)
+
+    async def _track_reconcile():
+        calls.append("reconcile")
+
+    async def _track_recover(*, startup: bool = True):
+        calls.append("recover")
+
+    sched._claim_pool_lease = _boom
+    sched._reconcile_terminal_task_attempts = _track_reconcile
+    sched._recover_orphans = _track_recover
+
+    with pytest.raises(SiblingSchedulerRunning):
+        await sched.run_forever(stop=asyncio.Event())
+
+    assert calls == [], (
+        "a sweep ran after a failed lease claim — the whole point of "
+        "claiming the lease FIRST is that neither sweep ever sees a row a "
+        "live sibling still owns")
+
+
+async def test_tick_refreshes_the_heartbeat(store):
+    """A running pool's heartbeat must advance on every tick — otherwise a
+    sibling waiting out `_HEARTBEAT_STALE_S` would take the lease over while
+    this process is still alive and ticking."""
+    import asyncio
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    await sched._claim_pool_lease()
+    first = await store.read_scheduler_heartbeat()
+
+    await asyncio.sleep(0.01)
+    await sched.tick()
+
+    second = await store.read_scheduler_heartbeat()
+    assert second["ts"] > first["ts"], (
+        "tick() never refreshed the pool lease heartbeat")

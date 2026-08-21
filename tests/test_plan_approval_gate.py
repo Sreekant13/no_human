@@ -383,6 +383,21 @@ async def test_a_corrected_plan_is_claimable_and_is_not_mistaken_for_an_orphan(s
     assert corrected.id in claimable
     assert orphan.id not in claimable
 
+    # `orphan` must actually read as an orphan to the sweep's liveness gate
+    # (row stamp AND newest event predate the grace window) — `corrected` is
+    # deliberately left fresh, since the point of this test is that a
+    # `correcting` PLANNING row is skipped for its OWN reason (plan_gate.
+    # correcting), not because it happens to look stale.
+    from datetime import datetime, timedelta, timezone
+    import time as _time
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await store.db.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?", (old, orphan.id))
+    await store.db.execute(
+        "UPDATE task_events SET ts = ? WHERE task_id = ?",
+        (_time.time() - 3600, orphan.id))
+    await store.db.commit()
+
     await sched._recover_orphans()
     assert (await store.get_task(corrected.id)).status is TaskStatus.PLANNING
     assert (await store.get_task(orphan.id)).status is TaskStatus.IMPLEMENTING

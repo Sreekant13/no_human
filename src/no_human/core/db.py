@@ -1289,6 +1289,23 @@ class Store:
                 "rolled_up INTEGER DEFAULT 0"
             )
 
+        # Single-row (id=1) leader marker for `Scheduler._claim_pool_lease`:
+        # which (pid, host) currently owns this database's pool, and when it
+        # last proved it was still alive. Exists so a second `nh start`/
+        # `nh serve` sharing this DB can refuse to boot alongside a live
+        # sibling instead of duplicate-claiming tasks and — incident
+        # 6408aba0 — having its own startup orphan sweep see the sibling's
+        # live mid-run row as unowned and requeue it out from under it.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS scheduler_heartbeat (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                pid INTEGER NOT NULL,
+                host TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ts REAL NOT NULL
+            )
+        """)
+
     # ----------------------------- tasks ---------------------------------- #
 
     @serialized_write
@@ -3702,6 +3719,45 @@ class Store:
         row = await self._fetchone(
             "SELECT MAX(ts) FROM task_events WHERE task_id = ?", (task_id,))
         return float(row[0]) if row and row[0] is not None else None
+
+    # ----------------------- scheduler heartbeat --------------------------- #
+    # Single-row (id=1) leader marker read/written by `Scheduler._claim_pool_
+    # lease` — see `_migrate`'s `scheduler_heartbeat` table for why it exists.
+
+    async def read_scheduler_heartbeat(self) -> dict | None:
+        """The current lease holder, or None if no process has ever claimed
+        one (or `clear_scheduler_heartbeat` cleared it on a clean shutdown)."""
+        row = await self._fetchone(
+            "SELECT pid, host, started_at, ts FROM scheduler_heartbeat "
+            "WHERE id = 1")
+        return dict(row) if row else None
+
+    @serialized_write
+    async def write_scheduler_heartbeat(
+        self, *, pid: int, host: str, started_at: str, ts: float,
+    ) -> None:
+        """Claim or refresh the id=1 lease row (upsert — same
+        ``ON CONFLICT ... DO UPDATE`` idiom as `upsert_profile`, since this is
+        genuinely a fixed-key upsert, not an append)."""
+        await self.db.execute(
+            """INSERT INTO scheduler_heartbeat (id, pid, host, started_at, ts)
+                 VALUES (1, :pid, :host, :started_at, :ts)
+               ON CONFLICT(id) DO UPDATE SET
+                 pid=excluded.pid, host=excluded.host,
+                 started_at=excluded.started_at, ts=excluded.ts""",
+            {"pid": pid, "host": host, "started_at": started_at, "ts": ts},
+        )
+        await self.db.commit()
+
+    @serialized_write
+    async def clear_scheduler_heartbeat(self, pid: int) -> None:
+        """Release the lease on a clean shutdown — ownership-guarded (mirrors
+        `cli/commands.py`'s `_release_pid_lock`): only deletes the row if
+        *pid* is still the one holding it, so a process that lost the lease
+        to a takeover (or never held it) cannot clear a sibling's claim."""
+        await self.db.execute(
+            "DELETE FROM scheduler_heartbeat WHERE id = 1 AND pid = ?", (pid,))
+        await self.db.commit()
 
     # ----------------------- project profiles ----------------------------- #
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -172,6 +173,22 @@ def _approve_option(blocker) -> dict | None:
     return None
 
 
+async def _age_task(store, task_id, seconds=3600):
+    """Back-date a row's `updated_at` and any `task_events` it already has so
+    it clears `Scheduler._row_is_live`'s activity-grace window before a test
+    calls `_recover_orphans` to simulate a crash worth recovering — these
+    routes are about what the sweep does with a genuinely dead row, not about
+    liveness detection, and a `set_status` moments earlier in the same test
+    body reads as live otherwise."""
+    old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    await store.db.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?", (old, task_id))
+    await store.db.execute(
+        "UPDATE task_events SET ts = ? WHERE task_id = ?",
+        (time.time() - seconds, task_id))
+    await store.db.commit()
+
+
 # --------------------------------------------------------------------------- #
 # Fix 1 — the gate is load-bearing on EVERY route into the attempt loop         #
 # --------------------------------------------------------------------------- #
@@ -188,6 +205,7 @@ async def test_serve_restart_during_context_does_not_implement_without_a_plan(
     orch = _orch(store, _cfg(tmp_path), coder)
     t = await _gated_task(store, bare_repo)
     await store.set_status(t, TaskStatus.CONTEXT, validate=False)
+    await _age_task(store, t.id)
 
     # The route: startup crash recovery.
     await Scheduler(store, lambda task=None: None)._recover_orphans()
@@ -218,6 +236,7 @@ async def test_serve_restart_during_planning_parks_on_the_plan_it_already_had(
     t = await _gated_task(store, bare_repo)
     await store.merge_context(t.id, {"plan": _PLAN_A.strip()})
     await store.set_status(t, TaskStatus.PLANNING, validate=False)
+    await _age_task(store, t.id)
 
     await Scheduler(store, lambda task=None: None)._recover_orphans()
     recovered = await store.get_task(t.id)
@@ -451,6 +470,11 @@ async def test_a_correcting_task_is_claimed_on_its_state_not_its_text(store):
     sched = Scheduler(store, lambda task=None: None)
     assert blank.id in {t.id for t in await sched._claimable()}
     assert orphan.id not in {t.id for t in await sched._claimable()}
+
+    # Only `orphan` needs to read as dead — `blank` stays fresh, since the
+    # point of this test is that a `correcting` PLANNING row is claimed on
+    # its state (plan_gate.correcting), not because it happens to look stale.
+    await _age_task(store, orphan.id)
 
     await sched._recover_orphans()
     assert (await store.get_task(blank.id)).status is TaskStatus.PLANNING

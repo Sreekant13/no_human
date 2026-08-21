@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import platform
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ from typing import Awaitable, Callable
 from ..agent.worker_context import WorkerContext, set_worker_context
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
-                      worktree_isolation_enabled)
+                      pid_alive, worktree_isolation_enabled)
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
@@ -333,6 +334,36 @@ def _summarize_event(event: dict) -> str | None:
     if kind == "decompose":
         return "decomposing into sub-tasks"
     return None
+
+
+class SiblingSchedulerRunning(RuntimeError):
+    """Raised by `Scheduler._claim_pool_lease` when a live sibling scheduler
+    already owns this database's pool.
+
+    A second `nh start`/`nh serve` sharing the same DB must not boot its own
+    pool alongside one that is already running it: the two would
+    duplicate-claim tasks, and — the incident this whole fix responds to
+    (6408aba0, task 2cc879d5) — the second process's STARTUP orphan sweep
+    used to see the first process's live REVIEWING row as an orphan (its own
+    `_inflight` is empty by definition right after boot) and requeue it,
+    clobbering a review-PASSED attempt out from under a worker that was
+    still running. Refusing to boot here is what makes it safe for
+    `Scheduler._recover_orphans`'s liveness gate to stay a per-row heuristic
+    instead of a perfect one: a process that never gets past this point never
+    reaches the sweep at all.
+
+    Carries the sibling's ``pid``/``host``/``age_s`` so a CLI/API caller can
+    print exactly what to stop (or how long until its heartbeat goes stale).
+    """
+
+    def __init__(self, *, pid: int, host: str, age_s: float):
+        self.pid = pid
+        self.host = host
+        self.age_s = age_s
+        super().__init__(
+            f"a no_human scheduler is already running against this database "
+            f"(pid {pid} on {host!r}, heartbeat {age_s:.0f}s old) — stop it "
+            f"first, or wait for its heartbeat to go stale")
 
 
 class Scheduler:
@@ -685,8 +716,16 @@ class Scheduler:
         return prior + fresh
 
     # Mid-run statuses only a live worker can hold. A task found in one of
-    # these at STARTUP (this process's _inflight is empty by definition) was
-    # orphaned by a crash/kill of the previous process.
+    # these with NO recent activity (`_row_is_live`, below) was orphaned by a
+    # crash/kill of its worker's process. NOT every task found in one of
+    # these AT STARTUP: that used to be the whole test (this process's
+    # `_inflight` is empty right after boot, so it looked like proof) and it
+    # is false the moment a second process shares this database — see
+    # `_recover_orphans` for incident 6408aba0, where exactly that let a
+    # second process's startup sweep clobber a first process's live,
+    # review-PASSED row. `_claim_pool_lease` now refuses to let a second
+    # process reach this sweep at all while a sibling's heartbeat is live;
+    # `_row_is_live` is the defense-in-depth layer under that refusal.
     _ORPHANABLE = (TaskStatus.CONTEXT, TaskStatus.PLANNING,
                    TaskStatus.REVIEWING, TaskStatus.TESTING)
 
@@ -698,6 +737,17 @@ class Scheduler:
     # costs little, while a live out-of-process run's longest silent stretch
     # (a full-suite pytest inside review) must fit under it.
     _STRANDED_GRACE_S = 900.0
+
+    # `_claim_pool_lease` only: how old a sibling's heartbeat may be before
+    # this process treats it as gone rather than live. Deliberately shorter
+    # than `_STRANDED_GRACE_S` above — that window is generous because
+    # requeueing a live row is destructive (incident 6408aba0) and a false
+    # "still stranded" costs only a delayed recovery, but a stale value HERE
+    # means an operator who killed a process and immediately restarted waits
+    # out the whole window before the new one will boot, and that failure
+    # mode is loud (an explicit refusal to start) rather than silent, so
+    # erring toward a shorter wait costs less.
+    _HEARTBEAT_STALE_S = 300.0
 
     async def _is_terminal_row(self, task) -> bool:
         """Re-read the live row; terminal = DONE, or FAILED with a cancel
@@ -759,6 +809,60 @@ class Scheduler:
                   "dispatching attempt 1", task.id[:8], ctx.get("base_branch"))
         return True
 
+    async def _claim_pool_lease(self) -> None:
+        """Refuse to boot this pool while a sibling scheduler's heartbeat on
+        this same database is live — the primary defense for incident
+        6408aba0 (see `_recover_orphans`): a process that never gets past
+        this raise never reaches the orphan sweep at all, so it cannot
+        requeue a row a live sibling still owns.
+
+        A single-row (`id=1`) heartbeat table is the leader marker. Reading
+        it:
+          - no row, or a row already stamped with OUR (pid, host) — claim/
+            refresh it and return; `started_at` is carried forward from the
+            existing row on a refresh so it still names when THIS run
+            actually started, not when it last ticked.
+          - a row stamped with a DIFFERENT (pid, host) that is fresh (younger
+            than `_HEARTBEAT_STALE_S`) and not provably dead — raise
+            `SiblingSchedulerRunning`, naming that pid/host/age so an
+            operator (or the CLI/API catching this) knows exactly what to
+            stop.
+          - otherwise (stale, or a same-host pid `pid_alive` says is gone) —
+            the sibling is presumed gone; take the lease over.
+
+        `pid_alive` is only trusted for a SAME-HOST pid: a pid number from a
+        different host means nothing here and is never treated as dead on
+        that evidence alone.
+
+        Fails OPEN on a read/write error (logs and continues) rather than
+        blocking boot on a lease table problem — the `_row_is_live` check in
+        `_recover_orphans` is the fallback layer for exactly that case.
+        """
+        my_pid = os.getpid()
+        my_host = platform.node()
+        now = time.time()
+        try:
+            row = await self.store.read_scheduler_heartbeat()
+        except Exception:  # noqa: BLE001 — fail open, sweep is the fallback
+            log.exception("pool lease: reading the heartbeat failed — booting anyway")
+            row = None
+
+        mine = row is not None and row["pid"] == my_pid and row["host"] == my_host
+        if row is not None and not mine:
+            age = now - float(row["ts"])
+            sibling_dead = row["host"] == my_host and not pid_alive(int(row["pid"]))
+            if age < self._HEARTBEAT_STALE_S and not sibling_dead:
+                raise SiblingSchedulerRunning(
+                    pid=int(row["pid"]), host=row["host"], age_s=age)
+
+        started_at = (row["started_at"] if mine
+                      else datetime.now(timezone.utc).isoformat())
+        try:
+            await self.store.write_scheduler_heartbeat(
+                pid=my_pid, host=my_host, started_at=started_at, ts=now)
+        except Exception:  # noqa: BLE001 — the lease is advisory once claimed
+            log.exception("pool lease: writing the heartbeat failed")
+
     async def _reconcile_terminal_task_attempts(self) -> None:
         """Startup-only: retire attempt rows left open on tasks that finished.
 
@@ -816,18 +920,62 @@ class Scheduler:
                 "startup: salvaged %d dead worktree(s), skipped %d",
                 salvaged, skipped)
 
+    async def _row_is_live(self, t) -> bool:
+        """True when *t* shows evidence a worker still owns it — this
+        process's own claim, or a row/event write within the grace window
+        from ANY process.
+
+        Used by BOTH `_recover_orphans` branches (startup and per-tick) —
+        see that method's docstring for why "at startup" alone used to stand
+        in for this check and was wrong (incident 6408aba0). Liveness is
+        judged on the newest persisted activity — row `updated_at` OR the
+        newest `task_event` — because `_inflight` is per-process: a run
+        driven by ANOTHER process (a second `nh start`/`nh serve`, the `nh
+        watch` TUI, a CLI-driven resume) is invisible to `_inflight` but its
+        events land in the same DB (B1, review 2026-08-10; every in-process
+        runner persists through EventPersister).
+        """
+        if t.id in self._inflight:
+            return True
+        if self._row_age_s(t.updated_at) < self._STRANDED_GRACE_S:
+            return True      # row itself is young — no query needed
+        ev_ts = await self.store.last_event_ts(t.id)
+        return ev_ts is not None and time.time() - ev_ts < self._STRANDED_GRACE_S
+
     async def _recover_orphans(self, *, startup: bool = True) -> None:
-        """Crash/strand recovery. At STARTUP (review 2026-07-25): nothing is
-        legitimately in-flight yet, so any mid-run status is an orphan of a
-        killed process — flip it to IMPLEMENTING (claimable) so the pool
-        re-runs it from its checkpoint. Since R15 (2026-08-09 incident) the
-        sweep also runs PER-TICK with ``startup=False``: a status write that
-        is lost or reverted (a stale full-row write-back did exactly that)
-        strands a row in a worker-only status while the process lives, and
-        the startup-only sweep left it invisible until the next restart —
-        66 minutes, in the incident. At runtime a row is an orphan only when
-        no live worker has it claimed AND it has not been touched for
-        ``_STRANDED_GRACE_S``."""
+        """Crash/strand recovery. A task found in one of `_ORPHANABLE`'s
+        mid-run statuses is recovered — flipped to IMPLEMENTING (claimable)
+        so the pool re-runs it from its checkpoint — ONLY when `_row_is_live`
+        says nothing is still working it.
+
+        That liveness check used to run at RUNTIME only; AT STARTUP the sweep
+        recovered every mid-run row unconditionally, on the theory (review
+        2026-07-25) that "nothing is legitimately in-flight yet, so any
+        mid-run status is an orphan of a killed process". True for the first
+        process ever to touch a database; false the moment a second `nh
+        start`/`nh serve` shares it — the second process's OWN `_inflight` is
+        empty right after boot regardless of what a FIRST, still-running
+        process is doing with that same row. That gap is how incident
+        6408aba0 lost a review-PASSED attempt (task 2cc879d5,
+        2026-0x-xx 17:29:07-17:35:58): a second process's startup sweep saw
+        the first process's live REVIEWING row, had no liveness evidence to
+        check, and requeued it to IMPLEMENTING out from under the worker
+        still reviewing it — which can also duplicate-claim the same task.
+        `Scheduler._claim_pool_lease` now refuses to let a second process
+        reach this sweep at all while a sibling's heartbeat is live; the
+        liveness gate below is defense in depth for what the lease alone
+        does not cover (a lease taken over from a dead process must still not
+        clobber a row a THIRD process — or this same process, mid-write to
+        its own DB connection — is actively touching).
+
+        Since R15 (2026-08-09 incident) the sweep also runs PER-TICK with
+        ``startup=False``: a status write that is lost or reverted (a stale
+        full-row write-back did exactly that) strands a row in a worker-only
+        status while the process lives, and the startup-only sweep left it
+        invisible until the next restart — 66 minutes, in that incident.
+        ``startup`` now only selects the event text; both call sites share
+        the same `_row_is_live` gate.
+        """
         for status in self._ORPHANABLE:
             for t in await self.store.list_tasks(status):
                 # Not an orphan: a task sitting in PLANNING with a human's
@@ -836,28 +984,16 @@ class Scheduler:
                 # very plan they rejected. `_claimable` picks it up instead.
                 if plan_gate.correcting(t):
                     continue
-                if not startup:
-                    if t.id in self._inflight:
-                        continue
-                    # Liveness is judged on the newest persisted activity —
-                    # row write OR event — because `_inflight` is per-process:
-                    # a CLI-driven run in another process is invisible to it,
-                    # but its events land in the same DB (B1, review
-                    # 2026-08-10; every in-process runner, including the
-                    # `nh watch` TUI, persists through EventPersister).
-                    if self._row_age_s(t.updated_at) < self._STRANDED_GRACE_S:
-                        continue      # row itself is young — no query needed
-                    ev_ts = await self.store.last_event_ts(t.id)
-                    if (ev_ts is not None
-                            and time.time() - ev_ts < self._STRANDED_GRACE_S):
-                        continue
-                    text = (f"found in {status.value} with no worker attached "
-                            "(status write lost, or its worker died) — "
-                            "requeued from its checkpoint")
-                else:
+                if await self._row_is_live(t):
+                    continue
+                if startup:
                     text = (f"found in {status.value} at startup with no "
                             "worker attached (previous process died mid-run) "
                             "— requeued from its checkpoint")
+                else:
+                    text = (f"found in {status.value} with no worker attached "
+                            "(status write lost, or its worker died) — "
+                            "requeued from its checkpoint")
                 # THE STATUS WRITE GOES FIRST, and nothing else happens until it
                 # lands. `set_status` CAS-guards terminal rows (SCRUM-73) and
                 # returns None when it refuses — a human can mark this task DONE
@@ -1276,6 +1412,16 @@ class Scheduler:
         # made from `store`, so if the connection's view is frozen the whole
         # tick is reasoning about a database that no longer exists.
         await self._check_db_liveness()
+        # Refresh, not re-claim: a sibling that outlives this loop's poll
+        # interval must never see our heartbeat go stale and take the lease
+        # while we are still running. `_claim_pool_lease`'s own-(pid,host)
+        # branch is exactly this refresh — best-effort, must never stall a
+        # tick over a lease-table hiccup (the startup call already got the
+        # loud, propagating check; this one is maintenance).
+        try:
+            await self._claim_pool_lease()
+        except Exception as exc:  # noqa: BLE001 — refresh must not kill the pool
+            log.warning("pool lease refresh failed: %s", exc)
         if self.wake is not None:
             try:
                 # Pass the claimed set so the stuck-active sweep judges only
@@ -1551,6 +1697,13 @@ class Scheduler:
         # ticking" against the interval it is SUPPOSED to tick at, rather than
         # against a constant that would be wrong for any other configuration.
         self._poll_interval = float(poll_interval)
+        # FIRST, unguarded: a live sibling's heartbeat must stop boot before
+        # anything below touches the DB — that's what makes it safe for
+        # every sweep after this line to assume it is the only writer this
+        # process needs to worry about not racing. Letting this propagate
+        # (not caught here) is deliberate: the caller (`nh serve`/`nh start`)
+        # is what prints the operator-visible refusal.
+        await self._claim_pool_lease()
         # BEFORE the orphan sweep: that sweep reads `latest_open_attempt` to
         # recover a checkpoint, and a row left open on a task that already
         # FINISHED is not a checkpoint to resume from — it is debris.
@@ -1585,6 +1738,16 @@ class Scheduler:
         # mid-coder takes minutes. Ask first, then wait — bounded.
         self.request_stop_checkpoints()
         await self.drain()
+        # Best-effort: an orderly shutdown clears the lease immediately so a
+        # restart doesn't wait out `_HEARTBEAT_STALE_S`. Ownership-guarded in
+        # `Store.clear_scheduler_heartbeat` (only deletes a row this pid
+        # wrote) so a crash between claim and this line just leaves the
+        # heartbeat to go stale on its own — never clears a row that isn't
+        # ours.
+        try:
+            await self.store.clear_scheduler_heartbeat(os.getpid())
+        except Exception:  # noqa: BLE001 — shutdown must not fail on this
+            log.exception("pool lease: clearing the heartbeat failed")
 
     async def queue_is_drained(self) -> bool:
         """Nothing running, nothing left to claim — the drain's exit condition.

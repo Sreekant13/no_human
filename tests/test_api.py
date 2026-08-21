@@ -2710,6 +2710,9 @@ async def test_a_retried_checkpoint_stays_cleared_when_the_fresh_run_crashes(
     fixes this is `Store.close_open_attempts`, which lives at the clear, so a
     test that simulates the clear itself would be testing its own simulation.
     """
+    import time
+    from datetime import datetime, timedelta, timezone
+
     t = await _seed_task(store, status=TaskStatus.FAILED)
     dead = await store.create_attempt(t.id, 1)
     await store.update_attempt(dead, commit_sha="a" * 40)
@@ -2717,8 +2720,25 @@ async def test_a_retried_checkpoint_stays_cleared_when_the_fresh_run_crashes(
     from no_human.core.scheduler import Scheduler
     sched = Scheduler(store, lambda task=None: None)
 
+    async def _age(task_id, seconds=3600):
+        # The startup/runtime sweep only recovers a row whose activity (row
+        # stamp AND newest event) predates the liveness grace window — a
+        # `set_status` moments ago, or a prior `_recover_orphans` call's own
+        # `orphan_recovered` event, both read as "still live" and are
+        # correctly left alone. This test is about checkpoint provenance
+        # across two crashes, not liveness detection, so it back-dates both
+        # before each sweep.
+        old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        await store.db.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?", (old, task_id))
+        await store.db.execute(
+            "UPDATE task_events SET ts = ? WHERE task_id = ?",
+            (time.time() - seconds, task_id))
+        await store.db.commit()
+
     # The crash before the retry: the sweep correctly rescues that work.
     await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+    await _age(t.id)
     await sched._recover_orphans()
     assert ((await store.find_task(t.id)).context or {})["resume_from"]["sha"] == "a" * 40
 
@@ -2727,6 +2747,7 @@ async def test_a_retried_checkpoint_stays_cleared_when_the_fresh_run_crashes(
 
     # …and the fresh run dies before it ever opens an attempt row of its own.
     await store.set_status(await store.find_task(t.id), status, validate=False)
+    await _age(t.id)
     await sched._recover_orphans()
 
     rf = ((await store.find_task(t.id)).context or {}).get("resume_from") or {}

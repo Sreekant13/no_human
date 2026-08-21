@@ -3409,7 +3409,8 @@ def serve(max_workers, until_empty):
     _assert_backend_usable()
     _warn_if_editable_install_dangles()
     from ..blockers import WakeWatcher, parse_duration
-    from ..core.scheduler import Scheduler, clamp_pool_width, resolve_serve_pool
+    from ..core.scheduler import (Scheduler, SiblingSchedulerRunning,
+                                  clamp_pool_width, resolve_serve_pool)
 
     conc = config.data.setdefault("concurrency", {})
     workers, enabled, error = resolve_serve_pool(config.data, cli_workers=max_workers)
@@ -3630,6 +3631,13 @@ def serve(max_workers, until_empty):
 
     try:
         rc = asyncio.run(_go()) or 0
+    except SiblingSchedulerRunning as exc:
+        # `run_forever`'s very first call, unguarded on purpose — this is
+        # the operator-visible refusal that call is FOR. See scheduler.py's
+        # `SiblingSchedulerRunning` docstring for the incident (6408aba0)
+        # this prevents.
+        console.print(f"[red]{exc}[/]")
+        sys.exit(1)
     finally:
         _release_pid_lock()
     sys.exit(rc)
