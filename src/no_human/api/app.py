@@ -1124,7 +1124,7 @@ async def approve_landed(
     task_id: str, body: LandedOverrideRequest, request: Request,
 ) -> dict[str, Any]:
     """The HUMAN landed-override affirmation: a human asserts (with required
-    justification) that a task's content landed at ``sha``, for either of two
+    justification) that a task's content landed at ``sha``, for any of three
     narrow shapes ``blockers/landed_override.py`` resolves and gates:
 
     - an ``awaiting_approval`` task where automated containment honestly
@@ -1136,7 +1136,9 @@ async def approve_landed(
       exhaustion, a pre-review test failure, a compile error) whose content
       a human later hand-landed — refused if the task was human-cancelled or
       already has PR evidence (that pair goes through
-      ``nh task restore-approval`` instead).
+      ``nh task restore-approval`` instead), or
+    - a ``pending`` task that a human hand-lands before any coder attempt
+      ever dispatched — refused if it already has PR evidence, same as above.
 
     See ``blockers/landed_override.py`` for the full contract; this endpoint
     only cheap-guards obviously-ineligible statuses and otherwise delegates
@@ -1151,16 +1153,19 @@ async def approve_landed(
 
     store = _store(request)
     task = await _require_task(store, task_id)
-    if task.status not in (TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED):
+    if task.status not in (
+        TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED, TaskStatus.PENDING,
+    ):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"task is {task.status.value!r}, not awaiting_approval or "
-                "a pre-PR failed task"
+                f"task is {task.status.value!r}, not awaiting_approval, "
+                "a pre-PR failed task, or a never-dispatched pending task"
             ),
         )
     try:
-        result = await approve_landed_override(store, task, body.sha, body.justification)
+        result = await approve_landed_override(
+            store, task, body.sha, body.justification, base=body.base)
     except OverrideRefused as exc:
         raise HTTPException(status_code=400, detail=exc.reason)
 

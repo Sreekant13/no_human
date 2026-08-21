@@ -623,6 +623,10 @@ class LandedOverrideRequest(BaseModel):
     # blockers/landed_override.py's approve_landed_override.
     sha: str
     justification: str
+    # Only consulted for a `pending_never_ran` task with no recorded
+    # base_branch — the tool never guesses one (see landed_override.py's
+    # module docstring / F1). Ignored otherwise.
+    base: str | None = None
 
 
 class SaveIntegrationConfigRequest(BaseModel):

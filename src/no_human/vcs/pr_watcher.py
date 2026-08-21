@@ -882,6 +882,34 @@ async def refs_resolvable(repo_path: str, *refs: str) -> bool:
     return True
 
 
+async def resolve_default_branch(repo_path: str) -> str:
+    """The repo's default branch, LOCAL refs only — ``""`` when it cannot be
+    read.
+
+    Order: ``origin/HEAD`` (the remote's declared default, set by `git clone`
+    or `git remote set-head`), then the checkout's own current branch. Both
+    are read-only and local — deliberately **no** `git remote show origin`
+    (a network round trip). ``origin/HEAD`` is rarely set in practice (no
+    onboarded profile on record configures it), so this usually falls
+    through to the checkout's *current* branch — the parked branch of
+    whatever happens to be checked out, not necessarily the project's real
+    default. That makes it unreliable as an authoritative value: the caller
+    (`blockers/landed_override.py`'s ``_base_hint``) uses it ONLY to compose
+    non-binding advisory text in a refusal message for the
+    ``pending_never_ran`` shape — never to fill in a ``base`` value. Fails
+    soft to ``""``, which that caller turns into a plain hint to pass
+    ``--base`` with no guess attached.
+    """
+    rc, out = await _git_rc(
+        repo_path, "symbolic-ref", "-q", "refs/remotes/origin/HEAD")
+    if rc == 0 and out:
+        return out.rsplit("/", 1)[-1]
+    rc, out = await _git_rc(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+    if rc == 0 and out and out != "HEAD":
+        return out
+    return ""
+
+
 async def _base_tips(repo_path: str, base: str) -> list[str]:
     """``base`` plus its remote-tracking counterpart — every ref that can
     legitimately be holding the landing.

@@ -393,6 +393,182 @@ async def test_failed_pre_pr_requires_justification(tmp_path, store):
 
 
 # --------------------------------------------------------------------------- #
+# the "pending_never_ran" shape — hand-landed before any coder attempt ran,   #
+# live incident 855f1263                                                     #
+# --------------------------------------------------------------------------- #
+
+async def _seed_pending(store, repo_path, *, pr_evidence=None) -> Task:
+    """A task no coder attempt ever dispatched for: PENDING, empty context —
+    no `base_branch`, since the dispatch-time write that would have recorded
+    one never ran."""
+    t = Task.new("landed-override-check", repo_path=str(repo_path))
+    t.context = {}
+    if pr_evidence:
+        t.context["pr_watch"] = pr_evidence
+    await store.create_task(t)
+    return t
+
+
+async def test_pending_task_completes_with_explicit_base(tmp_path, store):
+    """F1 fix: the only way a pending task's missing base is ever filled in
+    is an explicit human `base=` — never a guess."""
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    result = await approve_landed_override(
+        store, t, main_sha, "hand-landed by the supervising session",
+        base="main")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert fresh.context["base_branch"] == "main"
+
+    events = await store.list_events(t.id)
+    override_events = [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+    assert len(override_events) == 1
+    ev = override_events[0]
+    assert ev["shape"] == "pending_never_ran"
+    assert ev["base"] == "main"
+    assert ev["base_source"] == "human_asserted"
+    assert ev["prior_status"] == "pending"
+    assert "prior status: pending" in ev["text"]
+    assert result["shape"] == "pending_never_ran"
+    assert result["prior_status"] == "pending"
+
+
+async def test_pending_task_refused_when_sha_not_on_default_branch(
+    tmp_path, store,
+):
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-b", "side")
+    (repo / "a.txt").write_text("side change\n")
+    _git(repo, "commit", "-am", "side: never merged")
+    side_sha = _git_out(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    t = await _seed_pending(store, repo)
+
+    with pytest.raises(OverrideRefused):
+        await approve_landed_override(
+            store, t, side_sha, "asserting anyway", base="main")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert (await store.list_events(t.id)) == []
+
+
+async def test_pending_task_refused_without_justification(tmp_path, store):
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    with pytest.raises(OverrideRefused):
+        await approve_landed_override(
+            store, t, main_sha, "   ", base="main")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert fresh.context.get("landed_override_sha") is None
+    assert (await store.list_events(t.id)) == []
+
+
+async def test_pending_task_with_pr_evidence_is_refused(tmp_path, store):
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(
+        store, repo, pr_evidence="https://example.com/pull/1")
+
+    with pytest.raises(OverrideRefused, match="restore-approval"):
+        await approve_landed_override(store, t, main_sha, "asserting anyway")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert (await store.list_events(t.id)) == []
+
+
+async def test_pending_task_refuses_without_explicit_base(tmp_path, store):
+    """F1: no recorded base_branch and no `base=` — refuses. This is the
+    replacement for the old (flattering-only, F3-flagged)
+    `test_pending_base_defaults_from_the_repo_default_branch`: silently
+    trusting `resolve_default_branch`'s checkout-branch fallback as a VALUE
+    is exactly the false-completion risk that got this fix sent back."""
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    with pytest.raises(OverrideRefused, match="--base"):
+        await approve_landed_override(
+            store, t, main_sha, "hand-landed by the supervising session")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert fresh.context.get("landed_override_sha") is None
+    assert (await store.list_events(t.id)) == []
+
+
+async def test_pending_task_refuses_without_explicit_base_on_a_side_branch_checkout(
+    tmp_path, store,
+):
+    """F3's dangerous configuration, previously untested: the repo's CURRENT
+    checkout is a side branch that was never merged anywhere and no
+    `origin/HEAD` is configured — the exact shape of every onboarded profile
+    on this machine (empty `ProjectProfile.default_branch`, no
+    `git remote set-head` caller anywhere in the product). Must refuse, not
+    silently complete against "side"."""
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-b", "side")
+    (repo / "a.txt").write_text("side change\n")
+    _git(repo, "commit", "-am", "side: never merged")
+    t = await _seed_pending(store, repo)
+    main_sha = _git_out(repo, "rev-parse", "main")
+
+    with pytest.raises(OverrideRefused, match="--base"):
+        await approve_landed_override(
+            store, t, main_sha, "hand-landed by the supervising session")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert (await store.list_events(t.id)) == []
+
+
+async def test_pending_task_refusal_hint_names_the_checkout_branch(
+    tmp_path, store,
+):
+    """The refusal message may carry a non-binding hint (`_base_hint`) — but
+    it is text, never a value the call trusts."""
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    with pytest.raises(OverrideRefused) as exc_info:
+        await approve_landed_override(
+            store, t, main_sha, "hand-landed by the supervising session")
+
+    assert "'main'" in exc_info.value.reason
+    assert "--base" in exc_info.value.reason
+
+
+async def test_pending_task_with_cancel_request_is_refused(tmp_path, store):
+    """A cancel racing a hand-land must not be silently dropped: the DB's
+    `cancel_requested` column (set by `nh task cancel` before a live task's
+    status flip lands) gates the pending shape exactly like `cancel_reason`
+    gates the failed shape."""
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+    await store.request_cancel(t.id, "no longer needed")
+
+    with pytest.raises(OverrideRefused, match="cancellation request"):
+        await approve_landed_override(
+            store, t, main_sha, "hand-landed by the supervising session",
+            base="main")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
+    assert (await store.list_events(t.id)) == []
+
+
+# --------------------------------------------------------------------------- #
 # API: POST /api/tasks/{id}/approve-landed                                    #
 # --------------------------------------------------------------------------- #
 
@@ -485,6 +661,53 @@ async def test_api_approve_landed_completes_failed_pre_pr(tmp_path, store, clien
         json={"sha": landed_sha, "justification": "replay"},
     )
     assert r.status_code == 409, r.text
+
+
+async def test_approve_landed_endpoint_accepts_a_pending_task(
+    tmp_path, store, client,
+):
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    r = await client.post(
+        f"/api/tasks/{t.id}/approve-landed",
+        json={"sha": main_sha,
+              "justification": "hand-landed by the supervising session",
+              "base": "main"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["sha"] == main_sha
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    events = await store.list_events(t.id)
+    ev = [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND][0]
+    assert ev["shape"] == "pending_never_ran"
+    assert ev["base_source"] == "human_asserted"
+
+
+async def test_approve_landed_endpoint_refuses_a_pending_task_without_base(
+    tmp_path, store, client,
+):
+    """API twin of F1: the CLI and API must not drift — neither guesses a
+    base for a pending task that never recorded one."""
+    repo = _make_repo(tmp_path)
+    main_sha = _git_out(repo, "rev-parse", "main")
+    t = await _seed_pending(store, repo)
+
+    r = await client.post(
+        f"/api/tasks/{t.id}/approve-landed",
+        json={"sha": main_sha,
+              "justification": "hand-landed by the supervising session"},
+    )
+    assert r.status_code == 400, r.text
+    assert "--base" in r.json()["detail"]
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.PENDING
 
 
 # --------------------------------------------------------------------------- #

@@ -1970,8 +1970,38 @@ def task_cancel(task_id, reason):
             if not t:
                 print_no_task_matching(task_id)
                 sys.exit(1)
-            if t.status in {TaskStatus.DONE, TaskStatus.FAILED}:
+            if t.status is TaskStatus.DONE:
                 console.print(f"[yellow]task is already {t.status.value}[/]")
+                return
+            if t.status is TaskStatus.FAILED:
+                prior_reason = (t.context or {}).get("cancel_reason")
+                if prior_reason:
+                    console.print(
+                        f"[yellow]{t.id[:8]} is already cancelled[/] — "
+                        f"reason: {prior_reason} (no change)")
+                    return
+                # A FAILED task with no `cancel_reason` is a REAL failure, not
+                # a human cancel — a human asserting "call this cancelled" is
+                # a re-labelling, recorded the same way `nh approve --landed`
+                # records an assertion: honestly, with a human event, and
+                # without pretending automated evidence produced it.
+                from ..blockers import human_event
+                t.context = await store.merge_context(
+                    t.id, {"cancel_reason": reason})
+                await store.save_events(t.id, [{
+                    **human_event(
+                        "cancel", prior_status=TaskStatus.FAILED,
+                        prior_blocker=(t.blocker if isinstance(t.blocker, dict)
+                                       else None),
+                        reason=reason, actor="cli",
+                        text=f"human re-labelled a failed task as cancelled: "
+                             f"{reason}"),
+                    "prior_cancel_reason": prior_reason,
+                    "ts": time.time(),
+                }])
+                console.print(
+                    f"[red]cancelled[/] {t.id[:8]} — reason: {reason} "
+                    f"(was failed)")
                 return
 
             # Raise the stop flag first: it is the signal a running attempt sees.
@@ -4399,7 +4429,13 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
 @click.option("--because", "justification", default=None,
               help="Required with --landed: why a human is asserting this "
                    "landed rather than letting containment decide.")
-def approve(task_id, landed_sha, justification):
+@click.option("--base", "base_branch", default=None,
+              help="Required with --landed on a task that never dispatched "
+                   "(no base_branch was ever recorded): the branch --landed's "
+                   "commit is asserted to be an ancestor of. Ignored — and "
+                   "unnecessary — for a task that already recorded a base; "
+                   "this tool never guesses one.")
+def approve(task_id, landed_sha, justification, base_branch):
     """Approve and merge — squash-lands the PR under the operator identity
     (the agent still never merges on its own)."""
     config, _ = _bootstrap(require_auth=False)
@@ -4414,7 +4450,8 @@ def approve(task_id, landed_sha, justification):
                     sys.exit(1)
                 try:
                     result = await approve_landed_override(
-                        store, t, landed_sha, justification or "")
+                        store, t, landed_sha, justification or "",
+                        base=base_branch)
                 except OverrideRefused as exc:
                     console.print(f"[bold red]refused:[/] {exc.reason}")
                     sys.exit(1)

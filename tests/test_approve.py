@@ -430,3 +430,80 @@ def test_approve_landed_still_refuses_a_sha_not_in_the_base_branch(tmp_path):
 
     t, _ = _task_state(db, tid)
     assert t.status is TaskStatus.AWAITING_APPROVAL
+
+
+# --------------------------------------------------------------------------- #
+# the "pending_never_ran" shape — hand-landed before any coder attempt ran,   #
+# live incident 855f1263: `nh approve --landed` refused PENDING outright,    #
+# then refused a second time on "no recorded base_branch".                   #
+# --------------------------------------------------------------------------- #
+
+async def _pending_task(db, *, repo_path):
+    async with Store(db) as store:
+        t = Task.new("hand-landed before any attempt ran", repo_path=repo_path)
+        t.context = {}
+        await store.create_task(t)
+        return t.id
+
+
+def test_approve_landed_completes_a_pending_task_that_never_ran(tmp_path):
+    db = tmp_path / "nh.db"
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "main")
+    tid = asyncio.run(_pending_task(db, repo_path=str(repo)))
+
+    landed_result = _invoke(
+        approve, db,
+        [tid, "--landed", sha,
+         "--because", "landed by the supervising session",
+         "--base", "main"])
+
+    assert landed_result.exit_code == 0, landed_result.output
+    assert "residue:" in landed_result.output
+
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.DONE
+    override_events = [e for e in events
+                       if e.get("kind") == "approved_landed_override"]
+    assert len(override_events) == 1, events
+    assert override_events[0]["shape"] == "pending_never_ran"
+    assert override_events[0]["base_source"] == "human_asserted"
+    assert (t.context or {}).get("base_branch") == "main"
+
+
+def test_approve_landed_pending_requires_because(tmp_path):
+    db = tmp_path / "nh.db"
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "main")
+    tid = asyncio.run(_pending_task(db, repo_path=str(repo)))
+
+    landed_result = _invoke(approve, db, [tid, "--landed", sha])
+
+    assert landed_result.exit_code == 1, landed_result.output
+
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.PENDING
+    assert not any(
+        e.get("kind") == "approved_landed_override" for e in events), events
+
+
+def test_approve_landed_pending_requires_explicit_base(tmp_path):
+    """F1: `--because` alone is not enough for a pending task that never
+    recorded a base_branch — `--base` is required too, and this tool never
+    guesses one (see blockers/landed_override.py's module docstring)."""
+    db = tmp_path / "nh.db"
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "main")
+    tid = asyncio.run(_pending_task(db, repo_path=str(repo)))
+
+    landed_result = _invoke(
+        approve, db,
+        [tid, "--landed", sha, "--because", "landed by the supervising session"])
+
+    assert landed_result.exit_code == 1, landed_result.output
+    assert "--base" in landed_result.output
+
+    t, events = _task_state(db, tid)
+    assert t.status is TaskStatus.PENDING
+    assert not any(
+        e.get("kind") == "approved_landed_override" for e in events), events
