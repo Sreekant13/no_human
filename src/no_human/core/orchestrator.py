@@ -103,6 +103,7 @@ from .prompt_blocks import (
 from ..project_config import apply_repo_config, load_repo_config
 from .report_quality import report_inadequacy
 from ..vcs import (
+    CommitResult,
     GitError,
     GitRepo,
     ProtectedBranch,
@@ -2416,8 +2417,8 @@ class Orchestrator:
         if repo is not None and attempt_id:
             try:
                 if repo.has_changes():
-                    commit = repo.commit_all(
-                        f"[WIP-PARTIAL] {self._commit_message(task)}")
+                    commit = self._checkpoint_commit(
+                        repo, f"[WIP-PARTIAL] {self._commit_message(task)}")
                     wip_sha = commit.sha
                     committed_now = True
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
@@ -4345,8 +4346,8 @@ class Orchestrator:
             wip_sha = ""
             if repo.has_changes():
                 try:
-                    wip_commit = repo.commit_all(
-                        f"[WIP-PARTIAL] {self._commit_message(task)}"
+                    wip_commit = self._checkpoint_commit(
+                        repo, f"[WIP-PARTIAL] {self._commit_message(task)}"
                     )
                     wip_sha = wip_commit.sha
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
@@ -4381,8 +4382,8 @@ class Orchestrator:
             wip_sha = ""
             if repo.has_changes():
                 try:
-                    wip_commit = repo.commit_all(
-                        f"[WIP-PARTIAL] {self._commit_message(task)}"
+                    wip_commit = self._checkpoint_commit(
+                        repo, f"[WIP-PARTIAL] {self._commit_message(task)}"
                     )
                     wip_sha = wip_commit.sha
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
@@ -4450,8 +4451,8 @@ class Orchestrator:
                 wip_sha = ""
                 if repo.has_changes():
                     try:
-                        wip_commit = repo.commit_all(
-                            f"[WIP-PARTIAL] {self._commit_message(task)}"
+                        wip_commit = self._checkpoint_commit(
+                            repo, f"[WIP-PARTIAL] {self._commit_message(task)}"
                         )
                         wip_sha = wip_commit.sha
                         self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
@@ -4576,8 +4577,8 @@ class Orchestrator:
             wip_sha = ""
             if repo.has_changes():
                 try:
-                    wip_commit = repo.commit_all(
-                        f"[WIP-PARTIAL] {self._commit_message(task)}"
+                    wip_commit = self._checkpoint_commit(
+                        repo, f"[WIP-PARTIAL] {self._commit_message(task)}"
                     )
                     wip_sha = wip_commit.sha
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
@@ -4650,8 +4651,8 @@ class Orchestrator:
                 _wip = ""
                 if repo.has_changes():
                     try:
-                        _c = repo.commit_all(
-                            f"[WIP-PARTIAL] {self._commit_message(task)}")
+                        _c = self._checkpoint_commit(
+                            repo, f"[WIP-PARTIAL] {self._commit_message(task)}")
                         _wip = _c.sha
                         self.emit("checkpoint", f"WIP-PARTIAL {_wip[:8]} "
                                   f"({_c.files_changed} files preserved)")
@@ -4979,7 +4980,7 @@ class Orchestrator:
         for lr_path, lr_repo, lr_base_branch in linked_repos_git:
             try:
                 if lr_repo.has_changes():
-                    lr_commit = lr_repo.commit_all(commit_msg)
+                    lr_commit = self._checkpoint_commit(lr_repo, commit_msg)
                     linked_commits.append((lr_path, lr_repo, lr_base_branch))
                     self.emit("commit",
                               f"[linked:{lr_path}] {lr_commit.sha[:8]} "
@@ -8229,14 +8230,20 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             log.warning("learning proposal failed: %s", exc)
 
-    def _checkpoint_wip(self, repo: GitRepo, task: Task) -> str:
-        """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha.
+    def _checkpoint_commit(
+        self, repo: GitRepo, message: str, *, paths: list[str] | None = None,
+    ) -> CommitResult:
+        """The ONE commit seam for every checkpoint ([WIP-PARTIAL],
+        [WIP-BLOCKED], and the linked-repo commit).
 
         Routes through the same manifest-repair seam as the normal commit
-        path (`commit_with_manifest_repair`, orchestrator.py:4698): a WIP
+        path (`commit_with_manifest_repair`, orchestrator.py:4698): a
         checkpoint that touches a pinned file must survive the gate's own
         refusal exactly like a real commit does, instead of being the one
-        path that bypasses the seam and silently loses the work.
+        path that bypasses the seam and silently loses the work. A ledger
+        mutation is NEVER absent from the record, even when the retry still
+        fails — the `finally` drain runs on every exit path, success or
+        failure (R2, 2026-08-12).
 
         POLICY (checkpoint-is-a-safety-net, not a publish gate): the
         pre-commit manifest/export gate protects what SHIPS. A `[WIP-*]`
@@ -8253,18 +8260,25 @@ class Orchestrator:
         """
         repaired: list[tuple[list[str], str]] = []
         try:
+            return commit_with_manifest_repair(
+                repo, list(paths) if paths else None, message,
+                on_repair=lambda p, note: repaired.append((p, note)),
+            )
+        finally:
+            self._emit_manifest_repairs(repaired)
+
+    def _checkpoint_wip(self, repo: GitRepo, task: Task) -> str:
+        """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha.
+
+        Routes through the single checkpoint seam (`_checkpoint_commit`): a
+        WIP checkpoint that touches a pinned file must survive the gate's own
+        refusal exactly like a real commit does, instead of being a path
+        that bypasses the seam and silently loses the work.
+        """
+        try:
             if repo.has_changes():
-                try:
-                    commit = commit_with_manifest_repair(
-                        repo, None,
-                        f"[WIP-BLOCKED] {self._commit_message(task)}",
-                        on_repair=lambda p, note: repaired.append((p, note)),
-                    )
-                finally:
-                    # A ledger mutation is NEVER absent from the record, even
-                    # when the retry below still fails — same
-                    # drain-on-every-exit-path rule as orchestrator.py:4728.
-                    self._emit_manifest_repairs(repaired)
+                commit = self._checkpoint_commit(
+                    repo, f"[WIP-BLOCKED] {self._commit_message(task)}")
                 self.emit("checkpoint", f"WIP-BLOCKED {commit.sha[:8]}")
                 self._last_checkpoint_error = ""
                 self._last_checkpoint_unverified = ""

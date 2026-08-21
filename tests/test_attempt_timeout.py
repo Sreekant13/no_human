@@ -15,7 +15,7 @@ from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 
 from .test_e2e_orchestrator import (  # noqa: F401
-    RESUMABLE, FakeBackend, _config, bare_repo, store,
+    RESUMABLE, FakeBackend, _SHA_RE, _config, bare_repo, store,
 )
 
 
@@ -334,3 +334,74 @@ async def test_reset_then_mixed_streak_still_escalates_as_mixed(
     blob = ((b.get("question") or "") + (b.get("root_cause_hypothesis") or "")
             + (b.get("evidence") or "")).lower()
     assert "mixed" in blob, b
+
+
+class _HangAfterEditBackend:
+    """A coder turn that edits the tree (so the checkpoint has something to
+    commit) and then hangs forever — the timeout fires with `repo.has_changes()`
+    True, exactly the branch that checkpoints `[WIP-PARTIAL]` at
+    orchestrator.py ~4209."""
+
+    async def run(self, *a, cwd=None, **k):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b  # wip edit\n")
+        await asyncio.sleep(30)
+
+
+async def test_the_timeout_checkpoint_survives_a_repairable_manifest_refusal(
+    bare_repo, tmp_path, store, monkeypatch  # noqa: F811
+):
+    """The attempt-timeout `[WIP-PARTIAL]` checkpoint (orchestrator.py ~4209)
+    must route through the same manifest-repair seam as every other
+    checkpoint (`_checkpoint_commit`): a stale pin at the moment a hung coder
+    turn is aborted must be repaired and committed, not silently lost because
+    this recovery path called `repo.commit_all` directly. Regression proof:
+    reverting the timeout site to a raw `repo.commit_all` call bypasses the
+    mocked seam below, `calls` stays empty, and the first assertion fails."""
+    from no_human.core import orchestrator as orch_mod
+
+    calls = []
+    approved_paths = ["src/pkg/mod.py"]
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        calls.append((edited, commit_msg))
+        if on_repair is not None:
+            on_repair(approved_paths, "1 stale pin(s)")
+        return repo_arg.commit_all(commit_msg)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 1
+    events: list = []
+    orch = Orchestrator(store, cfg.data, _HangAfterEditBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert calls, ("commit_with_manifest_repair was never called — the "
+                   "timeout checkpoint bypassed the repair seam")
+    # The terminal status past the single timed-out attempt (FAILED vs an
+    # escalation) is the bounded-loop's business, not this seam's — this test
+    # only cares that the checkpoint commit itself survived the repairable
+    # refusal, which the assertions below verify directly.
+    assert outcome.status in (
+        TaskStatus.FAILED, TaskStatus.ESCALATED, TaskStatus.BLOCKED), outcome
+
+    kinds = [e["kind"] for e in events]
+    assert "checkpoint" in kinds, kinds
+    assert kinds.count("manifest_repaired") == 1, kinds
+    repaired = [e for e in events if e["kind"] == "manifest_repaired"][0]
+    assert repaired["paths"] == approved_paths
+    assert "src/pkg/mod.py" in repaired["text"]
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt recorded"
+    last = attempts[-1]
+    assert last["status"] == "failed", last
+    assert last["commit_sha"], "the repaired WIP checkpoint sha must be recorded"
+    assert _SHA_RE.match(last["commit_sha"]), last["commit_sha"]

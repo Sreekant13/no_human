@@ -33,6 +33,7 @@ at.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from pathlib import Path
@@ -347,6 +348,7 @@ async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
     line names the real reason rather than a generic "error inspecting"."""
     from ..blockers import resume_provenance
     from ..vcs.git import ProtectedBranch
+    from ..vcs.manifest_repair import commit_with_manifest_repair
 
     repo = _open_worktree_repo(entry, config)
     if repo is None:
@@ -398,17 +400,41 @@ async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
                         "out %s: %s", entry, branch, exc)
             return False
 
+    # Routed through the same manifest-repair seam as every other checkpoint
+    # commit (`Orchestrator._checkpoint_commit`): the pre-commit manifest
+    # gate is live for this worktree too (`push_hook.py:72` mirrors it via
+    # the per-worktree `hooksPath`), so a stale pin at the moment of a hard
+    # kill must be repaired-and-retried here as well, not just on the
+    # graceful-stop and attempt-timeout paths.
+    repaired: list[tuple[list[str], str]] = []
     try:
-        commit = repo.commit_all(
-            f"[WIP-PARTIAL] salvaged from a killed run: {task.title}")
-    except ProtectedBranch as exc:
-        log.warning("worktree salvage: skipping %s — refusing to commit on "
-                    "protected branch %s: %s", entry, branch, exc)
-        return False
-    except Exception as exc:  # noqa: BLE001
-        log.warning("worktree salvage: skipping %s — commit failed: %s",
-                    entry, exc)
-        return False
+        try:
+            commit = await asyncio.to_thread(
+                commit_with_manifest_repair, repo, None,
+                f"[WIP-PARTIAL] salvaged from a killed run: {task.title}",
+                on_repair=lambda p, note: repaired.append((p, note)),
+            )
+        except ProtectedBranch as exc:
+            log.warning("worktree salvage: skipping %s — refusing to commit "
+                        "on protected branch %s: %s", entry, branch, exc)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("worktree salvage: skipping %s — commit failed: %s",
+                        entry, exc)
+            return False
+    finally:
+        # A ledger mutation is NEVER absent from the record, even when the
+        # retry commit itself still failed (`export_guard.py approve`
+        # rewrites RELEASE_MANIFEST.txt in the working tree BEFORE the
+        # retry) — same rule as `Orchestrator._emit_manifest_repaired`.
+        if repaired:
+            rep_paths, rep_note = repaired[0]
+            log.warning(
+                "worktree salvage: %s re-approved %d pinned file(s) to "
+                "salvage this worktree: %s — %s",
+                entry, len(rep_paths), ", ".join(rep_paths)[:300],
+                rep_note[:200],
+            )
 
     await store.merge_context(task.id, {
         "resume_from": resume_provenance(

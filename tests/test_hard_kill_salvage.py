@@ -190,6 +190,47 @@ async def test_a_dead_implementing_worktree_is_committed_and_stamped(
     assert att["infra_failure"] == 1
 
 
+async def test_the_salvage_checkpoint_survives_a_repairable_manifest_refusal(
+        tmp_path, store, cfg, monkeypatch):
+    """`_salvage_one` routes its `[WIP-PARTIAL]` commit through
+    `commit_with_manifest_repair` (mirroring the seam
+    `Orchestrator._checkpoint_commit` uses) rather than a raw
+    `repo.commit_all(...)` — the pre-commit manifest gate is live for this
+    worktree too (`push_hook.py:72` mirrors it via the per-worktree
+    `hooksPath`), so a stale pin at the moment of a hard kill must be
+    repaired-and-retried here exactly as on the graceful-stop and
+    attempt-timeout paths. Mutation proof: reverting the call site to a raw
+    `repo.commit_all(...)` leaves `calls` empty."""
+    from no_human.core.worktree import salvage_dead_worktrees
+    from no_human.vcs import manifest_repair as manifest_repair_mod
+
+    b = await _build(store, cfg, tmp_path, "repairable")
+
+    calls: list[tuple] = []
+
+    def fake(repo_arg, paths, message, on_repair=None):
+        calls.append((paths, message))
+        if on_repair:
+            on_repair(["RELEASE_MANIFEST.txt"], "1 stale pin(s)")
+        return repo_arg.commit_all(message)
+
+    monkeypatch.setattr(manifest_repair_mod, "commit_with_manifest_repair", fake)
+
+    result = await salvage_dead_worktrees(store, cfg.data, live=set())
+
+    assert result == (1, 0)
+    assert calls, "the seam was never invoked — reverting to a raw commit_all empties this"
+    assert calls[0][1].startswith("[WIP-PARTIAL]")
+
+    new_head = _head(b["wt"])
+    task = await store.get_task(b["task"].id)
+    assert task.context["resume_from"]["sha"] == new_head
+    assert task.context["resume_from"]["by"] == "hard_kill_salvage"
+
+    attempts = await store.list_attempts(b["task"].id)
+    assert attempts[0]["commit_sha"] == new_head
+
+
 async def test_a_live_owner_pid_is_never_salvaged(tmp_path, store, cfg):
     import os
 
