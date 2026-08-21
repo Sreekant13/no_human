@@ -317,6 +317,8 @@ def test_restore_approval_refuses_a_cancelled_task(tmp_path):
     assert status is TaskStatus.FAILED, "status must not move"
     assert "state_repaired" not in kinds, (
         "no repair event may exist for a refused repair")
+    assert "human_restore_approval" not in kinds, (
+        "no repair event may exist for a refused repair")
 
 
 # --- restore-approval must clear the blocker's wake condition (2026-08-11 --- #
@@ -375,7 +377,7 @@ def test_restore_approval_disarms_the_wake_condition(tmp_path):
     assert fresh.status is TaskStatus.AWAITING_APPROVAL
     assert fresh.blocker is None
     assert fresh.wake_check_at is None
-    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    repaired = [e for e in events if e.get("kind") == "human_restore_approval"]
     assert len(repaired) == 1
     assert "after:2h" in repaired[0]["text"]
     assert "2026-08-11T22:00:00+00:00" in repaired[0]["text"]

@@ -2807,6 +2807,151 @@ def test_every_human_verb_emits_its_shared_human_event(
         assert ev.get("prior_blocker") == blocker, f"{verb}: {ev}"
 
 
+# --------------------------------------------------------------------------- #
+# restore-approval: event write moved INTO set_status's one transaction       #
+# (b404b872, MEDIUM-2) — matching every other human verb above. Before this   #
+# fix, each repair branch wrote its `state_repaired` event via a SEPARATE     #
+# `store.save_events` call made AFTER `set_status`; a process death or a      #
+# concurrent write landing between the two calls left the status change on   #
+# record with no trace of who/why (the same lost-write class as a4a666b0).   #
+# --------------------------------------------------------------------------- #
+
+def _seed_restore_approval_escalated(
+        db_path: Path, *, pr_url="https://example.invalid/pr/42") -> str:
+    """ESCALATED with `pr_watch` context + a `pr_open` event — the exact
+    precondition the ESCALATED/FAILED tail branch of `restore-approval`
+    requires (`task_has_pr_evidence` + a `PR_EVENT_KINDS` event on record)."""
+    async def _go():
+        async with Store(db_path) as s:
+            t = Task.new("escalated with an open PR", repo_path="/tmp/repo")
+            t.context = {"pr_watch": pr_url}
+            await s.create_task(t)
+            await s.save_events(t.id, [{
+                "source": "watcher", "kind": "pr_open", "text": pr_url,
+                "ts": 0.0}])
+            await s.set_status(t, TaskStatus.ESCALATED, validate=False)
+            return t.id
+    return asyncio.run(_go())
+
+
+def _seed_restore_approval_false_done(
+        db_path: Path, *, pr_url="https://example.invalid/pr/43") -> str:
+    """DONE with a PR still open and no completion event on record — the
+    false-done repair shape (task 8c8b36b5's incident; see
+    `tests/test_false_done_completion.py::_seed_false_done_cli`), reaching
+    DONE the same way a pre-fix build did: a direct SQL write that bypasses
+    `set_status`'s `SilentCompletion` guard."""
+    async def _go():
+        async with Store(db_path) as s:
+            t = Task.new("false done with an open PR", repo_path="/tmp/repo")
+            t.context = {"pr_watch": pr_url}
+            await s.create_task(t)
+            await s.save_events(t.id, [{
+                "source": "watcher", "kind": "pr_open", "text": pr_url,
+                "ts": 0.0}])
+            await s.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+            await s.db.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (TaskStatus.DONE.value, t.id))
+            await s.db.commit()
+            return t.id
+    return asyncio.run(_go())
+
+
+def _seed_restore_approval_blocked(
+        db_path: Path, *, pr_url="https://example.invalid/pr/44",
+        blocker: dict | None = None) -> str:
+    """BLOCKED after a PASSING review with an open PR — the stranded-post-pass
+    incident shape (`tests/test_approve.py::_blocked_task_with`)."""
+    async def _go():
+        async with Store(db_path) as s:
+            t = Task.new("blocked post-pass", repo_path="/tmp/repo")
+            t.context = {"pr_watch": pr_url}
+            await s.create_task(t)
+            await s.save_events(t.id, [{
+                "source": "watcher", "kind": "pr_open", "text": pr_url,
+                "ts": 0.0}])
+            aid = await s.create_attempt(t.id, 1)
+            await s.update_attempt(aid, review_passed=1)
+            t.blocker = dict(blocker or _HUMAN_VERB_BLOCKER)
+            await s.update_task_columns(t)
+            await s.set_status(t, TaskStatus.BLOCKED, validate=False,
+                               human_override=True)
+            return t.id
+    return asyncio.run(_go())
+
+
+def _raising_save_events(*a, **kw):
+    raise AssertionError(
+        "save_events must not be called — the repair event belongs in "
+        "set_status's own transaction")
+
+
+@pytest.mark.parametrize("branch,seed_fn", [
+    ("done", _seed_restore_approval_false_done),
+    ("blocked", _seed_restore_approval_blocked),
+    ("escalated", _seed_restore_approval_escalated),
+])
+def test_restore_approval_records_its_event_when_save_events_is_dead(
+        branch, seed_fn, tmp_path, monkeypatch):
+    """RED on main: each repair branch recorded its event with a SEPARATE
+    `store.save_events` call made AFTER `set_status` — a lost write if the
+    process dies or a concurrent write lands between the two. The fix folds
+    the event into `set_status(event=...)`'s own transaction, matching every
+    other human verb (PR #567). With `Store.save_events` monkeypatched to
+    raise, main's leftover call blows up; the fixed code never calls
+    `save_events` for these branches at all, so the stub never fires and the
+    event still lands via `set_status`."""
+    db = tmp_path / f"restore-{branch}.db"
+    task_id = seed_fn(db)
+    monkeypatch.setattr(Store, "save_events", _raising_save_events)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(
+        cli, ["task", "restore-approval", task_id[:8], "--reason", "repair"])
+
+    assert result.exit_code == 0, f"{branch}: {result.output}"
+    t = _get_task(db, task_id)
+    assert t.status is TaskStatus.AWAITING_APPROVAL, f"{branch}: {t.status}"
+
+    events = _list_events(db, task_id)
+    human = [e for e in events if e.get("source") == "human"]
+    assert len(human) == 1, \
+        f"{branch}: expected exactly one human event, got: {events}"
+    assert human[0]["kind"] == "human_restore_approval", f"{branch}: {human[0]}"
+
+
+def test_restore_approval_event_carries_the_prior_state(tmp_path, monkeypatch):
+    """AC2: the repair event must carry `prior_status`/`prior_blocker` as
+    they stood BEFORE the repair — `human_event` requires the caller to read
+    them off the task before `set_status` mutates it, since an overwritten
+    value cannot be recovered afterward."""
+    db = tmp_path / "restore-prior-state.db"
+    blocker = {"category": "AMBIGUITY", "question": "which store?",
+              "wake_condition": "after:2h"}
+    task_id = _seed_restore_approval_blocked(db, blocker=blocker)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "task", "restore-approval", task_id[:8],
+        "--reason", "conflict round paused"])
+
+    assert result.exit_code == 0, result.output
+    events = _list_events(db, task_id)
+    human = [e for e in events if e.get("source") == "human"]
+    assert len(human) == 1, events
+    ev = human[0]
+    assert ev["kind"] == "human_restore_approval", ev
+    assert ev["prior_status"] == "blocked", ev
+    assert ev["prior_blocker"] == blocker, ev
+    assert ev["reason"] == "conflict round paused", ev
+    assert ev["actor"] == "cli", ev
+    text = ev["text"]
+    assert "https://example.invalid/pr/44" in text, text
+    assert "PASS" in text, text
+    assert "after:2h" in text, text
+
+
 def test_task_retry_clears_the_checkpoint_like_its_HTTP_twin(tmp_path, monkeypatch):
     """`nh task retry` is the CLI twin of `POST /api/tasks/{id}/retry`, down to
     the docstring. The endpoint was fixed to clear `resume_from`; this was not,

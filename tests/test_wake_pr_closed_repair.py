@@ -119,6 +119,44 @@ async def test_a_state_repaired_event_makes_the_pr_closed_rung_terminal(store):
         f"expected exactly the ORIGINAL escalation, got {len(closed_events)}"
 
 
+async def test_a_human_restore_approval_event_makes_the_pr_closed_rung_terminal(store):
+    """Same as the `state_repaired` event-log fallback above, but for the
+    kind `restore-approval` now actually writes (`human_event`'s shared
+    shape, in the same transaction as the status write). 5 ticks must all
+    hold at awaiting_approval with zero further `pr_closed` events — proves
+    `_PR_CLOSED_ANSWER_KINDS` was extended, not just renamed."""
+    t = await _escalatable_task(store)
+    w = _closed_watcher(store)
+    escalated = await _escalate_once(store, t, w)
+
+    moved = await store.set_status(
+        escalated, TaskStatus.AWAITING_APPROVAL, validate=False,
+        human_override=True)
+    assert moved is not None
+    await store.save_events(escalated.id, [{
+        "source": "human", "kind": "human_restore_approval",
+        "text": f"escalated → awaiting_approval: spurious escalation "
+                f"reversed; PR: {PR_URL}",
+        "prior_status": "escalated",
+        "ts": time.time(),
+    }])
+    repaired = await store.get_task(escalated.id)
+    assert repaired.status is TaskStatus.AWAITING_APPROVAL
+
+    for i in range(5):
+        out = await w._check_open_pr(repaired)
+        assert out == "pr_closed_repair_honored", f"tick {i}: {out!r}"
+        assert repaired.status is TaskStatus.AWAITING_APPROVAL, \
+            f"tick {i}: rung re-escalated the repaired task"
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    events = await store.list_events(t.id)
+    closed_events = [e for e in events if e.get("kind") == "pr_closed"]
+    assert len(closed_events) == 1, \
+        f"expected exactly the ORIGINAL escalation, got {len(closed_events)}"
+
+
 async def test_the_repair_hold_is_emitted_once_not_per_tick(store):
     """The CONTEXT-STAMP path (what `restore-approval` actually writes):
     over 5 ticks, exactly one `pr_closed_repair_honored` event — not one per
@@ -233,7 +271,8 @@ def test_restore_approval_stamps_the_repaired_url(tmp_path, monkeypatch):
     """The CLI path end to end: `nh task restore-approval` on a task
     escalated via the pr_closed rung must stamp
     `context['pr_closed_repaired_url']` with the PR URL — the fast path
-    `_pr_closed_answered` checks first — and still record `state_repaired`.
+    `_pr_closed_answered` checks first — and still record
+    `human_restore_approval`.
     """
     import asyncio
 
@@ -274,4 +313,4 @@ def test_restore_approval_stamps_the_repaired_url(tmp_path, monkeypatch):
     fresh, events = asyncio.run(_check())
     assert fresh.status is TaskStatus.AWAITING_APPROVAL
     assert fresh.context.get("pr_closed_repaired_url") == PR_URL
-    assert any(e.get("kind") == "state_repaired" for e in events)
+    assert any(e.get("kind") == "human_restore_approval" for e in events)

@@ -1635,7 +1635,8 @@ def task_restore_approval(task_id, reason):
     blocker that already opened a PR (pr_open event + pr_watch in context)
     qualifies — the shape of the 2026-07-10 incident where the product's own
     results comment resumed a merge-ready task into the budget gate. The repair
-    is recorded as a state_repaired event carrying the displaced blocker.
+    is recorded as a human_restore_approval event carrying the displaced
+    blocker, in the same transaction as the status change.
 
     Accepts FAILED as well as ESCALATED since 2026-08-09: with
     `budget.exhaustion_terminal` (default on) the budget gate ends the task in
@@ -1697,31 +1698,34 @@ def task_restore_approval(task_id, reason):
                     console.print("[yellow]no PR evidence for this task — "
                                   "nothing outstanding to restore[/]")
                     sys.exit(1)
+                from ..blockers import human_event
                 prior = t.status.value
+                prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
+                cleared = [k for k in ("approved_at", "already_satisfied_report")
+                           if k in (t.context or {})]
+                event_text = (
+                    f"{prior} → awaiting_approval: {reason}; "
+                    f"false-done repair (no completion event on "
+                    f"record); PR: {pr_url}; cleared context keys: "
+                    f"{cleared}")
                 moved = await store.set_status(
                     t, TaskStatus.AWAITING_APPROVAL, validate=False,
-                    human_override=True)
+                    human_override=True,
+                    event=human_event(
+                        "restore_approval", prior_status=prior,
+                        prior_blocker=prior_blocker, reason=reason,
+                        actor="cli", text=event_text))
                 if moved is None:
                     console.print("[red]the transition was refused by the "
                                   "store (concurrent change?) — nothing was "
                                   "recorded; re-run after checking "
                                   "`nh task show`[/]")
                     sys.exit(1)
-                cleared = [k for k in ("approved_at", "already_satisfied_report")
-                           if k in (t.context or {})]
                 t.context = await store.merge_context(
                     t.id, {"approved_at": None, "already_satisfied_report": None})
                 t.blocker = None
                 t.wake_check_at = None
                 await store.update_task(t)
-                await store.save_events(t.id, [{
-                    "source": "human", "kind": "state_repaired",
-                    "text": f"{prior} → awaiting_approval: {reason}; "
-                            f"false-done repair (no completion event on "
-                            f"record); PR: {pr_url}; cleared context keys: "
-                            f"{cleared}",
-                    "ts": time.time(),
-                }])
                 console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                               f"(false-done repair recorded)")
                 return
@@ -1790,38 +1794,44 @@ def task_restore_approval(task_id, reason):
                     except (GitError, OSError):
                         pass
                     evidence = f"{evidence}; {tip_note}"
-                # Transition FIRST, record after — same ordering the
-                # ESCALATED/FAILED repair below uses, for the same reason: a
-                # silently-refused CAS must never leave an event describing a
-                # state change that never happened.
+                # The event is now written by `set_status` itself, in the
+                # same transaction as the status write (see `human_event`),
+                # so every value it needs must be read off the task BEFORE
+                # that call — a silently-refused CAS must never leave an
+                # event describing a state change that never happened, and
+                # `set_status` already enforces that by only inserting on a
+                # transition that actually took.
+                from ..blockers import human_event
                 prior = t.status.value
+                prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
                 displaced = str(t.blocker)[:400]
+                disarmed_condition = (t.blocker or {}).get("wake_condition")
+                disarmed_wake_check_at = t.wake_check_at
+                event_text = (
+                    f"{prior} → awaiting_approval: {reason}; "
+                    f"evidence: {evidence}; PR: {pr_url}; "
+                    f"displaced blocker: {displaced}; "
+                    f"disarmed wake_condition={disarmed_condition!r} "
+                    f"wake_check_at={disarmed_wake_check_at!r}")
                 moved = await store.set_status(
                     t, TaskStatus.AWAITING_APPROVAL, validate=False,
-                    human_override=True)
+                    human_override=True,
+                    event=human_event(
+                        "restore_approval", prior_status=prior,
+                        prior_blocker=prior_blocker, reason=reason,
+                        actor="cli", text=event_text))
                 if moved is None:
                     console.print("[red]the transition was refused by the "
                                   "store (concurrent change?) — nothing was "
                                   "recorded; re-run after checking "
                                   "`nh task show`[/]")
                     sys.exit(1)
-                disarmed_condition = (t.blocker or {}).get("wake_condition")
-                disarmed_wake_check_at = t.wake_check_at
                 t.blocker = None
                 t.wake_check_at = None
                 await store.update_task(t)
                 if pr_url:
                     t.context = await store.merge_context(
                         t.id, {"pr_closed_repaired_url": pr_url})
-                await store.save_events(t.id, [{
-                    "source": "human", "kind": "state_repaired",
-                    "text": f"{prior} → awaiting_approval: {reason}; "
-                            f"evidence: {evidence}; PR: {pr_url}; "
-                            f"displaced blocker: {displaced}; "
-                            f"disarmed wake_condition={disarmed_condition!r} "
-                            f"wake_check_at={disarmed_wake_check_at!r}",
-                    "ts": time.time(),
-                }])
                 console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                               f"(repair recorded)")
                 return
@@ -1835,28 +1845,37 @@ def task_restore_approval(task_id, reason):
                 console.print("[yellow]no PR event on record "
                               f"({'/'.join(sorted(PR_EVENT_KINDS))}) — refusing[/]")
                 sys.exit(1)
-            # Transition FIRST, record after — review-proven: writing the
-            # repair event before the transition let a silently-refused CAS
-            # leave an event describing a state change that never happened.
+            # The event is written by `set_status` itself, in the same
+            # transaction as the status write (see `human_event`), so every
+            # value it needs — including what the wake watcher would
+            # otherwise still act on — must be read off the task BEFORE that
+            # call. Naming what was disarmed in the event, not just dumping
+            # the raw (truncated) blocker, is what makes the repair
+            # auditable; a silently-refused CAS never gets an event, because
+            # `set_status` only inserts on a transition that actually took.
+            from ..blockers import human_event
             prior = t.status.value
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             displaced = str(t.blocker)[:400]
+            disarmed_condition = (t.blocker or {}).get("wake_condition")
+            disarmed_wake_check_at = t.wake_check_at
+            event_text = (
+                f"{prior} → awaiting_approval: {reason}; "
+                f"displaced blocker: {displaced}; "
+                f"disarmed wake_condition={disarmed_condition!r} "
+                f"wake_check_at={disarmed_wake_check_at!r}")
             moved = await store.set_status(
                 t, TaskStatus.AWAITING_APPROVAL, validate=False,
-                human_override=True)
+                human_override=True,
+                event=human_event(
+                    "restore_approval", prior_status=prior,
+                    prior_blocker=prior_blocker, reason=reason,
+                    actor="cli", text=event_text))
             if moved is None:
                 console.print("[red]the transition was refused by the store "
                               "(concurrent change?) — nothing was recorded; "
                               "re-run after checking `nh task show`[/]")
                 sys.exit(1)
-            # Capture what the wake watcher would otherwise still act on
-            # BEFORE clearing it — an armed blocker + wake_check_at surviving
-            # this repair is the live 2026-08-11 incident (a stale escalation
-            # blocker resumed a just-landed task straight back into
-            # implementing). Naming what was disarmed in the event, not just
-            # dumping the raw (truncated) blocker, is what makes the repair
-            # auditable.
-            disarmed_condition = (t.blocker or {}).get("wake_condition")
-            disarmed_wake_check_at = t.wake_check_at
             t.blocker = None
             t.wake_check_at = None
             await store.update_task(t)
@@ -1870,15 +1889,6 @@ def task_restore_approval(task_id, reason):
             if pr_url:
                 t.context = await store.merge_context(
                     t.id, {"pr_closed_repaired_url": pr_url})
-            import time as _time
-            await store.save_events(t.id, [{
-                "source": "human", "kind": "state_repaired",
-                "text": f"{prior} → awaiting_approval: {reason}; "
-                        f"displaced blocker: {displaced}; "
-                        f"disarmed wake_condition={disarmed_condition!r} "
-                        f"wake_check_at={disarmed_wake_check_at!r}",
-                "ts": _time.time(),
-            }])
             console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                           f"(repair recorded)")
 

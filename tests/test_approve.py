@@ -161,7 +161,7 @@ def test_restore_approval_accepts_a_blocked_task_with_a_passing_review(tmp_path)
     assert t.status is TaskStatus.AWAITING_APPROVAL
     assert t.blocker is None
     assert t.wake_check_at is None
-    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    repaired = [e for e in events if e.get("kind") == "human_restore_approval"]
     assert len(repaired) == 1, events
     text = repaired[0]["text"]
     assert "https://example.invalid/pr/9" in text
@@ -185,7 +185,7 @@ def test_blocked_without_a_passing_review_is_refused(tmp_path):
 
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.BLOCKED
-    assert not any(e.get("kind") == "state_repaired" for e in events), events
+    assert not any(e.get("kind") == "human_restore_approval" for e in events), events
 
 
 def test_blocked_with_no_review_verdict_is_refused(tmp_path):
@@ -199,7 +199,7 @@ def test_blocked_with_no_review_verdict_is_refused(tmp_path):
 
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.BLOCKED
-    assert not any(e.get("kind") == "state_repaired" for e in events), events
+    assert not any(e.get("kind") == "human_restore_approval" for e in events), events
 
 
 def test_blocked_without_pr_evidence_is_refused(tmp_path):
@@ -213,7 +213,7 @@ def test_blocked_without_pr_evidence_is_refused(tmp_path):
 
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.BLOCKED
-    assert not any(e.get("kind") == "state_repaired" for e in events), events
+    assert not any(e.get("kind") == "human_restore_approval" for e in events), events
 
 
 # --------------------------------------------------------------------------- #
@@ -314,7 +314,7 @@ def test_escalated_task_with_a_pr_only_in_the_event_log_is_restored(tmp_path):
     assert result.exit_code == 0, result.output
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.AWAITING_APPROVAL
-    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    repaired = [e for e in events if e.get("kind") == "human_restore_approval"]
     assert len(repaired) == 1, events
     assert (t.context or {}).get("pr_closed_repaired_url") == \
         "https://example.invalid/pr/480"
@@ -341,7 +341,7 @@ def test_escalated_task_with_no_pr_anywhere_is_still_refused(tmp_path):
     assert "restore-approval only repairs parked-PR tasks" in normalized
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.ESCALATED
-    assert not any(e.get("kind") == "state_repaired" for e in events), events
+    assert not any(e.get("kind") == "human_restore_approval" for e in events), events
 
 
 def test_escalated_task_whose_only_pr_is_abandoned_is_refused(tmp_path):
@@ -370,7 +370,7 @@ def test_escalated_task_whose_only_pr_is_abandoned_is_refused(tmp_path):
     assert "has no open PR" in result.output
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.ESCALATED
-    assert not any(e.get("kind") == "state_repaired" for e in events), events
+    assert not any(e.get("kind") == "human_restore_approval" for e in events), events
 
 
 # --------------------------------------------------------------------------- #

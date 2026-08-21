@@ -1275,7 +1275,12 @@ class WakeWatcher:
     #: by hand. `merged`/`shipped*` are not included: those are the WATCHER's
     #: own completion writes, already handled by `_complete_if_content_landed`
     #: falling through with a `landed` action before this guard ever runs.
-    _PR_CLOSED_ANSWER_KINDS = frozenset({"state_repaired", "human_merged"})
+    #: `restore-approval`'s repair event moved to the shared `human_event`
+    #: shape (`kind="human_restore_approval"`) so its write lands in the same
+    #: transaction as the status change; `state_repaired` is retained because
+    #: rows already written to live DBs before that change still carry it.
+    _PR_CLOSED_ANSWER_KINDS = frozenset(
+        {"state_repaired", "human_restore_approval", "human_merged"})
 
     async def _pr_closed_answered(self, task: Task, url: str) -> str | None:
         """Whether a human has already answered the `pr_closed` rung's

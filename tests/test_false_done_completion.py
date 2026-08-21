@@ -395,7 +395,7 @@ def test_restore_approval_repairs_a_false_done(tmp_path, monkeypatch):
     assert t.status is TaskStatus.AWAITING_APPROVAL
     assert "approved_at" not in (t.context or {})
     assert "already_satisfied_report" not in (t.context or {})
-    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    repaired = [e for e in events if e.get("kind") == "human_restore_approval"]
     assert repaired, events
     assert "253" in repaired[-1]["text"]
 

@@ -489,7 +489,7 @@ def test_restore_approval_accepts_pr_draft_only_evidence(tmp_path):
     assert result.exit_code == 0, result.output
     t, events = _task_state(db, tid)
     assert t.status is TaskStatus.AWAITING_APPROVAL
-    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    repaired = [e for e in events if e.get("kind") == "human_restore_approval"]
     assert len(repaired) == 1, events
     assert (t.context or {}).get("pr_closed_repaired_url") == \
         "https://example.invalid/pr/9"
