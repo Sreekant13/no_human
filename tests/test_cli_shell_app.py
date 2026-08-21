@@ -21,6 +21,7 @@ import time
 
 import pytest
 from click.testing import CliRunner
+from rich.cells import cell_len
 from textual.widgets import Static, RichLog
 
 from no_human.cli import shell as shell_mod
@@ -312,6 +313,175 @@ async def test_a_terminal_resize_rewraps_titles_under_the_column_at_once():
     # the continuation rows are not pressed against the pane's right edge:
     # a row that ends in a non-space at the last content cell was cropped
     assert all(r.endswith(" ") for r in block), block
+
+
+async def test_no_lanes_row_overflows_the_pane_at_a_narrow_terminal():
+    """Residual 2, proven at the App level: below `_TITLE_COLUMN + 10` (23)
+    cells, the lanes pane used to hand Textual an unwrapped row, which Textual
+    then wrapped on its own and pressed back to column 0. Read over the pane's
+    OUTER `region` (see `_lanes_rows`'s docstring - `size` is the content box
+    and would crop the last cell of every full row), every row must still fill
+    the pane exactly and end in the 1-cell padding: nothing cropped, nothing
+    bled past the edge, regardless of how narrow the pane got."""
+    title = "one two three four five six seven eight nine ten eleven twelve"
+    app = make_app(FakeClient([_t(id="narrow00abcd", title=title, status="implementing")]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await pilot.resize_terminal(40, 30)
+        await pilot.pause()
+        lanes = app.query_one("#lanes", Static)
+        width = lanes.region.width
+        assert width < 23, (
+            f"precondition: this test only proves something below the 23-cell "
+            f"threshold; got a pane {width} cells wide"
+        )
+        rows = _lanes_rows(app)
+    assert rows, "no rows painted at all"
+    for row in rows:
+        assert cell_len(row) == width, (width, repr(row))
+        assert row.endswith(" "), f"row pressed against the pane's edge: {row!r}"
+    # the title is not just present cell-for-cell, it is still whole: nothing
+    # dropped by the narrow-mode wrap, just re-flowed onto more rows
+    assert title in reflowed(rows), reflowed(rows)
+
+
+async def test_a_zwj_family_emoji_title_is_not_split_mid_grapheme_at_a_narrow_terminal():
+    """Independent review of e6ccb0b11 found `_chop`'s old per-code-point
+    accumulator overcounted a ZWJ family emoji - four people joined by three
+    zero-width joiners is ONE 2-cell grapheme cluster, but summing `cell_len`
+    per code point charged each person as its own glyph - and hard-broke the
+    cluster mid-sequence. The test above uses only ASCII, so it can't tell
+    this fix from the bug it replaces: Textual's own line handling already
+    guarantees a lot regardless of what `_chop` hands it. It does NOT paper
+    over this one - confirmed by literally swapping in the pre-fix module and
+    running this exact test: on that code this title painted rows measuring
+    13 cells instead of 14 (`' \U0001f468‍\U0001f469‍\U0001f467‍\U0001f466\U0001f468‍\U0001f469‍         '`,
+    the family sliced apart right at a joiner) with the orphaned tail
+    (`\U0001f467‍\U0001f466...`) picked up dangling at the start of the next row - so the
+    same `cell_len(row) == width` assertion this file already uses IS the
+    discriminator here; the dangling-ZWJ check just names the failure mode."""
+    family = "\U0001f468‍\U0001f469‍\U0001f467‍\U0001f466"  # man-woman-girl-boy, ZWJ-joined
+    title = family * 12
+    app = make_app(FakeClient([_t(id="zwjrow00abcd", title=title, status="implementing")]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await pilot.resize_terminal(40, 30)
+        await pilot.pause()
+        lanes = app.query_one("#lanes", Static)
+        width = lanes.region.width
+        assert width < 23, (
+            f"precondition: this test only proves something below the 23-cell "
+            f"threshold; got a pane {width} cells wide"
+        )
+        rows = _lanes_rows(app)
+    assert rows, "no rows painted at all"
+    for row in rows:
+        assert cell_len(row) == width, (width, repr(row))
+        assert row.endswith(" "), f"row pressed against the pane's edge: {row!r}"
+        stripped = row.strip()
+        assert not stripped.startswith("‍") and not stripped.endswith("‍"), (
+            f"a ZWJ family emoji was split mid-grapheme across two rows: {row!r}"
+        )
+
+
+async def test_a_vs16_emoji_title_keeps_its_column_at_a_less_narrow_terminal():
+    """The other half of the same reviewer finding: a VS16 emoji (a base
+    character plus U+FE0F, the invisible selector that forces emoji
+    presentation) is ONE 2-cell grapheme, but the pre-fix `_chop` summed
+    `cell_len` per code point and undercounted it, packing roughly twice as
+    many hearts into a row as actually fit - reproducing the reviewer's own
+    repro (`render_lanes([{title: '❤️'*30}], width=40)` painted a 67-cell
+    row) confirms the miscount at the model level. At the App level, swapping
+    in the pre-fix module for this exact test shows a second symptom of the
+    same miscount: the wrapped continuation rows lose the title column
+    entirely and bleed back to column 0 - `test_a_long_title_wraps_under_its_
+    own_column_in_the_lanes_pane`'s literal regression, reintroduced by a
+    grapheme a plain per-code-point sum gets wrong. That's the discriminator
+    here (`cell_len(row) == width` alone stays true either way at this pane
+    width, since Textual still pads whatever it's given to the exact width)."""
+    heart = "❤️"  # heart + VS16: one 2-cell grapheme
+    title = heart * 30
+    app = make_app(FakeClient([_t(id="heartrow0abc", title=title, status="implementing")]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await pilot.resize_terminal(80, 30)
+        await pilot.pause()
+        lanes = app.query_one("#lanes", Static)
+        width = lanes.region.width
+        assert width >= 23, (
+            f"precondition: this test proves the WIDE-mode title column is "
+            f"kept; got a pane {width} cells wide (narrow mode)"
+        )
+        rows = _lanes_rows(app)
+    assert rows, "no rows painted at all"
+    for row in rows:
+        assert cell_len(row) == width, (width, repr(row))
+    title_row, block = _title_block(rows, "heartrow")
+    assert block, f"no indented continuation rows after the title row: {rows!r}"
+    assert "implementing" in block[-1], f"status row is not the last indented row: {block!r}"
+    # every row between the title row and the status row is a wrapped title
+    # continuation, and every one of them must still hang under the title
+    # column - not bleed back to the pane's left margin, which is exactly
+    # what the pre-fix miscount did to this title.
+    PANE_LEFT_PADDING = 1
+    title_column = PANE_LEFT_PADDING + 13
+    for row in block[:-1]:
+        assert row.startswith(" " * title_column), (
+            f"a wrapped continuation row lost the title column: {row!r}"
+        )
+    # hearts carry no whitespace of their own, so `reflowed`'s space-joining
+    # would insert a space at every wrap point and falsely "cut" the title
+    # (see the CJK test below); reconstruct it the same way that test does -
+    # strip the title column off each title row and concatenate with nothing
+    # in between.
+    title_rows = [title_row] + block[:-1]
+    reconstructed_title = "".join(r[title_column:].rstrip() for r in title_rows)
+    assert reconstructed_title == title, (
+        f"the VS16 title was cut or mis-wrapped: {reconstructed_title!r}"
+    )
+
+
+async def test_a_double_width_title_still_renders_correctly_at_the_app_level():
+    """Content-parity check for AC 4: a CJK title, painted for real through the
+    Textual pipeline (not just `render_lanes` in isolation), still reaches the
+    screen whole, and every other field on the row - the same set
+    `test_every_field_visible_today_is_still_visible` pins at the model level -
+    survives alongside it."""
+    title = "回归测试" * 8  # 32 code points, 64 terminal cells
+    app = make_app(FakeClient([_t(
+        id="cjkrow00abcd", title=title, status="paused_quota",
+        live_status="waits quota", claimed=True,
+        approved_at="2026-08-20T10:00:00Z", blocker_human_stopped=True,
+        subtask_progress="2/5 subtasks", total_tokens=1_234,
+        total_cache_read=4_000_000,
+    )]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        rows = _lanes_rows(app)
+    title_row, block = _title_block(rows, "cjkrow00")
+    assert block, f"no indented continuation rows after the title row: {rows!r}"
+    # CJK text carries no whitespace of its own, so `reflowed`'s space-joining
+    # would insert a space at every wrap point and falsely "cut" the title;
+    # reconstruct it the same way the model-level test does instead - strip the
+    # title column off each title row and concatenate with nothing in between.
+    # `_TITLE_COLUMN` (13) is relative to the pane's content box (`size`), but
+    # these rows were read over the OUTER `region`, which adds `#lanes`'s own
+    # `padding: 0 1` - one more cell on the left - so the column starts at 14
+    # here, not 13. The tag rows (after the title) are plain ASCII with real
+    # spaces, so `reflowed` is exactly right for those.
+    PANE_LEFT_PADDING = 1
+    title_column = PANE_LEFT_PADDING + 13
+    tag_start = next(i for i, r in enumerate(block) if "waits quota" in r)
+    title_rows = [title_row] + block[:tag_start]
+    reconstructed_title = "".join(r[title_column:].rstrip() for r in title_rows)
+    assert reconstructed_title == title, (
+        f"the CJK title was cut or mis-wrapped: {reconstructed_title!r}"
+    )
+    tag_text = reflowed(block[tag_start:])
+    for needle in ("waits quota", "running", "waits for its own signal",
+                   "approved - merge pending", "you stopped it",
+                   "2/5 subtasks", "4,001,234 tok"):
+        assert needle in tag_text, needle
 
 
 async def test_the_lanes_pane_draws_the_board_columns_in_board_order():

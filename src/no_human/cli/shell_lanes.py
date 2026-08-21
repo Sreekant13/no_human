@@ -12,10 +12,11 @@ and the counts are not — they mirror the JS line for line.
 
 from __future__ import annotations
 
-import textwrap
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from rich.cells import cell_len, chop_cells
 
 Task = Mapping[str, Any]
 
@@ -213,6 +214,73 @@ def render_header(tasks: Iterable[Task]) -> str:
 _TITLE_COLUMN = 13
 
 
+def _chop(text: str, width: int) -> list[str]:
+    """Hard-break a single over-long word into pieces of at most `width`
+    cells. Delegates to `rich.cells.chop_cells`, which splits on grapheme
+    clusters rather than code points: a VS16 emoji (base + U+FE0F) or a ZWJ
+    family is one 2-cell grapheme and must never be split mid-sequence, which
+    a per-code-point accumulator gets wrong (it undercounts the invisible
+    joiner/selector as its own cell and can slice a family in half). A lone
+    grapheme wider than `width` (a 2-cell character in a 1-cell pane) cannot
+    be split further and is emitted alone — the one permitted overflow.
+    (`chop_cells` can hand back a leading empty string when the very first
+    grapheme alone already exceeds `width`; drop it, it paints nothing.)"""
+    pieces = [p for p in chop_cells(text, max(width, 1)) if p]
+    return pieces or [""]
+
+
+def _cell_wrap(text: str, width: int) -> list[str]:
+    """Greedy word wrap measured in cells. A word wider than `width` is
+    hard-broken via `_chop` rather than left to overflow the pane."""
+    if width <= 0:
+        return [text]
+    rows: list[str] = []
+    current: list[str] = []
+    used = 0
+    for word in text.split():
+        wlen = cell_len(word)
+        if wlen > width:
+            if current:
+                rows.append(" ".join(current))
+                current, used = [], 0
+            rows.extend(_chop(word, width))
+            continue
+        cost = wlen + (1 if current else 0)
+        if current and used + cost > width:
+            rows.append(" ".join(current))
+            current, used = [word], wlen
+        else:
+            current.append(word)
+            used += cost
+    if current:
+        rows.append(" ".join(current))
+    return rows or [text]
+
+
+def _layout(width: int | None) -> tuple[int, str] | None:
+    """(wrap width in cells, continuation indent) for the pane, or None to
+    leave wrapping to Textual (no width known, or a pane too narrow to
+    measure sensibly).
+
+    * `width` unknown -> None: unchanged, no wrapping, Textual wraps as
+      before.
+    * `width - _TITLE_COLUMN >= 10` -> the existing wide path: rows wrap to
+      the title column and continuations hang under it.
+    * `2 <= width < _TITLE_COLUMN + 10` -> narrow path: the pane is too
+      narrow for the title column itself, so rows wrap to the bare pane
+      width with no indent.
+    * `width < 2` -> None: nothing sensible to wrap to.
+    """
+    if width is None:
+        return None
+    avail = width - _TITLE_COLUMN
+    if avail >= 10:
+        return (avail, " " * _TITLE_COLUMN)
+    if width >= 2:
+        return (width, "")
+    return None
+
+
 def _status_style(task: Task) -> str:
     """The board's state vocabulary, in the terminal's four colours: green
     while an agent holds it, yellow while it waits on its own signal, red
@@ -227,16 +295,15 @@ def _status_style(task: Task) -> str:
 
 
 def _wrap_title(title: str, width: int | None) -> list[str]:
-    """Split the RAW title into chunks that fit the title column. Escaping
-    happens per chunk afterwards, so a literal "[" costs one cell in the
-    arithmetic here and one cell on screen."""
-    if width is None:
+    """Split the RAW title into chunks that fit the title column, measured in
+    terminal cells so a CJK or emoji title wraps at the same place it paints.
+    Escaping happens per chunk afterwards, so a literal "[" costs one cell in
+    the arithmetic here and one cell on screen."""
+    layout = _layout(width)
+    if layout is None:
         return [title]
-    avail = width - _TITLE_COLUMN
-    if avail < 10:  # a pane too narrow to wrap sensibly: let Textual wrap
-        return [title]
-    return textwrap.wrap(title, width=avail, break_long_words=True,
-                         break_on_hyphens=False) or [title]
+    avail, _indent = layout
+    return _cell_wrap(title, avail)
 
 
 #: A meta tag is carried as (style, plain text) until it is packed into rows,
@@ -251,32 +318,33 @@ def _markup(tag: Tag) -> str:
 
 
 def _pack_tags(tags: list[Tag], width: int | None) -> list[str]:
-    """The meta line, wrapped tag by tag so no tag is split across rows and
-    every overflow row keeps the title column's indent. A single tag wider
-    than the column (a long server-supplied `subtask_progress`) is the one
-    case that must break mid-tag: it is hard-wrapped into pieces that fit,
-    because a row wider than the pane comes back from Textual at column 0 —
-    the defect this whole block exists to remove. Without a width it is the
-    single line it always was."""
+    """The meta line, wrapped tag by tag (measured in terminal cells) so no
+    tag is split across rows and every overflow row keeps the title column's
+    indent. A single tag wider than the column (a long server-supplied
+    `subtask_progress`, possibly CJK/emoji) is the one case that must break
+    mid-tag: it is hard-wrapped into pieces that fit, because a row wider
+    than the pane comes back from Textual at column 0 — the defect this
+    whole block exists to remove. Without a width it is the single line it
+    always was."""
     sep = " [dim]·[/] "
-    if width is None or width - _TITLE_COLUMN < 10:
+    layout = _layout(width)
+    if layout is None:
         return [sep.join(_markup(t) for t in tags)]
-    avail = width - _TITLE_COLUMN
+    avail, _indent = layout
     fitted: list[Tag] = []
     for style, text in tags:
-        if len(text) <= avail:
+        if cell_len(text) <= avail:
             fitted.append((style, text))
         else:
-            fitted.extend((style, piece) for piece in textwrap.wrap(
-                text, width=avail, break_long_words=True, break_on_hyphens=False))
+            fitted.extend((style, piece) for piece in _cell_wrap(text, avail))
     rows: list[str] = []
     current: list[Tag] = []
     used = 0
     for tag in fitted:
-        cost = len(tag[1]) + (3 if current else 0)  # " · " between tags
+        cost = cell_len(tag[1]) + (3 if current else 0)  # " · " between tags
         if current and used + cost > avail:
             rows.append(sep.join(_markup(t) for t in current))
-            current, used = [tag], len(tag[1])
+            current, used = [tag], cell_len(tag[1])
         else:
             current.append(tag)
             used += cost
@@ -314,11 +382,44 @@ def _task_lines(task: Task, *, selected: bool, width: int | None = None) -> list
     chunks = [_escape(c) for c in _wrap_title(raw_title, width)]
     if selected:
         chunks = [f"[reverse]{c}[/reverse]" for c in chunks]
+
+    layout = _layout(width)
+    if layout is not None and not layout[1]:
+        # Narrow mode: the usual 13-cell header prefix (" {marker} {id:<8}  ")
+        # would itself overflow the pane, so the id gets its own wrapped,
+        # un-indented row instead of anchoring the title's column. Nothing is
+        # dropped — the id and the marker are still on screen, just above the
+        # title instead of beside it.
+        avail = layout[0]
+        header_plain = f"{'>' if selected else ' '} {_short(task)}"
+        header_rows = _cell_wrap(header_plain, avail)
+        style = "reverse" if selected else "dim"
+        lines = [f"[{style}]{row}[/{style}]" for row in header_rows]
+        lines.extend(chunks)
+        lines.extend(_pack_tags(tags, width))
+        return lines
+
     indent = " " * _TITLE_COLUMN
     lines = [f" {marker} [dim]{_short(task):<8}[/]  {chunks[0]}"]
     lines.extend(indent + c for c in chunks[1:])
     lines.extend(indent + row for row in _pack_tags(tags, width))
     return lines
+
+
+def _empty_hint_lines(hint: str, width: int | None) -> list[str]:
+    """The lane's empty-state hint, wrapped the same way a title would be so
+    a long hint (e.g. "All caught up - nothing needs your input", 43 cells)
+    cannot overflow a narrow pane. Wide mode keeps the current 3-cell prefix;
+    narrow mode drops it, matching `_layout`'s indent policy."""
+    layout = _layout(width)
+    if layout is None:
+        return [f"   [dim]{_escape(hint)}[/]"]
+    avail, indent = layout
+    if indent:  # wide mode: same 3-cell prefix as today
+        rows = _cell_wrap(hint, width - 3)
+        return [f"   [dim]{_escape(r)}[/]" for r in rows]
+    rows = _cell_wrap(hint, avail)  # narrow mode: no prefix
+    return [f"[dim]{_escape(r)}[/]" for r in rows]
 
 
 def render_lanes(tasks: Iterable[Task], selected_id: str | None = None,
@@ -351,9 +452,19 @@ def render_lanes(tasks: Iterable[Task], selected_id: str | None = None,
             count = (sum(1 for t in rows if is_real_failure(t))
                       if lane.key == "failed" else len(rows))
             head = f"[bold {lane.colour}]{lane.label}[/] [dim]{count}[/]"
+        # NOTE (narrow-mode header fallback, pinned by
+        # test_a_lane_header_is_left_unwrapped_in_narrow_mode): unlike titles,
+        # tags and empty hints, lane headers are NOT run through `_cell_wrap`
+        # here even below the 23-cell threshold. The gate bar mixes a solid
+        # background fill with inline markup and the plain header mixes two
+        # independently-styled runs (`[bold ...]label[/] [dim]count[/]`);
+        # neither can be split into `_cell_wrap` rows without restyling each
+        # fragment, which is out of scope for this fix. Textual still wraps
+        # an over-width header itself — it just may pick an uglier break
+        # point than the rest of this module's own wrapping does.
         lines.append(head)
         if not rows:
-            lines.append(f"   [dim]{lane.empty_hint}[/]")
+            lines.extend(_empty_hint_lines(lane.empty_hint, width))
         for task in rows:
             lines.extend(_task_lines(task, selected=str(task.get("id")) == selected_id,
                                      width=width))

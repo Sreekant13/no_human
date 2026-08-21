@@ -7,9 +7,11 @@ real app with Pilot.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 
 from no_human.cli.shell_input import (
     SLASH_COMMANDS,
@@ -392,6 +394,172 @@ def test_without_a_width_the_title_is_never_wrapped():
 def test_empty_loud_lane_says_so_instead_of_going_blank():
     out = render_lanes([])
     assert "All caught up" in out
+
+
+def _plain(line: str) -> str:
+    """Strip Rich markup, protecting an escaped bracket first (as Rich does),
+    so this measures the same string `_cells`'s arithmetic measures — the
+    two-step approach `test_cell_counting_treats_an_escaped_bracket_as_one_cell`
+    already pins."""
+    return re.sub(r"\[/?[^\]]*\]", "", line.replace("\\[", "\x00")).replace("\x00", "[")
+
+
+def test_a_double_width_title_is_measured_in_cells_not_code_points():
+    """CJK text: every character is two cells. Measuring with `len()` (code
+    points) would let a title that is actually 64 cells wide pass a 40-cell
+    budget unwrapped, and Textual would then wrap it back to column 0."""
+    title = "回归测试" * 8  # 32 code points, 64 terminal cells
+    out = render_lanes([_t(id="cjk00000", title=title)], width=40)
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "cjk00000" in ln)
+    meta = next(n for n in range(first + 1, first + 10) if "pending" in lines[n])
+    block = lines[first:meta]
+    for ln in block:
+        assert cell_len(_plain(ln)) <= 40, repr(ln)
+    assert len(block) > 1, block  # proves it actually wrapped
+    # reflow: strip the fixed 13-cell header prefix from the first row, then
+    # the indent from every continuation, and confirm the title survives
+    # whole — nothing dropped, nothing reordered, nothing recoded
+    header, *rest = block
+    reflowed = _plain(header)[13:] + "".join(_plain(ln).strip() for ln in rest)
+    assert reflowed == title
+
+
+def test_a_double_width_tag_is_measured_in_cells():
+    """A long CJK `subtask_progress` tag is measured in cells: measuring with
+    `len()` would under-count its width and let it overflow the pane instead
+    of hard-wrapping, the way test_a_single_tag_wider_than_the_pane_... above
+    already pins for ASCII."""
+    tag = "阶段三共五阶段等待评审完成第二遍检查工作进度报告清单确认无误提交合并"
+    out = render_lanes([_t(id="wide0000", title="T", subtask_progress=tag)], width=40)
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "wide0000" in ln)
+    block = [ln for ln in lines[first + 1:first + 12] if ln.startswith(" " * 13)]
+    plain = [_plain(ln) for ln in block]
+    assert all(cell_len(ln) <= 40 for ln in plain), plain
+    assert tag in "".join(ln.strip() for ln in plain)
+
+
+def test_a_zwj_family_emoji_title_is_not_split_mid_grapheme():
+    """Independent review of e6ccb0b11/fa1d32f6c: the old per-code-point
+    `_chop` (and, before it, `textwrap.wrap`) measured a ZWJ-joined family
+    emoji one code point at a time, so a title too long to fit its wrap
+    width got hard-broken INSIDE the four-person cluster - a lone joiner
+    left dangling at the end of one row with its partner stranded at the
+    start of the next. `rich.cells.chop_cells` (grapheme-aware) does not do
+    this. Going through the full Textual app hides the bug (Static's own
+    Rich-based renderer re-flows and happens to heal it), so this is
+    checked at the `render_lanes` level, before Textual ever sees the text -
+    confirmed by running this exact assertion against fa1d32f6c's `_chop`,
+    which produces a row ending in a bare trailing ZWJ (and the next row
+    starting with the stranded partner)."""
+    family = "\U0001f468‍\U0001f469‍\U0001f467‍\U0001f466"  # man-woman-girl-boy
+    title = family * 12
+    out = render_lanes([_t(id="zwjrow00", title=title, status="implementing")], width=18)
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "zwjrow00" in ln)
+    end = next(n for n in range(first, len(lines)) if lines[n] == "")
+    block = [_plain(ln) for ln in lines[first:end]]
+    for ln in block:
+        assert cell_len(ln) <= 18, (18, repr(ln))
+        stripped = ln.strip()
+        assert not stripped.startswith("‍") and not stripped.endswith("‍"), (
+            f"a ZWJ family emoji was split mid-grapheme across rows: {ln!r}"
+        )
+
+
+def test_a_vs16_emoji_title_is_not_split_mid_grapheme():
+    """The VS16 half of the same finding: a base character plus U+FE0F (the
+    'render as emoji' selector) is one 2-cell grapheme. The old code-point
+    accumulator could hard-break between the base and its selector,
+    stranding a bare heart on one row and a lone selector at the start of
+    the next - both malformed on a real terminal. Checked before Textual,
+    same reasoning as the ZWJ test above: at width=40 fa1d32f6c's `_chop`
+    never even fires (the whole title, measured whole, "fits" in one
+    67-cell row per the reviewer's own probe) - it is the per-word length
+    check upstream of `_chop` that undercounts by using code points, so this
+    also pins AC1's "none exceeds 40 cells"."""
+    title = "❤️" * 30  # heart + VS16, thirty times
+    out = render_lanes([_t(id="vs16row0", title=title, status="implementing")], width=40)
+    lines = out.splitlines()
+    first = next(n for n, ln in enumerate(lines) if "vs16row0" in ln)
+    end = next(n for n in range(first, len(lines)) if lines[n] == "")
+    block = [_plain(ln) for ln in lines[first:end]]
+    for ln in block:
+        assert cell_len(ln) <= 40, (40, repr(ln))
+        cleaned = ln.replace("❤️", "")
+        assert "❤" not in cleaned and "️" not in cleaned, (
+            f"a VS16 emoji was split mid-grapheme across rows: {ln!r}"
+        )
+
+
+def test_a_pane_narrower_than_the_title_column_still_wraps():
+    """Below a 23-cell pane, `_TITLE_COLUMN` (13) leaves under 10 cells for
+    the title — too narrow to wrap sensibly with a hanging indent, so
+    residual 2 used to bail out entirely and hand Textual an unwrapped row,
+    which wraps it back to column 0. Below the threshold, wrap on the bare
+    pane width instead, with no indent."""
+    title = "one two three four five six seven eight nine ten eleven twelve"
+    for width in (10, 15, 20):
+        out = render_lanes([_full_task(id="narrow01", title=title)], width=width)
+        lines = out.splitlines()
+        first = next(n for n, ln in enumerate(lines) if "narrow0" in ln)
+        end = next(n for n in range(first, len(lines)) if lines[n] == "")
+        block = lines[first:end]
+        for ln in block:
+            assert cell_len(_plain(ln)) <= width, (width, repr(ln))
+        # proves it no longer bails out to Textual: there IS a wrapped
+        # continuation, and it carries NO indent at these widths
+        assert len(block) > 3, (width, block)
+        assert not any(ln.startswith(" " * 13) for ln in block), (width, block)
+        assert "twelve" in "".join(block)
+
+
+def test_below_two_cells_wrapping_is_left_to_textual():
+    """`_layout` returns None below 2 cells — nothing sensible to wrap to —
+    so the title is emitted unwrapped, same as the `width is None` path."""
+    title = "a long title that would otherwise wrap into many short rows"
+    out = render_lanes([_t(id="tiny0001", title=title)], width=1)
+    title_line, _ = _row_lines(out, "tiny0001")
+    assert title in title_line
+
+
+def test_an_empty_lane_hint_is_wrapped_to_the_pane():
+    """Residual 3: 'All caught up - nothing needs your input' is 43 cells —
+    wider than many real terminal panes — and used to be emitted as one
+    unwrapped row that Textual then wrapped back to column 0."""
+    hint = "All caught up - nothing needs your input"
+
+    for width in (36, 20):  # 36: wide-mode branch; 20: narrow-mode branch
+        out = render_lanes([], width=width)
+        lines = out.splitlines()
+        for ln in lines:
+            assert cell_len(_plain(ln)) <= width, (width, repr(ln))
+        # nothing reworded or truncated: the full hint reassembles
+        reflowed = " ".join(
+            " ".join(_plain(ln).strip() for ln in lines if _plain(ln).strip()).split())
+        assert hint in reflowed, (width, reflowed)
+
+
+def test_without_a_width_the_empty_hint_is_the_single_line_it_always_was():
+    out = render_lanes([])
+    hint_lines = [ln for ln in out.splitlines() if "All caught up" in ln]
+    assert len(hint_lines) == 1
+    assert "All caught up - nothing needs your input" in hint_lines[0]
+
+
+def test_a_lane_header_is_left_unwrapped_in_narrow_mode():
+    """Narrow-mode fallback pinned per the plan's Section E: unlike titles,
+    tags and empty hints, a lane header mixes independently-styled spans
+    (the gate bar's background fill, or `[bold ...]label[/] [dim]count[/]`)
+    that `_cell_wrap` cannot split without restyling each fragment, so it is
+    left unwrapped even below the 23-cell threshold — see the NOTE next to
+    `lines.append(head)` in `render_lanes`. Textual still wraps an
+    over-width header itself; this only pins that `render_lanes` does not."""
+    out = render_lanes([_t(id="deadbeef", status="awaiting_input")], width=10)
+    lines = out.splitlines()
+    header = next(ln for ln in lines if "Needs Answer" in ln)
+    assert cell_len(_plain(header)) > 10, repr(header)
 
 
 # --------------------------------------------------------------------------- #
