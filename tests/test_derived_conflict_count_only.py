@@ -198,9 +198,18 @@ async def test_a_git_failure_resolving_the_base_is_not_count_only(tmp_path):
 # only because main had also gained two unrelated rule lines).                #
 # --------------------------------------------------------------------------- #
 
+# Synthetic rule lines, deliberately NOT real paths from this repo's
+# EXPORT_CLASSIFICATION.txt. One of these used to name a document the export
+# actually drops, and naming such a document from a SHIPPED test file is
+# exactly what test_no_exported_source_file_names_a_manifest_dropped_document
+# exists to catch — it turned main red on 2026-08-22. (Do not name the file
+# here either, even to explain the fix: the guard counts mentions, and a
+# comment is a mention. That is how the first attempt at this fix stayed red.)
+# The test only needs two rule lines main gained after the fork; what they name
+# is irrelevant to it.
 MAIN_GAINED_LINES = (
-    "ship   1  plugins/marketplace.json\n"
-    "drop   1  PRODUCT.md\n"
+    "ship   1  plugins/example-catalog.json\n"
+    "drop   1  docs/EXAMPLE_NOTES.md\n"
 )
 
 
