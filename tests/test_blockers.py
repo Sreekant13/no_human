@@ -1518,6 +1518,59 @@ async def test_third_dead_machine_resume_parks_with_an_honest_blocker(store):
 
 
 @pytest.mark.asyncio
+async def test_an_attributed_wall_death_is_not_a_dead_resume(store):
+    """f8efad06 (2026-08-21): four tasks were escalated "after 3 consecutive
+    dead machine resumes" whose ONLY dead row since the last wake-resume was
+    the quota wall the loop itself classified (`infra_failure = 1`,
+    failure_reason `quota: ...`). An attributed death has a known cause and
+    a wake; it is not the death-blind pattern this breaker exists for. The
+    watcher must resume, not back off. RED on main: wake_backoff."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(store, t, at=anchor)
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    assert refreshed.context["wake_dead_resumes"]["streak"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_dead_row_beside_a_wall_row_still_backs_off(store):
+    """Negative control for the exclusion: the wall row is ignored, but a
+    genuinely death-blind row (no infra attribution, no work) since the same
+    resume still trips the breaker exactly as before."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(store, t, at=anchor)
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0, infra_failure=1,
+        failure_reason="quota: wall")
+    dead_id = await _dead_attempt(store, t, 2, turns=0, tokens=0)
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "wake_backoff") in actions, actions
+    refreshed = await store.get_task(t.id)
+    state = refreshed.context["wake_dead_resumes"]
+    assert state["streak"] == 1
+    assert state["attempt_ids"] == [dead_id]          # the wall row is not named
+
+
+@pytest.mark.asyncio
 async def test_human_resume_proceeds_and_resets_the_streak(store):
     """A stale dead-resume streak left over from BEFORE a human acted must
     never gate a later machine resume — `resume_from.by == "human"` since

@@ -848,10 +848,19 @@ class WakeWatcher:
                 if (started := _parse_iso(row.get("started_at"))) is not None
                 and started >= last_resume_at
             ]
+            # An attempt the loop already ATTRIBUTED — a quota wall, a dead
+            # SDK session, any `infra_failure = 1` row — is not death-blind
+            # evidence: its cause is known, its park carries a wake, and the
+            # resume that follows is the loop working. INCIDENT (2026-08-21,
+            # task f8efad06): 2c8f23ff, 0986460c, f8de9cdf and e037008e each
+            # had exactly ONE such row (the weekly/session wall) and were
+            # escalated "after 3 consecutive dead machine resumes" anyway.
+            relevant = [row for row in relevant if not row.get("infra_failure")]
             if not relevant:
                 # A healthy dispatch creates its attempt row moments after
                 # `_resume` flips the task to IMPLEMENTING; absence here is
-                # not evidence of death, just of a row not written yet.
+                # not evidence of death, just of a row not written yet — or
+                # every row since the resume was an attributed wall park.
                 return "proceed", 0, []
             usage_cols = self.store._usage_columns()
 
