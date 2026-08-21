@@ -1,0 +1,773 @@
+"""Tests for no_human.review.verifiers — loader/selector/diff-filter/judge/runner.
+
+Pure unit tests: tmp_path only, no model call, no network, no subprocess, no
+`time.sleep`. Async tests need no marker (pyproject.toml: asyncio_mode = "auto").
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import inspect
+import json
+from pathlib import Path
+
+from no_human.review.verifiers import (
+    LoadReport,
+    Verifier,
+    VerifierResult,
+    build_prompt,
+    filter_diff,
+    load_verifiers,
+    parse_result,
+    run_verifiers,
+    select,
+    summary_line,
+    to_checklist_item,
+)
+
+# --------------------------------------------------------------------------
+# Fixtures / helpers
+# --------------------------------------------------------------------------
+
+DIFF = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/src/a.py\n"
+    "+++ b/src/a.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " def f():\n"
+    "-    return 1\n"
+    "+    return 2\n"
+    "+    # extra\n"
+    "diff --git a/docs/guide.md b/docs/guide.md\n"
+    "new file mode 100644\n"
+    "index 0000000..3333333\n"
+    "--- /dev/null\n"
+    "+++ b/docs/guide.md\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+# Guide\n"
+    "+content\n"
+    "diff --git a/web/src/old.ts b/web/src/old.ts\n"
+    "deleted file mode 100644\n"
+    "index 4444444..0000000 100644\n"
+    "--- a/web/src/old.ts\n"
+    "+++ /dev/null\n"
+    "@@ -1,2 +0,0 @@\n"
+    "-export const x = 1;\n"
+    "-export const y = 2;\n"
+)
+
+
+def _write(tmp_path: Path, text: str) -> Path:
+    d = tmp_path / ".no_human"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "verifiers.yaml"
+    p.write_text(text)
+    return p
+
+
+def _ok_json(verifier_id: str, *, passed: bool, file: str = "", line: int = 0) -> str:
+    return (
+        "VERIFIER_JSON_START\n"
+        f'{{"verifier_id": "{verifier_id}", "passed": {"true" if passed else "false"}, '
+        f'"evidence": "e", "file": {json.dumps(file)}, "line": {line}, "comment": "c"}}\n'
+        "VERIFIER_JSON_END"
+    )
+
+
+# --------------------------------------------------------------------------
+# 1. Public surface
+# --------------------------------------------------------------------------
+
+
+def test_public_surface_is_exactly_the_documented_names():
+    import no_human.review.verifiers as mod
+
+    names = {
+        "Verifier",
+        "LoadReport",
+        "VerifierResult",
+        "load_verifiers",
+        "select",
+        "filter_diff",
+        "build_prompt",
+        "parse_result",
+        "to_checklist_item",
+        "run_verifiers",
+        "summary_line",
+    }
+    for name in names:
+        assert hasattr(mod, name), name
+
+    assert dataclasses.is_dataclass(mod.Verifier)
+    assert mod.Verifier.__dataclass_params__.frozen is True
+    assert dataclasses.is_dataclass(mod.LoadReport)
+    assert dataclasses.is_dataclass(mod.VerifierResult)
+
+    sig = inspect.signature(mod.load_verifiers)
+    assert list(sig.parameters) == ["repo_path", "home"]
+    assert sig.parameters["home"].default is None
+
+    sig = inspect.signature(mod.select)
+    assert list(sig.parameters) == ["verifiers", "changed_paths"]
+
+    sig = inspect.signature(mod.filter_diff)
+    assert list(sig.parameters) == ["diff_text", "paths"]
+
+    sig = inspect.signature(mod.build_prompt)
+    assert list(sig.parameters) == ["verifier", "diff_hunks", "file_texts"]
+
+    sig = inspect.signature(mod.parse_result)
+    assert list(sig.parameters) == ["raw_output", "verifier", "files_checked"]
+
+    sig = inspect.signature(mod.to_checklist_item)
+    assert list(sig.parameters) == ["result"]
+
+    sig = inspect.signature(mod.run_verifiers)
+    params = sig.parameters
+    assert list(params) == ["judge", "verifiers", "diff_text", "read_file", "changed_paths"]
+    assert params["judge"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    for kw in ("verifiers", "diff_text", "read_file", "changed_paths"):
+        assert params[kw].kind == inspect.Parameter.KEYWORD_ONLY
+
+    sig = inspect.signature(mod.summary_line)
+    assert list(sig.parameters) == ["results"]
+
+
+# --------------------------------------------------------------------------
+# 2-17. load_verifiers / _load_file
+# --------------------------------------------------------------------------
+
+
+def test_load_valid_repo_file(tmp_path):
+    _write(
+        tmp_path,
+        """
+verifiers:
+  - id: rule-one
+    statement: First rule statement.
+    paths: src/**/*.py
+  - id: rule-two
+    statement: Second rule statement.
+    paths:
+      - docs/*
+      - "*.md"
+    severity: critical
+""",
+    )
+    report = load_verifiers(tmp_path)
+    assert isinstance(report, LoadReport)
+    assert report.problems == []
+    assert [v.id for v in report.verifiers] == ["rule-one", "rule-two"]
+    v1, v2 = report.verifiers
+    assert v1.paths == ("src/**/*.py",)
+    assert v1.severity == "high"
+    assert v1.source == "repo"
+    assert v2.paths == ("docs/*", "*.md")
+    assert v2.severity == "critical"
+
+
+def test_load_string_paths_becomes_one_tuple(tmp_path):
+    _write(tmp_path, "verifiers:\n  - id: r1\n    statement: s\n    paths: src/a.py\n")
+    report = load_verifiers(tmp_path)
+    assert report.verifiers[0].paths == ("src/a.py",)
+
+
+def test_load_missing_file_is_not_a_problem(tmp_path):
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert report.problems == []
+
+
+def test_load_malformed_yaml_reports_and_does_not_raise(tmp_path):
+    _write(tmp_path, "verifiers:\n\t- id: r1\n\t  statement: s\n\t  paths: a.py\n")
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 1
+
+
+def test_load_top_level_not_a_mapping_reported(tmp_path):
+    _write(tmp_path, "- 1\n- 2\n")
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 1
+    assert "mapping" in report.problems[0]
+
+
+def test_load_verifiers_key_not_a_list_reported(tmp_path):
+    _write(tmp_path, "verifiers: not-a-list\n")
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 1
+    assert "list" in report.problems[0]
+
+
+def test_load_unknown_key_skips_entry_with_problem(tmp_path):
+    _write(
+        tmp_path,
+        "verifiers:\n  - id: r1\n    statement: s\n    paths: a.py\n    extra: nope\n",
+    )
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 1
+    assert "extra" in report.problems[0]
+
+
+def test_load_bad_id_rejected(tmp_path):
+    entries = ["Upper", "a", '"-leading"']
+    yaml_text = "verifiers:\n"
+    for bad_id in entries:
+        yaml_text += f"  - id: {bad_id}\n    statement: s\n    paths: a.py\n"
+    _write(tmp_path, yaml_text)
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 3
+
+
+def test_load_empty_and_over_600_char_statement_rejected(tmp_path):
+    long_statement = "x" * 601
+    yaml_text = (
+        "verifiers:\n"
+        '  - id: r1\n    statement: ""\n    paths: a.py\n'
+        f'  - id: r2\n    statement: "{long_statement}"\n    paths: a.py\n'
+    )
+    _write(tmp_path, yaml_text)
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 2
+
+
+def test_load_missing_or_empty_paths_rejected(tmp_path):
+    yaml_text = (
+        "verifiers:\n"
+        "  - id: r1\n    statement: s\n"
+        "  - id: r2\n    statement: s\n    paths: []\n"
+    )
+    _write(tmp_path, yaml_text)
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 2
+
+
+def test_load_bad_severity_rejected(tmp_path):
+    _write(
+        tmp_path,
+        "verifiers:\n  - id: r1\n    statement: s\n    paths: a.py\n    severity: urgent\n",
+    )
+    report = load_verifiers(tmp_path)
+    assert report.verifiers == []
+    assert len(report.problems) == 1
+
+
+def test_load_global_appends_after_repo_with_source_global(tmp_path):
+    _write(tmp_path, "verifiers:\n  - id: r1\n    statement: s\n    paths: a.py\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "verifiers.yaml").write_text(
+        "verifiers:\n  - id: r2\n    statement: s\n    paths: b.py\n"
+    )
+    report = load_verifiers(tmp_path, home=home)
+    assert [v.id for v in report.verifiers] == ["r1", "r2"]
+    assert report.verifiers[0].source == "repo"
+    assert report.verifiers[1].source == "global"
+    assert report.problems == []
+
+
+def test_load_duplicate_id_repo_wins_and_global_is_a_problem(tmp_path):
+    _write(
+        tmp_path,
+        "verifiers:\n  - id: r1\n    statement: repo version\n    paths: a.py\n",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "verifiers.yaml").write_text(
+        "verifiers:\n  - id: r1\n    statement: global version\n    paths: b.py\n"
+    )
+    report = load_verifiers(tmp_path, home=home)
+    assert len(report.verifiers) == 1
+    assert report.verifiers[0].statement == "repo version"
+    assert report.verifiers[0].source == "repo"
+    assert len(report.problems) == 1
+    assert "r1" in report.problems[0]
+
+
+def test_load_one_bad_entry_does_not_drop_the_good_ones(tmp_path):
+    _write(
+        tmp_path,
+        "verifiers:\n"
+        "  - id: r1\n    statement: s\n    paths: a.py\n"
+        "  - id: BAD\n    statement: s\n    paths: a.py\n"
+        "  - id: r2\n    statement: s\n    paths: a.py\n",
+    )
+    report = load_verifiers(tmp_path)
+    assert [v.id for v in report.verifiers] == ["r1", "r2"]
+    assert len(report.problems) == 1
+
+
+def test_load_never_raises_on_any_garbage(tmp_path):
+    # binary bytes in place of text
+    repo1 = tmp_path / "repo1"
+    (repo1 / ".no_human").mkdir(parents=True)
+    (repo1 / ".no_human" / "verifiers.yaml").write_bytes(bytes(range(256)))
+    report1 = load_verifiers(repo1)
+    assert report1.verifiers == []
+    assert report1.problems
+
+    # a directory sitting where the file should be
+    repo2 = tmp_path / "repo2"
+    (repo2 / ".no_human" / "verifiers.yaml").mkdir(parents=True)
+    report2 = load_verifiers(repo2)
+    assert report2.verifiers == []
+    assert report2.problems
+
+    # top-level YAML list, not a mapping
+    repo3 = tmp_path / "repo3"
+    _write(repo3, "- 1\n- 2\n")
+    report3 = load_verifiers(repo3)
+    assert report3.verifiers == []
+    assert report3.problems
+
+
+def test_load_problems_are_single_sentences_naming_the_file(tmp_path):
+    path = _write(tmp_path, "verifiers: not-a-list\n")
+    report = load_verifiers(tmp_path)
+    assert len(report.problems) == 1
+    sentence = report.problems[0]
+    assert "\n" not in sentence
+    assert str(path) in sentence
+
+
+# --------------------------------------------------------------------------
+# 18-23. select
+# --------------------------------------------------------------------------
+
+
+def test_select_src_double_star_py():
+    v = Verifier(id="v1", statement="s", paths=("src/**/*.py",))
+    assert select([v], ["src/a.py"]) == [v]
+    assert select([v], ["src/a/b/c.py"]) == [v]
+    assert select([v], ["src/a.txt"]) == []
+
+
+def test_select_star_md_is_root_only():
+    v = Verifier(id="v1", statement="s", paths=("*.md",))
+    assert select([v], ["README.md"]) == [v]
+    assert select([v], ["docs/x.md"]) == []
+
+
+def test_select_web_src_double_star_suffix():
+    v = Verifier(id="v1", statement="s", paths=("web/src/**",))
+    assert select([v], ["web/src/x.ts"]) == [v]
+    assert select([v], ["web/src/a/b.ts"]) == [v]
+    assert select([v], ["web/other.ts"]) == []
+
+
+def test_select_docs_star_does_not_match_nested():
+    v = Verifier(id="v1", statement="s", paths=("docs/*",))
+    assert select([v], ["docs/a.md"]) == [v]
+    assert select([v], ["docs/a/b.md"]) == []
+
+
+def test_select_preserves_order_and_dedupes():
+    v1 = Verifier(id="a", statement="s", paths=("src/**",))
+    v2 = Verifier(id="b", statement="s", paths=("docs/*",))
+    result = select([v2, v1, v1], ["src/x.py", "docs/y.md"])
+    assert [v.id for v in result] == ["b", "a"]
+    assert select([v1], []) == []
+
+
+def test_select_normalises_leading_dot_slash_and_backslashes():
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    assert select([v], ["./src/a.py"]) == [v]
+    assert select([v], ["src\\a.py"]) == [v]
+
+
+# --------------------------------------------------------------------------
+# 24-28. filter_diff
+# --------------------------------------------------------------------------
+
+
+def test_filter_diff_keeps_only_matching_blocks():
+    kept, matched = filter_diff(DIFF, ["src/**/*.py"])
+    assert "src/a.py" in kept
+    assert "docs/guide.md" not in kept
+    assert "old.ts" not in kept
+    assert matched == ["src/a.py"]
+
+
+def test_filter_diff_deletion_uses_the_a_path():
+    kept, matched = filter_diff(DIFF, ["web/src/**"])
+    assert "old.ts" in kept
+    assert matched == ["web/src/old.ts"]
+
+
+def test_filter_diff_empty_and_no_match_return_empty():
+    assert filter_diff("", ["src/**"]) == ("", [])
+    assert filter_diff("   ", ["src/**"]) == ("", [])
+    kept, matched = filter_diff(DIFF, ["nomatch/**"])
+    assert kept == ""
+    assert matched == []
+
+
+def test_filter_diff_drops_preamble_before_first_block():
+    preamble = "commit abc123\nAuthor: x\n\n" + DIFF
+    kept, matched = filter_diff(preamble, ["src/**/*.py"])
+    assert "commit abc123" not in kept
+    assert matched == ["src/a.py"]
+
+
+def test_filter_diff_handles_quoted_and_spaced_paths():
+    quoted = (
+        'diff --git "a/weird name.py" "b/weird name.py"\n'
+        "index 1111111..2222222 100644\n"
+        '--- "a/weird name.py"\n'
+        '+++ "b/weird name.py"\n'
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    kept, matched = filter_diff(quoted, ["*.py"])
+    assert matched == ["weird name.py"]
+    assert "weird name.py" in kept
+
+
+def test_filter_diff_drops_an_unresolvable_block_without_crashing():
+    weird = "diff --git onlyonepath\nsome content\n"
+    kept, matched = filter_diff(weird, ["*"])
+    assert kept == ""
+    assert matched == []
+
+
+# --------------------------------------------------------------------------
+# 29-31. build_prompt
+# --------------------------------------------------------------------------
+
+
+def test_build_prompt_contains_statement_untrusted_clause_and_markers():
+    v = Verifier(id="rule1", statement="Every public function has a docstring.", paths=("src/**",))
+    prompt = build_prompt(
+        v,
+        "diff --git a/src/a.py b/src/a.py\n...",
+        {"src/a.py": "def f():\n    pass\n"},
+    )
+    assert "Every public function has a docstring." in prompt
+    assert "DATA" in prompt
+    assert "VERIFIER_JSON_START" in prompt
+    assert "VERIFIER_JSON_END" in prompt
+    assert "MUST cite" in prompt
+    assert "### src/a.py" in prompt
+    assert "rule1" in prompt
+
+
+def test_build_prompt_caps_each_file_at_20k_with_truncated_marker():
+    v = Verifier(id="rule1", statement="s", paths=("src/**",))
+    big = "x" * 25_000
+    prompt = build_prompt(v, "hunks", {"src/a.py": big})
+    assert "[truncated]" in prompt
+    section = prompt.split("### src/a.py", 1)[1].split("\n\n", 1)[0]
+    assert section.count("x") <= 20_000
+
+
+def test_build_prompt_caps_total_payload_at_120k_hunks_first():
+    v = Verifier(id="rule1", statement="s", paths=("src/**",))
+    hunks = "H" * 1000
+    # each file is under the per-file cap on its own, but nine of them
+    # together (135k) exceed the remaining total-payload budget (~119k)
+    files = {f"src/f{i}.py": "y" * 15_000 for i in range(9)}
+    prompt = build_prompt(v, hunks, files)
+    assert "H" * 1000 in prompt
+    assert prompt.count("y") < 9 * 15_000
+    assert "omitted" in prompt
+    assert "src/f0.py" in prompt
+
+
+# --------------------------------------------------------------------------
+# 32-40. parse_result
+# --------------------------------------------------------------------------
+
+
+def test_parse_result_pass():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = _ok_json("r1", passed=True)
+    result = parse_result(raw, v, ["src/a.py"])
+    assert isinstance(result, VerifierResult)
+    assert result.passed is True
+    assert result.no_verdict is False
+    assert result.evidence == "e"
+
+
+def test_parse_result_fail_with_citation():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = _ok_json("r1", passed=False, file="src/a.py", line=12)
+    result = parse_result(raw, v, ["src/a.py"])
+    assert result.passed is False
+    assert result.no_verdict is False
+    assert result.file == "src/a.py"
+    assert result.line == 12
+
+
+def test_parse_result_no_block_is_no_verdict():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    result = parse_result("nothing here", v, [])
+    assert result.passed is False
+    assert result.no_verdict is True
+    assert "no verdict" in result.evidence
+
+
+def test_parse_result_invalid_json_is_no_verdict():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = "VERIFIER_JSON_START\n{not json}\nVERIFIER_JSON_END"
+    result = parse_result(raw, v, [])
+    assert result.no_verdict is True
+
+
+def test_parse_result_non_dict_json_is_no_verdict():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = "VERIFIER_JSON_START\n[1, 2, 3]\nVERIFIER_JSON_END"
+    result = parse_result(raw, v, [])
+    assert result.no_verdict is True
+
+
+def test_parse_result_non_bool_passed_is_no_verdict():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    for passed_literal in ('"true"', "1"):
+        raw = (
+            "VERIFIER_JSON_START\n"
+            '{"verifier_id": "r1", "passed": ' + passed_literal + ", "
+            '"evidence": "e", "file": "", "line": 0, "comment": "c"}\n'
+            "VERIFIER_JSON_END"
+        )
+        result = parse_result(raw, v, [])
+        assert result.no_verdict is True, passed_literal
+
+
+def test_parse_result_wrong_verifier_id_is_no_verdict():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = _ok_json("other", passed=True)
+    result = parse_result(raw, v, [])
+    assert result.no_verdict is True
+
+
+def test_parse_result_tolerates_prose_and_json_fence():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = (
+        "Here is my analysis...\n"
+        "VERIFIER_JSON_START\n"
+        "```json\n"
+        '{"verifier_id": "r1", "passed": true, "evidence": "e", '
+        '"file": "", "line": 0, "comment": "c"}\n'
+        "```\n"
+        "VERIFIER_JSON_END\n"
+        "Thanks!"
+    )
+    result = parse_result(raw, v, [])
+    assert result.no_verdict is False
+    assert result.passed is True
+
+
+def test_parse_result_out_of_scope_file_gets_suffix():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+    raw = _ok_json("r1", passed=False, file="other/file.py", line=1)
+    result = parse_result(raw, v, ["src/a.py"])
+    assert result.file == "other/file.py"
+    assert "[cites a file outside the verifier scope]" in result.evidence
+
+
+def test_parse_result_coerces_line_and_normalises_file():
+    v = Verifier(id="r1", statement="s", paths=("src/**",))
+
+    def make(line_val, file_val):
+        raw = (
+            "VERIFIER_JSON_START\n"
+            '{"verifier_id": "r1", "passed": true, "evidence": "e", '
+            f'"file": {json.dumps(file_val)}, "line": {json.dumps(line_val)}, "comment": "c"}}\n'
+            "VERIFIER_JSON_END"
+        )
+        return parse_result(raw, v, ["src/a.py"])
+
+    assert make("12", "./src/a.py").line == 12
+    assert make("12", "./src/a.py").file == "src/a.py"
+    assert make(-3, "src/a.py").line == 0
+    assert make("abc", "src/a.py").line == 0
+
+
+# --------------------------------------------------------------------------
+# 41-46. run_verifiers
+# --------------------------------------------------------------------------
+
+
+async def test_run_verifiers_happy_path_records_prompts_and_propagates_tokens():
+    v1 = Verifier(id="r1", statement="py rule statement", paths=("src/**/*.py",))
+    v2 = Verifier(id="r2", statement="docs rule statement", paths=("docs/*",))
+    calls = []
+
+    async def judge(prompt):
+        calls.append(prompt)
+        vid = "r1" if "py rule statement" in prompt else "r2"
+        return _ok_json(vid, passed=True), 42
+
+    def read_file(path):
+        return "content of " + path
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v1, v2],
+        diff_text=DIFF,
+        read_file=read_file,
+        changed_paths=["src/a.py", "docs/guide.md"],
+    )
+    assert len(results) == 2
+    assert len(calls) == 2
+    assert "src/a.py" in calls[0]
+    assert "docs/guide.md" not in calls[0]
+    assert "docs/guide.md" in calls[1]
+    assert "src/a.py" not in calls[1]
+    assert all(r.tokens_used == 42 for r in results)
+    assert all(r.passed for r in results)
+
+
+async def test_run_verifiers_one_judge_raises_others_unaffected():
+    va = Verifier(id="a", statement="python rule statement", paths=("src/**/*.py",))
+    vb = Verifier(id="b", statement="docs rule statement", paths=("docs/*",))
+    vc = Verifier(id="c", statement="web rule statement", paths=("web/src/**",))
+
+    async def judge(prompt):
+        if "docs rule statement" in prompt:
+            raise RuntimeError("boom")
+        vid = "a" if "python rule statement" in prompt else "c"
+        return _ok_json(vid, passed=True), 5
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[va, vb, vc],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py", "docs/guide.md", "web/src/old.ts"],
+    )
+    by_id = {r.verifier_id: r for r in results}
+    assert len(results) == 3
+    assert by_id["a"].passed is True and by_id["a"].no_verdict is False
+    assert by_id["c"].passed is True and by_id["c"].no_verdict is False
+    assert by_id["b"].no_verdict is True
+    assert "RuntimeError" in by_id["b"].evidence
+
+
+async def test_run_verifiers_skips_unreadable_files_and_read_file_exceptions():
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    calls = []
+
+    async def judge(prompt):
+        calls.append(prompt)
+        return _ok_json("a", passed=True), 0
+
+    def read_file(path):
+        raise OSError("cannot read")
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=read_file,
+        changed_paths=["src/a.py"],
+    )
+    assert len(results) == 1
+    assert results[0].no_verdict is False
+    assert len(calls) == 1
+    assert "### src/a.py" not in calls[0]
+
+
+async def test_run_verifiers_no_matching_hunks_yields_no_verdict_without_calling_judge():
+    v = Verifier(id="a", statement="s", paths=("nomatch/**",))
+    called = False
+
+    async def judge(prompt):
+        nonlocal called
+        called = True
+        return "x", 0
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["nomatch/foo.py"],
+    )
+    assert len(results) == 1
+    assert results[0].no_verdict is True
+    assert called is False
+
+
+async def test_run_verifiers_only_runs_selected_verifiers():
+    va = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    vb = Verifier(id="b", statement="s", paths=("nomatch/**",))
+    calls = []
+
+    async def judge(prompt):
+        calls.append(prompt)
+        return _ok_json("a", passed=True), 0
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[va, vb],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert len(results) == 1
+    assert results[0].verifier_id == "a"
+    assert len(calls) == 1
+
+
+async def test_run_verifiers_tolerates_a_malformed_judge_return():
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+
+    async def judge(prompt):
+        return "not a tuple"
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert len(results) == 1
+    assert results[0].tokens_used == 0
+    assert results[0].no_verdict is True
+
+
+# --------------------------------------------------------------------------
+# 47-49. summary_line / to_checklist_item
+# --------------------------------------------------------------------------
+
+
+def test_summary_line_empty_all_pass_and_failures_sorted():
+    assert summary_line([]) == ""
+    passing = [
+        VerifierResult("a", True, "", "", 0, "", "high", [], 0, "", False),
+        VerifierResult("b", True, "", "", 0, "", "high", [], 0, "", False),
+    ]
+    assert summary_line(passing) == "2 of 2 satisfied"
+    mixed = [
+        VerifierResult("z", False, "", "", 0, "", "high", [], 0, "", False),
+        VerifierResult("a", True, "", "", 0, "", "high", [], 0, "", False),
+        VerifierResult("m", False, "", "", 0, "", "high", [], 0, "", False),
+    ]
+    assert summary_line(mixed) == "2 of 3 failed — m, z"
+
+
+def test_to_checklist_item_label_and_fields():
+    result = VerifierResult("rule-x", False, "ev", "f.py", 3, "cm", "critical", ["f.py"], 0, "", False)
+    item = to_checklist_item(result)
+    assert item.label == "rule:rule-x"
+    assert item.passed is False
+    assert item.severity == "critical"
+    assert item.file == "f.py"
+    assert item.line == 3
+    assert item.comment == "cm"
+
+
+def test_to_checklist_item_no_verdict_forces_high_severity():
+    result = VerifierResult("rule-x", False, "no verdict: x", "", 0, "", "low", [], 0, "", True)
+    item = to_checklist_item(result)
+    assert item.severity == "high"
