@@ -999,6 +999,13 @@ async def _classification_decisions(repo_path: str, ref: str) -> list[str] | Non
     absent on this side (deleted, or predates the ledger), or a `git show`
     that failed outright. The caller treats ``None`` as unsettled, never as
     "no rules to compare".
+
+    Also reused, as the public alias ``classification_decisions`` below, by
+    ``vcs.derived_conflict.classification_count_only`` to decide whether a
+    conflicted classification file differs ONLY by rule win-counts — that
+    caller depends on this exact contract (count elided, everything else
+    verbatim, order preserved), so a change here changes what that module
+    considers mechanically resolvable.
     """
     rc, text = await _git_rc(repo_path, "show", f"{ref}:{_CLASSIFICATION_LEDGER}")
     if rc != 0 or not text:
@@ -1011,6 +1018,12 @@ async def _classification_decisions(repo_path: str, ref: str) -> list[str] | Non
         else:
             decisions.append(line.strip())
     return decisions
+
+
+#: Public alias for cross-module reuse (``vcs.derived_conflict``) — same
+#: function, no behaviour change. Kept private-named above because every
+#: existing in-module caller predates this alias.
+classification_decisions = _classification_decisions
 
 
 async def _classification_settled(repo_path: str, commit: str, branch: str) -> bool:

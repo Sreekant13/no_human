@@ -2,12 +2,20 @@
 bugfix: `WakeWatcher._check_pr_conflict` must enumerate conflicting paths,
 name them in the `pr_conflict` event, and resolve mechanically (no coder
 round) when every conflicting path is a derived artefact. Only
-`RELEASE_MANIFEST.txt` qualifies (`dc.DERIVED_ARTEFACTS`) -- it is fully
-rebuilt from the tree by `export_guard.py approve`. `EXPORT_CLASSIFICATION.txt`
-sits right next to it in the export gate but is deliberately NOT derived:
-its per-rule win-COUNTS are hand-maintained and no command re-tallies them,
-so a conflict touching it -- alone, or mixed with the manifest -- must still
-open a coder round.
+`RELEASE_MANIFEST.txt` unconditionally qualifies (`dc.DERIVED_ARTEFACTS`) --
+it is fully rebuilt from the tree by `export_guard.py approve`.
+`EXPORT_CLASSIFICATION.txt` sits right next to it in the export gate and is
+NOT derived in general: its per-rule win-COUNTS are hand-maintained and no
+command re-tallies them, so a conflict touching it -- alone, or mixed with
+the manifest -- must still open a coder round BY DEFAULT. The one narrow
+exception (`dc.classification_count_only`, exercised end to end below and in
+`test_derived_conflict_count_only.py`): when every conflicting hunk in it
+differs from the other side ONLY in the numeric count digits -- same verb,
+same pattern, same everything else -- the conflict is arithmetic, not a hand
+decision, and is repaired with the EXISTING
+`approve_merge.reconcile_merge_count_drift` (never a second implementation).
+Any edit to a pattern, verb, comment, or an added/removed/reordered rule
+line still falls through to a coder round exactly as before.
 
 The scratch repo built by `_repo()` below is a real, from-scratch git
 repository with its own bare `origin`, self-contained STUB
@@ -497,9 +505,11 @@ async def test_a_manifest_only_conflict_is_resolved_without_a_coder_session(stor
     t = await _approval_task(store, str(work))
     resolver_calls = []
 
-    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin"):
+    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin",
+                         eligible=dc.DERIVED_ARTEFACTS):
         resolver_calls.append((repo_path, branch, base_tip_sha))
-        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha, remote=remote)
+        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha,
+                                            remote=remote, eligible=eligible)
 
     w = _watcher(store, events=events, derived_resolver=spying_resolver)
     result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
@@ -576,9 +586,11 @@ async def test_a_raising_enumeration_recovers_after_a_ref_fetch_and_resolves_mec
     t = await _approval_task(store, str(work))
     resolver_calls = []
 
-    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin"):
+    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin",
+                         eligible=dc.DERIVED_ARTEFACTS):
         resolver_calls.append((repo_path, branch, base_tip_sha))
-        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha, remote=remote)
+        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha,
+                                            remote=remote, eligible=eligible)
 
     w = _watcher(store, events=events, derived_resolver=spying_resolver)
     result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="feature")
@@ -780,6 +792,63 @@ async def test_a_source_conflict_still_opens_a_coder_round_exactly_as_today(stor
     assert stored.status == TaskStatus.IMPLEMENTING
 
 
+async def test_a_derived_shaped_conflict_with_an_unresolvable_base_tip_escalates_not_a_coder_round(
+        store, tmp_path, monkeypatch):
+    """Review finding on PR #568: after `mechanically_resolvable` replaced
+    `all_derived`, a conflict confined to the derived/classification files
+    whose base tip could NOT be resolved (the ref vanished between
+    enumeration's own resolve and the watcher's) left `eligible=None` and
+    fell through to a PAID coder round. Main escalated it ("could not resolve
+    the base tip to a commit"). A coder cannot fix these files; the honest
+    outcome is the escalation. Fails only wake.py's resolve call — the
+    enumeration's own call (inside `conflicting_paths`) still succeeds."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+    wt = tmp_path / "wt_feature"
+    _worktree(work, wt, "feature")
+    (wt / "RELEASE_MANIFEST.txt").write_text("pin feature\n", encoding="utf-8")
+    _git(wt, "commit", "-qam", "feature re-pins")
+    _push_branch(work, wt, "feature")
+    (work / "RELEASE_MANIFEST.txt").write_text("pin main\n", encoding="utf-8")
+    _git(work, "commit", "-qam", "main re-pins")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    real_resolve = dc.resolve_base_tip
+    calls = {"n": 0}
+
+    async def vanishing_ref(repo_path, base_branch):
+        # First caller is `conflicting_paths` (enumeration) -> real answer;
+        # the watcher's own call is the one that comes back empty.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_resolve(repo_path, base_branch)
+        return None
+
+    monkeypatch.setattr(dc, "resolve_base_tip", vanishing_ref)
+    paths = await dc.conflicting_paths(str(work), "main", "feature")
+    assert paths == {"RELEASE_MANIFEST.txt"}
+    calls["n"] = 0  # the watcher's enumeration is call #1 again
+
+    events = []
+    resolver_calls = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(
+        store, events=events,
+        derived_resolver=lambda *a, **k: resolver_calls.append((a, k)),
+    )
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/27", "DIRTY", branch="feature")
+
+    assert result == "escalated_pr_conflict", result
+    assert resolver_calls == []             # nothing to resolve against
+    kinds = [k for k, _ in events]
+    assert "escalated_pr_conflict" in kinds
+    assert "resumed" not in kinds           # never a coder round
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    assert "could not resolve the base tip" in (stored.blocker or {}).get("evidence", "")
+
+
 async def test_a_mixed_derived_and_source_conflict_opens_a_coder_round(store, tmp_path, monkeypatch):
     """Not every conflicting path is derived: unchanged behaviour, even
     though RELEASE_MANIFEST.txt is one of the conflicting paths too."""
@@ -848,7 +917,8 @@ async def test_a_failing_verify_escalates_and_pushes_nothing(store, tmp_path, mo
 
     before_sha = _git(work, "ls-remote", "origin", "refs/heads/feature").stdout.strip()
 
-    def failing_resolver(repo_path, branch, base_tip_sha, remote="origin"):
+    def failing_resolver(repo_path, branch, base_tip_sha, remote="origin",
+                          eligible=dc.DERIVED_ARTEFACTS):
         return dc.DerivedResolution(ok=False, step="verify", detail="synthetic failure for the test")
 
     events = []
@@ -987,6 +1057,199 @@ async def test_two_concurrent_count_bumps_are_reconciled_by_merge_arithmetic(
     assert v.returncode == 0, v.stdout + v.stderr
 
 
+async def test_a_count_only_classification_conflict_is_resolved_without_a_coder_session(
+    store, tmp_path, monkeypatch,
+):
+    """The bugfix scenario: EXPORT_CLASSIFICATION.txt is ITSELF a conflicting
+    path (unlike the identical-bump case above, which auto-merges cleanly) --
+    branch-a bumps the counted rule 1 -> 2 (for the one file it adds), main
+    bumps the SAME rule 1 -> 3 (for the two files it adds). The two edits are
+    different text on the same line, so git conflicts on it for real. But the
+    only difference between the two conflicting hunks is the digit -- same
+    verb, same pattern -- so this is arithmetic, not a hand decision, and
+    `mechanically_resolvable` must say so and the resolver must repair it with
+    the SAME `reconcile_merge_count_drift` arithmetic as the clean-auto-merge
+    case, never a second implementation."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(wt_a, "add", "src/base_two.py")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump counted rule 1 -> 2")
+    _approve(wt_a, ["src/base_two.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin base_two.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")
+    (work / "src" / "base_four.py").write_text("base four\n", encoding="utf-8")
+    _git(work, "add", "src/base_three.py", "src/base_four.py")
+    _bump_count(work, "src/base*.py", 3)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "add base_three.py + base_four.py, bump counted rule 1 -> 3")
+    _approve(work, ["src/base_three.py", "src/base_four.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin base_three.py + base_four.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    # sanity: this time the count bumps genuinely conflict (different digits
+    # on the same line) -- EXPORT_CLASSIFICATION.txt IS a conflicting path,
+    # `all_derived()` is False (it never considers this file), but the
+    # count-only shape check says the conflict is still mechanical.
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert dc.CLASSIFICATION_NAME in paths and paths <= (dc.DERIVED_ARTEFACTS | {dc.CLASSIFICATION_NAME})
+    assert not dc.all_derived(paths)
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    eligible = await dc.mechanically_resolvable(str(work), paths, base_tip, "branch-a")
+    assert eligible == paths
+
+    events = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resolved_pr_conflict"
+    kinds = [k for k, _ in events]
+    assert "pr_conflict_resolved" in kinds and "resumed" not in kinds
+    text = next(txt for k, txt in events if k == "pr_conflict_resolved")
+    assert "EXPORT_CLASSIFICATION.txt count reconciled" in text, text
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL
+    wt_check = tmp_path / "wt_check"
+    _worktree(work, wt_check, "check", "branch-a")
+    assert "ship   4  src/base*.py" in (wt_check / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    v = _verify(wt_check)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+async def test_a_count_conflict_that_also_flips_a_verb_opens_a_coder_round(store, tmp_path, monkeypatch):
+    """Same shape as the count-only conflict above, EXCEPT one side also
+    flips the rule's verdict (ship -> drop) instead of only changing the
+    digit. That is a hand decision, not arithmetic, so this must still open
+    a coder round -- the shape check must be exact-except-count, not merely
+    'touches the same line'."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(wt_a, "add", "src/base_two.py")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump counted rule 1 -> 2")
+    _approve(wt_a, ["src/base_two.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin base_two.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    cls = work / "EXPORT_CLASSIFICATION.txt"
+    cls.write_text(
+        cls.read_text(encoding="utf-8").replace("ship   1  src/base*.py", "drop   1  src/base*.py"),
+        encoding="utf-8",
+    )
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "main reclassifies the counted rule to drop")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert paths == {"EXPORT_CLASSIFICATION.txt"}
+    assert not dc.all_derived(paths)
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    assert await dc.mechanically_resolvable(str(work), paths, base_tip, "branch-a") is None
+
+    events = []
+    resolver_calls = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(
+        store, events=events,
+        derived_resolver=lambda *a, **k: resolver_calls.append((a, k)),
+    )
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resumed"
+    assert resolver_calls == []
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.IMPLEMENTING
+
+
+async def test_a_count_only_conflict_whose_arithmetic_fails_escalates(store, tmp_path, monkeypatch):
+    """A count-only conflict (same verb, same pattern, only the digit
+    differs) whose two declared counts don't satisfy the merge-base
+    arithmetic must escalate honestly, never guess and push. Main bumps to 5
+    instead of the correct 3 for the two files it adds -- a hand mistake, not
+    a derivable number."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "base_two.py").write_text("base two\n", encoding="utf-8")
+    _git(wt_a, "add", "src/base_two.py")
+    _bump_count(wt_a, "src/base*.py", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(wt_a, "commit", "-qm", "add base_two.py, bump counted rule 1 -> 2")
+    _approve(wt_a, ["src/base_two.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin base_two.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    # Hand-pin instead of `_approve()` here: main's own declared count (5) is
+    # wrong for main's own tree (3 files: base.py + the two new ones), so the
+    # stub `approve` would correctly refuse it as internally inconsistent --
+    # that is a DIFFERENT bug than the one under test. This mirrors
+    # `test_a_count_drift_that_is_not_merge_arithmetic_still_refuses` above:
+    # a hand mistake that only shows up once merged with branch-a.
+    (work / "src" / "base_three.py").write_text("base three\n", encoding="utf-8")
+    (work / "src" / "base_four.py").write_text("base four\n", encoding="utf-8")
+    _git(work, "add", "src/base_three.py", "src/base_four.py")
+    _bump_count(work, "src/base*.py", 5)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    _git(work, "commit", "-qm", "add base_three.py + base_four.py, bump counted rule 1 -> 5 (wrong)")
+    pins = work / "RELEASE_MANIFEST.txt"
+    pins.write_text(
+        pins.read_text(encoding="utf-8")
+        + "0" * 64 + "  src/base_four.py\n"
+        + "0" * 64 + "  src/base_three.py\n",
+        encoding="utf-8",
+    )
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "hand pin base_three.py + base_four.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    eligible = await dc.mechanically_resolvable(str(work), paths, base_tip, "branch-a")
+    assert eligible == paths
+
+    before = _git(work, "rev-parse", "origin/branch-a").stdout.strip()
+    events = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result != "resolved_pr_conflict"
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    evidence = (stored.blocker.get("evidence") or "") + (stored.blocker.get("question") or "")
+    assert "not merge arithmetic" in evidence or "not a mechanical merge" in evidence, stored.blocker
+    assert _git(work, "rev-parse", "origin/branch-a").stdout.strip() == before, "arithmetic failed but something was pushed"
+
+
+def test_the_count_repair_reuses_reconcile_merge_count_drift(tmp_path):
+    """The fix must never grow a second arithmetic implementation --
+    `derived_conflict` imports and calls the EXISTING
+    `approve_merge.reconcile_merge_count_drift`, proven here by identity, not
+    by behaviour (behaviour is covered by the end-to-end tests above)."""
+    from no_human.vcs import approve_merge
+
+    assert dc.reconcile_merge_count_drift is approve_merge.reconcile_merge_count_drift
+
+
 async def test_an_export_classification_conflict_alone_opens_a_coder_round(store, tmp_path, monkeypatch):
     """A conflict confined to EXPORT_CLASSIFICATION.txt is not mechanically
     resolvable: its counts are hand-maintained and no command rebuilds them,
@@ -1010,6 +1273,8 @@ async def test_an_export_classification_conflict_alone_opens_a_coder_round(store
     paths = await dc.conflicting_paths(str(work), "main", "feature")
     assert paths == {"EXPORT_CLASSIFICATION.txt"}
     assert not dc.all_derived(paths)
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    assert await dc.mechanically_resolvable(str(work), paths, base_tip, "feature") is None
 
     events = []
     resolver_calls = []
@@ -1063,6 +1328,8 @@ async def test_an_export_classification_conflict_mixed_with_manifest_opens_a_cod
     paths = await dc.conflicting_paths(str(work), "main", "feature")
     assert paths == {"RELEASE_MANIFEST.txt", "EXPORT_CLASSIFICATION.txt"}
     assert not dc.all_derived(paths)
+    base_tip = await dc.resolve_base_tip(str(work), "main")
+    assert await dc.mechanically_resolvable(str(work), paths, base_tip, "feature") is None
 
     events = []
     resolver_calls = []

@@ -14,11 +14,18 @@ needs — "is this conflict confined to derived artefacts?" and, if so,
 membership rule (see `DERIVED_ARTEFACTS` below) even though it sits next to
 `RELEASE_MANIFEST.txt` in the export gate: its per-rule win-COUNTs are
 hand-maintained, not rebuilt by any command, so a conflict touching it still
-needs a coder round exactly as before this module existed. ONE exception,
-which is not a decision: when the file merged CLEANLY and a count is stale
-only because both sides bumped it for files each added, the correct number is
-base + (branch - merge-base), and `_reconcile_merge_count_drift` writes it
-under exactly that equality (INCIDENT 2026-08-20, task c309a6a3).
+needs a coder round exactly as before this module existed — UNLESS the
+conflict's SHAPE, not just its filename, proves there is no hand decision in
+it at all: every conflicting hunk in the file differs ONLY in a rule's
+numeric win-count, never a pattern, a verb, a comment, or the line order
+(`classification_count_only`). That shape means both sides independently
+bumped the SAME rule for files each independently added — two reviewed
+counts meeting, not two reviewed decisions colliding — and the correct
+number is base + (branch - merge-base), written under exactly that equality
+by `reconcile_merge_count_drift` (reused, never reimplemented here). This is
+the same repair `reconcile_merge_count_drift` already made for a CLEAN merge
+with a stale count (INCIDENT 2026-08-20, task c309a6a3); `mechanically_resolvable`
+extends its use to the case where the count itself is what conflicts.
 
 `resolve_derived_conflict` is synchronous (it shells out, like
 `approve_merge.py`, which it reuses); the async watcher calls it via
@@ -36,6 +43,7 @@ from pathlib import Path
 from .approve_merge import (
     _APPROVE_TIMEOUT_S,
     _VERIFY_TIMEOUT_S,
+    _RULE_LINE_RE,
     CLASSIFICATION_NAME,
     COUNT_DRIFT_RE,
     _cap,
@@ -45,7 +53,13 @@ from .approve_merge import (
     reconcile_merge_count_drift,
 )
 from .git import GitError, GitRepo, ProtectedBranch
-from .pr_watcher import _base_tips, _git_rc, merge_tree_conflicts, refs_resolvable
+from .pr_watcher import (
+    _base_tips,
+    _git_rc,
+    classification_decisions,
+    merge_tree_conflicts,
+    refs_resolvable,
+)
 
 #: Repo-root paths that are REGENERATED FROM THE TREE, never authored: their
 #: bytes are a pure function of the other files in the commit, so a merge
@@ -57,23 +71,35 @@ from .pr_watcher import _base_tips, _git_rc, merge_tree_conflicts, refs_resolvab
 #: shipped file, and `export_guard.py approve` rewrites every pin from the
 #: working tree.
 #:
-#: `EXPORT_CLASSIFICATION.txt` does NOT qualify, despite sitting right next to
-#: the manifest in the same export gate: its rule lines carry a hand-maintained
-#: win-COUNT (`ship 293  tests/*.py`), and no command in `export_guard.py`
-#: re-tallies that count — `approve` rebuilds manifest pins and nothing else,
-#: `verify` only checks the count against the tree and REFUSES on a mismatch,
-#: it never repairs one (the one repair this module makes, the merge
-#: arithmetic in `_reconcile_merge_count_drift`, applies only to a file that
-#: did NOT conflict). Taking `--ours` on a real conflict there would
-#: silently discard a hand decision (a ship/drop flip, a new pattern) that
-#: only a coder round can make correctly — the exact thing this module exists
-#: to avoid doing to genuinely derived content. So a conflict touching this
-#: file — alone, or mixed with the manifest — falls through to a coder round.
+#: `EXPORT_CLASSIFICATION.txt` does NOT qualify FOR MEMBERSHIP HERE, despite
+#: sitting right next to the manifest in the same export gate: its rule lines
+#: carry a hand-maintained win-COUNT (`ship 293  tests/*.py`), and no command
+#: in `export_guard.py` re-tallies that count — `approve` rebuilds manifest
+#: pins and nothing else, `verify` only checks the count against the tree and
+#: REFUSES on a mismatch, it never repairs one. Taking `--ours` on a real
+#: conflict there would, IN GENERAL, silently discard a hand decision (a
+#: ship/drop flip, a new pattern) that only a coder round can make correctly
+#: — the exact thing this module exists to avoid doing to genuinely derived
+#: content. So a conflict touching this file — alone, or mixed with the
+#: manifest — falls through to a coder round BY DEFAULT.
+#:
+#: The one exception is not a filename rule but a SHAPE rule, decided by
+#: `classification_count_only` and applied by `mechanically_resolvable`: when
+#: every conflicting hunk in the classification file differs ONLY in a rule's
+#: numeric win-count (never a pattern, a verb, a comment, or the line order),
+#: both sides made the identical decision and independently bumped the same
+#: tally for files each added — that is merge arithmetic, not a hand
+#: decision, and `reconcile_merge_count_drift` (reused, not reimplemented)
+#: already makes exactly this repair for a cleanly-merged file. Taking
+#: `--ours` is safe only because eligibility already proved both sides carry
+#: identical decisions.
 #:
 #: Exact repo-root paths, never a glob or basename — `docs/RELEASE_MANIFEST.txt`
 #: must NOT qualify (same doctrine as pr_watcher._GENERATED_LEDGERS). Adding a
 #: second derived file is a one-line change HERE and nowhere else — but see
-#: the membership rule above before adding one.
+#: the membership rule above before adding one. `DERIVED_ARTEFACTS` itself
+#: stays `RELEASE_MANIFEST.txt`-only; the classification file is admitted per
+#: conflict, per `mechanically_resolvable`, never unconditionally.
 DERIVED_ARTEFACTS = frozenset({"RELEASE_MANIFEST.txt"})
 
 
@@ -151,6 +177,89 @@ def all_derived(paths: set[str] | None) -> bool:
     return bool(paths) and paths <= DERIVED_ARTEFACTS
 
 
+def _normalized_classification_lines(text: str) -> list[str]:
+    """`text` split into lines with every rule line's win-count digits
+    replaced by a single `#` placeholder — everything else (verb, both
+    spacing runs, pattern, and every non-rule line) kept byte-for-byte. Used
+    only for the strict textual half of `classification_count_only`: two
+    files whose rule lines match under this normalisation differ in COUNT
+    ONLY, never in alignment/spacing — a whitespace reflow of the count
+    changes `sp1`/`sp2` and so still compares unequal."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = _RULE_LINE_RE.match(line)
+        if m:
+            out.append(f"{m['verb']}{m['sp1']}#{m['sp2']}{m['pattern']}")
+        else:
+            out.append(line)
+    return out
+
+
+async def classification_count_only(repo_path: str, base_tip_sha: str,
+                                     branch: str) -> bool:
+    """True iff `EXPORT_CLASSIFICATION.txt` differs between `base_tip_sha`
+    and `branch` ONLY in the numeric win-count of otherwise-identical rule
+    lines — never a pattern, a verb, a comment, an added/removed/reordered
+    rule line, or a whitespace reflow. This is a conflict-SHAPE test: it says
+    nothing about whether the file is currently a git conflict (the caller,
+    `mechanically_resolvable`, combines this with the conflicting-paths set).
+
+    Two independent checks must both pass:
+      1. The DECISION sequence — `pr_watcher.classification_decisions`, which
+         already elides each rule's count — is identical on both sides. Reused
+         as-is, never reparsed here.
+      2. A strict textual check (`_normalized_classification_lines`) that
+         additionally requires identical line count, identical order, and
+         identical whitespace everywhere except the count digits themselves —
+         closing the hole check 1's `str.split()` leaves open for a pure
+         spacing reflow.
+
+    Fails closed (`False`) on any git failure, an absent file, or an empty
+    read on either side — the same doctrine as `all_derived`'s `None`-is-
+    ineligible: an unknown conflict shape is never treated as count-only.
+    """
+    decisions_base = await classification_decisions(repo_path, base_tip_sha)
+    decisions_branch = await classification_decisions(repo_path, branch)
+    if decisions_base is None or decisions_branch is None:
+        return False
+    if decisions_base != decisions_branch:
+        return False
+
+    rc_base, text_base = await _git_rc(repo_path, "show",
+                                        f"{base_tip_sha}:{CLASSIFICATION_NAME}")
+    rc_branch, text_branch = await _git_rc(repo_path, "show",
+                                            f"{branch}:{CLASSIFICATION_NAME}")
+    if rc_base != 0 or rc_branch != 0 or not text_base or not text_branch:
+        return False
+
+    return (_normalized_classification_lines(text_base)
+            == _normalized_classification_lines(text_branch))
+
+
+async def mechanically_resolvable(repo_path: str, paths: set[str] | None,
+                                  base_tip_sha: str,
+                                  branch: str) -> frozenset[str] | None:
+    """The eligible-for-mechanical-resolution artefact set for THIS conflict,
+    or `None` when no mechanical resolution applies. `DERIVED_ARTEFACTS` for
+    the existing manifest-only case — decided by `all_derived` alone, no new
+    git calls, exactly the same hot path as before this function existed.
+    `DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}` when the conflict is confined
+    to the classification file (alone, or together with the manifest) AND
+    `classification_count_only` confirms every differing rule line in it is a
+    count-only edit. `None` on anything else, including `paths` itself being
+    `None`/empty (could not enumerate) — fail closed, the caller must never
+    resolve a conflict it could not confirm is one of these two shapes."""
+    if not paths:
+        return None
+    if all_derived(paths):
+        return DERIVED_ARTEFACTS
+    eligible = DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}
+    if paths <= eligible and CLASSIFICATION_NAME in paths:
+        if await classification_count_only(repo_path, base_tip_sha, branch):
+            return eligible
+    return None
+
+
 @dataclass
 class DerivedResolution:
     """Result of `resolve_derived_conflict`. `step` names where it stopped —
@@ -218,13 +327,21 @@ def _parse_not_ship_classified(text: str) -> list[str]:
 
 
 def resolve_derived_conflict(repo_path: str, branch: str, base_tip_sha: str,
-                             remote: str = "origin") -> DerivedResolution:
+                             remote: str = "origin", *,
+                             eligible: frozenset[str] = DERIVED_ARTEFACTS,
+                             ) -> DerivedResolution:
     """Mechanically resolve a PR conflict already confirmed (by the caller,
-    via `all_derived`) to be confined to `DERIVED_ARTEFACTS`: merge the base
-    tip into a detached worktree of the branch, take either side of the
-    derived files and regenerate them from the merged tree, verify, and push
-    — no coder session. See the module docstring for why this exists and
-    docs/PLAN.md's step-by-step for the exact procedure this implements.
+    via `all_derived` or `mechanically_resolvable`) to be confined to
+    `eligible`: merge the base tip into a detached worktree of the branch,
+    take either side of the eligible files and regenerate/reconcile them from
+    the merged tree, verify, and push — no coder session. See the module
+    docstring for why this exists and docs/PLAN.md's step-by-step for the
+    exact procedure this implements.
+
+    `eligible` defaults to `DERIVED_ARTEFACTS` (today's manifest-only case,
+    unchanged behaviour); the caller passes
+    `DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}` when `mechanically_resolvable`
+    confirmed the conflict is also eligible by the count-only shape rule.
 
     Never force-pushes; never pushes a tree that fails `export_guard.py
     verify`. A failure at any step is reported via `DerivedResolution.ok =
@@ -260,14 +377,16 @@ def resolve_derived_conflict(repo_path: str, branch: str, base_tip_sha: str,
 
         return _resolve_in_worktree(
             repo=repo, worktree_path=tmp_dir, remote=remote, branch=branch,
-            base_tip_sha=base_tip_sha,
+            base_tip_sha=base_tip_sha, eligible=eligible,
         )
     finally:
         _cleanup_worktree(repo, tmp_dir)
 
 
 def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
-                         branch: str, base_tip_sha: str) -> DerivedResolution:
+                         branch: str, base_tip_sha: str,
+                         eligible: frozenset[str] = DERIVED_ARTEFACTS,
+                         ) -> DerivedResolution:
     branch_tip_sha = _sh(["git", "rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
 
     # -- step 3: merge --------------------------------------------------- #
@@ -275,12 +394,12 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     # resolve); rc 0 with nothing left conflicted is also fine (someone else
     # resolved it between enumeration and now) — continue either way. But
     # never resolve a conflict this routine did not enumerate: if anything
-    # OUTSIDE DERIVED_ARTEFACTS is still conflicted (the base moved in a way
-    # that changed the shape of the conflict), bail — a coder round handles
-    # that, not this one.
+    # OUTSIDE `eligible` is still conflicted (the base moved in a way that
+    # changed the shape of the conflict), bail — a coder round handles that,
+    # not this one.
     _sh(["git", "merge", "--no-edit", base_tip_sha], cwd=worktree_path)
     unmerged = _unmerged_paths(worktree_path)
-    outside = unmerged - DERIVED_ARTEFACTS
+    outside = unmerged - eligible
     if outside:
         _sh(["git", "merge", "--abort"], cwd=worktree_path)
         return DerivedResolution(
@@ -288,8 +407,13 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
             detail=_cap("merge produced conflict(s) outside the derived set "
                         f"(base moved?): {sorted(outside)}"))
 
-    # -- step 4: take either side of the derived files; they are rebuilt -- #
-    for path in sorted(unmerged & DERIVED_ARTEFACTS):
+    # -- step 4: take either side of the eligible files. For the manifest
+    # this is always safe (it is purely regenerated below). For the
+    # classification file it is safe ONLY because eligibility already proved
+    # (via `classification_count_only`) that both sides carry the identical
+    # decisions — the only thing left to differ is the win-count, and that
+    # gets repaired by merge arithmetic further down, never guessed here. --
+    for path in sorted(unmerged & eligible):
         co = _sh(["git", "checkout", "--ours", "--", path], cwd=worktree_path)
         if co.returncode != 0:
             _sh(["git", "merge", "--abort"], cwd=worktree_path)
@@ -315,7 +439,7 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
         return DerivedResolution(ok=False, step="regenerate", detail=_cap(diff_proc.stderr))
     changed = sorted({
         p.strip() for p in diff_proc.stdout.splitlines()
-        if p.strip() and p.strip() not in DERIVED_ARTEFACTS
+        if p.strip() and p.strip() not in eligible
     })
     shipped_changed = _ship_classified_paths(worktree_path, changed)
     unpinned = sorted(set(changed) - set(shipped_changed))
@@ -389,7 +513,10 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                             + approve_proc.stdout + approve_proc.stderr))
 
     # -- step 6: commit --------------------------------------------------- #
-    for name in sorted(DERIVED_ARTEFACTS):
+    names_to_add = set(DERIVED_ARTEFACTS)
+    if CLASSIFICATION_NAME in eligible:
+        names_to_add.add(CLASSIFICATION_NAME)
+    for name in sorted(names_to_add):
         if (worktree_path / name).exists():
             add = _sh(["git", "add", "--", name], cwd=worktree_path)
             if add.returncode != 0:
@@ -414,9 +541,67 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
             ok=False, step="verify", unpinned=unpinned,
             detail=f"export_guard verify timed out after {_VERIFY_TIMEOUT_S}s")
     if verify_proc.returncode != 0:
-        return DerivedResolution(
-            ok=False, step="verify", unpinned=unpinned,
-            detail=_cap(verify_proc.stdout + "\n" + verify_proc.stderr))
+        combined = verify_proc.stdout + verify_proc.stderr
+        # Backstop reconcile hop: this fires only when the classification
+        # file was ITSELF a conflicted path (so step 4 took `--ours` on it
+        # and the resulting declared count is stale) and the step-5
+        # approve-step hook above never ran (e.g. `shipped_changed` was
+        # empty). `verify` is the last gate before push, so it is the last
+        # place left to catch a count drift that is still merge arithmetic.
+        # Bounded to exactly one pass — `reconciled` guards against looping.
+        if (not reconciled and CLASSIFICATION_NAME in eligible
+                and COUNT_DRIFT_RE.search(combined)):
+            ok, note = reconcile_merge_count_drift(
+                worktree_path, base_tip_sha, branch_tip_sha, combined)
+            if not ok:
+                return DerivedResolution(
+                    ok=False, step="verify", unpinned=unpinned,
+                    detail=_cap(f"{CLASSIFICATION_NAME} count drift is not merge "
+                                f"arithmetic ({note}):\n{combined}"))
+            reconciled = note
+            retry_targets = _ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])
+            if retry_targets:
+                approve_proc = _run_export_guard(
+                    worktree_path, ["approve", *retry_targets], timeout=_APPROVE_TIMEOUT_S)
+                if approve_proc is None:
+                    return DerivedResolution(
+                        ok=False, step="regenerate", unpinned=unpinned,
+                        detail=f"export_guard approve timed out after "
+                               f"{_APPROVE_TIMEOUT_S}s (after post-verify count "
+                               f"reconcile: {note})")
+                if approve_proc.returncode != 0:
+                    return DerivedResolution(
+                        ok=False, step="regenerate", unpinned=unpinned,
+                        detail=_cap(f"export_guard approve refused after post-"
+                                    f"verify count reconcile "
+                                    f"({approve_proc.returncode}):\n"
+                                    + approve_proc.stdout + approve_proc.stderr))
+            add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
+            if add.returncode != 0:
+                return DerivedResolution(ok=False, step="verify", unpinned=unpinned,
+                                          detail=_cap(add.stderr))
+            status = _sh(["git", "status", "--porcelain"], cwd=worktree_path).stdout
+            if status.strip():
+                amend = _sh(["git", "commit", "--amend", "--no-edit"], cwd=worktree_path)
+                if amend.returncode != 0:
+                    return DerivedResolution(
+                        ok=False, step="commit", unpinned=unpinned,
+                        detail=_cap(amend.stdout + "\n" + amend.stderr))
+                merge_sha = _sh(["git", "rev-parse", "HEAD"],
+                                 cwd=worktree_path).stdout.strip()
+            verify_proc = _run_export_guard(worktree_path, ["verify"],
+                                             timeout=_VERIFY_TIMEOUT_S)
+            if verify_proc is None:
+                return DerivedResolution(
+                    ok=False, step="verify", unpinned=unpinned,
+                    detail=f"export_guard verify timed out after "
+                           f"{_VERIFY_TIMEOUT_S}s (after post-verify count "
+                           f"reconcile: {note})")
+            combined = verify_proc.stdout + verify_proc.stderr
+        if verify_proc.returncode != 0:
+            return DerivedResolution(
+                ok=False, step="verify", unpinned=unpinned,
+                detail=_cap(combined))
 
     # -- step 8: push from the MAIN repo, not the worktree ----------------- #
     # `add_worktree` installs a pre-push guard (push_hook.py) there that
