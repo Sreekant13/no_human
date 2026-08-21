@@ -19,6 +19,7 @@ __all__ = [
     "CommitResult",
     "PrResult",
     "open_pr",
+    "promote_draft_pr",
     "commit_with_manifest_repair",
     "parse_manifest_refusal",
     "land_task",
@@ -104,3 +105,20 @@ def open_pr(
     # push itself proves the branch/commit/PR-open path.
     marker = f"local-pr://{Path(url).name or 'remote'}/{branch}"
     return PrResult(marker, "local", branch, pushed_sha=pushed_sha)
+
+
+def promote_draft_pr(repo: GitRepo, pr_url: str, *, github_hosts: list[str] | None = None) -> str:
+    """Promote a draft PR/MR to ready-for-review. Returns an outcome token
+    (see ``github.mark_pr_ready``), never raises.
+
+    GitHub only: ``vcs/gitlab.py``'s ``open_mr`` never opens a draft, so
+    there is nothing to promote on GitLab, and any other remote has no PR
+    API at all — both return a ``"not_applicable: ..."`` token instead of a
+    new call.
+    """
+    url = repo.remote_url() or ""
+    if github.is_github_remote(url, github_hosts or []):
+        return github.mark_pr_ready(repo.path, pr_url)
+    if gitlab.is_gitlab_remote(url):
+        return "not_applicable: gitlab has no draft state"
+    return "not_applicable: remote has no PR API"

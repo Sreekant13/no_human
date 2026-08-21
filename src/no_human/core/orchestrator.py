@@ -106,6 +106,7 @@ from ..vcs import (
     PushBehindRemote,
     commit_with_manifest_repair,
     open_pr,
+    promote_draft_pr,
 )
 from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
@@ -7290,14 +7291,53 @@ class Orchestrator:
         # never strands the watcher on an attempt whose pr_url reads empty
         # while an earlier one carries the real URL. Best-effort: an audit
         # backfill must never fail an attempt that otherwise succeeded.
+        pr_url = ""
         try:
             pr = await resolve_task_pr(self.store, task)
-            if pr.url:
-                await self.store.update_attempt(attempt_id, pr_url=pr.url)
+            pr_url = pr.url
+            if pr_url:
+                await self.store.update_attempt(attempt_id, pr_url=pr_url)
         except Exception as exc:  # noqa: BLE001 — never fail the attempt on a backfill error
             log.warning("task %s: PR backfill failed: %s", task.id[:8], exc)
         task.context = await self.store.merge_context(
             task.id, {"already_satisfied_report": claim})
+
+        # Typed evidence, ALWAYS — even with no PR, so `doctor`/`task_pr` see
+        # a reason this task sits in AWAITING_APPROVAL. `review_round` is the
+        # round that just verified the claim: `_append_review_history` above
+        # already appended it, so `len(review_history)` counts it in.
+        review_round = len((task.context or {}).get("review_history") or [])
+        self.emit(
+            "already_satisfied",
+            "already-satisfied claim verified by the review gate",
+            review_round=review_round, reviewed_sha=reviewed_sha,
+            criteria=len(task.acceptance_criteria or []),
+            advisory=advisory_pass, pr_url=pr_url,
+        )
+
+        # Promote a resolved draft to ready — only when there IS a PR that
+        # could be a draft. Best-effort: the review passed and the PR exists
+        # either way; promotion failing must not fail the gate. Fail closed
+        # on the advertisement: an unpromoted PR does not get a `pr_open`
+        # event, so `doctor`/`task_pr` keep treating it as unbacked.
+        promoted = False
+        if pr_url:
+            try:
+                gh_hosts = self.config.get("git", {}).get("github_hosts")
+                outcome = await asyncio.to_thread(
+                    promote_draft_pr, repo, pr_url, github_hosts=gh_hosts)
+            except Exception as exc:  # noqa: BLE001 — never fail the gate on promotion
+                outcome = f"unavailable: {exc}"
+            self.emit("pr_ready", f"draft PR promoted to ready: {pr_url} ({outcome})",
+                      pr_url=pr_url)
+            if outcome in ("ready", "already_ready"):
+                promoted = True
+                self.emit("pr_open", pr_url, pr_kind="github", status="awaiting_approval")
+            else:
+                self._advisory(
+                    f"already-satisfied PR {pr_url} was not promoted to ready "
+                    f"({outcome}) — it stays unbacked for approval evidence "
+                    "until a human or a later run promotes it.")
         await self.store.set_status(task, TaskStatus.AWAITING_APPROVAL, validate=False)
         # The persisted detail must not claim a review that never ran (PR #101
         # review, low): advisory mode says so explicitly.
@@ -7309,7 +7349,7 @@ class Orchestrator:
             "criterion; no code change needed, awaiting your confirmation")
         self.emit("state", detail, status="awaiting_approval")
         return TaskOutcome(task, status=TaskStatus.AWAITING_APPROVAL,
-                           detail=detail, report=claim)
+                           pr_url=(pr_url if promoted else None), detail=detail, report=claim)
 
     def _blocker_reuse_eligible(
         self, blocker: Blocker, attempt_id: str | None,

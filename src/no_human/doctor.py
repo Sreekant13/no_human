@@ -25,6 +25,11 @@ from pathlib import Path
 from typing import Any
 
 from .core.db import Store
+from .vcs.task_pr import (
+    AWAITING_APPROVAL_EVIDENCE_KINDS,
+    DONE_EVIDENCE_KINDS,
+    PR_EVENT_KINDS,
+)
 
 # name → (evidence kinds, hint shown when the count is zero). The hint says
 # whether zero is plausible or alarming — doctor reports, the human decides.
@@ -141,10 +146,12 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
 WATCHER_STALE_SECONDS = 2 * 3600.0
 
 # Statuses that assert something happened → the event kinds that must exist to
-# back the claim. A status without its evidence is a signal that lies.
-REQUIRED_EVIDENCE: dict[str, tuple[str, ...]] = {
-    "awaiting_approval": ("pr_open",),
-    "done": ("pr_open",),
+# back the claim. A status without its evidence is a signal that lies. The
+# SAME objects `task_pr`/`restore-approval` use — one predicate for "does
+# this task have a PR / a legitimate completion", not three.
+REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
+    "awaiting_approval": AWAITING_APPROVAL_EVIDENCE_KINDS,
+    "done": DONE_EVIDENCE_KINDS,
 }
 
 # Task kinds that legitimately finish WITHOUT opening a PR — a standalone code
@@ -529,12 +536,13 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():
-        placeholders = ",".join("?" for _ in kinds)
+        sorted_kinds = sorted(kinds)
+        placeholders = ",".join("?" for _ in sorted_kinds)
         # A code-review / investigation task finishes with an artifact, not a
         # PR — don't demand pr_open evidence of it.
         kind_filter = ""
         kind_params: tuple[str, ...] = ()
-        if kinds == ("pr_open",):
+        if "pr_open" in kinds:
             kf_ph = ",".join("?" for _ in PR_LESS_KINDS)
             kind_filter = f" AND COALESCE(t.kind, '') NOT IN ({kf_ph})"
             kind_params = PR_LESS_KINDS
@@ -543,12 +551,13 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
                 AND NOT EXISTS (
                   SELECT 1 FROM task_events e WHERE e.task_id = t.id
                   AND json_extract(e.data, '$.kind') IN ({placeholders}))""",
-            (status, *kind_params, *kinds),
+            (status, *kind_params, *sorted_kinds),
         )
         for (task_id,) in rows:
             d.evidence_gaps.append(
-                f"task {task_id[:8]} is '{status}' with no {'/'.join(kinds)} "
-                "event — the status is not backed by evidence."
+                f"task {task_id[:8]} is '{status}' with none of "
+                f"{'/'.join(sorted_kinds)} on record — the status is not "
+                "backed by evidence."
             )
 
     # A failed attempt must SAY why (C2): an empty failure_reason is exactly

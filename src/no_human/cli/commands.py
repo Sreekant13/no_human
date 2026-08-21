@@ -48,7 +48,7 @@ from ..intake import (
     parse_source,
 )
 from ..notify import build_notifier
-from ..vcs.task_pr import task_has_pr_evidence
+from ..vcs.task_pr import PR_EVENT_KINDS, task_has_pr_evidence
 
 console = Console()
 
@@ -1775,8 +1775,9 @@ def task_restore_approval(task_id, reason):
                               "restore-approval only repairs parked-PR tasks[/]")
                 sys.exit(1)
             events = await store.list_events(t.id)
-            if not any(e.get("kind") == "pr_open" for e in events):
-                console.print("[yellow]no pr_open event on record — refusing[/]")
+            if not any(e.get("kind") in PR_EVENT_KINDS for e in events):
+                console.print("[yellow]no PR event on record "
+                              f"({'/'.join(sorted(PR_EVENT_KINDS))}) — refusing[/]")
                 sys.exit(1)
             # Transition FIRST, record after — review-proven: writing the
             # repair event before the transition let a silently-refused CAS

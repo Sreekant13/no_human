@@ -82,6 +82,41 @@ def open_pr(
     raise RuntimeError(f"gh pr create failed: {stderr}")
 
 
+def mark_pr_ready(repo_path: Path, pr_url: str) -> str:
+    """Promote a DRAFT PR to ready-for-review. Never raises.
+
+    Additive and non-destructive: `gh pr ready` flips one PR field, unlike
+    `gh pr edit --body` which replaces content. Repeated calls are
+    idempotent (see the `already_ready` outcome below); `--undo` is never
+    used.
+
+    Returns a short outcome token, embedded in the caller's emitted event:
+      - ``"ready"``        — the draft was promoted.
+      - ``"already_ready"``  — `gh` reports the PR is already ready for
+        review (idempotent re-run; not a failure).
+      - ``"refused: <reason>"`` — `gh` refused (e.g. the PR is CLOSED or
+        MERGED).
+      - ``"unavailable: <reason>"`` — `gh` itself could not run (not
+        installed, not authenticated, no network, PR not found).
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "ready", pr_url],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+    except FileNotFoundError as exc:
+        return f"unavailable: {exc}"
+
+    if proc.returncode == 0:
+        return "ready"
+
+    stderr = proc.stderr.strip()
+    lowered = stderr.lower()
+    if "already" in lowered and "ready" in lowered:
+        return "already_ready"
+    return f"refused: {stderr.splitlines()[0] if stderr else 'gh pr ready failed'}"
+
+
 def _existing_pr_url(repo_path: Path, branch: str) -> str | None:
     """Return the URL of the open PR for ``branch``, or None."""
     proc = subprocess.run(

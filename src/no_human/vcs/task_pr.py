@@ -80,7 +80,32 @@ async def resolve_task_pr(store: Any, task: Any) -> ResolvedPR:
     return ResolvedPR("", "", "none")
 
 
-_PR_EVENT_KINDS = {"pr_open", "pr_draft"}
+#: The event kinds that mean "there is a PR" — `pr_open` from `_finalize`'s
+#: delivering-PR open and `_gate_already_satisfied`'s promoted-draft path,
+#: `pr_draft` from `_open_draft_pr_for_review`. The one home for "does this
+#: task have a PR", shared by `task_pr`, `doctor` and `restore-approval`.
+PR_EVENT_KINDS = frozenset({"pr_open", "pr_draft"})
+
+#: Back-compat alias — the SAME object, so `is` still holds for both names.
+_PR_EVENT_KINDS = PR_EVENT_KINDS
+
+#: Evidence that legitimately backs `AWAITING_APPROVAL`: a PR (open or
+#: draft) or a typed `already_satisfied` event from `_gate_already_satisfied`
+#: (the no-PR already-satisfied case, which never produces a PR to point at).
+AWAITING_APPROVAL_EVIDENCE_KINDS = PR_EVENT_KINDS | frozenset({"already_satisfied"})
+
+#: Evidence that legitimately backs `DONE`: a delivered PR (`pr_open`, from
+#: `_finalize`), a human override of a landed task
+#: (`approved_landed_override`, from `blockers/landed_override.py`), a
+#: manually-recorded merge (`human_merged`), or an approved already-satisfied
+#: claim with no PR (`approved_already_satisfied`, from `cli/commands.py` /
+#: `api/app.py`'s approve routes).
+DONE_EVIDENCE_KINDS = frozenset({
+    "pr_open",
+    "approved_landed_override",
+    "human_merged",
+    "approved_already_satisfied",
+})
 
 
 async def task_has_pr_evidence(store: Any, task: Any) -> str:
