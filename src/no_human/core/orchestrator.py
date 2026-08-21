@@ -5154,7 +5154,7 @@ class Orchestrator:
             # exception carries their spend and it lands on the same columns.
             await self._record_review_usage(attempt_id, exc)
             return await self._escalate_reviewer_unavailable(
-                task, str(exc), repo=repo, branch=branch
+                task, str(exc), repo=repo, branch=branch, attempt_id=attempt_id,
             )
         # The gate RAN — pass or fail — so any streak of infra parks it survived
         # is over. Cleared here rather than in `_escalate_reviewer_unavailable`
@@ -6291,7 +6291,7 @@ class Orchestrator:
 
     async def _escalate_reviewer_unavailable(
         self, task: Task, detail: str, *, repo: GitRepo | None = None,
-        branch: str | None = None,
+        branch: str | None = None, attempt_id: int | str | None = None,
     ) -> TaskOutcome:
         """The review gate could not run — escalate it as what it actually was.
 
@@ -6370,6 +6370,14 @@ class Orchestrator:
         the first notification it is a SILENT one; `_MAX_REVIEW_INFRA_PARKS`
         consecutive dead gates is where self-healing stops being honest and the
         original escalation is the right answer after all.
+
+        `attempt_id`, when the caller has one in scope, closes the CODER's
+        attempt row for this round with `infra_failure=1` on every branch that
+        parks (QUOTA, corroborated QUOTA, TRANSIENT_INFRA x2) — never on the
+        early NOVEL_UNKNOWN return. Without it a reviewer-side wall death was
+        an unattributed dead row, indistinguishable from a genuinely dead
+        dispatch to anything keyed on that column (the dead-resume breaker in
+        `blockers/wake.py` among them).
         """
         session_error = _SESSION_ERROR_BLOCKER_MARKER in detail
         if not (session_error or _TRANSPORT_BLOCKER_MARKER in detail):
@@ -6408,6 +6416,7 @@ class Orchestrator:
             corroboration = await self._corroborated_quota_wall()
 
         if session_error and _quota_signal(detail):
+            quota = True
             blocker = Blocker(
                 category=BlockerCategory.QUOTA,
                 transient=True,
@@ -6433,6 +6442,7 @@ class Orchestrator:
                 ),
             )
         elif session_error and corroboration is not None:
+            quota = True
             resets_at, sibling_task_id = corroboration
             quota_wake_override = resets_at
             window_minutes = int(_QUOTA_CORROBORATION_WINDOW.total_seconds() // 60)
@@ -6467,6 +6477,7 @@ class Orchestrator:
                 ),
             )
         elif session_error:
+            quota = False
             blocker = Blocker(
                 category=BlockerCategory.TRANSIENT_INFRA,
                 transient=True,
@@ -6489,6 +6500,7 @@ class Orchestrator:
                 ),
             )
         else:
+            quota = False
             blocker = Blocker(
                 category=BlockerCategory.TRANSIENT_INFRA,
                 transient=True,
@@ -6509,6 +6521,29 @@ class Orchestrator:
                     "evidence above names the worker and the concurrency it "
                     "was dispatched into."
                 ),
+            )
+
+        # The coder's own attempt row for this round died on the SAME wall
+        # (or the same dead session) the reviewer just did — attribute it the
+        # same way the coder turn attributes its own infra parks (mirrored at
+        # the `_infra_sdk_failure`/`_quota_reason` call sites above), so the
+        # dead-resume breaker's `infra_failure` filter (`wake.py`,
+        # `_dead_resume_verdict`) — and anything else keyed on that column —
+        # can tell this attempt apart from an unexplained dead dispatch. Row
+        # close only: no new event kind, no change to `blocker`/`spent`/the
+        # park route below.
+        if attempt_id is not None:
+            reason = _quota_reason(detail) if quota else (
+                next(
+                    (line.strip()[:200] for line in detail.splitlines()
+                     if line.strip()),
+                    "reviewer session error",
+                )
+            )
+            await self.store.update_attempt(
+                attempt_id, status="failed",
+                failure_reason=f"{'quota' if quota else 'infra'}: {reason}",
+                infra_failure=1,
             )
 
         if spent:
@@ -7649,7 +7684,8 @@ class Orchestrator:
                 # As above: the no-verdict rounds' spend rides on the exception.
                 await self._record_review_usage(attempt_id, exc)
                 return await self._escalate_reviewer_unavailable(
-                    task, str(exc), repo=repo, branch=branch)
+                    task, str(exc), repo=repo, branch=branch,
+                    attempt_id=attempt_id)
             except Exception as exc:  # noqa: BLE001 — fail closed, never pass on error
                 self._emit_review("review_error", str(exc))
                 decision = ReviewDecision(passed=False, checklist=[ChecklistItem(

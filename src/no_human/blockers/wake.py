@@ -760,6 +760,10 @@ class WakeWatcher:
         if verdict == "park":
             await self._park_dead_resumes(task, streak, dead_ids)
             return "parked_dead_resumes"
+        # verdict is "proceed" (streak 0 — nothing dead, or a human/real-work
+        # resume) or "retry" (a backoff rung's window expired: DISPATCH now,
+        # carrying the ladder, rather than counting this tick as a second
+        # dead attempt — see `_dead_resume_verdict`).
 
         patch = {
             "resumed_at": now_iso(),
@@ -786,18 +790,37 @@ class WakeWatcher:
         # `resume_reason` beside it says the same thing and is kept for rows
         # written before provenance existed.
         patch["resume_from"] = resume_provenance(checkpoint, "wake")
-        # A real dispatch (human or machine) resets the dead-resume streak and
-        # re-anchors the window at THIS resume: only attempts started at or
-        # after it count toward the next streak evaluation.
-        patch["wake_dead_resumes"] = {
-            "streak": 0, "attempt_ids": [],
-            "last_resume_at": patch["resumed_at"], "backoff_until": None,
-        }
+        if verdict == "retry":
+            # A backoff rung's window expired: this IS the re-dispatch that
+            # rung was always supposed to end in — carry the ladder (streak,
+            # dead_ids) forward but re-anchor the window at THIS resume, so
+            # only attempts started at or after it are judged next time; the
+            # already-counted dead row falls out of scope instead of being
+            # re-counted on the next tick.
+            patch["wake_dead_resumes"] = {
+                "streak": streak, "attempt_ids": dead_ids,
+                "last_resume_at": patch["resumed_at"], "backoff_until": None,
+            }
+        else:
+            # A real dispatch (human, or a proceed with nothing dead on the
+            # table) resets the dead-resume streak and re-anchors the window
+            # at THIS resume: only attempts started at or after it count
+            # toward the next streak evaluation.
+            patch["wake_dead_resumes"] = {
+                "streak": 0, "attempt_ids": [],
+                "last_resume_at": patch["resumed_at"], "backoff_until": None,
+            }
         task.context = await self.store.merge_context(task.id, patch)
         task.wake_check_at = None
         await self.store.update_task_columns(task)
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
-        await self._emit(task, "resumed", f"{task.id[:8]} wake condition satisfied")
+        event_text = f"{task.id[:8]} wake condition satisfied"
+        if verdict == "retry":
+            event_text += (
+                f" — re-dispatch after dead-resume backoff #{streak}/"
+                f"{self.DEAD_RESUME_PARK_STREAK}"
+            )
+        await self._emit(task, "resumed", event_text)
         return "resumed"
 
     async def resume_now(self, task: Task, *, now: datetime | None = None) -> str:
@@ -812,20 +835,34 @@ class WakeWatcher:
     ) -> tuple[str, int, list[str]]:
         """Whether the machine resume due right now would repeat a dead
         pattern. Returns ``(verdict, streak, dead_attempt_ids)`` where
-        ``verdict`` is ``"proceed"`` (streak 0, resume normally),
-        ``"backoff"`` (streak 1-2, defer instead of resuming) or ``"park"``
-        (streak >= DEAD_RESUME_PARK_STREAK, escalate instead of resuming).
+        ``verdict`` is ``"proceed"`` (streak 0, resume normally), ``"retry"``
+        (a backoff window expired with no NEW dead attempt since it was set —
+        dispatch now, carrying the ladder forward, instead of counting this
+        tick), ``"backoff"`` (streak 1-2, defer instead of resuming) or
+        ``"park"`` (streak >= DEAD_RESUME_PARK_STREAK, escalate instead of
+        resuming).
 
-        The streak advances on every consecutive evaluation that reaches this
-        point with only dead evidence on the table — not only when a NEW dead
-        attempt appears. It cannot advance any other way: streak 1/2 are
-        deliberately never dispatched (that is the point of backing off), so
-        no new attempt row can appear between one evaluation and the next: an
-        evaluation gated behind an already-expired backoff window IS the
-        "would resume into the same failure again" signal. Each `backoff`
-        verdict re-arms `backoff_until` further out, so this function is
-        never reached twice for the same window (the `_resume` guard above
-        short-circuits those calls without re-evaluating).
+        🔴 THE STREAK USED TO ADVANCE ON EVERY CONSECUTIVE EVALUATION that
+        reached this point with only dead evidence on the table — not only
+        when a NEW dead attempt appeared. The prior version of this docstring
+        argued that was fine because "streak 1/2 are deliberately never
+        dispatched, so no new attempt row can appear between one evaluation
+        and the next" — and treated an evaluation gated behind an
+        already-expired backoff window as itself the "would resume into the
+        same failure again" signal. That argument was the defect: a rung that
+        never re-dispatches is not evidence of anything repeating — nothing
+        was RE-TRIED. It produced exactly one real dispatch (the single dead
+        attempt) plus two bare timer ticks, and escalated with "3 consecutive
+        dead machine resumes" naming that one attempt id three times — false,
+        four times on 2026-08-21 (2c8f23ff, 0986460c, f8de9cdf, e037008e).
+        STREAK NOW COUNTS ATTEMPTS, NEVER TICKS: it is structurally
+        ``len(dead_attempt_ids)`` (see the ``merged_ids`` derivation below),
+        so the escalation text is true by construction. A backoff window
+        expiring with no new attempt since it was armed returns ``"retry"``
+        — `_resume` dispatches on it, carrying the ladder but re-anchoring
+        `last_resume_at` at the new dispatch, so the NEXT evaluation only
+        sees rows started after it. Only a genuinely new dead attempt row
+        advances the streak.
 
         Fails OPEN on any error (DB blip, malformed state): a healthy task
         must never be backed off or parked by a bug in this bookkeeping.
@@ -843,10 +880,21 @@ class WakeWatcher:
                 # Nothing to judge against yet — fail open rather than guess.
                 return "proceed", 0, []
             rows = await self.store.list_attempts(task.id)
+            # `started_at` is SQLite `datetime('now')` — second-resolution, no
+            # fractional part (db.py). `last_resume_at` is `now_iso()` —
+            # microsecond-resolution. A dispatch's own attempt row routinely
+            # lands in the SAME wall-clock second as the resume that created
+            # it (a dead attempt fails almost immediately, by definition), and
+            # truncation can put its zeroed-microsecond `started_at` BEFORE a
+            # `last_resume_at` stamped later within that same second — which
+            # would wrongly drop the very row this comparison exists to catch.
+            # Floor `last_resume_at` to the second, matching `started_at`'s own
+            # resolution, so a same-second attempt is never spuriously excluded.
+            last_resume_floor = last_resume_at.replace(microsecond=0)
             relevant = [
                 row for row in rows
                 if (started := _parse_iso(row.get("started_at"))) is not None
-                and started >= last_resume_at
+                and started >= last_resume_floor
             ]
             # An attempt the loop already ATTRIBUTED — a quota wall, a dead
             # SDK session, any `infra_failure = 1` row — is not death-blind
@@ -873,9 +921,20 @@ class WakeWatcher:
                 # Any attempt that did real work resets the streak.
                 return "proceed", 0, []
             dead_ids = sorted({str(row["id"]) for row in relevant})
-            prior_ids = set(state.get("attempt_ids") or [])
-            merged_ids = sorted(prior_ids | set(dead_ids))
-            streak = int(state.get("streak") or 0) + 1
+            prior_ids = list(state.get("attempt_ids") or [])
+            new_ids = [i for i in dead_ids if i not in prior_ids]
+            if not new_ids:
+                # The backoff window expired, but every dead row on the table
+                # is one already counted toward `prior_ids` — nothing new was
+                # TRIED since the last evaluation (no dispatch happened in
+                # between: streak 1/2 verdicts never resume). Dispatch now
+                # instead of re-counting the same row as a second death;
+                # `streak`/`prior_ids` are carried unchanged, structurally
+                # `len(prior_ids)` — the invariant `_park_dead_resumes`'s
+                # message text relies on.
+                return "retry", len(prior_ids), prior_ids
+            merged_ids = prior_ids + new_ids
+            streak = len(merged_ids)
             verdict = "park" if streak >= self.DEAD_RESUME_PARK_STREAK else "backoff"
             return verdict, streak, merged_ids
         except Exception:  # noqa: BLE001 — fail open, never park on a bug
@@ -918,6 +977,11 @@ class WakeWatcher:
     ) -> None:
         """Stop resuming: park with an honest blocker naming the dead-resume
         pattern and the dead attempt ids, instead of resuming a 4th time."""
+        # `streak == len(dead_ids)` is an invariant maintained by
+        # _dead_resume_verdict (streak is derived as len(merged_ids), never
+        # incremented independently) — the "{streak} consecutive dead machine
+        # resumes (attempts: …)" text below is true by construction, not by
+        # coincidence.
         # Load-bearing terminal guard (SCRUM-68) — see _resume.
         if await self._is_terminal(task):
             return

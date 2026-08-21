@@ -1367,6 +1367,20 @@ async def _dead_attempt(store, task, attempt_number, *, turns=0, tokens=0):
     return attempt_id
 
 
+async def _dispatched_then_died(store, task, n, *, wake_at=None):
+    """What the orchestrator does after a re-dispatch: a fresh attempt row
+    that dies (0 priced tokens, <=1 turn), then the task re-parks BLOCKED
+    with its wake condition intact — the same shape `_park` builds a task
+    with, but reusing the SAME row/id and never touching `wake_dead_resumes`
+    (which `_resume`/`_backoff_dead_resume` already wrote and the next tick
+    must read back unchanged)."""
+    dead_id = await _dead_attempt(store, task, n, turns=0, tokens=0)
+    task.wake_check_at = wake_at
+    await store.update_task_columns(task)
+    await store.set_status(task, TaskStatus.BLOCKED, validate=False)
+    return dead_id
+
+
 def _dead_resume_blocked_task_kwargs(now):
     return dict(
         status=TaskStatus.BLOCKED,
@@ -1413,9 +1427,22 @@ async def test_dead_resume_backoff_doubles_and_caps_at_six_hours(
     now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
     anchor = (now - timedelta(hours=1)).isoformat()
     t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
-    dead_id = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+    # `prior_ids` are already-counted dead rows from earlier rounds — deliberately
+    # NOT backed by real attempt rows, since only their count (the prior streak)
+    # matters here. `dead_id` is the row that's actually on the table now, and it
+    # must be a DIFFERENT id from every `prior_ids` entry: under DEFECT 1's fix,
+    # `_dead_resume_verdict` only advances the streak for attempt ids not already
+    # in `attempt_ids` (a repeat evaluation of an already-known dead row now
+    # returns "retry", not another "backoff" — see the docstring on
+    # `_dead_resume_verdict`). Aliasing `dead_id` into the seeded `attempt_ids`
+    # (as this test did pre-fix) would make it look already-counted and this
+    # tick would retry instead of backing off, testing the very pattern the fix
+    # removed instead of the doubling math this test is actually about.
+    prior_ids = [f"prior-{i}" for i in range(prior_streak)]
     await _machine_resumed(
-        store, t, at=anchor, streak=prior_streak, attempt_ids=[dead_id])
+        store, t, at=anchor, streak=prior_streak, attempt_ids=prior_ids)
+    dead_id = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+    assert dead_id not in prior_ids
 
     watcher = WakeWatcher(store, _cfg(wake_poll_interval=poll_interval))
     actions = await watcher.tick(now=now)
@@ -1447,19 +1474,75 @@ async def test_dead_resume_backoff_emits_event_naming_the_streak(store):
 
 
 @pytest.mark.asyncio
-async def test_third_dead_machine_resume_parks_with_an_honest_blocker(store):
-    """Multi-tick pin (root-cause regression): the streak must advance
-    across repeated ticks that re-evaluate the SAME dead attempt once its
-    backoff window has expired — streak 1-2 never dispatch, so no NEW
-    attempt row can appear between ticks. A design that only advances the
-    streak when a fresh attempt id shows up can never reach 3 in
-    production; this drives one dead attempt through three real
-    watcher.tick() calls to prove it does."""
+async def test_an_expired_dead_resume_backoff_redispatches_instead_of_recounting(
+    store,
+):
+    """Direct RED-on-main pin for DEFECT 1: a backoff window expiring with no
+    NEW dead attempt since it was armed must dispatch ("retry"), not count the
+    same already-known dead row as a second death. Pre-fix, this tick returned
+    "backoff" again (streak 1 -> 2) purely because the timer fired — no new
+    evidence, no new attempt, nothing tried since the first backoff."""
     now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
     anchor = (now - timedelta(hours=1)).isoformat()
     t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
     await _machine_resumed(store, t, at=anchor)
     dead_id = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+
+    actions = await watcher.tick(now=now)
+    assert (t.id, "wake_backoff") in actions
+    refreshed = await store.get_task(t.id)
+    backoff_until = datetime.fromisoformat(
+        refreshed.context["wake_dead_resumes"]["backoff_until"])
+
+    later = backoff_until + timedelta(seconds=1)
+    actions = await watcher.tick(now=later)
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    # The ladder is CARRIED, not reset — this is a re-dispatch of the same
+    # rung, not a fresh streak.
+    assert dead_state["streak"] == 1
+    assert dead_state["attempt_ids"] == [dead_id]
+    # RFC 7396 merge patch: writing `backoff_until: None` DELETES the key
+    # from the stored blob rather than setting it to `null` — `.get()`, not
+    # `[...]`, is the correct read (same idiom `_resume` itself uses).
+    assert dead_state.get("backoff_until") is None
+    # Re-anchored at THIS dispatch so the next evaluation only judges rows
+    # started at/after it, not the already-counted one.
+    assert dead_state["last_resume_at"] == datetime.fromisoformat(
+        dead_state["last_resume_at"]).isoformat()
+    assert datetime.fromisoformat(dead_state["last_resume_at"]) >= later
+
+
+@pytest.mark.asyncio
+async def test_third_dead_machine_resume_parks_with_an_honest_blocker(store):
+    """Multi-cycle regression pin. The OLD argument — "streak 1/2 are
+    deliberately never dispatched, so no new attempt row can appear between
+    one evaluation and the next, so re-evaluating the same expired backoff
+    window IS evidence of a repeat" — was the defect: a rung that never
+    re-dispatches never actually RE-TRIES anything, so counting its expiry as
+    a second death is counting a timer, not an attempt. On 2026-08-21 this
+    produced exactly one real dead dispatch plus two bare timer ticks and
+    escalated four tasks (2c8f23ff, 0986460c, f8de9cdf, e037008e) with "3
+    consecutive dead machine resumes" naming the SAME single attempt id three
+    times.
+
+    The fix: an expired backoff window with no new dead attempt since it was
+    armed returns "retry" — `_resume` DISPATCHES on it (carrying the ladder,
+    re-anchoring the window), so the streak only ever advances when a
+    genuinely NEW dead attempt row appears after that dispatch. This drives
+    THREE real dead attempts through three full backoff-then-redispatch
+    cycles to reach a park, so `streak == len(dead_attempt_ids)` by
+    construction, not by coincidence."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(store, t, at=anchor)
+    dead_id_1 = await _dead_attempt(store, t, 1, turns=0, tokens=0)
 
     watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
 
@@ -1481,40 +1564,167 @@ async def test_third_dead_machine_resume_parks_with_an_honest_blocker(store):
     refreshed = await store.get_task(t.id)
     assert refreshed.context["wake_dead_resumes"]["streak"] == 1
 
-    # Tick 3, past the first backoff window: streak 1 -> 2, backs off ~20m —
-    # no new attempt row was created (the task never resumed), yet the
-    # streak still advances.
+    # Tick 3, past the first backoff window: the rung ENDS in a re-dispatch —
+    # no new attempt row exists yet, so nothing was tried since the first
+    # backoff, so this is "retry", not a second death.
     now2 = backoff_until_1 + timedelta(seconds=1)
     actions = await watcher.tick(now=now2)
-    assert (t.id, "wake_backoff") in actions
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    assert (t.id, "parked_dead_resumes") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 1
+    assert dead_state["attempt_ids"] == [dead_id_1]
+
+    # That re-dispatch died too (0 priced tokens, <=1 turn) and the loop
+    # parked the task again with the SAME wake condition — this is a
+    # genuinely NEW dead attempt row, so it DOES advance the streak.
+    dead_id_2 = await _dispatched_then_died(store, t, 2)
+
+    actions = await watcher.tick(now=now2)
+    assert (t.id, "wake_backoff") in actions, actions
     refreshed = await store.get_task(t.id)
     assert refreshed.status == TaskStatus.BLOCKED
-    assert refreshed.context["wake_dead_resumes"]["streak"] == 2
-    backoff_until_2 = datetime.fromisoformat(
-        refreshed.context["wake_dead_resumes"]["backoff_until"])
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_2]
+    backoff_until_2 = datetime.fromisoformat(dead_state["backoff_until"])
     assert backoff_until_2 > backoff_until_1
+    assert backoff_until_2 - now2 == timedelta(minutes=20)
 
-    # Tick 4, past the second backoff window: streak 2 -> 3, parks honestly
-    # instead of resuming a 4th time.
+    # Past the second backoff window: another re-dispatch (retry), still no
+    # NEW dead attempt yet, so streak stays 2.
     now3 = backoff_until_2 + timedelta(seconds=1)
+    actions = await watcher.tick(now=now3)
+    assert (t.id, "resumed") in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_2]
+
+    # A THIRD genuinely new dead attempt: streak 2 -> 3, parks honestly
+    # instead of resuming a 4th time.
+    dead_id_3 = await _dispatched_then_died(store, t, 3)
+
     actions = await watcher.tick(now=now3)
     assert (t.id, "parked_dead_resumes") in actions
     assert (t.id, "resumed") not in actions
     refreshed = await store.get_task(t.id)
     assert refreshed.status == TaskStatus.ESCALATED
     assert refreshed.blocker["dead_resume_streak"] == 3
-    assert refreshed.blocker["dead_resume_attempt_ids"] == [dead_id]
-    assert dead_id in refreshed.blocker["question"]
+    assert refreshed.blocker["dead_resume_attempt_ids"] == [
+        dead_id_1, dead_id_2, dead_id_3,
+    ]
+    assert dead_id_1 in refreshed.blocker["question"]
+    assert dead_id_2 in refreshed.blocker["question"]
+    assert dead_id_3 in refreshed.blocker["question"]
     # The wake condition must never be silently dropped by the park.
     assert refreshed.blocker["wake_condition"] == "after:2h"
 
-    # A 5th tick must not resume — the task already left the parked
+    # A further tick must not resume — the task already left the parked
     # statuses the watcher polls, and even if it hadn't, it must stay put.
     now4 = now3 + timedelta(hours=1)
     actions = await watcher.tick(now=now4)
     assert (t.id, "resumed") not in actions
     refreshed = await store.get_task(t.id)
     assert refreshed.status == TaskStatus.ESCALATED
+
+
+@pytest.mark.asyncio
+async def test_escalation_names_one_attempt_id_per_streak_point(store):
+    """The escalation text must be honest: exactly `streak` dead attempt ids,
+    all of them named, and `len(dead_resume_attempt_ids) == dead_resume_streak`
+    — the invariant that makes "3 consecutive dead machine resumes" true by
+    construction rather than a coincidence of the old (buggy) counting."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(store, t, at=anchor)
+    dead_id_1 = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+
+    actions = await watcher.tick(now=now)
+    assert (t.id, "wake_backoff") in actions
+    refreshed = await store.get_task(t.id)
+    backoff_until_1 = datetime.fromisoformat(
+        refreshed.context["wake_dead_resumes"]["backoff_until"])
+
+    now2 = backoff_until_1 + timedelta(seconds=1)
+    await watcher.tick(now=now2)  # retry: re-dispatch, streak still 1
+    dead_id_2 = await _dispatched_then_died(store, t, 2)
+    actions = await watcher.tick(now=now2)
+    assert (t.id, "wake_backoff") in actions
+    refreshed = await store.get_task(t.id)
+    backoff_until_2 = datetime.fromisoformat(
+        refreshed.context["wake_dead_resumes"]["backoff_until"])
+
+    now3 = backoff_until_2 + timedelta(seconds=1)
+    await watcher.tick(now=now3)  # retry: re-dispatch, streak still 2
+    dead_id_3 = await _dispatched_then_died(store, t, 3)
+    actions = await watcher.tick(now=now3)
+    assert (t.id, "parked_dead_resumes") in actions
+
+    refreshed = await store.get_task(t.id)
+    assert refreshed.blocker["dead_resume_streak"] == 3
+    assert len(refreshed.blocker["dead_resume_attempt_ids"]) == \
+        refreshed.blocker["dead_resume_streak"]
+
+    events = await store.list_events(t.id)
+    park_events = [e for e in events if e.get("kind") == "escalated_dead_resumes"]
+    assert len(park_events) == 1
+    text = park_events[0]["text"]
+    assert "3 consecutive" in text
+    for dead_id in (dead_id_1, dead_id_2, dead_id_3):
+        assert dead_id in text
+
+
+@pytest.mark.asyncio
+async def test_the_2c8f23ff_recorded_state_replays_as_proceed(store):
+    """Built as an in-test fixture from the values quoted in the task
+    description (2026-08-21 incident, task 2c8f23ff) — never read or point a
+    test at the live `~/.no_human` DB. One attempt: turns_used=1, 0 priced
+    tokens, infra_failure=1, failure_reason exactly as recorded, blocker
+    wake_condition="quota_refreshed". This is an attributed wall death (AC1's
+    exclusion), so the watcher must resume normally, not back off."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(
+        store,
+        status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "quota_refreshed",
+            "raised_at": (now - timedelta(hours=3)).isoformat(),
+            "confidence": 0.9,
+        },
+        # quota_refreshed is satisfied once wake_check_at passes — set it in
+        # the past so this tick's condition check fires, same as a real
+        # quota-park's recorded reset time.
+        wake_at=now.isoformat(),
+    )
+    await _machine_resumed(store, t, at=anchor)
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0,
+        infra_failure=1,
+        failure_reason=(
+            "quota: You have hit your weekly limit · resets 6pm "
+            "(Asia/Jerusalem)"
+        ),
+    )
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    assert refreshed.context["wake_dead_resumes"]["streak"] == 0
 
 
 @pytest.mark.asyncio

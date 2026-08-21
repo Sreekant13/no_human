@@ -6739,6 +6739,54 @@ async def test_a_dead_reviewer_session_parks_the_whole_run(bare_repo, tmp_path,
     assert parked.blocker["resume_branch"].startswith("no-human/")
     # The diff did NOT pass: no PR was opened on an unreviewed change.
     assert not outcome.pr_url
+    # DEFECT 2(b): the coder's own attempt row for this round must be closed
+    # as infra-attributed, or this reviewer-side wall death is an unattributed
+    # dead row to anything keyed on `infra_failure` — the dead-resume breaker
+    # (`blockers/wake.py`, `_dead_resume_verdict`) among them.
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt row was ever created — the test proves nothing"
+    coder_attempt = attempts[-1]
+    assert coder_attempt["infra_failure"] == 1, coder_attempt
+    assert (coder_attempt["failure_reason"] or "").startswith("quota:"), (
+        coder_attempt)
+
+
+async def test_a_transient_infra_reviewer_park_classifies_its_attempt_row(
+        bare_repo, tmp_path, store):
+    """Sibling of the QUOTA-park test above, for the plain TRANSIENT_INFRA
+    branch (`elif session_error:` in `_escalate_reviewer_unavailable` — the
+    marker is present but the prose carries no quota signal and no bare
+    `_BARE_SDK_RESULT_MARKER`, so it never reaches the QUOTA or corroborated-
+    QUOTA branches). Same requirement: the coder's attempt row must be closed
+    `infra_failure=1`, this time with an `infra:`-prefixed reason."""
+    from no_human.review.reviewer import REVIEW_SESSION_ERROR_MARKER
+
+    cfg = _config(tmp_path)
+    reviewer = UnavailableReviewer(
+        "the reviewer reached no verdict after 2 rounds "
+        f"({REVIEW_SESSION_ERROR_MARKER} reviewer session error (error) — "
+        "connection reset by peer)")
+    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_add_mul),
+                        SlackNotifier(None), event_sink=[].append,
+                        reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+    parked = await store.get_task(t.id)
+
+    assert reviewer.calls, "the gate never ran — the test proves nothing"
+    assert parked.blocker["category"] == "TRANSIENT_INFRA", parked.blocker
+    assert parked.blocker["wake_condition"].startswith("after:"), parked.blocker
+    assert not outcome.pr_url
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt row was ever created — the test proves nothing"
+    coder_attempt = attempts[-1]
+    assert coder_attempt["infra_failure"] == 1, coder_attempt
+    assert (coder_attempt["failure_reason"] or "").startswith("infra:"), (
+        coder_attempt)
 
 
 async def test_a_verdict_clears_the_consecutive_infra_park_streak(
