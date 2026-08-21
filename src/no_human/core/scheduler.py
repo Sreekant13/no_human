@@ -39,7 +39,7 @@ from . import slot_wait
 from .events import EventPersister
 from .infra_breaker import infra_breaker
 from .task import TaskStatus
-from .worktree import sweep_stale_worktrees
+from .worktree import salvage_dead_worktrees, sweep_stale_worktrees
 
 log = logging.getLogger("no_human.scheduler")
 
@@ -757,6 +757,23 @@ class Scheduler:
             log.info(
                 "startup: reclaimed %d stale worktree(s), skipped %d",
                 removed, skipped)
+
+    async def _salvage_dead_worktrees(self) -> None:
+        """Startup-only: commit + checkpoint the uncommitted work of an
+        IMPLEMENTING task whose worker was KILLED (the hard-kill twin of
+        `Orchestrator._honor_server_stop`). Runs before the first tick,
+        because the task's own next run reaps its worktree
+        (`_reap_dead_worktrees`) with no salvage. Must never block boot."""
+        try:
+            salvaged, skipped = await salvage_dead_worktrees(
+                self.store, self._config)
+        except Exception:  # noqa: BLE001 — salvage must never block boot
+            log.exception("startup: salvaging dead worktrees failed")
+            return
+        if salvaged or skipped:
+            log.info(
+                "startup: salvaged %d dead worktree(s), skipped %d",
+                salvaged, skipped)
 
     async def _recover_orphans(self, *, startup: bool = True) -> None:
         """Crash/strand recovery. At STARTUP (review 2026-07-25): nothing is
@@ -1492,6 +1509,11 @@ class Scheduler:
         # FINISHED is not a checkpoint to resume from — it is debris.
         await self._reconcile_terminal_task_attempts()
         await self._sweep_stale_worktrees()
+        # AFTER the sweep (which only reclaims TERMINAL leftovers and never
+        # touches this) and BEFORE orphan recovery: an IMPLEMENTING task's
+        # dirty worktree from a hard-killed worker must be salvaged before
+        # its own next run reaps it with no commit.
+        await self._salvage_dead_worktrees()
         await self._recover_orphans()
         # AFTER the orphan sweep (which only moves rows between claimable
         # states) and BEFORE the first tick: a wall the previous process was

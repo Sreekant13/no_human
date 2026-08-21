@@ -8127,9 +8127,13 @@ class Orchestrator:
         exactly this incident's shape. `_honor_server_stop` writes the
         IMPLEMENTING twin, ``by == "server_stop"``: a graceful stop mid-coder
         leaves a [WIP-PARTIAL] diff no review has judged, so a zero-diff claim
-        on top of it is the same laundering shape. Both values live in
-        `blockers.MACHINE_REQUEUE_PROVENANCE`, which is what this gate reads —
-        a third machine writer must join that set, not this docstring. A
+        on top of it is the same laundering shape.
+        `worktree.salvage_dead_worktrees` writes the hard-kill twin,
+        ``by == "hard_kill_salvage"`` — a SIGKILL mid-coder leaves the same
+        unjudged [WIP-PARTIAL] diff, so the same gate applies. All three
+        values live in `blockers.MACHINE_REQUEUE_PROVENANCE`, which is what
+        this gate reads — a fourth machine writer must join that set, not
+        this docstring. A
         `wake` resume (CI-fix, quota, timer) or a
         human-gated `nh reply` never had a review in flight to interrupt, and its
         already-reviewed escape (D15, `test_the_already_satisfied_escape_fires_

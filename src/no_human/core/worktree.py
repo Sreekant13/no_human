@@ -38,7 +38,7 @@ import shutil
 from pathlib import Path
 
 from ..testing import runner
-from .task import TERMINAL_STATES
+from .task import TERMINAL_STATES, TaskStatus
 
 log = logging.getLogger("no_human.worktree")
 
@@ -319,3 +319,203 @@ async def sweep_stale_worktrees(
             log.warning("worktree sweep: error inspecting %s: %s", entry, exc)
             skipped += 1
     return (removed, skipped)
+
+
+def _open_worktree_repo(entry: Path, config):
+    """``GitRepo(entry)`` for a worktree directory itself (not the main
+    repo `_default_open_repo` opens) — guarded the same way: any failure to
+    open reads as "cannot salvage", never as an exception that aborts the
+    whole pass."""
+    from ..vcs import GitRepo
+
+    try:
+        return GitRepo(
+            entry,
+            identity_name=config["git"]["agent_identity_name"],
+            identity_email=config["git"]["agent_identity_email"],
+            never_push_to=config["git"]["never_push_to"],
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
+    """Commit + stamp one provably-dead IMPLEMENTING worktree. Returns
+    ``True`` on a real salvage, ``False`` on any skip (already logged with
+    its reason). Never raises — the caller wraps this in its own
+    try/except, but every internal failure here is also caught so the log
+    line names the real reason rather than a generic "error inspecting"."""
+    from ..blockers import resume_provenance
+    from ..vcs.git import ProtectedBranch
+
+    repo = _open_worktree_repo(entry, config)
+    if repo is None:
+        log.warning("worktree salvage: skipping %s — could not open as a "
+                    "git repo", entry)
+        return False
+
+    try:
+        if not repo.has_changes():
+            log.debug("worktree salvage: skipping %s — clean, nothing to "
+                      "salvage", entry)
+            return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("worktree salvage: skipping %s — could not read status: "
+                    "%s", entry, exc)
+        return False
+
+    ctx = task.context or {}
+    prior = ctx.get("resume_from") or {}
+    # Identical to `Orchestrator._honor_server_stop` /
+    # `Scheduler._inherited_checkpoint`: a human's gate is executed, never
+    # decided over; a stamp-less legacy resume reads as a human's too.
+    human_gated = bool(prior.get("sha")) and (
+        prior.get("by") == "human"
+        or (not prior.get("by")
+            and ctx.get("resume_reason") != "wake_condition_satisfied"))
+    if human_gated:
+        log.info("worktree salvage: skipping %s — resume_from is human-gated, "
+                 "not overwriting it", entry)
+        return False
+
+    branch = (attempt.get("branch_name") or "").strip()
+    if not branch:
+        log.warning("worktree salvage: skipping %s — attempt has no "
+                    "recorded branch_name", entry)
+        return False
+
+    try:
+        cur = repo.current_branch()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("worktree salvage: skipping %s — could not read current "
+                    "branch: %s", entry, exc)
+        return False
+    if cur != branch:
+        try:
+            repo.checkout(branch)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("worktree salvage: skipping %s — could not check "
+                        "out %s: %s", entry, branch, exc)
+            return False
+
+    try:
+        commit = repo.commit_all(
+            f"[WIP-PARTIAL] salvaged from a killed run: {task.title}")
+    except ProtectedBranch as exc:
+        log.warning("worktree salvage: skipping %s — refusing to commit on "
+                    "protected branch %s: %s", entry, branch, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("worktree salvage: skipping %s — commit failed: %s",
+                    entry, exc)
+        return False
+
+    await store.merge_context(task.id, {
+        "resume_from": resume_provenance(
+            {"sha": commit.sha, "branch": branch}, "hard_kill_salvage"),
+        "handoff": {
+            "wip_sha": commit.sha,
+            "commit": commit.sha,
+            "stopped_because": "killed mid-implementation (owner pid gone)",
+            "turns_used": None,
+        },
+    })
+    await store.update_attempt(
+        attempt["id"], status="interrupted",
+        failure_reason=(
+            "interrupted: worker process died mid-implementation — "
+            f"salvaged {commit.sha[:8]}"),
+        infra_failure=1, commit_sha=commit.sha,
+    )
+    log.info(
+        "worktree salvage: salvaged %d file(s) from dead worktree %s "
+        "(task %s) as %s on %s",
+        commit.files_changed, entry, task.id[:8], commit.sha[:8], branch,
+    )
+    return True
+
+
+async def salvage_dead_worktrees(
+    store, config, *, open_repo=None, live: set[str] | None = None,
+) -> tuple[int, int]:
+    """Startup-only. The hard-kill twin of `Orchestrator._honor_server_stop`:
+    a task killed mid-IMPLEMENTING (SIGKILL, OOM, crash) keeps its dirty
+    worktree through `sweep_stale_worktrees` (non-terminal tasks are always
+    skipped there), and its own NEXT run reaps that worktree with no salvage
+    commit (`Orchestrator._reap_dead_worktrees`) — this runs first, before
+    that reap can happen, and turns the uncommitted diff into a
+    ``[WIP-PARTIAL]`` commit with a machine-provenance ``resume_from`` stamp
+    instead of silently discarding it.
+
+    Deliberately separate from `sweep_stale_worktrees`: that janitor deletes
+    terminal leftovers, this one commits non-terminal (IMPLEMENTING) ones and
+    never deletes anything. Both are startup-only, both never raise.
+
+    ``open_repo`` is accepted for signature parity with `sweep_stale_worktrees`
+    but unused here — salvage always opens the WORKTREE itself (`entry`), not
+    the main repo, via `_open_worktree_repo`.
+
+    Returns ``(salvaged, skipped)``. Every skip is logged with its reason."""
+    from ..config import pid_alive, worktree_owner, worktree_root
+
+    if live is None:
+        live = _LIVE_WORKTREES
+    root = worktree_root(config)
+    if not root.is_dir():
+        log.debug("worktree salvage: root %s does not exist, nothing to "
+                  "salvage", root)
+        return (0, 0)
+
+    salvaged = 0
+    skipped = 0
+    for entry in sorted(root.iterdir()):
+        try:
+            if not entry.is_dir():
+                continue
+            if str(entry) in live:
+                continue  # a run in THIS process owns it right now
+
+            task_id, owner_pid = worktree_owner(entry.name)
+            if owner_pid is None:
+                continue  # legacy bare-<task_id> shape: no salvage, uncounted
+            if pid_alive(owner_pid):
+                log.info(
+                    "worktree salvage: skipping %s — owner pid %d is alive",
+                    entry, owner_pid)
+                skipped += 1
+                continue
+
+            task = await store.get_task(task_id)
+            if task is None:
+                continue  # unknown to this store: not ours to salvage
+            if task.status is not TaskStatus.IMPLEMENTING:
+                log.debug(
+                    "worktree salvage: skipping %s — task %s is %s, not "
+                    "implementing", entry, task_id[:8], task.status.value)
+                skipped += 1
+                continue
+
+            attempt = await store.latest_open_attempt(task.id)
+            if attempt is None:
+                log.debug(
+                    "worktree salvage: skipping %s — no open attempt, "
+                    "nothing died", entry)
+                skipped += 1
+                continue
+
+            if not is_agent_worktree(entry, config, live=live):
+                log.warning(
+                    "worktree salvage: skipping %s — not a recognizable "
+                    "agent worktree", entry)
+                skipped += 1
+                continue
+
+            if await _salvage_one(entry, task, attempt, config, store):
+                salvaged += 1
+            else:
+                skipped += 1
+        except Exception as exc:  # noqa: BLE001 — one bad entry must not
+            # abort the whole pass.
+            log.warning("worktree salvage: error inspecting %s: %s", entry, exc)
+            skipped += 1
+    return (salvaged, skipped)

@@ -259,11 +259,17 @@ def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, A
 SERVER_STOP_REASON = "__server_stop__"
 
 #: ``resume_from.by`` values the MACHINE writes after an interrupted run — a
-#: killed process (``orphan_recovery``, the scheduler's startup sweep) or a
-#: graceful stop (``server_stop``, `Orchestrator._honor_server_stop`). The
-#: already-satisfied gate reads this set: a zero-diff claim over a diff no
-#: completed review judged must route to a full review on either path.
-MACHINE_REQUEUE_PROVENANCE = frozenset({"orphan_recovery", "server_stop"})
+#: killed process (``orphan_recovery``, the scheduler's startup sweep), a
+#: graceful stop (``server_stop``, `Orchestrator._honor_server_stop`), or a
+#: hard kill mid-IMPLEMENTING (``hard_kill_salvage``,
+#: `core.worktree.salvage_dead_worktrees` — the startup salvage of a worktree
+#: whose owner pid died un-gracefully to SIGKILL/OOM/crash; the hard-kill twin
+#: of ``server_stop``). The already-satisfied gate reads this set: a zero-diff
+#: claim over a diff no completed review judged must route to a full review on
+#: any of these paths.
+MACHINE_REQUEUE_PROVENANCE = frozenset(
+    {"orphan_recovery", "server_stop", "hard_kill_salvage"}
+)
 
 
 @dataclass
