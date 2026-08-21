@@ -53,6 +53,7 @@ from ..blockers import (
     blocker_prompt_suffix,
     fallback_blocker,
     find_stored_answer,
+    human_event,
     missing_access,
     notification_line,
     parse_blocker,
@@ -2416,6 +2417,7 @@ class Orchestrator:
             # whatever branch this worker happens to have active.
             sha, branch = prior["sha"], (prior.get("branch") or "")
             kept_prior = True
+        prior_status = task.status
         prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
         task.blocker = user_pause_blocker(
             reason, checkpoint={"sha": sha, "branch": branch or ""},
@@ -2434,7 +2436,12 @@ class Orchestrator:
         # `update_task` would rewrite the whole context blob from this in-memory
         # copy and drop whatever the CLI or the watcher merged meanwhile.
         await self.store.update_task_columns(task)
-        await self.store.set_status(task, TaskStatus.BLOCKED, validate=False)
+        await self.store.set_status(
+            task, TaskStatus.BLOCKED, validate=False,
+            event=human_event(
+                "pause", prior_status=prior_status, prior_blocker=prior_blocker,
+                reason=reason, actor="orchestrator"),
+        )
         # Honoured, so it must not re-fire on `nh task resume`.
         await self.store.clear_cancel_request(task.id)
         self.emit(

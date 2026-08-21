@@ -544,6 +544,36 @@ async def test_honoured_stop_with_no_measurable_checkpoint_keeps_the_prior(
     assert resume_checkpoint(fresh.blocker) == {"sha": "a" * 40, "branch": "no-human/w"}
 
 
+async def test_honoured_stop_writes_the_shared_human_pause_event(
+        store, bare_repo, tmp_path):
+    """b404b872: a human pause of a RUNNING task is honoured by the
+    orchestrator, not the CLI, so it is the one human status change the CLI
+    verbs cannot record. `_honor_cancel` must write the SAME `human_event`
+    shape, in the same `set_status` transaction, carrying the status and
+    blocker the pause landed on. RED on the PR head without this hunk: the
+    park happens, no `human_pause` row exists."""
+    orch, _backend, task, _repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+    task.blocker = {"category": "CI_GATE", "wake_condition": "ci_green",
+                    "resume_commit": "a" * 40, "resume_branch": "no-human/w"}
+    prior_status = task.status
+
+    await orch._honor_cancel(task, None, None, "Paused from board")
+
+    events = [e for e in await store.list_events(task.id)
+              if e.get("kind") == "human_pause"]
+    assert len(events) == 1, events
+    ev = events[0]
+    assert ev["source"] == "human"
+    assert ev["actor"] == "orchestrator"
+    assert ev["reason"] == "Paused from board"
+    assert ev["prior_status"] == prior_status.value
+    assert ev["prior_blocker"]["category"] == "CI_GATE"
+    assert ev["prior_blocker"]["wake_condition"] == "ci_green"
+    fresh = await store.get_task(task.id)
+    assert fresh.status == TaskStatus.BLOCKED
+
+
 async def test_honoured_stop_respects_a_send_backs_cleared_checkpoint(
         store, bare_repo, tmp_path):
     """D1 of the first review: a human's send-back writes `resume_from` with

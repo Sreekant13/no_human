@@ -1498,11 +1498,18 @@ def task_pause(task_id, reason):
             # Carry the checkpoint the task already had (twin of the board's
             # direct-park branch; `carried_checkpoint` honours a human's
             # sha-less `resume_from` as a veto).
-            from ..blockers import carried_checkpoint, user_pause_blocker
+            from ..blockers import carried_checkpoint, human_event, user_pause_blocker
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             prior = carried_checkpoint(t) or {}
             t.blocker = user_pause_blocker(reason, checkpoint=prior, paused_by="cli")
             await store.update_task(t)
-            await store.set_status(t, TaskStatus.BLOCKED)
+            await store.set_status(
+                t, TaskStatus.BLOCKED,
+                event=human_event(
+                    "pause", prior_status=prior_status, prior_blocker=prior_blocker,
+                    reason=reason, actor="cli"),
+            )
             await store.clear_cancel_request(t.id)
             console.print(f"[yellow]paused[/] {t.id[:8]} — resume with: "
                           f"[bold]nh task resume {t.id[:8]}[/]")
@@ -1533,7 +1540,9 @@ def task_resume(task_id):
             # STALE `resume_from` (or from base) and silently throws away the
             # work the parked attempt had already committed. Read it before
             # clearing the blocker, which is what holds the sha.
-            from ..blockers import resume_checkpoint, resume_provenance
+            from ..blockers import human_event, resume_checkpoint, resume_provenance
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             checkpoint = resume_checkpoint(t.blocker)
             # Provenance is stamped UNCONDITIONALLY — see `WakeWatcher._resume`.
             # Gating it on the checkpoint left the previous actor's `by`
@@ -1548,7 +1557,12 @@ def task_resume(task_id):
             # "Run again" withdraws any pending stop, or the next attempt would
             # honour it immediately and park the task straight back.
             await store.clear_cancel_request(t.id)
-            await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+            await store.set_status(
+                t, TaskStatus.IMPLEMENTING, validate=False,
+                event=human_event(
+                    "resume", prior_status=prior_status, prior_blocker=prior_blocker,
+                    actor="cli"),
+            )
             resumed_at = f" from {checkpoint['sha'][:8]}" if checkpoint else ""
             console.print(f"[green]resumed[/] {t.id[:8]}{resumed_at} → implementing")
 
@@ -1861,11 +1875,18 @@ def task_cancel(task_id, reason):
                 )
                 return
 
+            from ..blockers import human_event
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             t.context = await store.merge_context(
                 t.id, {"cancel_reason": reason})
             await store.clear_cancel_request(t.id)
             await store.set_status(
-                t, TaskStatus.FAILED, validate=False, human_override=True)
+                t, TaskStatus.FAILED, validate=False, human_override=True,
+                event=human_event(
+                    "cancel", prior_status=prior_status, prior_blocker=prior_blocker,
+                    reason=reason, actor="cli"),
+            )
             console.print(f"[red]cancelled[/] {t.id[:8]} — reason: {reason}")
 
     asyncio.run(_go())
@@ -1889,6 +1910,8 @@ def task_retry(task_id):
                     f"can be retried. Use [bold]nh task resume[/] for parked tasks."
                 )
                 return
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             t.blocker = None
             t.wake_check_at = None
             # None deletes the key (RFC 7396) — clears cancel_reason atomically.
@@ -1911,6 +1934,7 @@ def task_retry(task_id):
             # straight back. Retire those rows first — see
             # `Store.close_open_attempts` for why the distinction has to be
             # made here and cannot be made by the sweep.
+            from ..blockers import human_event
             await store.close_open_attempts(t.id)
             t.context = await store.merge_context(
                 t.id, {"cancel_reason": None, "retried_at": _now_iso(),
@@ -1918,7 +1942,11 @@ def task_retry(task_id):
             await store.update_task_columns(t)
             await store.clear_cancel_request(t.id)
             await store.set_status(
-                t, TaskStatus.PENDING, validate=False, human_override=True)
+                t, TaskStatus.PENDING, validate=False, human_override=True,
+                event=human_event(
+                    "retry", prior_status=prior_status,
+                    prior_blocker=prior_blocker, actor="cli"),
+            )
             console.print(f"[green]retried[/] {t.id[:8]} → pending (will run on next dispatch)")
 
     asyncio.run(_go())
@@ -3039,6 +3067,7 @@ def reply(task_id, answer, choose, run):
         Blocker,
         answer_record,
         apply_action,
+        human_event,
         is_plan_approval_action,
         is_terminal_action,
         resume_checkpoint,
@@ -3059,6 +3088,8 @@ def reply(task_id, answer, choose, run):
                     f"[yellow]task is {t.status.value}, not blocked[/] — nothing to resume"
                 )
                 return
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             b = Blocker.from_dict(t.blocker) if t.blocker else None
             question = b.question if b else None
 
@@ -3161,7 +3192,12 @@ def reply(task_id, answer, choose, run):
             # `nh task pause` is resumed by answering it).
             await store.clear_cancel_request(t.id)
             # Resume into the working loop from the [WIP-BLOCKED] checkpoint.
-            await store.set_status(t, resume_to, validate=False)
+            await store.set_status(
+                t, resume_to, validate=False,
+                event=human_event(
+                    "reply", prior_status=prior_status, prior_blocker=prior_blocker,
+                    actor="cli"),
+            )
             console.print(f"[green]resumed[/] {t.id[:8]} with your answer")
             if not run:
                 console.print(f"run it with:  [bold]nh watch {t.id[:8]}[/]")
@@ -4116,6 +4152,8 @@ def unblock(task_id, fail):
                     f"(blocked/awaiting_input/paused_quota/escalated) can be "
                     f"unblocked; use `nh reject` to send a live task back")
                 return
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             t.wake_check_at = None
             if target is TaskStatus.IMPLEMENTING:
                 # Re-entering the loop by hand IS a human gate, so record whose
@@ -4145,7 +4183,13 @@ def unblock(task_id, fail):
                 await store.clear_cancel_request(t.id)
             else:
                 await store.update_task(t)
-            await store.set_status(t, target, validate=False)
+            from ..blockers import human_event
+            await store.set_status(
+                t, target, validate=False,
+                event=human_event(
+                    "unblock", prior_status=prior_status, prior_blocker=prior_blocker,
+                    actor="cli"),
+            )
             console.print(f"[green]{t.id[:8]} -> {target.value}[/]")
 
     asyncio.run(_go())
@@ -4463,7 +4507,9 @@ def reject(task_id, reason):
             # The CLI twin of the drawer's "Send back" — same human gate, same
             # provenance stamp. No checkpoint is involved, so this CLEARS any
             # recorded sha rather than relabelling one it never chose.
-            from ..blockers import resume_provenance
+            from ..blockers import human_event, resume_provenance
+            prior_status = t.status
+            prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             # Twin of the endpoint, down to this line: a `resume_from` with no
             # sha reads to the orphan sweep exactly like none at all, so the
             # dead rows are retired or the sweep re-stamps over this decision.
@@ -4480,7 +4526,12 @@ def reject(task_id, reason):
             t.wake_check_at = None
             await store.update_task_columns(t)
             await store.clear_cancel_request(t.id)
-            await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+            await store.set_status(
+                t, TaskStatus.IMPLEMENTING, validate=False,
+                event=human_event(
+                    "reject", prior_status=prior_status, prior_blocker=prior_blocker,
+                    reason=reason, actor="cli"),
+            )
             console.print(
                 f"[yellow]sent back[/] {t.id[:8]} — run [bold]nh watch {t.id[:8]}[/] to retry."
             )

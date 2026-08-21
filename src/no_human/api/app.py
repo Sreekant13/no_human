@@ -1364,6 +1364,8 @@ async def send_back(
         raise HTTPException(status_code=409, detail="task is already done")
     if task.status == TaskStatus.FAILED and (task.context or {}).get("cancel_reason"):
         raise HTTPException(status_code=409, detail="task is cancelled")
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     await store.append_context_list(
         task.id, "send_back_feedback", {"at": _now(), "message": body.message})
     # A human pressing "Send back" IS the gate the zero-diff honesty check looks
@@ -1371,7 +1373,7 @@ async def send_back(
     # here, so the write CLEARS any recorded `sha`/`branch` rather than
     # relabelling a sha this human never chose — relabelling is what disarmed
     # the gate and credited the loop's own abandoned partial.
-    from ..blockers import resume_provenance
+    from ..blockers import human_event, resume_provenance
     # A CLEAR is a clear however it is spelled: this writes `sha: None`, and
     # the orphan sweep reads a `resume_from` with no sha exactly as it reads no
     # `resume_from` at all — so without this the sweep would re-stamp the dead
@@ -1389,7 +1391,12 @@ async def send_back(
     # attempt would honour it on turn zero and park the task straight back
     # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
     await store.clear_cancel_request(task.id)
-    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(
+        task, TaskStatus.IMPLEMENTING, validate=False,
+        event=human_event(
+            "reject", prior_status=prior_status, prior_blocker=prior_blocker,
+            reason=body.message, actor="operator:api"),
+    )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
         "type": "task_updated",
@@ -1492,12 +1499,19 @@ async def pause_task(
     # Carry the checkpoint the task already had (a crashed worker's park is
     # exactly where it is worth keeping) — `carried_checkpoint` honours a
     # human's sha-less `resume_from` as a veto, like `_honor_cancel`.
-    from ..blockers import carried_checkpoint, user_pause_blocker
+    from ..blockers import carried_checkpoint, human_event, user_pause_blocker
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     prior = carried_checkpoint(task) or {}
     task.blocker = user_pause_blocker(
         "Paused by operator via web board", checkpoint=prior, paused_by="board")
     await store.update_task_columns(task)
-    await store.set_status(task, TaskStatus.BLOCKED, validate=False)
+    await store.set_status(
+        task, TaskStatus.BLOCKED, validate=False,
+        event=human_event(
+            "pause", prior_status=prior_status, prior_blocker=prior_blocker,
+            actor="operator:api"),
+    )
     await store.clear_cancel_request(task.id)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
@@ -1521,6 +1535,8 @@ async def resume_task(
             status_code=409,
             detail=f"task is {task.status.value!r} — only parked tasks can be resumed",
         )
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     if isinstance(task.blocker, dict) and task.blocker.get("human_stopped"):
         blocker_data = dict(task.blocker)
         del blocker_data["human_stopped"]
@@ -1537,7 +1553,7 @@ async def resume_task(
     # base) and silently threw away everything the parked attempt had already
     # committed, and it left the previous actor's `by` describing a resume a
     # human had just performed. Two independent reviews found this same hole.
-    from ..blockers import resume_checkpoint, resume_provenance
+    from ..blockers import human_event, resume_checkpoint, resume_provenance
     checkpoint = resume_checkpoint(task.blocker)
     task.blocker = None
     task.wake_check_at = None
@@ -1548,7 +1564,12 @@ async def resume_task(
     # attempt would honour it on turn zero and park the task straight back
     # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
     await store.clear_cancel_request(task.id)
-    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(
+        task, TaskStatus.IMPLEMENTING, validate=False,
+        event=human_event(
+            "resume", prior_status=prior_status, prior_blocker=prior_blocker,
+            actor="operator:api"),
+    )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
                           "tasks": [t.model_dump() for t in tasks]})
@@ -1570,6 +1591,9 @@ async def cancel_task(
             status_code=409,
             detail=f"task is already {task.status.value!r}",
         )
+    from ..blockers import human_event
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     reason = (body.reason if body else None) or ""
     reason = reason.strip()[:500] or "Cancelled from board"
     task.context = await store.merge_context(
@@ -1578,7 +1602,11 @@ async def cancel_task(
     # it, as `nh task cancel` does (cli/commands.py).
     await store.clear_cancel_request(task.id)
     await store.set_status(
-        task, TaskStatus.FAILED, validate=False, human_override=True)
+        task, TaskStatus.FAILED, validate=False, human_override=True,
+        event=human_event(
+            "cancel", prior_status=prior_status, prior_blocker=prior_blocker,
+            reason=reason, actor="operator:api"),
+    )
     # Cancel must STOP the work, not just flip the status. A running task's SDK
     # (claude) and pytest subprocesses live under its worktree and would keep
     # churning + holding resources otherwise (a cancelled task left 3 orphans).
@@ -1672,6 +1700,9 @@ async def retry_task(
             status_code=409,
             detail=f"task is {task.status.value!r} — only failed tasks can be retried",
         )
+    from ..blockers import human_event
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     task.blocker = None
     task.wake_check_at = None
     # None deletes the key (RFC 7396) — clears cancel_reason atomically.
@@ -1697,7 +1728,11 @@ async def retry_task(
     # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
     await store.clear_cancel_request(task.id)
     await store.set_status(
-        task, TaskStatus.PENDING, validate=False, human_override=True)
+        task, TaskStatus.PENDING, validate=False, human_override=True,
+        event=human_event(
+            "retry", prior_status=prior_status, prior_blocker=prior_blocker,
+            actor="operator:api"),
+    )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
                           "tasks": [t.model_dump() for t in tasks]})
@@ -3063,6 +3098,7 @@ async def reply_task(
         Blocker,
         answer_record,
         apply_action,
+        human_event,
         is_plan_approval_action,
         is_terminal_action,
         resume_checkpoint,
@@ -3078,6 +3114,8 @@ async def reply_task(
             status_code=409,
             detail=f"task is {task.status.value!r}, not a parked state — no question to answer",
         )
+    prior_status = task.status
+    prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     ctx = task.context or {}
     replies = ctx.get("human_replies") or []
     blocker = task.blocker or {}
@@ -3163,7 +3201,12 @@ async def reply_task(
     # attempt would honour it on turn zero and park the task straight back
     # (same as the CLI twin: cli/commands.py `nh task retry` / `nh reply`).
     await store.clear_cancel_request(task.id)
-    await store.set_status(task, resume_to, validate=False)
+    await store.set_status(
+        task, resume_to, validate=False,
+        event=human_event(
+            "reply", prior_status=prior_status, prior_blocker=prior_blocker,
+            actor="operator:api"),
+    )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
         "type": "task_updated",

@@ -314,6 +314,54 @@ def user_pause_blocker(
     }
 
 
+def human_event(
+    verb: str,
+    *,
+    prior_status: "TaskStatus | str",
+    prior_blocker: dict[str, Any] | None = None,
+    reason: str | None = None,
+    actor: str | None = None,
+    text: str | None = None,
+) -> dict[str, Any]:
+    """The ONE ``task_events`` shape every human status-changing verb emits.
+
+    ``Store.set_status``'s ``event=`` parameter inserts a ``task_events`` row
+    in the SAME transaction as the status write (see its docstring), but
+    until now nothing used it for the human verbs — ``nh task resume`` /
+    ``pause`` / ``retry`` / ``cancel``, ``nh unblock``, ``nh reject``,
+    ``nh reply``, and their board API twins. A human action that changed a
+    task's status left no record of WHO changed it or what it changed FROM.
+    This is the one place that shape is built, so a verb that forgets to
+    pass ``event=human_event(...)`` fails LOUDLY (an omitted event stays
+    omitted) instead of silently inventing a differently-shaped one, the
+    same failure mode `resume_provenance`'s docstring describes for
+    ``resume_from``.
+
+    ``prior_status`` and ``prior_blocker`` must be read off the task by the
+    CALLER *before* it mutates ``task.status`` / ``task.blocker`` — this
+    function does no I/O and cannot recover a value already overwritten.
+    ``prior_blocker`` is the full blocker dict as it stood at that moment
+    (or ``None`` when there wasn't one, e.g. resuming a plain AWAITING_INPUT
+    with no blocker attached — not every parked status carries one).
+    """
+    ev: dict[str, Any] = {
+        "source": "human",
+        "kind": f"human_{verb}",
+        "text": text or f"{verb} by human",
+        "prior_status": (
+            prior_status.value if isinstance(prior_status, TaskStatus)
+            else str(prior_status)
+        ),
+    }
+    if prior_blocker is not None:
+        ev["prior_blocker"] = prior_blocker
+    if reason:
+        ev["reason"] = reason
+    if actor:
+        ev["actor"] = actor
+    return ev
+
+
 #: The cooperative-stop reason a SERVER SHUTDOWN hands a running attempt.
 #: Never written to ``tasks.cancel_requested`` — it is signalled in-process
 #: (`Orchestrator.request_server_stop`) so a SIGKILL cannot leave it behind

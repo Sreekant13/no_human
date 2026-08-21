@@ -3163,3 +3163,61 @@ async def test_create_task_records_a_supported_backend_and_refuses_an_unknown_on
     r = await client.post("/api/tasks", json={"title": "Typo", "backend": "kodex"})
     assert r.status_code == 422, r.text
     assert "codex" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# human_event task_events on the board's own endpoints — a prior review found #
+# these share NO code with the CLI twins, despite comments claiming parity,   #
+# and were left silently unwired.                                             #
+# --------------------------------------------------------------------------- #
+
+_API_HUMAN_VERB_BLOCKER = {"category": "AMBIGUITY", "question": "which store?"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verb,seed_status,blocker,path,payload,expected_status,expected_kind", [
+        ("resume", TaskStatus.ESCALATED, _API_HUMAN_VERB_BLOCKER,
+         "resume", None, TaskStatus.IMPLEMENTING, "human_resume"),
+        ("pause", TaskStatus.IMPLEMENTING, None,
+         "pause", None, TaskStatus.BLOCKED, "human_pause"),
+        ("retry", TaskStatus.FAILED, _API_HUMAN_VERB_BLOCKER,
+         "retry", None, TaskStatus.PENDING, "human_retry"),
+        ("cancel", TaskStatus.IMPLEMENTING, _API_HUMAN_VERB_BLOCKER,
+         "cancel", {"reason": "stop it"}, TaskStatus.FAILED, "human_cancel"),
+        ("send-back", TaskStatus.AWAITING_APPROVAL, None,
+         "send-back", {"message": "redo it"}, TaskStatus.IMPLEMENTING, "human_reject"),
+        ("reply", TaskStatus.ESCALATED, _API_HUMAN_VERB_BLOCKER,
+         "reply", {"answer": "SQLite only"}, TaskStatus.IMPLEMENTING, "human_reply"),
+    ])
+async def test_every_board_endpoint_emits_its_shared_human_event(
+        client, store, verb, seed_status, blocker, path, payload,
+        expected_status, expected_kind):
+    """Table-driven, one row per board endpoint behind a human-facing button:
+    each must go through the SAME `human_event()` emitter the CLI twins use
+    (`blockers/taxonomy.py`), recording `source=human`, `kind=human_<verb>`,
+    `prior_status`, and the full prior blocker JSON in the SAME write as the
+    status change — never a differently-shaped or independently-invented
+    event, and never a silently-unwired endpoint."""
+    t = await _seed_task(store, status=seed_status)
+    if blocker is not None:
+        t.blocker = blocker
+        await store.update_task(t)
+
+    if payload is not None:
+        r = await client.post(f"/api/tasks/{t.id}/{path}", json=payload)
+    else:
+        r = await client.post(f"/api/tasks/{t.id}/{path}")
+
+    assert r.status_code == 200, f"{verb}: {r.text}"
+    fresh = await store.find_task(t.id)
+    assert fresh.status == expected_status, f"{verb}: {fresh.status}"
+
+    events = await store.list_events(t.id)
+    human = [e for e in events if e.get("source") == "human"]
+    assert len(human) == 1, f"{verb}: expected exactly one human event, got: {events}"
+    ev = human[0]
+    assert ev["kind"] == expected_kind, f"{verb}: {ev}"
+    assert ev["prior_status"] == seed_status.value, f"{verb}: {ev}"
+    if blocker is not None:
+        assert ev.get("prior_blocker") == blocker, f"{verb}: {ev}"

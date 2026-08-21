@@ -2664,6 +2664,112 @@ def test_a_human_verb_adopts_only_the_checkpoint_IT_read(verb, args, tmp_path, m
         f"'0e22fe3d', the blocker's checkpoint is '75c68e08': {resume_from}")
 
 
+# --------------------------------------------------------------------------- #
+# human_event task_events — every human status-changing verb records WHO      #
+# changed a task's status and what it changed FROM, in the same write.        #
+# --------------------------------------------------------------------------- #
+
+_HUMAN_VERB_BLOCKER = {"category": "AMBIGUITY", "question": "which store?"}
+
+
+def _seed_human_verb_task(db_path: Path, status: TaskStatus, *,
+                          blocker: dict | None) -> str:
+    """Seed a task at `status`, optionally carrying `blocker`, with NO events —
+    so a test can assert the verb under test wrote exactly one."""
+    async def _go():
+        async with Store(db_path) as s:
+            t = Task.new("human verb test", repo_path="/tmp/repo")
+            await s.create_task(t)
+            if blocker is not None:
+                t.blocker = blocker
+                await s.update_task(t)
+            await s.set_status(t, status, validate=False)
+            return t.id
+    return asyncio.run(_go())
+
+
+def test_task_resume_emits_human_resume_event_with_prior_status_and_blocker(
+        tmp_path, monkeypatch):
+    """The acceptance test: `nh task resume` on an ESCALATED task with a
+    blocker moves it to IMPLEMENTING (as today) AND now records a
+    `source=human`, `kind=human_resume` task_event carrying `prior_status`
+    and the full prior blocker JSON — before this fix it wrote nothing."""
+    db = tmp_path / "test.db"
+    task_id = _seed_human_verb_task(
+        db, TaskStatus.ESCALATED, blocker=_HUMAN_VERB_BLOCKER)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "resume", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    t = _get_task(db, task_id)
+    assert t.status is TaskStatus.IMPLEMENTING, t.status
+
+    events = _list_events(db, task_id)
+    human = [e for e in events if e.get("source") == "human"]
+    assert len(human) == 1, f"expected exactly one human event, got: {events}"
+    ev = human[0]
+    assert ev["kind"] == "human_resume", ev
+    assert ev["prior_status"] == "escalated", ev
+    assert ev["prior_blocker"] == _HUMAN_VERB_BLOCKER, ev
+
+
+@pytest.mark.parametrize(
+    "verb,seed_status,blocker,argv,expected_status,expected_kind,stub_no_server", [
+        ("nh task resume", TaskStatus.ESCALATED, _HUMAN_VERB_BLOCKER,
+         ["task", "resume", "__ID__"], TaskStatus.IMPLEMENTING, "human_resume", False),
+        ("nh task pause", TaskStatus.IMPLEMENTING, None,
+         ["task", "pause", "__ID__", "--reason", "hold"],
+         TaskStatus.BLOCKED, "human_pause", True),
+        ("nh task retry", TaskStatus.FAILED, _HUMAN_VERB_BLOCKER,
+         ["task", "retry", "__ID__"], TaskStatus.PENDING, "human_retry", False),
+        ("nh task cancel", TaskStatus.BLOCKED, _HUMAN_VERB_BLOCKER,
+         ["task", "cancel", "__ID__", "--reason", "stop"],
+         TaskStatus.FAILED, "human_cancel", False),
+        ("nh unblock", TaskStatus.ESCALATED, _HUMAN_VERB_BLOCKER,
+         ["unblock", "__ID__"], TaskStatus.IMPLEMENTING, "human_unblock", False),
+        ("nh reject", TaskStatus.AWAITING_APPROVAL, None,
+         ["reject", "__ID__", "--reason", "redo it"],
+         TaskStatus.IMPLEMENTING, "human_reject", False),
+        ("nh reply", TaskStatus.ESCALATED, _HUMAN_VERB_BLOCKER,
+         ["reply", "__ID__", "SQLite only", "--no-run"],
+         TaskStatus.IMPLEMENTING, "human_reply", False),
+    ])
+def test_every_human_verb_emits_its_shared_human_event(
+        verb, seed_status, blocker, argv, expected_status, expected_kind,
+        stub_no_server, tmp_path, monkeypatch):
+    """Table-driven, one row per human status-changing verb: every one of them
+    must go through the SAME `human_event()` emitter in `blockers/taxonomy.py`
+    — never a differently-shaped, independently-invented event. Only the
+    seed/args/expected outcome vary per row; the shape asserted at the bottom
+    never does. `nh task resume` wrote no event at all before this fix; a
+    prior attempt at this same ticket wired only the CLI half and left the
+    board's API endpoints (which share no code with these commands) silently
+    unwired despite comments claiming parity — this table pins the CLI side,
+    `tests/test_api.py` pins the API twins."""
+    db = tmp_path / f"verb-{expected_kind}.db"
+    task_id = _seed_human_verb_task(db, seed_status, blocker=blocker)
+    runner = _make_runner(db, monkeypatch)
+    if stub_no_server:
+        monkeypatch.setattr("no_human.cli.commands._server_owns_worker", lambda cfg: False)
+
+    argv = [task_id[:8] if a == "__ID__" else a for a in argv]
+    result = runner.invoke(cli, argv)
+
+    assert result.exit_code == 0, f"{verb}: {result.output}"
+    t = _get_task(db, task_id)
+    assert t.status is expected_status, f"{verb}: {t.status}"
+
+    events = _list_events(db, task_id)
+    human = [e for e in events if e.get("source") == "human"]
+    assert len(human) == 1, f"{verb}: expected exactly one human event, got: {events}"
+    ev = human[0]
+    assert ev["kind"] == expected_kind, f"{verb}: {ev}"
+    assert ev["prior_status"] == seed_status.value, f"{verb}: {ev}"
+    if blocker is not None:
+        assert ev.get("prior_blocker") == blocker, f"{verb}: {ev}"
+
+
 def test_task_retry_clears_the_checkpoint_like_its_HTTP_twin(tmp_path, monkeypatch):
     """`nh task retry` is the CLI twin of `POST /api/tasks/{id}/retry`, down to
     the docstring. The endpoint was fixed to clear `resume_from`; this was not,
