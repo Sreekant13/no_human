@@ -47,6 +47,7 @@ from no_human.core.task import Task, TaskStatus
 from no_human.vcs import GitError, GitRepo, commit_with_manifest_repair
 from no_human.vcs import approve_merge
 from no_human.vcs import derived_conflict as dc
+from no_human.vcs import manifest_repair
 from no_human.vcs.approve_merge import reconcile_commit_count_drift
 from tests.test_vcs import _HOOK_CHECK_SRC
 
@@ -232,25 +233,57 @@ def _cmd_approve(args) -> int:
     drift = builder.check_counts(_rules(root), _tracked(root))
     if drift:
         # Real export_guard.py writes refusals to STDERR (manifest_repair.py's
-        # reactive path reads `proc.stderr` to find the count-drift message).
+        # reactive AND proactive paths read `proc.stderr` to find the
+        # count-drift message).
         sys.stderr.write("approve: REFUSED -- fix EXPORT_CLASSIFICATION.txt first -- "
                          "approvals on top of a wrong classification pin the wrong review:\\n"
                          + "\\n".join(f"  {d}" for d in drift) + "\\n")
         return 2
     cls = _classification(root)
-    bad = [p for p in args.paths if p not in cls.shipped]
-    if bad:
+    shipped = set(cls.shipped)
+    pins = _read_pins(root)
+
+    if not args.paths and not args.all and not args.prune:
         sys.stderr.write(
-            "approve: REFUSED -- not ship-classified (classify each in "
-            f"{builder.CLASSIFICATION_NAME} first):\\n"
-            + "\\n".join(f"  {p}" for p in bad) + "\\n"
+            "approve: REFUSED -- approved 0 file(s); pass PATH(s) or --all "
+            "(or --prune) -- nothing to approve was given\\n"
         )
         return 2
-    pins = _read_pins(root)
-    for p in args.paths:
-        pins[p] = _sha256(root / p)
+
+    if args.paths:
+        targets = list(dict.fromkeys(args.paths))
+        bad = [p for p in targets if p not in shipped]
+        if bad:
+            sys.stderr.write(
+                "approve: REFUSED -- not ship-classified (classify each in "
+                f"{builder.CLASSIFICATION_NAME} first):\\n"
+                + "\\n".join(f"  {p}" for p in bad) + "\\n"
+            )
+            return 2
+    elif args.all:
+        # Same shape as the real guard: new-or-changed pins only, matching
+        # `_APPROVED_RE`/`_PRUNED_RE` in manifest_repair.py so the proactive
+        # path can parse this stub's stdout exactly as it parses the real
+        # guard's.
+        targets = sorted(
+            p for p in shipped if pins.get(p) != _sha256(root / p))
+    else:
+        targets = []
+
+    pruned = sorted(set(pins) - shipped)
+    if args.prune:
+        for p in pruned:
+            del pins[p]
+            sys.stdout.write(f"pruned    {p} (no longer ships)\\n")
+
+    for p in targets:
+        digest = _sha256(root / p)
+        was = pins.get(p)
+        pins[p] = digest
+        state = "unchanged" if was == digest else (f"was {was[:12]}" if was else "new")
+        sys.stdout.write(f"approved  {digest[:12]}  {p} ({state})\\n")
+
     _write_pins(root, pins)
-    sys.stdout.write(f"approve: pinned {len(args.paths)} path(s)\\n")
     return 0
 
 
@@ -283,7 +316,9 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_approve = sub.add_parser("approve")
-    p_approve.add_argument("paths", nargs="+")
+    p_approve.add_argument("paths", nargs="*")
+    p_approve.add_argument("--all", action="store_true")
+    p_approve.add_argument("--prune", action="store_true")
     sub.add_parser("verify")
     args = parser.parse_args()
     args.root = args.root.resolve()
@@ -1634,6 +1669,144 @@ def test_reconcile_commit_count_drift_reuses_the_merge_reconcilers_shared_code()
     assert "_write_classification_lines(" in fn_src
     assert "COUNT_DRIFT_RE" in fn_src
     assert "fnmatch" not in fn_src, "a second glob matcher would defeat cls.wins as the single win-count source"
+
+
+# --------------------------------------------------------------------------- #
+# PROACTIVE-time reconciliation: `approve_pending_pins` (run before every     #
+# commit attempt) must reconcile a count drift the SAME way the reactive     #
+# path does, not just log a refusal -- an attempt that adds a brand-new ship #
+# file + a brand-new drop-classified test file, touching no already-pinned   #
+# file, never triggers the reactive path at all (no pinned content changed,  #
+# so no hook refusal to react to).                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_proactive_pin_maintenance_reconciles_a_count_drift_and_commits(tmp_path):
+    """AC1: an attempt that adds a brand-new ship file AND a brand-new
+    drop-classified test file -- touching NO already-pinned file -- never
+    forces the REAL pre-commit hook to refuse (nothing pinned changed), so
+    only the PROACTIVE `approve --all --prune` step ever sees the stale
+    declared counts. That step must reconcile via the SAME
+    `_try_reconcile_count_drift` helper the reactive path uses, not just log
+    the refusal and leave the attempt to commit unpinned with stale counts.
+    RED on unfixed code: the proactive approve refuses rc 2 on the count
+    drift, EXPORT_CLASSIFICATION.txt keeps its stale counts, and
+    src/base2.py is never pinned -- yet the commit itself still "succeeds"
+    (there is no hook here to catch it), which is exactly the silent-failure
+    the followup ticket describes."""
+    work = _repo(tmp_path)
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y", never_push_to=[])
+    repo.create_branch("no-human/proactive-drift", base="main")
+
+    # Brand-new ship file (bumps `ship 1 src/base*.py` -> 2) and brand-new
+    # drop-classified test file (bumps `drop 1 tests/**` -> 2). Neither
+    # touches src/base.py (the already-pinned file), so this is isolated to
+    # the PROACTIVE path exclusively -- no hook refusal is even possible.
+    (work / "src" / "base2.py").write_text("base2\n", encoding="utf-8")
+    (work / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+
+    repairs = []
+    result = commit_with_manifest_repair(
+        repo, ["src/base2.py", "tests/test_y.py"], "feat: base2 + y",
+        on_repair=lambda paths, note: repairs.append((paths, note)),
+    )
+    assert result.sha, result
+    assert repairs, "on_repair was never called -- the proactive step did not reconcile"
+    last_note = repairs[-1][1]
+    assert "count drift reconciled" in last_note, last_note
+
+    cls_text = _git(work, "show", "HEAD:EXPORT_CLASSIFICATION.txt").stdout
+    assert "ship   2  src/base*.py" in cls_text, cls_text
+    assert "drop   2  tests/**" in cls_text, cls_text
+
+    changed = _git(work, "show", "--name-only", "--format=", "HEAD").stdout
+    assert "EXPORT_CLASSIFICATION.txt" in changed, changed
+    assert "RELEASE_MANIFEST.txt" in changed, changed
+
+    pins = (work / "RELEASE_MANIFEST.txt").read_text(encoding="utf-8")
+    assert "src/base2.py" in pins, pins
+
+
+def test_proactive_unexplained_count_drift_is_logged_with_the_reconcilers_arithmetic(
+        tmp_path, caplog):
+    """AC2: a drift the attempt did NOT cause (already on `main` before the
+    branch existed) must NOT be silently reconciled by the proactive step --
+    only drift this attempt's own diff fully explains is a mechanical fix,
+    anything else stays a hand decision. The commit still succeeds (the
+    proactive path is advisory-only by contract), but the warning must carry
+    the reconciler's own declined arithmetic, not just the guard's stale
+    number, so a human reading the log sees the safety net ran and why it
+    declined."""
+    work = _repo(tmp_path)
+    # Pre-existing drift the attempt did not cause: a second tests/** file
+    # already on `main`, declared count left at 1.
+    (work / "tests" / "test_pre.py").write_text("pre\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "pre-existing drift, not this attempt")
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y", never_push_to=[])
+    repo.create_branch("no-human/proactive-unexplained", base="main")
+
+    (work / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+    before = (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+
+    repairs = []
+    with caplog.at_level("WARNING"):
+        result = commit_with_manifest_repair(
+            repo, ["tests/test_y.py"], "feat: y",
+            on_repair=lambda paths, note: repairs.append((paths, note)),
+        )
+    assert result.sha, result
+    assert not repairs, f"on_repair fired on an unexplained drift: {repairs}"
+    assert (work / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8") == before
+
+    assert any("count-drift reconciliation declined" in r.message for r in caplog.records), \
+        [r.message for r in caplog.records]
+    assert any("not explained by this attempt's own changes" in r.message for r in caplog.records), \
+        [r.message for r in caplog.records]
+
+
+def test_proactive_drop_only_count_drift_still_reports_the_ledger_rewrite(tmp_path):
+    """Attempt-1 regression: a DROP-only drift (no new/changed ship file)
+    leaves the post-reconciliation retry's `approve --all --prune` with
+    nothing new to (re-)pin or prune -- `r_approved` and `r_pruned` are BOTH
+    empty even though `_try_reconcile_count_drift` already rewrote and
+    staged EXPORT_CLASSIFICATION.txt before the retry ran. The independent
+    review of attempt 1 found this exact gap (manifest_repair.py:259): the
+    retry branch only called `on_repair` when `r_approved or r_pruned` was
+    non-empty, so the ledger rewrite rode into the commit unreported. RED on
+    that code: `on_repair` never fires even though
+    EXPORT_CLASSIFICATION.txt changed and shipped in the commit."""
+    work = _repo(tmp_path)
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y", never_push_to=[])
+    repo.create_branch("no-human/proactive-drop-only-drift", base="main")
+
+    # Only a new drop-classified file -- no new/changed ship file, so the
+    # retry's `--all --prune` finds nothing to (re-)pin or prune.
+    (work / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+
+    repairs = []
+    result = commit_with_manifest_repair(
+        repo, ["tests/test_y.py"], "feat: y",
+        on_repair=lambda paths, note: repairs.append((paths, note)),
+    )
+    assert result.sha, result
+    assert repairs, "the ledger rewrite (EXPORT_CLASSIFICATION.txt) was never reported to on_repair"
+    assert "count drift reconciled" in repairs[-1][1], repairs[-1]
+
+    cls_text = _git(work, "show", "HEAD:EXPORT_CLASSIFICATION.txt").stdout
+    assert "drop   2  tests/**" in cls_text, cls_text
+    changed = _git(work, "show", "--name-only", "--format=", "HEAD").stdout
+    assert "EXPORT_CLASSIFICATION.txt" in changed, changed
+
+
+def test_approve_pending_pins_reuses_the_shared_count_drift_reconciler():
+    """AC3 (reuse-by-identity): the proactive path's count-drift handling
+    must call the SAME `_try_reconcile_count_drift` helper the reactive path
+    uses -- no second refusal parser, no second drift regex."""
+    fn_src = inspect.getsource(manifest_repair.approve_pending_pins)
+    assert "_try_reconcile_count_drift(" in fn_src
+    assert "COUNT_DRIFT_RE" in fn_src
+    assert "re.compile(" not in fn_src, "a second drift regex would defeat the shared parser"
 
 
 # --------------------------------------------------------------------------- #

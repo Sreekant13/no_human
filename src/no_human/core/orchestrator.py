@@ -1263,6 +1263,29 @@ class Orchestrator:
         self._sink({"source": "orchestrator", "kind": kind, "text": text, **meta})
         self._telemetry_hook(kind, meta)
 
+    def _emit_manifest_repairs(self, repaired: list[tuple[list[str], str]]) -> None:
+        """Drain every ``on_repair(paths, note)`` call from one manifest
+        repair pass into a single ``manifest_repaired`` event.
+
+        A repair pass can call back more than once (proactive pin
+        maintenance, then a reconciled count drift, then a reactive
+        re-approve) and every one of them mutated the release-approval
+        ledger — reporting only the first (``repaired[0]``) silently dropped
+        later mutations from the task's record. The union of paths and every
+        note are both carried: ``text`` for a human skimming the event feed,
+        ``notes`` as a list field for a caller that wants each note intact.
+        """
+        if not repaired:
+            return
+        paths = list(dict.fromkeys(p for ps, _ in repaired for p in ps))
+        notes = [n for _, n in repaired if n]
+        self.emit(
+            "manifest_repaired",
+            f"re-approved {len(paths)} pinned file(s): " + ", ".join(paths)[:300]
+            + (f" — {'; '.join(notes)[:400]}" if notes else ""),
+            paths=paths[:20], notes=notes[:20],
+        )
+
     def _telemetry_hook(self, kind: str, meta: dict[str, Any]) -> None:
         """The ONE server-side telemetry hook: map a small set of emitted
         kinds to the closed telemetry allowlist (opt-in, default OFF — see
@@ -4885,18 +4908,10 @@ class Orchestrator:
                 # happened, so the drain must run on every exit path — R2,
                 # 2026-08-12. (`if repaired:` previously sat after the
                 # except-return and could not be reached.)
-                if repaired:
-                    # The pipeline changed the release-approval ledger — that
-                    # must be on the task's record, warnings included
-                    # (approve prints e.g. "N stale pin(s)" to stderr).
-                    rep_paths, rep_note = repaired[0]
-                    self.emit(
-                        "manifest_repaired",
-                        f"re-approved {len(rep_paths)} pinned file(s): "
-                        + ", ".join(rep_paths)[:300]
-                        + (f" — {rep_note[:200]}" if rep_note else ""),
-                        paths=rep_paths[:20],
-                    )
+                # The pipeline changed the release-approval ledger — that
+                # must be on the task's record, warnings included (approve
+                # prints e.g. "N stale pin(s)" to stderr).
+                self._emit_manifest_repairs(repaired)
         await self.store.update_attempt(attempt_id, commit_sha=commit.sha)
         # Size is reported, not enforced: the human approving the PR is the gate,
         # and they should see how big the change is (config.py:safety explains why
@@ -8187,15 +8202,7 @@ class Orchestrator:
                     # A ledger mutation is NEVER absent from the record, even
                     # when the retry below still fails — same
                     # drain-on-every-exit-path rule as orchestrator.py:4728.
-                    if repaired:
-                        rep_paths, rep_note = repaired[0]
-                        self.emit(
-                            "manifest_repaired",
-                            f"re-approved {len(rep_paths)} pinned file(s): "
-                            + ", ".join(rep_paths)[:300]
-                            + (f" — {rep_note[:200]}" if rep_note else ""),
-                            paths=rep_paths[:20],
-                        )
+                    self._emit_manifest_repairs(repaired)
                 self.emit("checkpoint", f"WIP-BLOCKED {commit.sha[:8]}")
                 self._last_checkpoint_error = ""
                 self._last_checkpoint_unverified = ""

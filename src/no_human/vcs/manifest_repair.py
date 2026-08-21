@@ -153,7 +153,12 @@ def approve_pending_pins(
       Nothing changed, so there is nothing to report through ``on_repair``;
       the guard's own FIX text is logged so it stays visible. Classification
       is a ledger DECISION; no pipeline makes it — same doctrine as the
-      reactive repair's unclassified refusal.
+      reactive repair's unclassified refusal. **Exception:** a declared
+      win-COUNT drift that this attempt's own diff fully explains is not a
+      hand decision — it is mechanically reconciled by the same
+      ``_try_reconcile_count_drift`` the reactive path uses, and
+      ``--all --prune`` is re-run once so the pin maintenance completes in
+      the same commit.
     * ``TimeoutExpired`` / ``OSError`` — logged, never fails a commit that
       would otherwise succeed.
     """
@@ -168,19 +173,25 @@ def approve_pending_pins(
 
     _stage_untracked_for_approve(repo, paths)
 
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(guard), "approve", "--all", "--prune"],
-            cwd=repo.path, capture_output=True, text=True,
-            timeout=_PREAPPROVE_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        _logger.warning(
-            "manifest pin maintenance timed out after %ss; continuing "
-            "without it", _PREAPPROVE_TIMEOUT_S)
-        return
-    except OSError as exc:
-        _logger.warning("manifest pin maintenance failed to start: %s", exc)
+    def _run_approve_all() -> subprocess.CompletedProcess | None:
+        # None == timeout/OSError, already logged; caller must not raise.
+        try:
+            return subprocess.run(
+                [sys.executable, str(guard), "approve", "--all", "--prune"],
+                cwd=repo.path, capture_output=True, text=True,
+                timeout=_PREAPPROVE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            _logger.warning(
+                "manifest pin maintenance timed out after %ss; continuing "
+                "without it", _PREAPPROVE_TIMEOUT_S)
+            return None
+        except OSError as exc:
+            _logger.warning("manifest pin maintenance failed to start: %s", exc)
+            return None
+
+    proc = _run_approve_all()
+    if proc is None:
         return
 
     out = proc.stdout or ""
@@ -206,7 +217,65 @@ def approve_pending_pins(
         return
 
     # 2 (or anything else the guard might exit with): refused before any pin
-    # was written. Nothing to report through on_repair — nothing changed.
+    # was written. Nothing changed — UNLESS the refusal is a declared
+    # win-COUNT drift that this attempt's own diff fully explains, which is
+    # not a hand decision and is reconciled by the same helper the reactive
+    # path (commit_with_manifest_repair, below) uses.
+    refusal_text = (proc.stderr or "") + (proc.stdout or "")
+    if COUNT_DRIFT_RE.search(refusal_text):
+        reconciled, note = _try_reconcile_count_drift(repo, refusal_text)
+        if reconciled:
+            # `_try_reconcile_count_drift` already rewrote AND staged
+            # EXPORT_CLASSIFICATION.txt at this point — that ledger change
+            # must reach `on_repair` regardless of what the retry below
+            # approves or prunes (e.g. a `drop`-only drift leaves nothing
+            # for `--all` to re-pin). Gating the report on the retry's own
+            # output would let the staged rewrite ride into the commit
+            # unreported.
+            reconciled_note = f"count drift reconciled: {note}"
+            retry = _run_approve_all()
+            if retry is None:
+                if on_repair is not None:
+                    on_repair([], reconciled_note)
+                return
+            r_out = retry.stdout or ""
+            r_approved = _APPROVED_RE.findall(r_out)
+            r_pruned = _PRUNED_RE.findall(r_out)
+            r_tail = (r_out.strip() + "\n" + (retry.stderr or "").strip()).strip()[:1000]
+            if retry.returncode == 0:
+                if on_repair is not None:
+                    on_repair(r_approved, f"{reconciled_note}; " + r_tail[:500])
+                return
+            if retry.returncode == 1:
+                _logger.warning(
+                    "manifest pin maintenance: %s file(s) refused on scan "
+                    "hits after a count-drift reconciliation (%s):\n%s",
+                    r_out.count("REFUSED"), note, r_tail)
+                if on_repair is not None:
+                    on_repair(
+                        r_approved,
+                        f"{reconciled_note}; pre-commit pin maintenance "
+                        "(partial — some file(s) refused on scan hits): "
+                        + r_tail[:500],
+                    )
+                return
+            # rc 2/other again: log and stop — no second reconciliation
+            # attempt (the retry already consumed the one drift it
+            # explained) — but the ledger rewrite above already happened
+            # and must still be reported.
+            _logger.warning(
+                "manifest pin maintenance: approve --all --prune refused "
+                "again (%s) even after reconciling a count drift (%s):\n%s",
+                retry.returncode, note, r_tail)
+            if on_repair is not None:
+                on_repair(r_approved, reconciled_note)
+            return
+        why_not = f"; count-drift reconciliation declined: {note}" if note else ""
+        _logger.warning(
+            "manifest pin maintenance: approve --all --prune refused (%s):"
+            "\n%s%s", proc.returncode, tail, why_not)
+        return
+
     _logger.warning(
         "manifest pin maintenance: approve --all --prune refused (%s):\n%s",
         proc.returncode, tail)

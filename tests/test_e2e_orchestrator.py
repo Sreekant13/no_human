@@ -6971,6 +6971,52 @@ async def test_a_checkpoint_repair_is_on_the_task_record(
     assert "src/pkg/mod.py" in repaired["text"]
 
 
+async def test_every_manifest_repair_note_reaches_the_event(
+        bare_repo, tmp_path, store, monkeypatch):
+    """AC4: a single `commit_with_manifest_repair` call can invoke
+    `on_repair` more than once in one drain -- e.g. a proactive count-drift
+    reconciliation (rewrites EXPORT_CLASSIFICATION.txt) followed by the
+    ordinary pin re-approve in the SAME call. `_emit_manifest_repairs` must
+    union every note and every path into the one `manifest_repaired` event,
+    not only `repaired[0]` -- the second note (and its path) must not be
+    silently shadowed."""
+    from no_human.core import orchestrator as orch_mod
+
+    repo = GitRepo(bare_repo)
+    repo.create_branch("wip/every-repair-note")
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return a + b + 3\n")
+
+    def fake_commit_with_manifest_repair(repo_arg, edited, commit_msg, on_repair=None):
+        if on_repair is not None:
+            on_repair(["a.py"], "pre-commit pin maintenance: pinned a.py")
+            on_repair(["b.py"], "count drift reconciled: drop tests/**: 1 -> 2")
+        return repo_arg.commit_all(commit_msg)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("multi-note repair test", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    sha = orch._checkpoint_wip(repo, t)
+
+    assert sha, "the repaired commit must still produce a resume sha"
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("manifest_repaired") == 1, kinds
+    repaired = [e for e in events if e["kind"] == "manifest_repaired"][0]
+    assert repaired["paths"] == ["a.py", "b.py"], repaired
+    assert "pinned a.py" in repaired["text"], repaired
+    assert "count drift reconciled" in repaired["text"], repaired
+    assert repaired["notes"] == [
+        "pre-commit pin maintenance: pinned a.py",
+        "count drift reconciled: drop tests/**: 1 -> 2",
+    ], repaired
+
+
 async def test_a_checkpoint_repair_before_a_second_refusal_is_still_recorded(
         bare_repo, tmp_path, store, monkeypatch):
     """Criterion #2 (ledger-never-silent): a repair that happens but is
