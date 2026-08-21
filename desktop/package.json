@@ -11,16 +11,17 @@
   "scripts": {
     "desktop": "electron .",
     "test": "node --test",
-    "dist": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac --publish never",
-    "dist:dir": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac dir --publish never",
-    "dist:bundled": "bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac --publish never && bash ../packaging/make-dmg.sh",
-    "dist:win": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
-    "dist:win:bundled": "powershell -NoProfile -ExecutionPolicy Bypass -File ../packaging/build-installer.ps1 && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
-    "dist:linux": "node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never",
-    "dist:linux:bundled": "bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never"
+    "dist": "node ../packaging/ensure-electron.mjs && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac --publish never",
+    "dist:dir": "node ../packaging/ensure-electron.mjs && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac dir --publish never",
+    "dist:bundled": "node ../packaging/ensure-electron.mjs && bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --mac --publish never && bash ../packaging/make-dmg.sh",
+    "dist:win": "node ../packaging/ensure-electron.mjs && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
+    "dist:win:bundled": "node ../packaging/ensure-electron.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File ../packaging/build-installer.ps1 && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --win --publish never",
+    "dist:linux": "node ../packaging/ensure-electron.mjs && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never",
+    "dist:linux:bundled": "node ../packaging/ensure-electron.mjs && bash ../packaging/build-installer.sh && node ../packaging/derive-icons.mjs && electron-builder --config electron-builder.config.cjs --linux --publish never",
+    "ensure-electron": "node ../packaging/ensure-electron.mjs"
   },
   "devDependencies": {
-    "electron": "38.8.6",
+    "electron": "43.4.1",
     "electron-builder": "^26.15.3"
   },
   "nhPackagedFiles": {

@@ -15,6 +15,9 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { NH_EXE_NAME, bundledNhPath } from "./server.mjs";
 import { validateIco } from "../packaging/icoFromPng.mjs";
+import { createRequire } from "node:module";
+const requireCjs = createRequire(import.meta.url);
+const { assertElectronNoticesPresent } = requireCjs("./electronNotices.cjs");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(here, "package.json"), "utf8"));
@@ -264,6 +267,16 @@ test("Electron's and Chromium's notices ship too, or the DMG is undistributable"
         `${entry.from} does not look like the notice it claims to be`);
     }
   }
+
+  // THE SECOND DEFECT, found 2026-08-22 while bumping Electron 38 -> 43.
+  // Electron 42 removed the package's `postinstall` hook: `dist/` — where both
+  // notices live — is now fetched on the FIRST EXECUTION of the electron
+  // binary, so `npm ci` leaves it absent. app-builder-lib's file matcher only
+  // WARNS on a missing extraResources source, so a clean CI build packaged an
+  // app with neither notice and exited 0. The content check above cannot see
+  // it either: it is guarded by existsSync, which is now permanently false in
+  // a fresh checkout. The guard below is what closes it, and these two tests
+  // are what keep the guard honest.
 
   // The destination names must not collide with our own MIT LICENSE, which is
   // the whole reason they are renamed rather than shipped under their own.
@@ -738,4 +751,55 @@ test("linux: the .deb has the metadata electron-builder refuses to build without
     "desktopName is what Electron uses as app_id / WM_CLASS on Linux");
   assert.equal(builderConfig.linux.syncDesktopName, true,
     "syncDesktopName makes the shipped .desktop filename match Electron's app_id");
+});
+
+test("packaging refuses to start when Electron's notices are missing", () => {
+  // Drives the real guard against a temp root that has no electron/dist.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nh-notices-"));
+  assert.throws(
+    () => assertElectronNoticesPresent(root),
+    /refusing to package without Electron's and Chromium's licence notices/,
+    "a missing node_modules/electron/dist must stop the build, not warn");
+  // and it must NAME what is missing, or the operator cannot act on it
+  try {
+    assertElectronNoticesPresent(root);
+  } catch (err) {
+    assert.match(err.message, /node_modules\/electron\/dist\/LICENSE/);
+    assert.match(err.message, /LICENSES\.chromium\.html/);
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("the guard passes once both notices exist, and is wired into beforePack", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nh-notices-ok-"));
+  const dist = path.join(root, "node_modules", "electron", "dist");
+  fs.mkdirSync(dist, { recursive: true });
+  fs.writeFileSync(path.join(dist, "LICENSE"), "Copyright (c) GitHub Inc.");
+  fs.writeFileSync(path.join(dist, "LICENSES.chromium.html"), "<html>Chromium</html>");
+  assert.doesNotThrow(() => assertElectronNoticesPresent(root));
+  assert.equal(typeof builderConfig.beforePack, "function",
+    "the guard must run as a beforePack hook, or nothing calls it during a build");
+  // typeof alone stays green against `beforePack: async () => {}`. Read the
+  // hook's source and require that it actually reaches the guard.
+  assert.match(String(builderConfig.beforePack), /assertElectronNoticesPresent/,
+    "beforePack must call the guard, not merely be some function");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("the config exports the config and nothing else, or electron-builder refuses to build", () => {
+  // Hanging a helper off module.exports of electron-builder.config.cjs made
+  // EVERY `npm run dist*` die at Packager.validateConfig with "configuration
+  // has an unknown property" — before beforePack could run, on every platform,
+  // notices present or not. app-builder-lib validates the exported object
+  // against its own scheme.json, whose root is additionalProperties:false.
+  // Run that same check here, offline, so the mistake cannot come back.
+  const scheme = requireCjs("app-builder-lib/scheme.json");
+  assert.equal(scheme.additionalProperties, false,
+    "this test is only meaningful while the builder rejects unknown keys");
+  const known = new Set(Object.keys(scheme.properties));
+  assert.ok(known.has("beforePack") && known.has("appId"),
+    "sanity: the schema we loaded is the Configuration schema");
+  const unknown = Object.keys(builderConfig).filter((k) => !known.has(k));
+  assert.deepEqual(unknown, [],
+    `electron-builder would reject these top-level config keys: ${unknown.join(", ")}`);
 });

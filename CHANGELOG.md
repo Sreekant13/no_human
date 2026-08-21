@@ -6,6 +6,15 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+- **Electron moves to 43.4.1**, clearing all 18 open Electron advisories (4
+  high) against the desktop bundle: the app now ships Chromium 150 instead of
+  the 38-line's Chromium. The jump goes to the current supported line rather
+  than to 39.8.10, the version the advisories name — Electron patches only its
+  three newest majors, so 39 is already unsupported and would have to be
+  redone. `extract-zip` (a high with no patch available) leaves the tree
+  entirely: Electron 43 no longer depends on it. `tar` and `brace-expansion`
+  are patched in the same lockfile pass, taking `npm audit` to zero.
+
 ## [0.1.4] — 2026-08-21
 
 Fixes `nh mcp-serve` on every install that resolves dependencies from PyPI —

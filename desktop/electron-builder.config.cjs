@@ -24,6 +24,10 @@
 const fs = require("fs");
 const path = require("path");
 const { signingBanner, signingPlan } = require("./signing.cjs");
+// The Electron/Chromium licence-notice guard lives in its own module: this
+// file must export the config object and NOTHING else, or electron-builder's
+// schema validation (additionalProperties: false) refuses to build at all.
+const { assertElectronNoticesPresent } = require("./electronNotices.cjs");
 
 const plan = signingPlan(process.env);
 
@@ -246,6 +250,7 @@ async function adhocSeal(context) {
   console.log(`  \u2713 ad-hoc sealed and verified: ${app}`);
 }
 
+
 module.exports = {
   appId: "dev.nohuman.board",
   productName: "no_human",
@@ -329,6 +334,7 @@ module.exports = {
   // the macOS hook exists to repair a signature electron-builder INVALIDATES by
   // injecting into Contents/, and Windows has no equivalent seal to break. An
   // unsigned .exe here is simply unsigned, not "damaged".
+  beforePack: async () => assertElectronNoticesPresent(),
   afterPack: adhocSeal,
   // Generates latest-mac.yml locally. `--publish never` on every script means
   // nothing is ever uploaded; this block only tells the updater where to LOOK
