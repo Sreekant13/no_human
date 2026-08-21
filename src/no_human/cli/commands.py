@@ -40,7 +40,8 @@ from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.runtime import build_orchestrator
 from ..core import slot_wait
 from ..core.slot_wait import is_waiting_for_slot
-from ..core.task import Task, TaskStatus
+from ..core.task import (PRIORITY_ORDER, Task, TaskStatus,
+                          normalise_priority)
 from ..intake import (
     classify_kind,
     ingest_from_url,
@@ -946,7 +947,12 @@ def task() -> None:
 @click.option("--approve-plan", is_flag=True, default=False,
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")
-def task_add(source, title, repo, description, criteria, external_id, kind, linked_repo, run, verbose, grill, backend, approve_plan):
+@click.option("--priority", default=None, type=click.Choice(list(PRIORITY_ORDER)),
+              help="Dispatch priority, high|medium|low (default: medium). Orders "
+                   "the PENDING queue only, with no aging: a low task can wait "
+                   "behind an unbounded medium/high stream, and is never preempted "
+                   "once a task starts running.")
+def task_add(source, title, repo, description, criteria, external_id, kind, linked_repo, run, verbose, grill, backend, approve_plan, priority):
     """Add a task — from a GitHub/GitLab issue URL, a plain sentence, or --title.
 
     A positional SOURCE is either an issue URL or a plain sentence: an issue
@@ -1044,6 +1050,8 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
                 sys.exit(1)
             if backend:
                 t.config["backend"] = backend
+            if priority:
+                t.priority = normalise_priority(priority)
             if approve_plan:
                 from ..core.plan_gate import CONFIG_KEY as _PLAN_APPROVAL_KEY
                 t.config[_PLAN_APPROVAL_KEY] = True
@@ -1186,13 +1194,14 @@ def task_config(task_id, assignments):
     """Set human-only per-task overrides: nh task config TASK_ID KEY=VALUE ...
 
     Human-only by construction — this CLI is the operator's tool, the agent
-    never calls it. Accepts exactly the keys the orchestrator reads as
-    per-task overrides (size limits, lifetime caps, the per-attempt token
-    cap). The human is the gate: this sets the exact requested value,
-    raising or lowering an existing cap. (Blocker options still never lower
-    — see `apply_action`.)
+    never calls it. Accepts the keys the orchestrator reads as per-task
+    overrides (size limits, lifetime caps, the per-attempt token cap) plus
+    `priority` (high|medium|low), which sets the task's dispatch priority
+    column directly rather than going through `task.config`. The human is
+    the gate: this sets the exact requested value, raising or lowering an
+    existing cap. (Blocker options still never lower — see `apply_action`.)
     """
-    from ..blockers import ActionError, apply_action
+    from ..blockers import ActionError, apply_action, human_event
     from ..core.bounds import Bounds
 
     config, _ = _bootstrap(require_auth=False)
@@ -1205,20 +1214,63 @@ def task_config(task_id, assignments):
         key, _, value = assignment.partition("=")
         settings[key.strip()] = value.strip()
 
+    new_priority = settings.pop("priority", None)
+
     async def _go():
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
                 print_no_task_matching(task_id)
                 sys.exit(1)
-            try:
-                applied = apply_action(
-                    t, {"set_task_config": settings}, human_override=True,
-                    bounds=Bounds.from_config(config.get("bounds")))
-            except ActionError as exc:
-                console.print(f"[red]{exc}[/]")
-                sys.exit(1)
+
+            priority_note = None
+            if new_priority is not None:
+                # `normalise_priority("")` reads as "unset -> default", the
+                # right call for a DB row with a blank column; a human
+                # writing `priority=` here almost certainly typo'd or
+                # emptied an assignment, not asked for medium — reject it
+                # rather than silently applying a value they never named.
+                if not new_priority:
+                    console.print(
+                        "[red]priority requires a value: one of "
+                        f"{', '.join(PRIORITY_ORDER)}[/]")
+                    sys.exit(1)
+                try:
+                    priority_note = normalise_priority(new_priority)
+                except ValueError as exc:
+                    console.print(f"[red]{exc}[/]")
+                    sys.exit(1)
+
+            applied = ""
+            if settings:
+                try:
+                    applied = apply_action(
+                        t, {"set_task_config": settings}, human_override=True,
+                        bounds=Bounds.from_config(config.get("bounds")))
+                except ActionError as exc:
+                    console.print(f"[red]{exc}[/]")
+                    sys.exit(1)
+
+            prior_priority = t.priority
+            if priority_note is not None:
+                t.priority = priority_note
+                applied = ", ".join(
+                    p for p in (applied, f"priority={priority_note}") if p)
+
+            # Write the column BEFORE the event that attests to it: if the
+            # column write fails, no event claims a change that didn't
+            # happen (the evidence-gap class `nh doctor` is built to catch).
             await store.update_task_columns(t)
+
+            if priority_note is not None:
+                await store.save_events(t.id, [{
+                    **human_event(
+                        "priority", prior_status=t.status,
+                        reason=f"{prior_priority} -> {priority_note}",
+                        text=f"priority set to {priority_note} by human"),
+                    "ts": time.time(),
+                }])
+
             console.print(f"[green]applied[/] {applied}")
 
     asyncio.run(_go())

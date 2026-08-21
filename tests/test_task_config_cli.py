@@ -168,3 +168,102 @@ def test_config_unknown_task_id_exits_nonzero(tmp_path, monkeypatch):
 
     assert result.exit_code != 0
     assert "no task matching" in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# nh task config priority=... — dispatch priority is not a `task.config` key  #
+# --------------------------------------------------------------------------- #
+
+def test_config_sets_priority(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "config", task_id, "priority=high"])
+
+    assert result.exit_code == 0, result.output
+    assert "priority=high" in result.output
+    after = _get_task(db, task_id)
+    assert after.priority == "high"
+    assert "priority" not in after.config  # never routed through task.config
+
+
+def test_config_rejects_unknown_priority(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "config", task_id, "priority=urgent"])
+
+    assert result.exit_code != 0
+    assert "unknown priority" in result.output.lower()
+    assert _get_task(db, task_id).priority == "medium"  # unchanged
+
+
+def test_config_priority_alongside_a_cap_is_atomic(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "task", "config", task_id,
+        "attempt_tokens=6000000", "priority=high",
+    ])
+
+    assert result.exit_code == 0, result.output
+    after = _get_task(db, task_id)
+    assert after.config["attempt_tokens"] == 6_000_000
+    assert after.priority == "high"
+
+
+def test_config_priority_alongside_a_bad_cap_applies_neither(tmp_path, monkeypatch):
+    # The reverse of the atomic-write test above: an invalid CAP must not
+    # leave a partially-applied priority behind either.
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "task", "config", task_id,
+        "attempt_tokens=0", "priority=high",
+    ])
+
+    assert result.exit_code != 0
+    after = _get_task(db, task_id)
+    assert after.config == {}
+    assert after.priority == "medium"
+
+
+def test_config_rejects_empty_priority(tmp_path, monkeypatch):
+    # `priority=` (blank value) must not silently normalise to "medium" —
+    # a human writing this almost certainly typo'd or emptied an
+    # assignment, and the intake decision forbids unsetting to NULL/default
+    # through this verb; a blank must fail the same as an unknown token.
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "config", task_id, "priority="])
+
+    assert result.exit_code != 0
+    assert _get_task(db, task_id).priority == "medium"  # unchanged
+
+
+def test_config_priority_writes_a_human_event(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "config", task_id, "priority=low"])
+
+    assert result.exit_code == 0, result.output
+
+    async def _events():
+        async with Store(db) as s:
+            return await s.list_events(task_id)
+    events = asyncio.run(_events())
+    priority_events = [e for e in events if e.get("kind") == "human_priority"]
+    assert priority_events, f"expected a human_priority event, got {events}"
+    ev = priority_events[-1]
+    assert ev["source"] == "human"
+    assert "medium -> low" in (ev.get("reason") or "")

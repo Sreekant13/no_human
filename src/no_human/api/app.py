@@ -48,7 +48,7 @@ from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
 from ..core.orchestrator import Orchestrator, is_agent_session, is_narration
-from ..core.task import Task, TaskStatus
+from ..core.task import Task, TaskStatus, normalise_priority
 from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
     AttemptOut, BoardPayload, CancelRequest, CreateProjectRequest, CreateTaskRequest,
@@ -661,7 +661,10 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
         kind=body.kind,
         external_id=external_id,
     )
-    task.priority = body.priority
+    try:
+        task.priority = normalise_priority(body.priority)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     task.acceptance_criteria = body.acceptance_criteria
     task.linked_repos = linked
     # PR-001: honour an explicitly pinned base. Blank/whitespace is treated as

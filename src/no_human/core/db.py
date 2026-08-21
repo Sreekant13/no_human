@@ -1346,15 +1346,21 @@ class Store:
         return [Task.from_row(dict(r)) for r in rows]
 
     async def list_claimable_tasks(self, status: TaskStatus) -> list[Task]:
-        """Tasks in `status`, OLDEST FIRST — the scheduler's claim order.
+        """Tasks in `status`, OLDEST FIRST — this query's own order, and the
+        scheduler's claim order for IMPLEMENTING (which this module never
+        re-ranks). For PENDING, `scheduler._rank_pending` re-sorts what this
+        returns — by prior-work split, then `priority_rank`, then this
+        oldest-first order as the final tie-break — so the queue order a
+        PENDING batch actually dispatches in is FIFO only within a priority
+        tier, not across the whole batch (live, 2026-08-22).
 
         Deliberately NOT `list_tasks`. That one is DESC because the board
         legitimately shows newest first, and the scheduler consuming it made
         dispatch LIFO: on 2026-08-12 four tickets filed a day earlier had never
         dispatched while overnight filings went out within minutes, because
-        every fresh filing landed at the head of the PENDING list. Queue order
-        is FIFO; display order is not; they are two different questions and now
-        two different queries.
+        every fresh filing landed at the head of the PENDING list. This query's
+        order is FIFO; display order is not; they are two different questions
+        and now two different queries.
 
         `rowid ASC` is the tie-break, not decoration: `created_at` is an
         ISO-8601 string, so two rows created inside the same microsecond (or

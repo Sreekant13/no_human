@@ -39,7 +39,7 @@ from . import plan_gate
 from . import slot_wait
 from .events import EventPersister
 from .infra_breaker import infra_breaker
-from .task import TaskStatus
+from .task import TaskStatus, priority_rank
 from .worktree import salvage_dead_worktrees, sweep_stale_worktrees
 
 log = logging.getLogger("no_human.scheduler")
@@ -50,20 +50,25 @@ log = logging.getLogger("no_human.scheduler")
 # pending-first starved three budget-raised resumes behind every newly
 # imported ticket on a one-worker pool (live, 2026-07-24).
 #
-# Within a status, OLDEST first (`list_claimable_tasks`): the claim path
-# used to consume `list_tasks`, which is `created_at DESC` for the board, so
-# the NEWEST pending ticket dispatched first and four day-old tickets never
-# dispatched at all (live, 2026-08-12) — including the repro-gate fix that
-# was blocking an escalated task. WIP-first (across statuses) and FIFO
-# (within a status) are independent and both hold.
+# Within a status, `list_claimable_tasks` still hands back OLDEST first: the
+# claim path used to consume `list_tasks`, which is `created_at DESC` for the
+# board, so the NEWEST pending ticket dispatched first and four day-old
+# tickets never dispatched at all (live, 2026-08-12) — including the
+# repro-gate fix that was blocking an escalated task. WIP-first (across
+# statuses) still holds unconditionally.
 #
-# Within PENDING specifically, prior-work tasks (a burned attempt, or a
-# context marker left by an open draft PR / a prior resume) are claimed
-# ahead of never-started ones, still oldest-first within each group
-# (`_claimable`'s pending split, live 2026-08-20): a newcomer ticket and a
-# task carrying sunk context/an open PR both land in PENDING between
-# attempts, and without this a restart's fresh claim can fill every slot
-# with newcomers while the sunk-cost task waits behind them.
+# Within PENDING specifically, `_rank_pending` (below) re-sorts that
+# oldest-first batch two ways before FIFO ever applies: prior-work tasks (a
+# burned attempt, or a context marker left by an open draft PR / a prior
+# resume) are claimed ahead of never-started ones (`_claimable`'s pending
+# split, live 2026-08-20) — a newcomer ticket and a task carrying sunk
+# context/an open PR both land in PENDING between attempts, and without this
+# a restart's fresh claim can fill every slot with newcomers while the
+# sunk-cost task waits behind them — and *within* each of those two groups,
+# `priority_rank` (high > medium > low) now orders ahead of age (live,
+# 2026-08-22: a `high` ticket used to wait behind however many `medium`
+# tickets happened to be older). FIFO is only the final tie-break inside a
+# priority tier of a group, not the ordering of a status on its own anymore.
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
 
 # PLANNING is claimed too, but only for a plan-approval correction resumed
@@ -711,7 +716,22 @@ class Scheduler:
     async def _rank_pending(self, rows: list) -> list:
         """Split an oldest-first PENDING batch into prior-work tasks (a
         burned attempt, or a PR/resume marker in context — `_has_prior_work`)
-        ahead of never-started ones, FIFO preserved within each group.
+        ahead of never-started ones; within each group, order by priority
+        (high > medium > low), FIFO preserved within equal priority.
+
+        Three-key order: prior-work split, then priority, then FIFO. Priority
+        only reorders the PENDING queue — it never preempts a task that is
+        already claimed/running, and quota-parked resumes (claimed through a
+        different status ahead of PENDING in `_claimable`) never reach here.
+
+        No aging term: this is a plain priority sort re-run every tick, not a
+        priority queue with fairness built in. A `low` task is starved for as
+        long as the `medium`/`high` stream stays non-empty, and `medium` by a
+        `high` stream, same as FIFO's own starvation of a task behind an
+        unbounded queue — priority just narrows which tier that can happen
+        within. Deliberate for this landing: no operator has asked for aging
+        yet, and it is easy to bolt on later (e.g. a wait-time term in the
+        sort key) without touching the three-key order above.
 
         `attempt_counts()` is one grouped query, fetched here (only when the
         pending group is non-empty) rather than N per-task lookups. Any
@@ -727,6 +747,8 @@ class Scheduler:
         prior, fresh = [], []
         for t in rows:
             (prior if _has_prior_work(t, attempt_counts) else fresh).append(t)
+        prior.sort(key=lambda t: priority_rank(getattr(t, "priority", None)))
+        fresh.sort(key=lambda t: priority_rank(getattr(t, "priority", None)))
         return prior + fresh
 
     # Mid-run statuses only a live worker can hold. A task found in one of

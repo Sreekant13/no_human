@@ -497,6 +497,21 @@ declaration).
 Each task stores the `config` it ran under (`tasks.config`), so a task's
 behaviour is reproducible even if the global config later changes.
 
+## Dispatch priority
+
+`tasks.priority` is `high`, `medium` (default) or `low`; unlike the keys
+above it is a task column, not part of `tasks.config`. It only orders the
+PENDING queue — quota-parked resumes and prior-work tasks still dispatch
+ahead of it as before, running tasks are never preempted, and there is no
+aging term, so a `low` task can wait indefinitely behind a busy
+`medium`/`high` stream. Two write points, both validated against the same
+`high|medium|low` vocabulary and rejecting anything else:
+
+```
+nh task add --priority high …
+nh task config <id> priority=high    # human-only; writes a human_priority event
+```
+
 ## `.no_human.yml` — config the repo carries itself (C3-G2)
 
 A target repo can ship its own hints so no_human works well on it without the

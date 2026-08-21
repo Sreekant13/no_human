@@ -11,6 +11,42 @@ from enum import Enum
 from typing import Any
 
 
+PRIORITY_ORDER = ("high", "medium", "low")   # dispatch order, first = first
+DEFAULT_PRIORITY = "medium"
+
+
+def normalise_priority(value: Any) -> str:
+    """Validate and canonicalise a priority token.
+
+    Empty/None maps to the default; anything not in PRIORITY_ORDER raises
+    ValueError so writers (CLI/API) can reject junk before it hits the DB.
+    """
+    if value is None:
+        return DEFAULT_PRIORITY
+    token = str(value).strip().lower()
+    if not token:
+        return DEFAULT_PRIORITY
+    if token not in PRIORITY_ORDER:
+        raise ValueError(
+            f"unknown priority {value!r}; one of {', '.join(PRIORITY_ORDER)}"
+        )
+    return token
+
+
+def priority_rank(value: Any) -> int:
+    """Sort key for dispatch ordering; never raises — fails soft to medium's rank.
+
+    Used on the claim path, where a hand-written/legacy DB row with junk in
+    the priority column must not break scheduling.
+    """
+    if value is None:
+        return PRIORITY_ORDER.index(DEFAULT_PRIORITY)
+    token = str(value).strip().lower()
+    if token not in PRIORITY_ORDER:
+        return PRIORITY_ORDER.index(DEFAULT_PRIORITY)
+    return PRIORITY_ORDER.index(token)
+
+
 class TaskStatus(str, Enum):
     PENDING = "pending"
     CONTEXT = "context"
@@ -455,7 +491,7 @@ class Task:
             status=TaskStatus(row["status"]),
             blocker=json.loads(row["blocker"]) if row["blocker"] else None,
             wake_check_at=row["wake_check_at"],
-            priority=row["priority"],
+            priority=row["priority"] or DEFAULT_PRIORITY,
             context=json.loads(row["context"] or "{}"),
             plan=json.loads(row["plan"] or "{}"),
             config=json.loads(row["config"] or "{}"),
