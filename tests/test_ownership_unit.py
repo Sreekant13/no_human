@@ -1,0 +1,270 @@
+"""Unit matrix for `no_human.testing.ownership.owned_failing_ids` — the
+resolver `orchestrator.py`'s plain-red branch calls to decide whether a
+failing test node id names a test FUNCTION the current attempt's own diff
+added or modified (ownership by test id, not by file). Each case builds a
+throwaway two-commit git repo and reads the resolver directly, off any
+orchestrator machinery — see tests/test_owned_test_attribution.py for the
+end-to-end acceptance shapes through `orch.run_task`.
+
+Also covers `orchestrator._attributed_ids`, the pure helper that decides
+which failing ids get billed once `owned` is known.
+"""
+
+import subprocess
+
+from no_human.core.orchestrator import _attributed_ids
+from no_human.testing import ownership
+
+
+def _repo(tmp_path, name):
+    root = tmp_path / name
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    subprocess.run(["git", "config", "user.email", "u@e.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "u"], cwd=root, check=True)
+    return root
+
+
+def _commit(root, msg):
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, check=True,
+                   capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# owned_failing_ids
+# ---------------------------------------------------------------------------
+
+
+def test_added_file_and_modified_function_are_owned_untouched_sibling_is_not(
+    tmp_path,
+):
+    root = _repo(tmp_path, "added_and_modified")
+    (root / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n"
+    )
+    _commit(root, "base: test_a, test_b")
+
+    (root / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n    assert 1 == 1\n\n\n"
+        "def test_b():\n    assert True\n"
+    )
+    (root / "test_new.py").write_text("def test_c():\n    assert True\n")
+    _commit(root, "modify test_a, add test_new.py::test_c")
+
+    owned = ownership.owned_failing_ids(
+        root, "HEAD~1", "HEAD",
+        ["test_mod.py::test_a", "test_mod.py::test_b", "test_new.py::test_c"],
+    )
+    assert owned == ["test_mod.py::test_a", "test_new.py::test_c"], owned
+
+
+def test_ids_relative_to_a_routed_cwd_are_owned_through_the_cwd_prefix(tmp_path):
+    """Review finding on PR #570: pytest node ids are rootdir/cwd-relative,
+    git's diff is repo-root-relative. With the runner routed into `pkg/`,
+    the id `tests/test_mod.py::test_a` names `pkg/tests/test_mod.py` — an
+    id that, looked up unprefixed, misses the diff ("not owned", the guard
+    silently inert) or collides with a same-named ROOT path the diff added
+    (falsely owned). `cwd=` prefixes the lookup; the ids come back verbatim."""
+    root = _repo(tmp_path, "routed_cwd")
+    (root / "pkg" / "tests").mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "pkg" / "tests" / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n"
+    )
+    _commit(root, "base: pkg/tests/test_mod.py")
+
+    # The routed project's test_a is modified; an unrelated ROOT-level file
+    # with the SAME relative name is ADDED (the collision decoy).
+    (root / "pkg" / "tests" / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n    assert 1 == 1\n\n\n"
+        "def test_b():\n    assert True\n"
+    )
+    (root / "tests" / "test_mod.py").write_text("def test_zzz():\n    assert True\n")
+    _commit(root, "modify pkg test_a; add a root decoy with the same relative name")
+
+    ids = ["tests/test_mod.py::test_a", "tests/test_mod.py::test_b"]
+    # Routed cwd: test_a owned (modified), test_b not; ids returned verbatim.
+    assert ownership.owned_failing_ids(root, "HEAD~1", "HEAD", ids, cwd="pkg") == [
+        "tests/test_mod.py::test_a"]
+    # Unprefixed, the same ids hit the root decoy (an ADDED file) and BOTH
+    # read as owned — the false attribution the prefix exists to prevent.
+    assert ownership.owned_failing_ids(root, "HEAD~1", "HEAD", ids) == ids
+    # Root cwd spelled explicitly behaves like no cwd.
+    assert ownership.owned_failing_ids(root, "HEAD~1", "HEAD", ids, cwd="") == ids
+
+
+def test_parametrize_decorator_change_owns_every_variant(tmp_path):
+    root = _repo(tmp_path, "parametrize")
+    (root / "test_p.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.mark.parametrize('x', [1])\n"
+        "def test_p(x):\n    assert x == 1\n"
+    )
+    _commit(root, "base: parametrize([1])")
+
+    (root / "test_p.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.mark.parametrize('x', [1, 2])\n"
+        "def test_p(x):\n    assert x in (1, 2)\n"
+    )
+    _commit(root, "widen the parametrize list")
+
+    owned = ownership.owned_failing_ids(
+        root, "HEAD~1", "HEAD", ["test_p.py::test_p[1]", "test_p.py::test_p[2]"],
+    )
+    assert owned == ["test_p.py::test_p[1]", "test_p.py::test_p[2]"], owned
+
+
+def test_class_and_parametrized_node_ids_resolve(tmp_path):
+    root = _repo(tmp_path, "class_and_param")
+    (root / "test_c.py").write_text(
+        "import pytest\n\n\n"
+        "class TestC:\n"
+        "    def test_a(self):\n        assert True\n\n\n"
+        "@pytest.mark.parametrize('x', [1])\n"
+        "def test_a(x):\n    assert x == 1\n"
+    )
+    _commit(root, "base: TestC.test_a and top-level test_a")
+
+    (root / "test_c.py").write_text(
+        "import pytest\n\n\n"
+        "class TestC:\n"
+        "    def test_a(self):\n        assert True\n        assert 1 == 1\n\n\n"
+        "@pytest.mark.parametrize('x', [1])\n"
+        "def test_a(x):\n    assert x == 1\n"
+    )
+    _commit(root, "modify only TestC.test_a's body")
+
+    owned = ownership.owned_failing_ids(
+        root, "HEAD~1", "HEAD",
+        ["test_c.py::TestC::test_a", "test_c.py::test_a[x1]"],
+    )
+    assert owned == ["test_c.py::TestC::test_a"], owned
+
+
+def test_directly_modified_fixture_owns_its_users_but_not_transitive_ones(
+    tmp_path,
+):
+    root = _repo(tmp_path, "fixtures")
+    (root / "conftest.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def f2():\n    return 1\n\n\n"
+        "@pytest.fixture\n"
+        "def f_mid(f2):\n    return f2 + 1\n"
+    )
+    (root / "test_fx.py").write_text(
+        "def test_direct(f2):\n    assert f2 == 1\n\n\n"
+        "def test_indirect(f_mid):\n    assert f_mid == 2\n"
+    )
+    _commit(root, "base: f2, f_mid, two tests")
+
+    (root / "conftest.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def f2():\n    return 1  # modified\n\n\n"
+        "@pytest.fixture\n"
+        "def f_mid(f2):\n    return f2 + 1\n"
+    )
+    _commit(root, "modify only f2's body")
+
+    owned = ownership.owned_failing_ids(
+        root, "HEAD~1", "HEAD", ["test_fx.py::test_direct", "test_fx.py::test_indirect"],
+    )
+    assert owned == ["test_fx.py::test_direct"], (
+        "test_indirect only requests f_mid directly — f_mid itself is "
+        "untouched, so it must not be owned via f2 transitively: " + str(owned)
+    )
+
+
+def test_unresolvable_id_is_owned_only_when_its_file_was_added(tmp_path):
+    root = _repo(tmp_path, "unresolvable")
+    (root / "existing.py").write_text("def test_e():\n    assert True\n")
+    _commit(root, "base")
+
+    (root / "existing.py").write_text(
+        "def test_e():\n    assert True\n\n\ndef test_f():\n    assert True\n"
+    )
+    (root / "brand_new.py").write_text("def test_new():\n    assert True\n")
+    _commit(root, "add brand_new.py, add test_f to existing.py")
+
+    owned = ownership.owned_failing_ids(
+        root, "HEAD~1", "HEAD",
+        [
+            "no_double_colon_here",  # unparseable id -> never owned
+            "existing.py::test_missing_func",  # modified file, function absent
+            "brand_new.py::test_anything_not_actually_there",  # added file
+        ],
+    )
+    assert owned == ["brand_new.py::test_anything_not_actually_there"], owned
+
+
+def test_renamed_file_is_not_treated_as_added(tmp_path):
+    root = _repo(tmp_path, "renamed")
+    (root / "old_name.py").write_text("def test_r():\n    assert True\n")
+    _commit(root, "base")
+
+    subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=root, check=True)
+    _commit(root, "pure rename, no content change")
+
+    owned = ownership.owned_failing_ids(root, "HEAD~1", "HEAD", ["new_name.py::test_r"])
+    assert owned == [], (
+        "a pure rename (git status 'R', not 'A') with no content change must "
+        "not own an untouched function: " + str(owned)
+    )
+
+
+def test_total_resolution_failure_owns_nothing(tmp_path):
+    root = _repo(tmp_path, "resolution_failure")
+    (root / "a.py").write_text("def test_a():\n    assert True\n")
+    _commit(root, "one commit only")
+
+    owned = ownership.owned_failing_ids(
+        root, "this-ref-does-not-exist", "HEAD", ["a.py::test_a"]
+    )
+    assert owned == [], (
+        "a bad before_ref must fail the WHOLE resolution closed, not just "
+        "the one id: " + str(owned)
+    )
+
+
+def test_parse_node_id_rejects_shapes_that_are_not_a_python_test_id():
+    assert ownership.parse_node_id("no_colons_here") is None
+    assert ownership.parse_node_id("not_python.txt::test_x") is None
+    assert ownership.parse_node_id("/abs/path/test_x.py::test_x") is None
+    assert ownership.parse_node_id("../escapes/test_x.py::test_x") is None
+    assert ownership.parse_node_id("test_x.py::") is None
+
+
+def test_parse_node_id_strips_bracket_suffix_from_last_segment_only():
+    assert ownership.parse_node_id("t.py::TestC::test_a[1-2]") == (
+        "t.py", ("TestC",), "test_a",
+    )
+    assert ownership.parse_node_id("t.py::test_a") == ("t.py", (), "test_a")
+
+
+# ---------------------------------------------------------------------------
+# _attributed_ids
+# ---------------------------------------------------------------------------
+
+
+def test_attributed_ids_owned_empty_reproduces_todays_rule_byte_for_byte():
+    # inconclusive base check (None) -> fall back to every failing id
+    assert _attributed_ids(["a", "b"], None, []) == ["a", "b"]
+    # base check ran, found every id pre-existing ([]) -> `[] or failing`
+    assert _attributed_ids(["a", "b"], [], []) == ["a", "b"]
+    # base check isolated a subset -> exactly that subset
+    assert _attributed_ids(["a", "b", "c"], ["b"], []) == ["b"]
+
+
+def test_attributed_ids_newly_failing_empty_with_owned_bills_only_owned():
+    # base check found EVERY id pre-existing, but one is also owned: bill
+    # only the owned id, not the genuinely pre-existing siblings.
+    assert _attributed_ids(["a", "b", "c"], [], ["b"]) == ["b"]
+
+
+def test_attributed_ids_mixed_is_an_ordered_union_in_input_order():
+    assert _attributed_ids(["a", "b", "c", "d"], ["b"], ["d"]) == ["b", "d"]
+    # input-order preserved, not the order either source list names them
+    assert _attributed_ids(["d", "c", "b", "a"], ["b"], ["d"]) == ["d", "b"]

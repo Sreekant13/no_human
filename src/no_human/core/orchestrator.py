@@ -81,7 +81,7 @@ from ..review.reviewer import (
     ReviewerUnavailable,
 )
 from ..review.selfcheck import ChecklistItem
-from ..testing import runner
+from ..testing import ownership, runner
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
 from .prompt_blocks import (
@@ -1103,6 +1103,31 @@ def _tamper_escalation_detail(report, scope: str = "") -> str:
         f"(totals: tests {report.tests_before}->{report.tests_after}, "
         f"assertions {report.assertions_before}->{report.assertions_after})"
     )
+
+
+def _attributed_ids(
+    failing: list[str], newly_failing: list[str] | None, owned: list[str],
+) -> list[str]:
+    """Which failing ids does this attempt get billed for?
+
+    Today's rule (`newly_failing or failing`), plus: an id this attempt's own
+    diff added or modified (`owned`) is always billed and never excused,
+    regardless of what the base-tree check found. `owned == []` reproduces
+    today's rule byte-for-byte.
+
+    The `newly_failing == []` branch is load-bearing: the base check RAN and
+    found every failing id pre-existing, but one of them is also owned — bill
+    ONLY the owned id(s), not the genuinely pre-existing siblings that shared
+    the run (a plain `newly_failing or failing` / union-of-sets formulation
+    would wrongly re-bill every sibling here).
+    """
+    if not owned:
+        return list(newly_failing or failing)
+    if newly_failing == []:
+        owned_set = set(owned)
+        return [t for t in failing if t in owned_set]
+    keep = set(newly_failing or failing) | set(owned)
+    return [t for t in failing if t in keep]
 
 
 class Orchestrator:
@@ -5299,13 +5324,21 @@ class Orchestrator:
                         repo, test_cmd, base, failing_tests, cwd=test_cwd,
                         env_dependent=bool((task.config or {}).get("env_setup")),
                     )
+                    # Ownership: does THIS attempt's own diff name the failing
+                    # test function itself (added or modified, per-function not
+                    # per-file)? An owned id can never be excused as flaky or
+                    # pre-existing — the flaky/pre-existing excuses classify by
+                    # TREE, never by whether the current attempt wrote the test.
+                    owned = await self._owned_failing_tests(
+                        repo, base, failing_tests, cwd=test_cwd)
                     # `newly_failing == []` is the ONLY excuse path: the base
                     # check RAN and every failing id was already red on base. An
                     # empty `failing_tests` (unparseable red) or an inconclusive
                     # base check (`None`) both keep the current fail-the-attempt
                     # behaviour — fail-closed, never a silent pass on a red run
-                    # we could not attribute.
-                    if newly_failing == []:
+                    # we could not attribute. An owned id blocks this excuse too:
+                    # a test the attempt itself modified is never pre-existing.
+                    if newly_failing == [] and not owned:
                         note = (
                             "tests failed, but every failing test already fails "
                             "on the base tree — pre-existing, not introduced by "
@@ -5329,8 +5362,9 @@ class Orchestrator:
                         # Name the NEWLY-failing ids when the base check isolated
                         # them (mixed run); otherwise (None → inconclusive/
                         # fail-closed) fall back to all failing ids, byte-for-byte
-                        # the prior message.
-                        attributed = newly_failing or failing_tests
+                        # the prior message — plus any owned id, which is always
+                        # billed and never excused regardless of tree evidence.
+                        attributed = _attributed_ids(failing_tests, newly_failing, owned)
                         # ONE more piece of evidence before we bill the attempt.
                         # The base check reads ONE run of the base tree, so for a
                         # LOAD-DEPENDENT flake it is a coin flip: base happened to
@@ -5338,8 +5372,12 @@ class Orchestrator:
                         # is charged for a failure it did not cause. The tiebreaker
                         # that does not depend on which tree got lucky is the
                         # CHANGE tree itself — see `_flaky_on_rerun`: the ids on
-                        # their own, then the whole suite again, both here.
-                        flaky = await self._flaky_on_rerun(
+                        # their own, then the whole suite again, both here. An
+                        # owned id skips the re-run entirely: `_flaky_on_rerun` is
+                        # all-or-nothing over `attributed`, so its presence forces
+                        # FAIL regardless of what the re-run would show, and
+                        # skipping also saves the stage-2 full-suite cost.
+                        flaky = None if owned else await self._flaky_on_rerun(
                             repo, test_cmd, attributed, cwd=test_cwd,
                         )
                         # The helper answers all-or-nothing by construction. This
@@ -5380,6 +5418,12 @@ class Orchestrator:
                                 detail += " — " + ", ".join(attributed)
                             if newly_failing:
                                 detail += " (newly failing vs the base tree)"
+                            owned_attr = [t for t in attributed if t in set(owned)]
+                            if owned_attr:
+                                detail += (
+                                    " — this change's own test(s): "
+                                    + ", ".join(owned_attr)
+                                )
                             if is_stuck:
                                 self.emit("stuck", "same failure signature repeated; resetting context")
                             # Same ordering rule as the layered path: note before excerpt.
@@ -5394,14 +5438,44 @@ class Orchestrator:
                             # the attribution line above. When the base check was
                             # inconclusive (newly_failing is None → all ids blamed)
                             # keep the full block, byte-for-byte the prior behaviour.
+                            # An owned id must always keep its traceback even when
+                            # newly_failing narrowed the set some other way.
                             excerpts = getattr(test_result, "traceback_excerpts", {}) or {}
-                            if newly_failing:
+                            if owned:
+                                keep = set(attributed)
+                                excerpts = {k: v for k, v in excerpts.items() if k in keep}
+                            elif newly_failing:
                                 keep = set(newly_failing)
                                 excerpts = {k: v for k, v in excerpts.items() if k in keep}
                             excerpt_block = runner.render_traceback_excerpts(excerpts)
                             if excerpt_block:
                                 detail += "\n" + excerpt_block
-                            await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                            if owned_attr:
+                                self.emit(
+                                    "tests",
+                                    "tests failed on test(s) this change added or "
+                                    "modified — not excusable as flaky or "
+                                    "pre-existing: " + ", ".join(owned_attr),
+                                    ok=False,
+                                    failing_tests=failing_tests,
+                                    owned_failures=owned_attr,
+                                )
+                                await self.store.update_attempt(
+                                    attempt_id,
+                                    status="failed",
+                                    failure_reason=detail,
+                                    test_results={
+                                        "ran": test_result.ran, "ok": test_result.ok,
+                                        "passed": test_result.passed,
+                                        "failed": test_result.failed,
+                                        "errors": test_result.errors,
+                                        "tamper_flag": False,
+                                        "failing_tests": failing_tests,
+                                        "owned_failures": owned_attr,
+                                    },
+                                )
+                            else:
+                                await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
                             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
@@ -8901,6 +8975,41 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 repo._run("worktree", "remove", "--force", str(wt_dir))
             shutil.rmtree(wt_dir, ignore_errors=True)
+
+    async def _owned_failing_tests(
+        self, repo: GitRepo, base: str | None, failing_tests: list[str],
+        *, cwd: str | None = None,
+    ) -> list[str]:
+        """Of *failing_tests*, which name a test FUNCTION this attempt's own
+        diff added or modified (ownership by test id, not by file)?
+
+        Same ref range the neighbouring base-tree attribution already uses:
+        `_review_base(repo, base)` as before, `HEAD` as after — the range the
+        reviewer and the PR both see. Same `cwd` too: node ids are relative
+        to where the runner ran (`_newly_failing_vs_base` maps it the same
+        way), so the lookup is prefixed with that directory relative to the
+        repo root; a cwd outside the repo cannot own anything in its diff.
+        Blocking subprocess work, so run off the event loop. Never raises:
+        any failure here must not fail an attempt that would otherwise pass.
+        """
+        if not failing_tests:
+            return []
+        rel_cwd: str | None = None
+        if cwd is not None:
+            try:
+                rel = Path(cwd).resolve().relative_to(Path(repo.path).resolve())
+                rel_cwd = "" if str(rel) == "." else str(rel)
+            except ValueError:
+                return []  # cross-repo cwd: its ids are not in this diff
+        try:
+            return await asyncio.to_thread(
+                ownership.owned_failing_ids,
+                Path(repo.path), self._review_base(repo, base), "HEAD",
+                failing_tests, cwd=rel_cwd,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("ownership resolution failed", exc_info=True)
+            return []
 
     async def _newly_failing_vs_base(
         self, repo: GitRepo, test_cmd: str | None, base: str | None,
