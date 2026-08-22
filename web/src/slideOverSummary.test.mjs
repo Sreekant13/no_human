@@ -1308,3 +1308,13 @@ test("landFailureFeedback truncates stderr to the first 200 characters", () => {
   const shown = fb.text.split(" — ")[1];
   assert.equal(shown.length, 200);
 });
+
+test("an infra-stamped paused_quota park reads as a dead session, not quota", () => {
+  const task = { status: "paused_quota", kind: "task", blocker: { category: "QUOTA", infra: true } };
+  const text = narrativeText(narrativeFor(task));
+  assert.match(text, /session died/i);
+  assert.doesNotMatch(text, /quota/i);
+  const badge = sectionSummary("system", { task });
+  assert.match(badge.text, /session died/i);
+  assert.doesNotMatch(badge.text, /quota/i);
+});

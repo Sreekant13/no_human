@@ -136,3 +136,24 @@ test("clip trims on a word boundary and marks truncation", () => {
   assert.ok(c.endsWith("…"), "marks truncation");
   assert.ok(!c.includes("wor…"), "cut on a word boundary, not mid-word");
 });
+
+test("an infra-stamped QUOTA park says the session died, never quota", () => {
+  // core/orchestrator.py _park_quota stamps blocker.infra when the SDK
+  // transport died before any token (2026-08-22, a 1 MB buffer line). The
+  // task retries on its own; nothing about quota is true of it.
+  const d = decisionFor({
+    status: "paused_quota",
+    blocker: {
+      category: "QUOTA",
+      wake_condition: "quota_refreshed",
+      root_cause_hypothesis: "SDK died before the session produced any tokens",
+      confidence: 1.0,
+      infra: true,
+    },
+  });
+  assert.equal(d.categoryLabel, "Paused — session died");
+  assert.doesNotMatch(d.headline, /quota/i);
+  assert.doesNotMatch(d.ask, /quota/i);
+  assert.match(d.ask, /retries on its own/i);
+  assert.equal(d.wake, "quota_refreshed");
+});

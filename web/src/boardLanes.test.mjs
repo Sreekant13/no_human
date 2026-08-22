@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES,
+  LANES, routeTask, isNeedsYou, isWaiting, waitingTagText, isRealFailure, BOARD_LANES, OUTCOME_LANES,
   isRunning, isQueued, cardActivity, deriveCounts,
 } from "./boardLanes.js";
 
@@ -243,4 +243,12 @@ test("deriveCounts: one definition — strip/lane/sidebar cannot disagree", () =
 test("deriveCounts defaults safely on non-array input", () => {
   assert.deepEqual(deriveCounts(null), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
   assert.deepEqual(deriveCounts(undefined), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
+});
+
+test("the card's waiting tag says the session died for an infra-stamped park, quota otherwise", () => {
+  assert.equal(waitingTagText({ status: "paused_quota", blocker: { category: "QUOTA" } }), "waits for quota");
+  const dead = waitingTagText({ status: "paused_quota", blocker: { category: "QUOTA", infra: true } });
+  assert.match(dead, /session died/i);
+  assert.doesNotMatch(dead, /quota/i);
+  assert.equal(waitingTagText({ status: "blocked", blocker_wake_condition: "after:30m" }), "waits for its own signal");
 });

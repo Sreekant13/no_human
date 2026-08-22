@@ -59,6 +59,18 @@ const CATEGORY_COPY = {
   },
 };
 
+// The same park, raised by a DEAD SESSION rather than a wall: the backend
+// stamps `blocker.infra` when the Agent SDK transport died before the session
+// produced a token (core/orchestrator.py _park_quota). The task sleeps and
+// retries on its own; nothing about quota is true of it, so the copy must not
+// say quota.
+const INFRA_PARK_COPY = {
+  label: "Paused — session died",
+  headline: "This task's agent session died before it did any work",
+  ask: "It retries on its own shortly — you don't need to answer. Resume it now to retry sooner, or stop here.",
+  resumeLabel: "Resume now",
+};
+
 const DEFAULT_COPY = {
   label: "Needs a decision",
   headline: "This task is waiting for your decision",
@@ -95,7 +107,10 @@ export function decisionFor(task) {
   if (!b || typeof b !== "object") return null;
 
   const category = b.category ? String(b.category) : null;
-  const copy = (category && CATEGORY_COPY[category]) || DEFAULT_COPY;
+  const infraPark = category === "QUOTA" && b.infra === true;
+  const copy = infraPark
+    ? INFRA_PARK_COPY
+    : (category && CATEGORY_COPY[category]) || DEFAULT_COPY;
   const options = normalizeOptions(b.options);
   const question = b.question ? String(b.question) : null;
 
@@ -123,7 +138,7 @@ export function decisionFor(task) {
 
   return {
     category,
-    categoryLabel: categoryLabelFor(category),
+    categoryLabel: infraPark ? INFRA_PARK_COPY.label : categoryLabelFor(category),
     headline: copy.headline,
     ask,
     // `question` is set only when the agent asked something explicit — the panel

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { fmtTokens, taskBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
-import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
+import { BOARD_LANES, routeTask, isWaiting, cardActivity, waitingTagText } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
@@ -326,7 +326,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
       )}
       {waiting && (
         <div className="card-waiting-tag" title={task.blocker_wake_condition || "will resume on its own"}>
-          ◷ {task.status === "paused_quota" ? "waits for quota" : "waits for its own signal"}
+          ◷ {waitingTagText(task)}
         </div>
       )}
       <div className="card-title-row">

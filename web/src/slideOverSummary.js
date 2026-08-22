@@ -200,6 +200,10 @@ export function narrativeFor(task) {
     return { before: `This ${kind} couldn't make progress on its own —`, phrase: "waiting for your decision", after: "", colorVar: colorForStatus(status) };
   }
   if (status === "paused_quota") {
+    // `blocker.infra`: the park came from a dead agent session, not a wall.
+    if (task.blocker && task.blocker.infra === true) {
+      return { before: `This ${kind} is paused —`, phrase: "its agent session died; it retries on its own", after: "", colorVar: colorForStatus(status) };
+    }
     return { before: `This ${kind} is paused —`, phrase: "waiting for its subscription quota to refresh", after: "", colorVar: colorForStatus(status) };
   }
   if (ACTIVE_STATUSES.has(status)) {
@@ -691,7 +695,10 @@ export function sectionSummary(key, { task, diff } = {}) {
       if (task.status === "failed") return { text: "Pipeline stopped — failed", colorVar: colorForStatus("failed") };
       if (isHumanStopped(task)) return { text: "Parked — you stopped it", colorVar: colorForStatus(task.status) };
       if (PARKED_STATUSES.has(task.status)) return { text: "Paused, waiting on you", colorVar: colorForStatus(task.status) };
-      if (task.status === "paused_quota") return { text: "Paused for quota", colorVar: colorForStatus(task.status) };
+      if (task.status === "paused_quota") {
+        const dead = task.blocker && task.blocker.infra === true;
+        return { text: dead ? "Paused — session died" : "Paused for quota", colorVar: colorForStatus(task.status) };
+      }
       if (task.status === "compound_parent") return { text: "Coordinating sub-tasks", colorVar: colorForStatus(task.status) };
       const stage = STATUS_STAGE_LABEL[task.status];
       return { text: stage ? `Running — ${stage}` : "Running", colorVar: colorForStatus(task.status) };

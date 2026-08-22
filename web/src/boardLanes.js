@@ -84,6 +84,15 @@ export function isWaiting(task) {
   );
 }
 
+// The card's waiting tag. A paused_quota park stamped `blocker.infra` came
+// from a dead agent session, not a wall (core/orchestrator.py _park_quota):
+// nothing about quota is true of it, so the card must not say quota.
+export function waitingTagText(task) {
+  if (task?.status !== "paused_quota") return "waits for its own signal";
+  if (task?.blocker && task.blocker.infra === true) return "waits to retry — session died";
+  return "waits for quota";
+}
+
 const NEEDS_YOU_LANES = new Set(LANES.filter((l) => l.needsYou).map((l) => l.key));
 
 // SINGLE source of truth for "this task needs a human" — the same routing the
