@@ -74,12 +74,27 @@ METERED_AUTH_VARS = (
 # The SECOND coding backend's credential (OpenAI Codex).                       #
 # --------------------------------------------------------------------------- #
 #
-# BYO-API-KEY IS THE ONLY SANCTIONED PATH, and that is a legal constraint, not a
-# convenience. OpenAI's terms prohibit using ChatGPT to power third-party
-# services, so no_human never routes a user's ChatGPT subscription: there is no
-# browser-login flow here, no `codex login`, and the Codex CLI is invoked with
-# `preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
-# credential that happens to exist on the machine.
+# BYO-API-KEY IS THE ONLY SANCTIONED PATH — a deliberately CONSERVATIVE choice
+# under genuine uncertainty, not a known legal boundary. An earlier version of
+# this comment asserted, unsourced, that OpenAI's terms forbid a ChatGPT
+# sign-in from driving a third-party service; no such clause was ever found,
+# and that assertion is withdrawn. What OpenAI's own docs actually say
+# (`developers.openai.com/codex/auth`, 308-redirecting to
+# `learn.chatgpt.com/docs/auth`, fetched 2026-08-22): a ChatGPT sign-in is an
+# officially documented Codex CLI method "for local work", but the same page
+# steers "programmatic Codex CLI workflows, such as CI/CD jobs" to an API
+# key — nearer what no_human does, since it drives the CLI unattended.
+# Whether a third-party tool may drive that ChatGPT sign-in on a user's
+# behalf is still open: `openai/codex` discussion #8338 asked exactly this
+# and an OpenAI maintainer answered only the licensing half, leaving the
+# policy half unresolved. So no_human takes the conservative path pending
+# legal advice — a lawyer should settle it, and the answer may well be that
+# a subscription path is fine — and does not route a user's ChatGPT
+# subscription: there is no browser-login flow here, no `codex login`, and
+# the Codex CLI is invoked with `preferred_auth_method="apikey"` so it
+# cannot silently fall back to a ChatGPT credential that happens to exist on
+# the machine. See `agent/codex_backend.py`'s module docstring for the full
+# quoted source and the still-open question.
 #
 # The same discipline as the Anthropic key applies verbatim: the MODE
 # (`worker.backend: codex`) may live in config.yaml, the KEY never does — it
@@ -544,8 +559,13 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
             "the coder backend is 'codex' (worker.backend, or a task's "
             "--backend) but no OPENAI_API_KEY was found. The "
             "Codex backend runs on YOUR OWN OpenAI API key — there is no "
-            "subscription path, because OpenAI's terms prohibit using ChatGPT "
-            "to power third-party services.\n"
+            "subscription path here today. Not because one is a known legal "
+            "boundary: OpenAI documents 'Sign in with ChatGPT' for local "
+            "Codex CLI use, but steers programmatic/CI workflows to an API "
+            "key, and whether a third-party tool may drive that sign-in for "
+            "you is unresolved. no_human takes the conservative path until "
+            "a lawyer settles it; see agent/codex_backend.py's module "
+            "docstring for the quoted source.\n"
             f"Add the key to {env_path} (chmod 600):\n"
             "  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env\n"
             "It must never go in config.yaml. To go back to Claude, set "

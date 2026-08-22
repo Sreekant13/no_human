@@ -552,8 +552,9 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
     # only when the operator sets `worker.backend: codex` AND supplies their own
     # key. Both conditions are load-bearing: the backend REFUSES to start
     # without OPENAI_API_KEY rather than finding some other credential, because
-    # BYO-API-key is the only sanctioned path (OpenAI prohibits using ChatGPT to
-    # power third-party services).
+    # BYO-API-key is the only sanctioned path — a deliberately conservative
+    # choice under unresolved legal uncertainty, not a known prohibition (see
+    # agent/codex_backend.py's module docstring).
     #
     # The channel is `<dynamic>` because argv is assembled at runtime — the
     # binary is `codex`, resolved by `find_codex_cli`.

@@ -11,14 +11,49 @@ thing. The Codex CLI already ships all of that. So this backend drives
 CLI: a subprocess, a JSONL event stream, and a normalizer. It adds ZERO Python
 dependencies for the same reason the Claude path needs no ``anthropic`` package.
 
-WHY BYO-API-KEY ONLY, AND NOTHING ELSE. OpenAI's terms prohibit using ChatGPT to
-power third-party services. There is therefore NO subscription path here: no
-browser login flow, no ``codex login``, no reuse of a ChatGPT session. The run
-demands ``OPENAI_API_KEY`` from ``~/.no_human/.env`` (the mode lives in config,
-the key never does — the same rule as constraint §1) and passes
-``preferred_auth_method=apikey`` so the CLI cannot silently fall back to a
-ChatGPT credential that happens to be on the machine. If the key is absent the
-backend refuses to start rather than degrading to whatever auth it finds.
+WHY BYO-API-KEY ONLY, AND NOTHING ELSE. An earlier version of this docstring
+asserted, as settled fact, that OpenAI's terms forbid a ChatGPT sign-in from
+driving a third-party service. That sentence was never sourced — no such
+clause was found in OpenAI's terms — and is withdrawn.
+
+WHAT OPENAI'S OWN DOCUMENTATION SAYS, quoted from
+``developers.openai.com/codex/auth`` (308-redirects to
+``learn.chatgpt.com/docs/auth``), fetched 2026-08-22:
+
+  * "Codex supports two ways for a person to sign in when using OpenAI
+    models: Sign in with ChatGPT for subscription access [and] Sign in
+    with an API key for usage-based access."
+  * "The ChatGPT desktop app, Codex CLI, and IDE extension support both
+    sign-in methods for local work."
+  * "Use API key authentication for programmatic Codex CLI workflows,
+    such as CI/CD jobs. Don't expose Codex execution in untrusted or
+    public environments."
+
+So a ChatGPT sign-in IS an officially documented Codex CLI method for local
+work — the first two quotes above contradict the withdrawn sentence for
+exactly the case we would use. The THIRD quote is the unfavourable half and
+must not be dropped just because it is unfavourable: OpenAI steers
+PROGRAMMATIC workflows — CI/CD jobs, nearer what no_human does, since it
+drives the CLI unattended with nobody at the keyboard — to the API key, not
+to a ChatGPT sign-in.
+
+STILL OPEN, named here as open rather than resolved: whether a THIRD-PARTY
+tool may drive that ChatGPT sign-in on a user's behalf. ``openai/codex``
+discussion #8338 asked exactly this question; an OpenAI maintainer answered
+only the licensing half and left the policy half unresolved — unanswered,
+not settled either way.
+
+So BYO-API-key is the deliberately CONSERVATIVE choice under genuine
+uncertainty, not a finding of law: the one path whose terms are unambiguous,
+taken pending legal advice. A lawyer should settle this, and the answer may
+well be that a subscription path is fine. Until then there is NO
+subscription path here: no browser login flow, no ``codex login``, no reuse
+of a ChatGPT session. The run demands ``OPENAI_API_KEY`` from
+``~/.no_human/.env`` (the mode lives in config, the key never does — the
+same rule as constraint §1) and passes ``preferred_auth_method=apikey`` so
+the CLI cannot silently fall back to a ChatGPT credential that happens to be
+on the machine. If the key is absent the backend refuses to start rather
+than degrading to whatever auth it finds.
 See ``config.assert_codex_api_key_mode``.
 
 WHAT THIS BACKEND CANNOT DO, stated here and declared in
@@ -232,9 +267,14 @@ class CodexBackend:
                 "the coder backend is 'codex' (worker.backend, or this task's "
                 "--backend) but no OPENAI_API_KEY was found. "
                 "Codex runs on YOUR OWN OpenAI API key — there is no "
-                "subscription path (OpenAI's terms prohibit using ChatGPT to "
-                "power third-party services). Add the key to ~/.no_human/.env "
-                "(chmod 600):\n"
+                "subscription path here. Not because one is known to be "
+                "forbidden: OpenAI documents 'Sign in with ChatGPT' for local "
+                "Codex CLI use, but steers programmatic/CI workflows to an "
+                "API key, and whether a third-party tool may drive that "
+                "sign-in for you is unresolved. no_human takes the "
+                "conservative path until a lawyer settles it. See the module "
+                "docstring for the quoted source. Add the key to "
+                "~/.no_human/.env (chmod 600):\n"
                 "  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env\n"
                 "The key never belongs in config.yaml."
             )
@@ -276,8 +316,10 @@ class CodexBackend:
             # Nobody is at the keyboard (§22). An approval prompt in a headless
             # run is an indefinite hang, not a safety feature.
             "--ask-for-approval", "never",
-            # THE LEGALITY GATE, in code: never fall back to a ChatGPT login
-            # that happens to exist on this machine.
+            # THE CONSERVATIVE-PATH GATE, in code: never fall back to a
+            # ChatGPT login that happens to exist on this machine. Not a
+            # known legal boundary — see the module docstring — but the
+            # deliberate choice while that question is unresolved.
             "--config", 'preferred_auth_method="apikey"',
         ]
         mapped = _EFFORT_MAP.get((effort or "").lower())

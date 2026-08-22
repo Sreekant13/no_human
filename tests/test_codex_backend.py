@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -163,10 +164,11 @@ def test_the_codex_model_is_its_own_config_key_not_a_claude_tier(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
-    """BYO-API-key is the ONLY sanctioned path: OpenAI prohibits using ChatGPT
-    to power third-party services. `preferred_auth_method="apikey"` is what
-    stops the CLI falling back to a ChatGPT login that happens to be on the
-    machine, so it is pinned here rather than left to the CLI's default."""
+    """BYO-API-key is the only path no_human offers — the conservative choice
+    under unresolved legal uncertainty, not a sourced prohibition (see the
+    module docstring). `preferred_auth_method="apikey"` is what stops the CLI
+    falling back to a ChatGPT login that happens to be on the machine, so it
+    is pinned here rather than left to the CLI's default."""
     monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
     cmd = cx.CodexBackend()._command(Path("/repo"), effort="high", resume=None)
     assert 'preferred_auth_method="apikey"' in cmd
@@ -201,6 +203,8 @@ def test_a_missing_openai_key_refuses_rather_than_finding_other_auth():
     assert "OPENAI_API_KEY" in msg
     assert "no subscription path" in msg
     assert "config.yaml" in msg  # the key never lives there
+    assert "prohibit" not in msg.lower()  # the unsourced claim is withdrawn
+    assert "lawyer" in msg.lower()  # names the uncertainty honestly
 
 
 def test_the_claude_credential_is_not_exported_into_the_codex_subprocess():
@@ -221,6 +225,80 @@ def test_a_missing_codex_cli_is_an_absence_with_a_name(monkeypatch):
     with pytest.raises(BackendUnavailable) as exc:
         cx.CodexBackend()._command(Path("/repo"), effort=None, resume=None)
     assert "npm install -g @openai/codex" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# 2b. The legal wording is sourced, honest, and behaviour-free                 #
+# --------------------------------------------------------------------------- #
+
+def test_no_shipped_file_asserts_an_unsourced_openai_prohibition():
+    """AC1: no shipped file under src/ or docs/ asserts, as fact, that
+    OpenAI's terms prohibit using ChatGPT to power a third-party service —
+    that claim was never sourced (see the module docstring's withdrawal)."""
+    banned = re.compile(r"(terms )?prohibit\w*\s+(using\s+)?ChatGPT", re.I)
+    literal = "power third-party services"
+
+    # Positive control: the scanner catches the retired sentence itself, and
+    # the literal substring it used to assert.
+    needle = "OpenAI's terms prohibit using ChatGPT to power third-party services."
+    assert banned.search(needle)
+    assert literal in needle
+
+    root = Path(cx.__file__).resolve().parents[3]
+    scanned = list((root / "src").rglob("*.py")) + list((root / "docs").rglob("*.md"))
+    assert scanned, "the scan must not be scanning nothing"
+    # Second positive control: this file is in the scanned set and carries a
+    # known-present token, so an empty/misdirected scan cannot pass silently.
+    assert any(
+        p.name == "codex_backend.py" and "preferred_auth_method" in p.read_text()
+        for p in scanned
+    )
+
+    offenders = []
+    for path in scanned:
+        text = path.read_text(encoding="utf-8")
+        if banned.search(text) or literal in text:
+            offenders.append(str(path.relative_to(root)))
+    assert not offenders, f"unsourced OpenAI prohibition claim in: {offenders}"
+
+
+def test_the_module_docstring_cites_its_primary_source_and_both_halves():
+    """AC2 + AC3: the honest replacement names its primary source (both
+    URLs, the fetch date, all three quotes' distinguishing fragments, and
+    the unfavourable programmatic-workflow guidance) and names the
+    third-party sign-in question as OPEN rather than resolved, citing
+    discussion #8338 and what it did and did not answer."""
+    doc = " ".join(cx.__doc__.split())  # collapse line-wrap whitespace
+    for fragment in (
+        "two ways for a person to sign in",
+        "both sign-in methods for local work",
+        "programmatic Codex CLI workflows",
+        "developers.openai.com/codex/auth",
+        "learn.chatgpt.com/docs/auth",
+        "2026-08-22",
+        "CI/CD",
+        "API key",
+        "8338",
+        "licensing",
+        "lawyer",
+    ):
+        assert fragment in doc, f"module docstring is missing: {fragment!r}"
+    assert "third-party" in doc or "third party" in doc
+    assert "unresolved" in doc or "unanswered" in doc
+
+
+def test_the_wording_change_added_no_subscription_machinery():
+    """AC5: this ticket changes what we CLAIM, not what we DO — no
+    subscription auth path, no login flow, no reading of Codex's own
+    credential file, and the api-key argv flag is still emitted."""
+    src_root = Path(cx.__file__).resolve().parents[1]  # .../src/no_human
+    codex_src = (src_root / "agent" / "codex_backend.py").read_text()
+    config_src = (src_root / "config.py").read_text()
+    for text in (codex_src, config_src):
+        assert "login_chatgpt" not in text
+        assert "auth.json" not in text
+        assert "codex_auth_mode" not in text
+    assert 'preferred_auth_method="apikey"' in codex_src
 
 
 # --------------------------------------------------------------------------- #
@@ -582,6 +660,8 @@ def test_codex_mode_requires_the_key_and_says_there_is_no_subscription_path(
     assert "no subscription path" in msg
     assert "ChatGPT" in msg           # names the reason, not just the rule
     assert "config.yaml" in msg
+    assert "prohibit" not in msg.lower()  # the unsourced claim is withdrawn
+    assert "lawyer" in msg.lower()  # names the uncertainty honestly
 
 
 def test_codex_mode_scrubs_the_routings_that_would_move_the_bill(

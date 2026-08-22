@@ -42,14 +42,39 @@ The **mode** lives in config; the **key never does**. `nh` refuses to load a
 config file containing either vendor's API key, and refuses to start with
 `worker.backend: codex` and no `OPENAI_API_KEY` on file.
 
-## There is no subscription path for Codex, deliberately
+## Codex is BYO-API-key only — a conservative choice, not a known prohibition
 
-OpenAI's terms prohibit using ChatGPT to power third-party services. no_human
-therefore has **no** Codex-on-a-ChatGPT-subscription mode: no browser login, no
-reuse of an existing `codex login`, no routing of anyone's consumer plan. The
-CLI is invoked with `preferred_auth_method="apikey"` precisely so it cannot fall
-back to a ChatGPT credential that happens to be on the machine. If you want that
-mode, you want a different tool.
+An earlier version of this section asserted that OpenAI's terms forbid using
+a ChatGPT sign-in to drive a third-party service. That claim was never
+sourced and is withdrawn.
+
+What OpenAI's own documentation says, quoted from
+[`developers.openai.com/codex/auth`](https://developers.openai.com/codex/auth)
+(308-redirects to
+[`learn.chatgpt.com/docs/auth`](https://learn.chatgpt.com/docs/auth)),
+fetched 2026-08-22: "Codex supports two ways for a person to sign in ...
+Sign in with ChatGPT for subscription access [and] Sign in with an API key
+for usage-based access," and "The ChatGPT desktop app, Codex CLI, and IDE
+extension support both sign-in methods for local work." A ChatGPT sign-in is
+therefore an officially documented Codex CLI method. But the same page also
+says: "Use API key authentication for programmatic Codex CLI workflows, such
+as CI/CD jobs" — closer to what no_human does, since it drives the CLI
+unattended.
+
+Whether a third-party tool may drive that ChatGPT sign-in on a user's behalf
+is still open: [`openai/codex` discussion
+#8338](https://github.com/openai/codex/discussions/8338) asked exactly this,
+and an OpenAI maintainer answered only the licensing half, leaving the
+policy half unresolved.
+
+So no_human takes the conservative path pending legal advice, not as a
+finding of law — a lawyer should settle this, and the answer may well be
+that a subscription path is fine. Until then, no_human has **no**
+Codex-on-a-ChatGPT-subscription mode: no browser login, no reuse of an
+existing `codex login`, no routing of anyone's consumer plan. The CLI is
+invoked with `preferred_auth_method="apikey"` precisely so it cannot fall
+back to a ChatGPT credential that happens to be on the machine. If you want
+that mode today, you want a different tool.
 
 (The Claude path is different because a Claude *subscription* is the operator's
 own credential on the operator's own machine — see the auth constraint. That
