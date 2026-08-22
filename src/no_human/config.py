@@ -1474,6 +1474,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # enforcing, and this comment still claimed otherwise until 2026-07-22.
         "mode": "advisory",
     },
+    # UI evidence (testing/ui_evidence.py): the harness drives a real browser
+    # at the attempt's own dev server from a coder-written walk manifest.
+    # OFF by default — it is a per-repo opt-in, and the egress allowlist
+    # charges the browser channel against this key.
+    "ui_evidence": {"enabled": False},
     "tamper_adjudication": {
         # When the test-tampering guard fires, ask ONE fresh-context reviewer
         # whether the ticket REQUIRED those test changes, instead of ending the

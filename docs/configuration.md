@@ -456,6 +456,17 @@ set it `false` to skip straight to the agentic reviewer even when
 section is not written into the defaults file; set it yourself to change the
 behaviour, the same as `lint.command` and `tests.command` above.
 
+## UI evidence
+
+```yaml
+ui_evidence:
+  enabled: false   # the harness drives a headless browser at the attempt's own
+                   # dev server from a coder-written walk manifest and keeps the
+                   # screenshots, video and console errors as evidence. Opt-in per
+                   # install: the browser fetches whatever the page references, so
+                   # this is the key the egress allowlist charges that channel to.
+```
+
 ## Timeouts read straight from your config
 
 Two wall-clock ceilings are read the same way and default generously so a

@@ -816,6 +816,23 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
                                      "team_brain.control_plane_url"),
     },
 
+    "testing/ui_evidence.py": {
+        "http:urllib.request": Allowed(
+            "the attempt's OWN dev server — one GET of base_url as a readiness "
+            "probe before the browser walk (`_reachable`)",
+            "loopback: `_base_url_problem` refuses any base_url whose host is "
+            "not 127.0.0.1/localhost, the opener carries `ProxyHandler({})` so "
+            "no proxy can reroute it, and `_NoRedirect` refuses every 3xx so a "
+            "`Location:` header cannot send it anywhere else — exactly one "
+            "connection, to base_url"),
+        "sdk:playwright": Allowed(
+            "whatever the attempt's OWN dev server serves — a headless browser "
+            "is pointed only at 127.0.0.1/localhost (every `goto` with a scheme "
+            "or netloc is refused at manifest validation), but a page it loads "
+            "can reference fonts, scripts or beacons on any host, and the "
+            "browser fetches those like any browser would",
+            _CFG + "ui_evidence.enabled"),
+    },
     "ci/jenkins_session.py": {
         "sdk:playwright": Allowed(
             "ci.base_url — drives a REAL BROWSER through the Jenkins SSO form "
@@ -1971,7 +1988,11 @@ def test_loopback_entries_really_bind_loopback() -> None:
             if entry.gate.startswith("loopback:"):
                 checked += 1
                 assert "127.0.0.1" in (PKG / module).read_text(), (module, channel)
-    assert checked == 10, f"expected 10 loopback channels, found {checked}"
+    # 11 = the 10 that predate the UI evidence runner + its readiness probe
+    # (one connection to a validated 127.0.0.1/localhost base_url, redirects
+    # refused). The runner's BROWSER is deliberately NOT loopback: a page it
+    # loads can fetch from anywhere, so that channel is config-gated instead.
+    assert checked == 11, f"expected 11 loopback channels, found {checked}"
 
 
 def test_no_unused_local_classifications() -> None:
