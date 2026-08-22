@@ -289,13 +289,23 @@ hour to review.
 they execute (`_FORGE_MERGE` in
 [`agent/guard.py`](../src/no_human/agent/guard.py)) — for the spellings the
 matcher models, with the caveat from the reviewer section above, which applies
-here in the same words: the modelled set is not closed. `_FORGE_MERGE` anchors
-on `gh pr merge` / `glab mr merge`, so a global option between the binary and
-the subcommand walks past it — measured on 2026-08-22 in both session modes,
-`gh --repo <o/r> pr merge <n>`, `gh -R <o/r> pr merge <n>` and
-`glab -R <o/r> mr merge <n>` are all allowed. Treat the matcher as a cost on
-the obvious spellings, not as the door: the control that closes it is a check
-at the act, not a longer pattern.
+here in the same words: the modelled set is not closed. The lexical
+`_FORGE_MERGE` anchors on `gh pr merge` / `glab mr merge`, so a global option
+between the binary and the subcommand walks past IT — which is why the
+argv-shaped check exists beside it: `_forge_invocations` reads the resolved
+argv, so `gh -R <o/r> pr merge <n>`, `gh --repo <o/r> pr merge <n>`,
+`gh pr -R <o/r> merge <n>` and the `glab mr` equivalents are denied in both
+session modes. It also recurses into shell-runner wrappers (`bash -c`, `sh -c`,
+`timeout`, `xargs`, …) and subshell/grouping heads (`$(...)`, `{ ...; }`), up
+to two levels deep — the same bound `_git_invocations` already used — so
+`bash -c "gh -R <o/r> pr merge <n>"` is denied, not just the unwrapped
+spelling (`tests/test_guard.py::test_a_shell_runner_wrapper_does_not_hide_the_forge_merge`).
+That is a raise in the cost of the obvious wrapped spellings, not a closed
+door — see security.md's "WHAT THIS RULE IS" for what a command-line guard
+structurally cannot see, including nesting past two levels, and note that
+`glab mr accept` (glab's own alias for `merge`) is still allowed today. Treat
+the matcher as a cost on the obvious spellings, not as the door: the control
+that closes it is a check at the act, not a longer pattern.
 
 Pushes to `main`, `master` and `release/*` are refused too, and that rule has
 a second enforcement point, which is the part worth knowing. The first is

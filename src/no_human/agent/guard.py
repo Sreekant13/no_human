@@ -1306,6 +1306,18 @@ _REDIR_SUFFIX = re.compile(r"\d*(?:>>|>|<)&?\S*$")
 #: tokenising so the body's own argv[0] is what gets read.
 _GROUPING = re.compile(r"(?:^|(?<=\s))[({]|[)}](?=\s|$)|<\(|\)")
 
+#: `_GROUPING` above eats ` ( `, ` { `, `)`, `}` but not `$(` — the `$`
+#: defeats its whitespace lookbehind — so `_forge_invocations` needs its own
+#: sibling for command substitution / grouping heads (`$(gh pr merge 7)`,
+#: `{ gh pr merge 7; }`, `` `gh pr merge 7` ``). A sibling, not an edit to
+#: `_GROUPING` itself: other rules depend on its current behavior.
+_SUBST_HEAD = re.compile(r"(?:^|(?<=\s))[$`]?[({]|`")
+
+#: A `gh`/`glab` mention inside a shell-runner argument — precompiled once so
+#: the depth-bounded recursion in `_forge_invocations` stays linear even on
+#: the 50k-char / 1000-wrapper adversarial case.
+_FORGE_MENTION = re.compile(r"\b(?:gh|glab)\s+\S")
+
 _MASK_KEY = re.compile(r"\x00m\d+\x00")
 
 
@@ -1699,10 +1711,18 @@ _LIVE_SERVER_REASON = (
 # lexical rule in favour of an argv one is exactly how eight spellings of
 # `nh merge-stack run` regressed earlier today.
 
-#: gh/glab options that sit before the subcommand and take a value.
-_FORGE_GLOBAL_OPT_WITH_ARG = frozenset({
-    "-R", "--repo", "--hostname", "-H", "--host",
-})
+# Value-taking global options the tools actually accept — measured by
+# execution, not assumed: `gh 2.97.0 --help` lists only `--help`/`--version`
+# as top-level flags and REJECTS `-H`/`--host`/`--hostname` outright
+# ("unknown flag"); `glab --help` / `glab help mr` list only `-R`/`--repo` as
+# a value-taking global. `--hostname`/`-H`/`--host` used to sit in this set;
+# an entry here consumes the NEXT token, so listing a BOOLEAN flag as if it
+# took a value swallowed the verb (`gh -H pr merge 7` read as `("merge",
+# "7")`, not `("pr", "merge")`, and was ALLOW). `_forge_subcommand` now scans
+# FOR the `pr`/`mr` noun instead of taking the first two bare words, which is
+# what makes narrowing this set safe: an unlisted boolean flag is skipped by
+# one token, not two, and the noun is still found a token later.
+_FORGE_GLOBAL_OPT_WITH_ARG = frozenset({"-R", "--repo"})
 
 #: git subcommands a read-only session must not run.
 _GIT_WRITE_SUBCOMMANDS = frozenset({
@@ -1719,22 +1739,56 @@ _FORGE_WRITE_PAIRS = {
 }
 _FORGE_MERGE_PAIRS = {("pr", "merge"), ("mr", "merge")}
 
+#: The nouns every `_FORGE_WRITE_PAIRS`/`_FORGE_MERGE_PAIRS` entry keys off.
+#: `_forge_subcommand` scans FOR this noun rather than taking the first two
+#: bare words, so an unlisted boolean global flag (skipped by one token, not
+#: two — see `_FORGE_GLOBAL_OPT_WITH_ARG` above) cannot shift the noun into
+#: the verb's position and the verb out of the pair entirely.
+_FORGE_NOUNS = frozenset({"pr", "mr"})
+
+
+#: `--repo=`/`-R=` single-token forms of `_FORGE_GLOBAL_OPT_WITH_ARG`. A
+#: value-taking global can also land BETWEEN the noun and the verb —
+#: `gh pr -R o/r merge 7` merges the PR and was ALLOW: the noun scan found
+#: `pr` and read the very next token, `-R`, as the verb. Skipping these
+#: forms (and the same two entries `_FORGE_GLOBAL_OPT_WITH_ARG` already
+#: models) after the noun closes that without over-denying — an arbitrary
+#: flag like `--title`/`--body` is deliberately NOT skipped here, or
+#: `gh issue create --title "pr" --body "merge"` would read its `--body`
+#: value as the verb and DENY a command that never touches a PR/MR.
+_FORGE_GLOBAL_OPT_EQ = ("-R=", "--repo=")
+
 
 def _forge_subcommand(argv: list[str]) -> tuple[str, str]:
-    """(noun, verb) for a `gh`/`glab` argv, skipping the tool's own global
-    options and their values. `gh -R o/r pr merge 7` -> ("pr", "merge")."""
-    words: list[str] = []
+    """(noun, verb) for a `gh`/`glab` argv: scans past the tool's own global
+    options (and their values) for a `pr`/`mr` noun, then skips the same
+    value-taking globals again (plus their `=`-joined form) before reading
+    the verb. `gh -R o/r pr merge 7` -> ("pr", "merge"); `gh pr -R o/r merge
+    7` -> ("pr", "merge") too, not ("pr", "-R") — the global slid AFTER the
+    noun this time, and only the modelled `-R`/`--repo` forms are skipped
+    there, never an arbitrary flag. `gh -H pr merge 7` -> ("pr", "merge")
+    also — `-H` is not in `_FORGE_GLOBAL_OPT_WITH_ARG` so it is skipped by
+    one token, not two, and the noun is still found."""
     i = 1
-    while i < len(argv) and len(words) < 2:
+    while i < len(argv):
         tok = argv[i]
         if tok.startswith("-"):
             i += 2 if tok in _FORGE_GLOBAL_OPT_WITH_ARG else 1
             continue
-        words.append(tok)
+        if tok in _FORGE_NOUNS:
+            j = i + 1
+            while j < len(argv):
+                vtok = argv[j]
+                if vtok in _FORGE_GLOBAL_OPT_WITH_ARG:
+                    j += 2
+                    continue
+                if vtok.startswith(_FORGE_GLOBAL_OPT_EQ):
+                    j += 1
+                    continue
+                break
+            return tok, (argv[j] if j < len(argv) else "")
         i += 1
-    while len(words) < 2:
-        words.append("")
-    return words[0], words[1]
+    return "", ""
 
 
 _GIT_WRITE = re.compile(
@@ -2069,25 +2123,62 @@ def _git_subcommand(argv: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
-def _forge_invocations(cmd: str) -> list[list[str]]:
+def _forge_invocations(cmd: str, _depth: int = 0) -> list[list[str]]:
     """Every `gh`/`glab` argv in ``cmd``, found the way `_git_invocations`
     finds git: split on shell separators, strip `VAR=value` and wrappers, and
     read `basename(argv[0])`. A global option before the subcommand no longer
     hides the verb, because the verb is read from argv rather than matched
-    next to the binary."""
+    next to the binary.
+
+    Recurses up to two levels into nested shell runners — `bash -c "gh -R o/r
+    pr merge 7"`, `sh -c "glab -R o/r mr merge 12"`, `timeout 30 gh …`,
+    `xargs gh …` — the same bound `_git_invocations` uses, mirrored rather
+    than shared (no helper refactor across the two paths). `$(...)`, `` `...`
+    `` and `{ ...; }` are stripped per segment with `_SUBST_HEAD` (a
+    `_GROUPING` sibling — `_GROUPING` itself is untouched) before
+    tokenising, and `_strip_shell_keywords` drops a leading `if`/`then`/etc.
+    so `if true; then gh -R o/r pr merge 7; fi` is seen after `_CMD_SEP`
+    splits on `;`. Bounded depth — a guard must not become a parser with
+    unbounded work; `_FORGE_MENTION` is precompiled so the bound holds on a
+    50k-char / 1000-wrapper adversarial command.
+
+    Deliberate polarity: a quoted MENTION of `gh`/`glab` inside a runner
+    argument (`bash -c "echo gh pr merge 7"`) is recursed into and analysed
+    too — matching `_FORGE_MERGE`'s existing unanchored lexical stance. A
+    false denial costs one message; a missed one merges a PR. Purely
+    additive over the un-recursed version: it can only add argvs `_git_invocations`-style callers see, never remove one.
+
+    Structural limit, not covered by this recursion: a command assembled at
+    RUNTIME (`$VAR`, a heredoc, `base64 -d | sh`) is not visible to any
+    static rule — see docs/verification.md.
+    """
     found: list[list[str]] = []
     for seg in _CMD_SEP.split(cmd):
         seg = seg.strip()
         if not seg:
             continue
+        seg_body = _SUBST_HEAD.sub(" ", _GROUPING.sub(" ", seg))
         try:
-            tokens = shlex.split(seg)
+            tokens = shlex.split(seg_body)
         except ValueError:
-            tokens = seg.split()
+            tokens = seg_body.split()
+        tokens = _strip_shell_keywords(tokens)
         argv = _strip_wrappers(
             tokens, is_extra_target=lambda n: n in {"gh", "glab"})
-        if argv and PurePosixPath(argv[0]).name in {"gh", "glab"}:
+        if not argv:
+            continue
+        name = PurePosixPath(argv[0]).name
+        if name in {"gh", "glab"}:
             found.append(argv)
+        elif name in _SHELL_RUNNERS and _depth < 2:
+            for j, tok in enumerate(argv[1:], start=1):
+                # `bash -c "gh -R o/r pr merge 7"` — quoted payload, one token.
+                if _FORGE_MENTION.search(tok):
+                    found.extend(_forge_invocations(tok, _depth + 1))
+                # `timeout 30 gh …` / `xargs gh …` — the rest of THIS argv.
+                elif PurePosixPath(tok).name in {"gh", "glab"}:
+                    found.append(argv[j:])
+                    break
     return found
 
 

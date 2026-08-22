@@ -1196,6 +1196,156 @@ def test_a_global_option_does_not_hide_the_forge_merge():
         assert _ev("Bash", {"command": cmd}).allow, cmd
 
 
+def test_a_shell_runner_wrapper_does_not_hide_the_forge_merge():
+    """`_forge_invocations` read `argv[0]` and stopped — every sibling argv
+    path (`_git_invocations`, `_git_push_invocations`) recurses two levels
+    into `_SHELL_RUNNERS`, but the forge path never got it. MEASURED on
+    c0af1fd3e (both modes, before this fix): every row below was ALLOW —
+    a `bash -c`/`sh -c`/`timeout`/`xargs` wrapper, or a `$(...)`/`{...;}`/
+    `if...;then...;fi` grouping, laundered a merge past the guard entirely:
+
+        ALLOW  bash -c "gh -R o/r pr merge 7 --squash"
+        ALLOW  $(gh -R o/r pr merge 7)
+        ALLOW  { gh -R o/r pr merge 7; }
+        ALLOW  if true; then gh -R o/r pr merge 7; fi
+        ALLOW  sh -c "glab -R o/r mr merge 12"
+        ALLOW  timeout 30 gh -R o/r pr merge 7
+        ALLOW  xargs gh -R o/r pr merge
+        ALLOW  bash -c "sh -c \"gh -R o/r pr merge 7\""   (two-level nesting)
+        DENY   bash -c "gh pr merge 7"                     (control: lexical
+                                                             _FORGE_MERGE
+                                                             already reaches
+                                                             the unwrapped,
+                                                             flagless spelling)
+
+    Every spelling below is reachable by the fix (depth <= 2, `_SUBST_HEAD`
+    grouping strip, `_strip_shell_keywords`); none is disclosed as unreachable
+    here. The disclosed structural limit is runtime-assembled commands
+    (`$VAR`, heredocs, `base64 -d | sh`) — not exercised by this test."""
+    for readonly in (False, True):
+        for cmd in (
+            'bash -c "gh -R o/r pr merge 7 --squash"',
+            'sh -c "glab -R o/r mr merge 12"',
+            "timeout 30 gh -R o/r pr merge 7",
+            "xargs gh -R o/r pr merge",
+            "$(gh -R o/r pr merge 7)",
+            "{ gh -R o/r pr merge 7; }",
+            "if true; then gh -R o/r pr merge 7; fi",
+            'bash -c "sh -c \\"gh -R o/r pr merge 7\\""',
+            'bash -c "gh pr merge 7"',
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_the_wrapper_recursion_does_not_overcorrect():
+    """The recursion added above can only ADD argvs it sees inside a shell
+    runner — it must not start denying commands that merely mention `gh`/
+    `glab`/`pr`/`merge` as text, or route through a non-runner argv[0].
+    Corpus is deliberately read-only-safe so both session modes stay ALLOW."""
+    for readonly in (False, True):
+        for cmd in (
+            'bash -c "gh -R o/r pr view 7"',
+            'sh -c "gh -R o/r pr list"',
+            "echo 'gh -R o/r pr merge 7'",
+            "grep -n 'pr merge' src/no_human/agent/guard.py",
+            "gh pr checkout 7",
+            "git -C . log",
+            'gh issue create --title "pr" --body "merge"',
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert d.allow, f"readonly={readonly} must stay allowed: {cmd!r} -> {d.reason}"
+
+
+def test_a_boolean_flag_cannot_swallow_the_forge_verb():
+    """`_FORGE_GLOBAL_OPT_WITH_ARG` used to list `--hostname`/`-H`/`--host` as
+    value-taking globals. `gh 2.97.0 --help` (executed) lists only `--help`/
+    `--version` as top-level flags and REJECTS `-H`/`--host`/`--hostname`
+    (`unknown flag`); `glab --help` / `glab help mr` (executed) list only
+    `-R`/`--repo` as a value-taking global. An entry in that set consumes the
+    NEXT token — so listing a boolean flag swallowed the verb: with
+    `_forge_subcommand`'s OLD positional-word reading, `gh -H pr merge 7`
+    read as `("merge", "7")`, not `("pr", "merge")`, and was ALLOW on
+    c0af1fd3e. `_forge_subcommand` now scans for the `pr`/`mr` noun instead
+    of taking the first two bare words, which is what makes narrowing this
+    set safe: an unlisted boolean flag is skipped by one token, not two, and
+    the noun is still found a token later — so `--hostname` (still rejected
+    by real `gh`, still worth denying defensively) stays DENY too."""
+    assert guard._FORGE_GLOBAL_OPT_WITH_ARG == {"-R", "--repo"}
+    for readonly in (False, True):
+        for cmd in (
+            "gh -H pr merge 7",
+            "gh --host x pr merge 7",
+            "gh --hostname h.example.com pr merge 7",
+            "gh --repo=o/r pr merge 7",
+            "glab --host=x mr merge 12",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_a_global_option_between_the_noun_and_the_verb_does_not_hide_the_forge_merge():
+    """The noun-scan rewrite of `_forge_subcommand` fixed the flag-BEFORE-noun
+    case but reopened the flag-BETWEEN-noun-and-verb case: after finding
+    `pr`/`mr`, it used to read the very next token as the verb unconditionally,
+    so `gh pr -R o/r merge 7` read as `("pr", "-R")`, never matched
+    `_FORGE_MERGE_PAIRS`, and was ALLOW — a base-DENY(-on-c0af1fd3e)->head-
+    ALLOW regression caught in independent review, executable against the
+    installed `gh 2.97.0` (`gh pr -R no-human-ai/no_human-private view 643`
+    returns real PR JSON; `-R` is accepted after the noun exactly as before
+    it). `_forge_subcommand` now skips the same modelled value-taking globals
+    (`_FORGE_GLOBAL_OPT_WITH_ARG`, plus their `-R=`/`--repo=` single-token
+    form) a second time, after the noun, before reading the verb — so the
+    global slides past regardless of which side of the noun it lands on."""
+    for readonly in (False, True):
+        for cmd in (
+            "gh pr -R o/r merge 7",
+            "gh pr --repo o/r merge 7",
+            "gh pr -R=o/r merge 7",
+            "glab mr -R o/r merge 12",
+            "glab mr --repo o/r merge 12",
+            'bash -c "gh pr -R o/r merge 7"',
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+    # an arbitrary (non-modelled) flag between noun and verb is NOT skipped —
+    # skipping it would read an unrelated flag's value as the verb and
+    # over-deny a command that never touches a PR/MR.
+    assert _ev("Bash", {"command": 'gh issue create --title "pr" --body "merge"'}).allow
+
+
+def test_the_forge_recursion_is_depth_bounded():
+    """`_depth < 2` bounds the forge recursion the same way it bounds
+    `_git_invocations` — work stays linear in command length regardless of
+    how many `bash -c` wrappers are nested, so a 50k-char adversarial command
+    cannot turn a PreToolUse hook into a timeout vector.
+
+    The < 1s threshold is a STRUCTURAL bound, not a machine-specific one:
+    `_depth < 2` means at most three tokenisation passes ever run regardless
+    of nesting count, so cost is O(command length), not O(2^nesting). This
+    was measured locally (see the assertion below) at a small fraction of the
+    threshold, giving ~2 orders of magnitude of headroom for a slower CI box
+    or the standard GitHub Actions runner."""
+    payload = 'echo "gh -R o/r pr merge 7"'
+    for _ in range(1000):
+        payload = f'bash -c "{payload}" # {"x" * 40}'
+    assert len(payload) > 50_000
+    start = time.perf_counter()
+    d = guard.evaluate("Bash", {"command": payload}, forbidden_paths=FORBIDDEN,
+                       never_push_to=PROTECTED, readonly=False)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"forge recursion took {elapsed:.3f}s on a 1000-wrapper command"
+    assert not d.allow, "the innermost merge, however deeply wrapped, must still deny"
+
+
 def test_the_read_only_regex_is_not_redundant_with_the_argv_check():
     """The argv check added alongside it does NOT subsume it. Measured: with
     the regex disabled, 42 of 196 wrapper x verb cases went ALLOW — command

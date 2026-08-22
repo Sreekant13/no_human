@@ -97,6 +97,33 @@ All notable changes to no_human. The format follows
   of a control that has to live at the act itself. Seven rounds and six reviews
   produced that sentence, and it is the honest one.
 
+- **The forge-merge argv check (`_forge_invocations` in `agent/guard.py`) read
+  `gh`/`glab` off the bare command and never recursed into a shell wrapper —
+  its sibling git check already did. `bash -c "gh pr merge 7"`, `sh -c`,
+  `timeout`, `xargs`, `$(gh pr merge 7)`, `{ gh pr merge 7; }` and
+  `if...then...fi` all reached `gh pr merge`/`glab mr merge` past the guard in
+  both coder and read-only mode. Fixed the same way the earlier PreToolUse
+  round fixed the equivalent gap for `nh approve`: bounded two-level recursion
+  into shell runners and grouping heads, mirroring `_git_invocations`. A
+  second, smaller defect in the same function: `--hostname`/`-H`/`--host` were
+  listed as value-taking global options, which they are not (`gh --help`,
+  `glab --help`, executed, list only `-R`/`--repo`) — a boolean flag in that
+  set swallows the next token, which was the verb, so `gh -H pr merge 7` read
+  as `("merge", "7")` and passed. Narrowed the set to `{-R, --repo}` and moved
+  subcommand detection from positional-word reading to a scan for the `pr`/`mr`
+  noun, which is what makes the narrower set safe against an unrecognized
+  flag. The recursion is bounded at `_depth < 2`, same as the git check, so a
+  1,000-level nested wrapper still evaluates in well under a second.
+  Independent review then caught that the noun scan, alone, read the token
+  immediately after `pr`/`mr` as the verb unconditionally — a value-taking
+  global landing AFTER the noun (`gh pr -R o/r merge 7`, `gh pr --repo o/r
+  merge 7`, and the `glab mr` equivalents) shifted the verb into the flag's
+  slot the same way a global BEFORE the noun used to. Fixed by skipping the
+  same modelled globals (and their `-R=`/`--repo=` single-token form) a
+  second time, after the noun, before reading the verb — an unmodelled flag
+  there is still read as the verb on purpose, so it cannot swallow the next
+  token and over-deny an unrelated command.
+
 ## [0.1.4] — 2026-08-21
 
 Fixes `nh mcp-serve` on every install that resolves dependencies from PyPI —
