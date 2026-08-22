@@ -1374,8 +1374,17 @@ async def send_back(
         raise HTTPException(status_code=409, detail="task is cancelled")
     prior_status = task.status
     prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
+    _sent_back_at = _now()
     await store.append_context_list(
-        task.id, "send_back_feedback", {"at": _now(), "message": body.message})
+        task.id, "send_back_feedback",
+        {"at": _sent_back_at, "message": body.message})
+    # Mark the send-back pending — cleared at the next `attempt_start`, or
+    # named in the blocker if a loop-head gate (budget/attempt ceiling)
+    # refuses to start a round at all (`orchestrator._refuse_round`).
+    from ..blockers import record_pending_send_back
+    await record_pending_send_back(
+        store, task, source="send_back", message=body.message,
+        actor="operator:api", at=_sent_back_at)
     # A human pressing "Send back" IS the gate the zero-diff honesty check looks
     # for, so record that this re-entry is theirs. No checkpoint is involved
     # here, so the write CLEARS any recorded `sha`/`branch` rather than

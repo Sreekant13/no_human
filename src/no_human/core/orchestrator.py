@@ -46,11 +46,13 @@ from ..agent.supervisor import SupervisorHook
 from ..agent.verification_receipts import KINDS
 from ..blockers import (
     MACHINE_REQUEUE_PROVENANCE,
+    PENDING_KEY,
     SERVER_STOP_REASON,
     Blocker,
     BlockerCategory,
     BlockerOption,
     blocker_prompt_suffix,
+    clear_pending_send_back,
     fallback_blocker,
     find_stored_answer,
     human_event,
@@ -58,6 +60,9 @@ from ..blockers import (
     notification_line,
     parse_blocker,
     question_hash,
+    refusal_event,
+    refusal_note,
+    remedy_text,
     render_report,
     reuse_record,
     triage,
@@ -3467,21 +3472,36 @@ class Orchestrator:
             # Lifetime budget next — same cheap boundary. max_attempts bounds
             # THIS loop; every resume starts a fresh one, which is how one task
             # reached attempt 17 and 21.2M tokens with no cap ever firing.
-            budget_blocker = await self._check_lifetime_budget(task)
-            if budget_blocker is not None:
-                return await self._raise_blocker(
-                    task, budget_blocker, repo=repo, branch=self._active_branch
-                )
-            # Under the cap is not the same question as "can afford to
-            # start" — remaining budget strictly between 0 and one attempt's
-            # fixed startup cost is a guaranteed-dead attempt otherwise: it
-            # burns an attempt slot and ~0.9M raw tokens before failing with
-            # the same BUDGET_EXHAUSTED it would have failed with for free.
-            floor_blocker = await self._check_attempt_startup_floor(task)
-            if floor_blocker is not None:
-                return await self._raise_blocker(
-                    task, floor_blocker, repo=repo, branch=self._active_branch
-                )
+            #
+            # Gate-agnostic funnel (2026-08-22): a human send-back delivered
+            # while EITHER loop-head gate refuses used to look identical to
+            # organic exhaustion — the send-back was recorded
+            # (`send_back_feedback`) and the task moved, but nothing ever said
+            # the send-back itself never started a round. `_refuse_round`
+            # is a no-op wrapper around `_raise_blocker` when there is no
+            # pending send-back (byte-identical to the old direct calls); any
+            # future loop-head gate added to this tuple gets the same
+            # coverage for free.
+            for gate_name, check in (
+                ("lifetime budget", self._check_lifetime_budget),
+                # Under the cap is not the same question as "can afford to
+                # start" — remaining budget strictly between 0 and one
+                # attempt's fixed startup cost is a guaranteed-dead attempt
+                # otherwise: it burns an attempt slot and ~0.9M raw tokens
+                # before failing with the same BUDGET_EXHAUSTED it would have
+                # failed with for free.
+                ("attempt startup floor", self._check_attempt_startup_floor),
+            ):
+                gate_blocker = await check(task)
+                if gate_blocker is not None:
+                    return await self._refuse_round(
+                        task, gate_blocker, gate=gate_name, repo=repo,
+                        branch=self._active_branch,
+                    )
+            # A round IS starting — any pending send-back is no longer
+            # pending (it will be consumed by this round's coder turn, not
+            # refused).
+            await clear_pending_send_back(self.store, task)
             self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}",
                       max_turns=self.bounds.max_turns_per_attempt)
             # C2: systematic root-cause step at the START of a retry — two
@@ -8435,6 +8455,55 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 — fail open toward honesty
             self._advisory(f"blocker challenge skipped: {exc}")
             return None
+
+    async def _refuse_round(
+        self, task: Task, blocker: Blocker, *, gate: str,
+        repo: GitRepo | None = None, branch: str | None = None,
+    ) -> TaskOutcome:
+        """A loop-head gate (``_check_lifetime_budget``,
+        ``_check_attempt_startup_floor``, or any future gate that refuses
+        BEFORE an attempt row exists) just refused to start a round. If a
+        human send-back is pending, that refusal used to be indistinguishable
+        from organic exhaustion — the send-back was recorded
+        (``send_back_feedback``) and the task moved, but nothing ever said
+        the send-back itself never started a round.
+
+        No pending send-back: byte-identical to the direct ``_raise_blocker``
+        call this replaced (negative control — AC3).
+        """
+        pending = (task.context or {}).get(PENDING_KEY)
+        if not pending:
+            return await self._raise_blocker(
+                task, blocker, repo=repo, branch=branch
+            )
+
+        remedy = remedy_text(blocker)
+        note = refusal_note(pending, gate=gate, remedy=remedy)
+        blocker.root_cause_hypothesis = (
+            f"{note} {blocker.root_cause_hypothesis}"
+            if blocker.root_cause_hypothesis else note
+        )
+        blocker.evidence = (
+            f"{note} {blocker.evidence}" if blocker.evidence else note
+        )
+        pr_url = ""
+        try:
+            pr_url = (await resolve_task_pr(self.store, task)).url
+        except Exception:  # noqa: BLE001 — a lookup failure never blocks
+            # the refusal itself.
+            self._advisory("send_back_refused: could not resolve the task's PR")
+        event = refusal_event(
+            task, pending, blocker, gate=gate, remedy=remedy, pr_url=pr_url,
+        )
+        blocker.send_back_refused = {
+            k: v for k, v in event.items() if k != "send_back_refused"
+        }
+        self.emit(
+            "send_back_refused",
+            f"send-back refused a round: {gate} — {remedy}",
+            **event,
+        )
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
     async def _raise_blocker(
         self, task: Task, blocker: Blocker, *, repo: GitRepo | None = None,

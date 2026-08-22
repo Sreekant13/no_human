@@ -1038,7 +1038,8 @@ class WakeWatcher:
         # deeper than the rung's own recheck).
         if await self._is_terminal(task):
             return None
-        rounds = await self._append_comments_as_feedback(task, comments)
+        rounds = await self._append_comments_as_feedback(
+            task, comments, pr_ref=pr_ref)
         if not (task.context or {}).get("pr_comment_ref"):
             task.context = await self.store.merge_context(
                 task.id, {"pr_comment_ref": pr_ref})
@@ -1109,13 +1110,24 @@ class WakeWatcher:
         return (self._is_bot_author(getattr(comment, "author", ""))
                 or is_agent_comment(getattr(comment, "body", None)))
 
-    async def _append_comments_as_feedback(self, task: Task, comments: list) -> int:
+    async def _append_comments_as_feedback(
+        self, task: Task, comments: list, *, pr_ref: str = "",
+    ) -> int:
         """Append PR comments to send_back_feedback; bump revision_rounds.
 
         Each entry lands via an atomic list append (concurrent writers both
         survive); the rounds counter is read-then-merge (worst case under two
         watchers: an off-by-one round count, never lost feedback). Refreshes
         ``task.context`` from the store. Returns the new round count.
+
+        Also records the newest comment as a pending send-back
+        (``blockers.send_back``) — this is the ONE chokepoint both human
+        PR-comment callers (``_inject_pr_feedback``,
+        ``_check_approval_pr_comments``) route through, so it is the single
+        place to mark "a human send-back is pending and has not yet started
+        a round" for that path. Cleared at the next `attempt_start`, or
+        named in the blocker if a loop-head gate refuses to start a round at
+        all (`orchestrator._refuse_round`).
         """
         entries = []
         for c in comments:
@@ -1147,6 +1159,13 @@ class WakeWatcher:
         rounds = int((task.context or {}).get("revision_rounds", 0)) + 1
         task.context = await self.store.merge_context(
             task.id, {"revision_rounds": rounds})
+        if entries:
+            from .send_back import record_pending_send_back
+            newest = entries[-1]
+            await record_pending_send_back(
+                self.store, task, source="pr_comment",
+                message=newest["message"], actor=newest.get("author", ""),
+                at=newest.get("at"), pr_ref=pr_ref)
         return rounds
 
     async def _complete_if_content_landed(
@@ -2438,7 +2457,7 @@ class WakeWatcher:
                 f"({', '.join(sorted({getattr(c, 'author', '?') for c in fresh}))})",
             )
             return None
-        rounds = await self._append_comments_as_feedback(task, human)
+        rounds = await self._append_comments_as_feedback(task, human, pr_ref=url)
         if newest:
             task.context = await self.store.merge_context(
                 task.id, {"pr_comment_since": newest})

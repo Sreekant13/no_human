@@ -434,6 +434,12 @@ class Blocker:
     # (blockers/answers.py, orchestrator._raise_blocker). "" when unknown (a
     # blocker built outside an attempt, e.g. the plan-approval gate).
     attempt_id: str = ""
+    # Structured "this refusal is a refused human send-back, not organic
+    # exhaustion" marker (intake Q4). Set only by
+    # `orchestrator._refuse_round` when a pending send-back
+    # (`blockers.send_back`) hit a loop-head gate before an attempt row
+    # existed. None for every ordinary blocker.
+    send_back_refused: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # `options` is list[BlockerOption] unconditionally, whoever built it:
@@ -465,6 +471,9 @@ class Blocker:
                 dict(self.escalation_latency) if self.escalation_latency else None
             ),
             "attempt_id": self.attempt_id,
+            "send_back_refused": (
+                dict(self.send_back_refused) if self.send_back_refused else None
+            ),
         }
 
     @classmethod
@@ -501,6 +510,10 @@ class Blocker:
                 if data.get("escalation_latency") else None
             ),
             attempt_id=str(data.get("attempt_id", "") or ""),
+            send_back_refused=(
+                dict(data["send_back_refused"])
+                if data.get("send_back_refused") else None
+            ),
         )
 
 

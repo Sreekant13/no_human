@@ -40,6 +40,14 @@ from .taxonomy import (
     user_pause_blocker,
 )
 from .wake import WakeWatcher, parse_duration
+from .send_back import (
+    PENDING_KEY,
+    clear_pending_send_back,
+    record_pending_send_back,
+    refusal_event,
+    refusal_note,
+    remedy_text,
+)
 
 __all__ = [
     "HARNESS_ONLY_CATEGORIES",
@@ -74,4 +82,10 @@ __all__ = [
     "blocker_prompt_suffix",
     "WakeWatcher",
     "parse_duration",
+    "PENDING_KEY",
+    "clear_pending_send_back",
+    "record_pending_send_back",
+    "refusal_event",
+    "refusal_note",
+    "remedy_text",
 ]

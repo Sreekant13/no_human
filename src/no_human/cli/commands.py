@@ -4773,12 +4773,19 @@ def reject(task_id, reason):
             if t.status == TaskStatus.FAILED and (t.context or {}).get("cancel_reason"):
                 console.print(f"[red]task is cancelled[/] — cannot reject {t.id[:8]}")
                 sys.exit(1)
+            _sent_back_at = _now_iso()
             await store.append_context_list(t.id, "send_back_feedback",
-                                            {"at": _now_iso(), "message": reason})
+                                            {"at": _sent_back_at, "message": reason})
             # The CLI twin of the drawer's "Send back" — same human gate, same
             # provenance stamp. No checkpoint is involved, so this CLEARS any
             # recorded sha rather than relabelling one it never chose.
-            from ..blockers import human_event, resume_provenance
+            from ..blockers import human_event, record_pending_send_back, resume_provenance
+            # Mark the send-back pending — cleared at the next `attempt_start`,
+            # or named in the blocker if a loop-head gate refuses to start a
+            # round at all (`orchestrator._refuse_round`).
+            await record_pending_send_back(
+                store, t, source="reject", message=reason, actor="cli",
+                at=_sent_back_at)
             prior_status = t.status
             prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             # Twin of the endpoint, down to this line: a `resume_from` with no
