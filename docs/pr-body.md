@@ -68,7 +68,7 @@ The PR body carries these as six merged sentences. They were sixteen, and
 the sixteen are kept here verbatim so nothing the shorter form folds
 together is lost:
 
-1. no interactive UI check was performed. no_human never drives a browser at your change: the only page it drives is a CI server's login form, and the only other browser it touches it hands a URL to (the local board, a login link) without driving. So any `e2e` entry above is the project's own harness printing its own result, not a human-style walkthrough
+1. no interactive UI check was performed. no_human never drives a browser at your change except `testing/ui_evidence.py`'s walk, which is reported as its own evidence and not as a receipt in this log; the only other page it drives is a CI server's login form, and the board it opens without driving, so any `e2e` entry above is the project's harness printing its result, not a human-style walkthrough
 
 2. an entry shows that a command LINE was submitted to the shell and what came back - never that the check recognised inside it RAN, and never that it was the RIGHT command. `pytest -k test_nothing` selects no tests and prints a clean run; a type check over one file says nothing about the rest
 

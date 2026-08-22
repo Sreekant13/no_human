@@ -1359,7 +1359,7 @@ def test_section_never_claims_a_ui_walkthrough_even_with_an_e2e_receipt():
     s = Orchestrator._verification_section(rows)
     assert "no interactive UI check was performed" in s
     assert "never drives a browser at your change" in s
-    assert "the only page it drives is a CI server's login form" in s
+    assert "the only other page it drives is a CI server's login form" in s
     assert "not a human-style walkthrough" in s
 
 
@@ -1505,7 +1505,7 @@ def _pin_ui(s: str, entry: str) -> None:
     unclassified = sorted(set(imported) - set(_DEPENDENCIES))
     assert not unclassified, (
         f"undeclared dependency {unclassified}: entry 1 of _VERIFICATION_LIMITS "
-        f"says no_human never drives a browser at your change. Classify each in "
+        f"names testing/ui_evidence.py as the only browser driven at your change. Classify each in "
         f"_DEPENDENCIES; if one CAN drive a browser, that entry is now false and "
         f"the entry - not this list - is what has to change.")
     # NON-VACUITY. A parse that found nothing would satisfy the assertion above
@@ -1516,7 +1516,10 @@ def _pin_ui(s: str, entry: str) -> None:
     drivers = sorted(d for d, drives in _DEPENDENCIES.items() if drives)
     assert drivers == ["playwright"], drivers
     assert sorted(imported["playwright"]) == [
-        "ci/jenkins_session.py"], "a new module drives a browser"
+        "ci/jenkins_session.py", "testing/ui_evidence.py"], "a new module drives a browser"
+    # The UI evidence runner DOES drive a browser at the change, so the entry
+    # must name it as the one exception and route its result elsewhere.
+    assert "testing/ui_evidence.py" in entry and "not a receipt" in entry
     root = Path(no_human.__file__).resolve().parent
     hands_over = re.compile(r"\bwebbrowser\s*\.\s*open\b")
     sources = {p.relative_to(root).as_posix(): p.read_text(encoding="utf-8")

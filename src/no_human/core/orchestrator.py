@@ -17443,10 +17443,12 @@ SIX of them read a checkpoint and TWO do not — but do
         "stripped before display; look-alike letters are NOT detected",
         "nothing here checks that these commands exercise the diff - no receipt "
         "is compared against the files this PR changes; no interactive UI "
-        "check was performed (no_human never drives a browser at your change: "
-        "the only page it drives is a CI server's login form, and the local "
-        "board it opens without driving, so an `e2e` entry is the project's "
-        "own harness printing its own result, not a human-style walkthrough); "
+        "check was performed (no_human never drives a browser at your change "
+        "except testing/ui_evidence.py's walk, reported as its own evidence, "
+        "not a receipt; the only other page it drives is a CI "
+        "server's login form, and the board it opens without driving, "
+        "so an `e2e` entry is the project's harness printing its result, "
+        "not a human-style walkthrough); "
         "and no_human's own test run, "
         "CI, and the independent review are separate signals - this section "
         "covers only the coder session's own commands",
