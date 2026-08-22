@@ -216,7 +216,7 @@ async def test_incident_attempt_leaves_lifetime_attempts_unchanged(
         await orch._run_attempt(task, repo, 1, "main")
 
     assert backend.calls, "the backend never ran — the test proves nothing"
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0, (
         "a dead SDK dispatch charged a lifetime attempt")
     assert await store.count_attempts(task.id) == 1, (
@@ -240,7 +240,7 @@ async def test_quota_prose_wall_leaves_lifetime_attempts_unchanged(
         await orch._run_attempt(task, repo, 1, "main")
 
     assert backend.calls, "the backend never ran — the test proves nothing"
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0, "a quota wall charged a lifetime attempt"
     attempts = await store.list_attempts(task.id)
     assert len(attempts) == 1, "the row must still exist — it is the record"
@@ -334,7 +334,7 @@ async def test_genuine_failure_still_consumes_an_attempt_and_fails(
 
     assert backend.calls, "the backend never ran — the test proves nothing"
     assert outcome.status == TaskStatus.FAILED
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 1
     attempts = await store.list_attempts(task.id)
     assert len(attempts) == 1
@@ -366,7 +366,7 @@ async def test_incident_task_is_paused_not_failed(store, bare_repo, tmp_path):
         f"{outcome.status} {outcome.detail}")
     assert parked.blocker["wake_condition"] == "quota_refreshed"
     assert parked.wake_check_at, "a quota park with no re-check stamp never wakes"
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0
 
 
@@ -416,6 +416,61 @@ async def test_nine_incident_attempts_would_not_exhaust_the_budget(store):
 # --------------------------------------------------------------------------- #
 # (8) — the fleet breaker, in isolation                                       #
 # --------------------------------------------------------------------------- #
+
+
+async def test_all_infra_task_does_not_loop_forever_the_fleet_breaker_bounds_it(
+        store, bare_repo, tmp_path):
+    """Devil's-advocate answer, made concrete: with infra tokens excluded from
+    the per-task budget (`Store._lifetime_included_sql`), what still stops a
+    task whose EVERY attempt is infra-classified from looping forever on a
+    dead SDK session at real cost? Not the per-task token cap — that is the
+    whole point of the fix under test. Not even `lifetime_attempts` in the
+    way one might hope — an infra row is excluded from that count too, so a
+    single task retrying itself alone does not trip it (see
+    `test_breaker_trips_on_three_distinct_tasks_and_not_on_one`'s "one task
+    retrying itself is that task's problem, not the fleet's"). What DOES fire
+    is the fleet-wide `InfraBreaker`: real dispatches through
+    `orch._run_attempt`, each one dying the exact incident shape, each one
+    recording an infra failure against the SAME task id. Three distinct
+    TASKS trip it — so this one task alone never trips the breaker by
+    itself, but it demonstrates the actual dispatch path
+    (`_infra_sdk_failure` classification -> `record_infra_failure`) that the
+    pool relies on, and folding in two more tasks is exactly
+    `test_breaker_trips_on_three_distinct_tasks_and_not_on_one`, already
+    green. Together the two tests are the full answer: no single task can be
+    stopped by its own budget once its attempts are all infra, but the fleet
+    breaker still stops the POOL from burning real dispatch cost on a dead
+    session, independent of any one task's token or attempt tally."""
+    breaker = infra_breaker()
+    orch, backend, task, repo = await _run_one_attempt(
+        store, bare_repo, tmp_path, _incident_result())
+
+    with pytest.raises(QuotaExhausted):
+        await orch._run_attempt(task, repo, 1, "main")
+
+    assert backend.calls, "the backend never ran — the test proves nothing"
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
+    assert used_attempts == 0, "the infra dispatch must not consume an attempt"
+    assert await _orch(store)._check_lifetime_budget(task) is None, (
+        "an all-infra task must not read as budget-exhausted")
+
+    # This one task's own dispatch already recorded one strike against the
+    # fleet breaker (real orchestrator wiring, not a simulated call) — two
+    # more DISTINCT tasks doing the same trips the pool into cooldown, which
+    # is the actual mechanism that bounds unattended infra looping. Confirmed
+    # here rather than merely asserted: the breaker is not yet tripped after
+    # this one task (matching the "one task retrying itself" contract above),
+    # and does trip once two more distinct tasks join it.
+    assert breaker.tripped() is None, (
+        "one task's own infra failures must not alone trip the fleet breaker")
+    assert breaker.record_infra_failure("other-task-1") is False, (
+        "the SECOND distinct task must not yet trip it either — only the "
+        "THIRD reaches the threshold")
+    assert breaker.record_infra_failure("other-task-2") is True, (
+        "the fleet breaker must trip once infra failures span 3 distinct "
+        "tasks — the mechanism that actually bounds unattended infra "
+        "looping when a single task's own budget cannot")
+    assert breaker.tripped() is not None
 
 
 def test_breaker_trips_on_three_distinct_tasks_and_not_on_one():

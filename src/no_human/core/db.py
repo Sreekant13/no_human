@@ -1066,19 +1066,23 @@ class Store:
             # backfills it, so old rows keep counting exactly as they always
             # did, which is correct since nothing knows they were infra.
             # The row itself is NEVER skipped — it is the only durable record
-            # of the incident — only `lifetime_usage_by_class`'s attempt
-            # COUNT excludes it, which is the single chokepoint both budget
-            # gates (`_check_lifetime_budget`, `_at_lifetime_ceiling`) read,
-            # so they cannot disagree about whether a dead dispatch counted.
+            # of the incident — only `lifetime_usage_by_class`'s attempt COUNT
+            # AND cost-weighted token sums exclude it (both gated by the same
+            # `_lifetime_included_sql` predicate), which is the single
+            # chokepoint both budget gates (`_check_lifetime_budget`,
+            # `_at_lifetime_ceiling`) read, so they cannot disagree about
+            # whether a dead dispatch counted on either axis.
             "infra_failure": "INTEGER",
             # 1 = this attempt was a post-PASS MECHANICAL round — a pr_conflict
             # rebase, or a re-verification tick after the change had already
             # passed independent review (`orchestrator._mechanical_round`).
             # The row is never skipped — it is the durable record — only
-            # `lifetime_usage_by_class`'s attempt COUNT excludes it, the same
-            # chokepoint `infra_failure` uses, so both budget gates
+            # `lifetime_usage_by_class`'s attempt COUNT AND cost-weighted
+            # token sums exclude it, the same `_lifetime_included_sql`
+            # predicate `infra_failure` uses, so both budget gates
             # (`_check_lifetime_budget`, `_at_lifetime_ceiling`) cannot
-            # disagree. NULL/0 on every pre-existing row; nothing backfills it.
+            # disagree on either axis. NULL/0 on every pre-existing row;
+            # nothing backfills it.
             # INCIDENT 2026-08-13: tasks 79183501 and 1a4b7bf7 PASSED review,
             # then each supervising-train landing under their open PRs spawned
             # a pr_conflict rebase round that burned a lifetime attempt, until
@@ -1091,10 +1095,11 @@ class Store:
         # `create_attempt`'s stale-row sweep, `close_open_attempts` and
         # `close_attempts_of_terminal_tasks` — never by the agent) AND zero
         # priced work (`_zero_priced_work_sql()`, over `_usage_columns()`) is
-        # also excluded from `lifetime_usage_by_class`'s attempt COUNT, at the
-        # same chokepoint `infra_failure` / `mechanical_round` use. The
-        # boundary: an interrupted attempt WITH real priced spend still
-        # counts — only the zero-priced interrupted shape does not. See
+        # also excluded from `lifetime_usage_by_class`'s attempt COUNT AND
+        # cost-weighted token sums, at the same chokepoint `infra_failure` /
+        # `mechanical_round` use. The boundary: an interrupted attempt WITH
+        # real priced spend still counts — only the zero-priced interrupted
+        # shape does not. See
         # `lifetime_usage_by_class` for the full incident and reasoning.
         for col, decl in att_wanted.items():
             if col not in att_existing:
@@ -2189,6 +2194,73 @@ class Store:
             f"COALESCE({c}, 0)" for c in cls._usage_columns()) + ") = 0"
 
     @classmethod
+    def _lifetime_included_sql(cls) -> str:
+        """SQL boolean predicate: TRUE when an attempts row counts toward the
+        lifetime BUDGET — on BOTH axes, the attempt count and the
+        cost-weighted token sums.
+
+        INCIDENT (2026-08-2x, task ae2a535c): the attempt count already
+        excluded `infra_failure`/`mechanical_round`/dead-`interrupted` rows,
+        but the token SUMs in ``lifetime_usage_by_class`` had NO such gating
+        at all — a plain unconditional ``SUM`` over every row, infra or not.
+        An infra-classified row's tokens "still summed below" (the comment
+        that used to sit next to that SUM, now removed because it is no
+        longer true) even though its attempt was already spared. That let a
+        quota wall or a dead SDK dispatch exhaust the TOKEN cap while
+        consuming zero ATTEMPTS — the environment's failure billed as the
+        task's own spend.
+
+        This is the ONE fragment both the attempt-count CASE and the
+        included/excluded token-sum CASEs in ``lifetime_usage_by_class`` use,
+        so the two axes cannot drift apart again the way they just did. There
+        is no second, independently-typed predicate anywhere in this method.
+
+        Excluded spend is NOT discarded: ``lifetime_usage_by_class`` returns
+        it as a separate (excluded) dict so callers can still report it (`nh
+        status`, the BUDGET_EXHAUSTED blocker, the drawer) as "spend the
+        environment burned, not the task" — and ``lifetime_usage`` still
+        reconstructs the old all-in raw total from included + excluded, so
+        nothing that wanted the whole-life sum loses it.
+
+        Deliberately scoped to a single task's own attempts, nothing more: no
+        fleet-level or all-time pool ceiling is added here (a larger, related
+        proposal — PR #605 — was rejected specifically for adding one; that
+        stays out of scope for this fix — a fleet-level ceiling, if wanted,
+        is a separate ticket and must be a ROLLING window, never an all-time
+        one). What bounds a task whose every attempt is infra-classified is
+        NOT `lifetime_attempts` — an infra row never increments the attempt
+        count, so a single task retrying itself alone never trips it
+        (`test_breaker_trips_on_three_distinct_tasks_and_not_on_one`'s "one
+        task retrying itself is that task's problem, not the fleet's") — nor
+        `_check_attempt_startup_floor`/`_min_viable_attempt_cost`, which is
+        computed from `included` spend only and so stays near zero for an
+        all-infra task. Which mechanism actually bounds it depends on the
+        infra SHAPE:
+
+        * A dead SDK dispatch (auth/billing wall, zero tokens streamed) is
+          bounded by the fleet-wide `InfraBreaker` (`core.infra_breaker`):
+          it trips the whole worker pool into a cooldown after 3 DISTINCT
+          tasks show this shape close together — independent of any single
+          task's own token or attempt tally
+          (`test_all_infra_task_does_not_loop_forever_the_fleet_breaker_bounds_it`).
+        * A mid-attempt quota wall WITH real tokens streamed
+          (`Orchestrator._park_quota`) is bounded by NEITHER of the above:
+          streamed tokens clear the `InfraBreaker`'s streak before the quota
+          branch is even reached (`record_healthy`), and that branch
+          deliberately does not bump the breaker — a billing wall is not a
+          dead dispatch. What bounds THIS shape is the park itself: the task
+          is parked with `wake_check_at = exc.resets_at` and a
+          `quota_refreshed` blocker, so it cannot re-attempt before the
+          account's own quota window resets — the wake cadence is the
+          bound, not a token or attempt count.
+        """
+        return (
+            "COALESCE(infra_failure, 0) = 0 "
+            "AND COALESCE(mechanical_round, 0) = 0 "
+            f"AND NOT (status = 'interrupted' AND {cls._zero_priced_work_sql()})"
+        )
+
+    @classmethod
     def _output_columns_by_class(cls) -> dict[str, tuple[str, ...]]:
         """The output SHARE of the four ``*tokens_used`` columns.
 
@@ -2215,23 +2287,34 @@ class Store:
 
     async def lifetime_usage_by_class(
         self, task_id: str
-    ) -> tuple[int, dict[str, int]]:
-        """(attempts, {tokens_used, cache_read_tokens, cache_creation_tokens,
-        output_tokens}).
+    ) -> tuple[int, dict[str, int], dict[str, int]]:
+        """(attempts, included, excluded).
 
-        The same rows and the same addend columns ``lifetime_usage`` sums, kept
-        in their three price classes so the budget gate can weight them
-        (``core.pricing.weighted_tokens``), plus a FOURTH key that is not a
-        fourth class: ``output_tokens`` is the output slice of ``tokens_used``,
-        carried here so the splat into ``weighted_tokens`` can charge it the
-        output premium. It is deliberately absent from ``lifetime_usage``'s
-        raw total, which would otherwise count it twice. The classes are
-        summed across all
+        ``included``/``excluded`` are both ``{tokens_used, cache_read_tokens,
+        cache_creation_tokens, output_tokens}`` — the same addend columns
+        ``lifetime_usage`` sums, kept in their three price classes so the
+        budget gate can weight them (``core.pricing.weighted_tokens``), plus
+        a FOURTH key that is not a fourth class: ``output_tokens`` is the
+        output slice of ``tokens_used``, carried here so the splat into
+        ``weighted_tokens`` can charge it the output premium. It is
+        deliberately absent from ``lifetime_usage``'s raw total, which would
+        otherwise count it twice. The classes are summed across all
         registered roles (``USAGE_ROLES``: coder, reviewer, planner,
         utility, supervisor, distill) because they all bill at the same three
         rates. For the same numbers cut by ROLE instead, see
         ``lifetime_usage_by_role`` — it partitions the identical column set,
         so the two always agree on the total.
+
+        ``attempts`` and ``included`` are gated by the SAME predicate,
+        ``_lifetime_included_sql`` — see that method for the incident this
+        fixes (infra/mechanical/dead-interrupted rows used to escape the
+        attempt count but NOT the token sums). ``excluded`` is the mirror: the
+        spend every excluded row carried, still reported rather than
+        discarded, so a caller can show "X weighted excluded as infra"
+        alongside the task's own gated spend. Nothing is ever dropped —
+        ``included[name] + excluded[name]`` always equals what an
+        unconditional ``SUM`` over that column would have returned, which is
+        exactly how ``lifetime_usage`` reconstructs the old all-in raw total.
         """
         # The three raw classes PLUS the output share, which is a slice of the
         # first of them rather than a fourth class — see
@@ -2241,9 +2324,21 @@ class Store:
         # before the column existed, which is the honest treatment of
         # "unknown" and the only one available (there is no backfill).
         wanted = {**self._usage_columns_by_class(), **self._output_columns_by_class()}
-        selects = ", ".join(
-            "COALESCE(SUM({}), 0) AS {}".format(
-                " + ".join(f"COALESCE({c}, 0)" for c in cols), name)
+        included_sql = self._lifetime_included_sql()
+        inc_selects = ", ".join(
+            "COALESCE(SUM(CASE WHEN {cond} THEN {expr} ELSE 0 END), 0) "
+            "AS inc_{name}".format(
+                cond=included_sql,
+                expr=" + ".join(f"COALESCE({c}, 0)" for c in cols),
+                name=name)
+            for name, cols in wanted.items()
+        )
+        exc_selects = ", ".join(
+            "COALESCE(SUM(CASE WHEN {cond} THEN 0 ELSE {expr} END), 0) "
+            "AS exc_{name}".format(
+                cond=included_sql,
+                expr=" + ".join(f"COALESCE({c}, 0)" for c in cols),
+                name=name)
             for name, cols in wanted.items()
         )
         # The ATTEMPT count excludes rows classified `infra_failure = 1`
@@ -2285,27 +2380,62 @@ class Store:
         # any session it runs meters tokens. The server-stop row ALSO
         # carries `infra_failure=1` (its work is checkpointed, not lost, and
         # a coder cannot trigger a shutdown), so it is excluded by the
-        # infra branch whatever it spent; its tokens still sum below. There
-        # is no way for a coder to convert its own failing attempts into
-        # free ones.
+        # infra branch whatever it spent — but its tokens are NOT dropped:
+        # they land in `excluded` below, still visible to any caller that
+        # wants to report environment spend. There is no way for a coder to
+        # convert its own failing attempts into free ones.
         #
-        # The token SUMs above are UNCHANGED (a dead row contributes 0
-        # anyway), and the row is never deleted or skipped — it is the
-        # durable record; only the COUNT changes, at the single chokepoint
-        # both budget gates (`_check_lifetime_budget`, `_at_lifetime_ceiling`)
-        # read, so they cannot disagree about whether a dead dispatch or a
-        # dead interrupted row counted.
+        # The server-stop row is one instance of a broader shape, not the only
+        # one: a FULLY-PRICED coder row — real tokens streamed, real work done
+        # — can also be closed whole under `infra_failure=1` by
+        # `worktree.salvage_dead_worktrees` (`hard_kill_salvage`, on a
+        # SIGKILL/pid-death) and by the reviewer-side wall path (a dead or
+        # quota-walled review turn closes the CODER's attempt row for that
+        # round with `infra_failure=1`, ~`orchestrator.py:7178`, so a
+        # reviewer-session death is not left an unattributed dead row) — and
+        # likewise by the coder's own quota/infra wall (`_park_quota`'s
+        # `infra_failure=1` row, which can carry millions of streamed tokens)
+        # and the repro corrective round. Every one of these writers is
+        # harness-triggered only — never reachable from the coder's own
+        # `update_attempt(status='failed')` — which is what makes
+        # excluding a fully-priced row WHOLE, rather than pro-rating it,
+        # sanctioned by this single-predicate design: the predicate doesn't
+        # ask how much a row spent, only whether the harness (not the coder)
+        # is the reason it didn't finish.
+        #
+        # RECONCILE DELIBERATELY, NOT BY DRIFT: queued ticket b5f7a61e decides
+        # the ATTEMPT axis on "did the coder do priced work" and says the token
+        # axis is tracked separately. Since this change ONE predicate governs
+        # both axes and `test_one_predicate_governs_both_attempt_count_and_token_sums`
+        # pins it, so that ticket cannot land as written: either the two axes
+        # split again on purpose (and the test is changed with the reason in
+        # the PR body) or fully-priced walled rows' tokens come back under the
+        # cap — which is the exact defect this change closes. Decide, don't drift.
+        #
+        # The token SUMs above are now gated by the EXACT SAME
+        # `_lifetime_included_sql` predicate as the attempt count (previously
+        # they were unconditional — see that method's docstring for the
+        # incident) — one fragment, referenced here for the attempt count,
+        # the included sums, and the excluded sums, so all three can never
+        # drift apart again. The row is never deleted or skipped — it is the
+        # durable record; only which bucket its tokens land in changes, at
+        # the single chokepoint both budget gates (`_check_lifetime_budget`,
+        # `_at_lifetime_ceiling`) read, so they cannot disagree about whether
+        # a dead dispatch or a dead interrupted row counted.
         row = await self._fetchone(
-            "SELECT COALESCE(SUM(CASE WHEN COALESCE(infra_failure, 0) = 0 "
-            "AND COALESCE(mechanical_round, 0) = 0 "
-            f"AND NOT (status = 'interrupted' AND {self._zero_priced_work_sql()}) "
-            f"THEN 1 ELSE 0 END), 0) AS n, {selects} FROM attempts "
+            f"SELECT COALESCE(SUM(CASE WHEN {included_sql} THEN 1 ELSE 0 "
+            f"END), 0) AS n, {inc_selects}, {exc_selects} FROM attempts "
             "WHERE task_id = ?",
             (task_id,),
         )
         if not row:
-            return (0, {name: 0 for name in wanted})
-        return (int(row["n"]), {name: int(row[name]) for name in wanted})
+            empty = {name: 0 for name in wanted}
+            return (0, dict(empty), dict(empty))
+        return (
+            int(row["n"]),
+            {name: int(row[f"inc_{name}"]) for name in wanted},
+            {name: int(row[f"exc_{name}"]) for name in wanted},
+        )
 
     async def lifetime_usage(self, task_id: str) -> tuple[int, int]:
         """(attempts, tokens) spent over the task's WHOLE life, resumes included.
@@ -2335,10 +2465,18 @@ class Store:
         a bucket beside it; `sum(by_class.values())` would double-count it and
         move a number this docstring promises will keep matching every surface
         token for token.
+
+        ``lifetime_usage_by_class`` now splits those addends into ``included``
+        (what counts toward the budget) and ``excluded`` (infra/mechanical/
+        dead-interrupted spend, reported but not charged to the cap) — this
+        method reconstructs the same all-in raw total as before by summing
+        BOTH, so every caller that wants the whole-life figure (`nh`, the web
+        surfaces, `eval/northstar.py`) keeps seeing it unchanged.
         """
-        attempts, by_class = await self.lifetime_usage_by_class(task_id)
-        return attempts, sum(
-            by_class[name] for name in self._usage_columns_by_class()
+        attempts, included, excluded = await self.lifetime_usage_by_class(task_id)
+        addend_cols = self._usage_columns_by_class()
+        return attempts, sum(included[name] for name in addend_cols) + sum(
+            excluded[name] for name in addend_cols
         )
 
     async def lifetime_usage_by_role(

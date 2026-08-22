@@ -8,11 +8,14 @@ raises the budget for that one task — a human decision, never a retry's.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from no_human.blockers import BlockerCategory, apply_action, route_for
 from no_human.core.bounds import Bounds
 from no_human.core.db import Store
+from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT
 from no_human.core.task import Task, TaskStatus
 
 
@@ -116,6 +119,175 @@ async def test_default_token_cap_parks_a_9M_burn(store):
 
     b = await _orch(store)._check_lifetime_budget(t)  # default bounds, no override
     assert b is not None and "tokens" in b.root_cause_hypothesis
+
+
+# --------------------------------------------------------------------------- #
+# The token-exclusion fix: infra/mechanical/dead-interrupted tokens must be   #
+# gated by the SAME predicate that already spares their attempt — ae2a535c    #
+# killed itself at 17.3M/17M this way (see this file's module docstring's    #
+# sibling ticket). PR #605's AC1 is the discriminating case (a).             #
+# --------------------------------------------------------------------------- #
+
+
+async def _infra_heavy_task(store):
+    """3 infra-classified attempts totalling 7.9M weighted (3.0M + 3.0M +
+    1.9M) + 1 genuine attempt at 0.5M weighted. Every figure uses ONLY fresh
+    `tokens_used` (weight 1.0 — `core.pricing.FRESH_WEIGHT`), so weighted ==
+    raw and the numbers in the ticket are exact, not approximate. The cap is
+    explicitly stamped `budget_unit: weighted` so `_stored_token_cap`'s
+    cutover guard reads the 8,000,000 verbatim instead of treating it as a
+    pre-2026-07-31 raw override and converting it down."""
+    t = Task.new("infra-heavy", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 8_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+    await store.create_task(t)
+    for n, tokens in enumerate((3_000_000, 3_000_000, 1_900_000), start=1):
+        aid = await store.create_attempt(t.id, n)
+        await store.update_attempt(aid, status="failed", infra_failure=1,
+                                    tokens_used=tokens)
+    aid = await store.create_attempt(t.id, 4)
+    await store.update_attempt(aid, status="failed", tokens_used=500_000)
+    return t
+
+
+async def test_infra_heavy_task_is_not_budget_exhausted_at_8M_cap(store):
+    """PR #605's AC1, the discriminating case: 3 infra-classified attempts
+    totalling 7.9M weighted + 1 genuine attempt at 0.5M weighted must NOT
+    trip BUDGET_EXHAUSTED at an 8M cap.
+
+    RED on unfixed code: the infra attempts' tokens summed unconditionally
+    into the cap right alongside the genuine attempt's (7.9M + 0.5M = 8.4M
+    over the 8M cap), even though their ATTEMPTS were already spared —
+    exactly how ae2a535c killed itself at 17.3M/17M with no genuine attempt
+    anywhere near that size. `Store._lifetime_included_sql` now gates the
+    token sums with the identical predicate that already gated the attempt
+    count, so the fix reads this as 0.5M/8M — comfortably under."""
+    t = await _infra_heavy_task(store)
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is None, (
+        "3 infra-classified attempts (7.9M weighted) must not count toward "
+        "the 8M cap — only the genuine 0.5M attempt should")
+
+
+async def test_infra_heavy_tasks_excluded_spend_is_reported(store):
+    """The excluded spend must never simply vanish: it is reported on the
+    emitted `lifetime_budget` event (`excluded_tokens_weighted`/
+    `excluded_tokens_raw`) so `nh status`/the drawer can show "X weighted
+    excluded as infra" — and it must equal exactly the 7.9M the 3 infra
+    attempts burned, not a partial or double-counted figure."""
+    t = await _infra_heavy_task(store)
+    events = []
+    o = _orch(store)
+    o._sink = events.append
+
+    assert await o._check_lifetime_budget(t) is None
+    ev = next(e for e in events if e["kind"] == "lifetime_budget")
+    assert ev["attempts_used"] == 1, (
+        "only the genuine attempt should consume a lifetime attempt")
+    assert ev["tokens_used"] == 500_000, (
+        "the task's own GATED raw spend must be the genuine attempt alone")
+    assert ev["excluded_tokens_weighted"] == 7_900_000
+    assert ev["excluded_tokens_raw"] == 7_900_000
+
+
+async def test_genuine_attempts_tokens_still_count_exactly_as_before(store):
+    """Regression (c): a task with ONLY genuine attempts — no infra,
+    mechanical, or dead-interrupted rows — must see its tokens counted
+    exactly as before this change. The new EXCLUDED bucket must never eat
+    into an ordinary attempt's contribution to the cap."""
+    t = Task.new("genuine", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=2, tokens_each=1_000_000)
+
+    used_attempts, by_class, excluded = (
+        await store.lifetime_usage_by_class(t.id))
+    assert used_attempts == 2
+    assert (by_class["tokens_used"] + by_class["cache_read_tokens"]
+            + by_class["cache_creation_tokens"]) == 2_000_000
+    assert sum(excluded.values()) == 0, (
+        "an all-genuine task must exclude nothing")
+
+
+async def test_interrupted_attempt_with_real_spend_counts_on_both_axes(store):
+    """THE BOUNDARY (incident 2026-08-20; full history in
+    `tests/test_dead_interrupted_not_work.py`, which this pins again here
+    since it sits outside this ticket's VERIFY command's file list): an
+    `interrupted` row is excluded ONLY when it burned zero priced work. A
+    worker that died mid-attempt with real spend already on the meter must
+    still count — on BOTH the attempt axis and the token axis — because the
+    work happened and was lost, and that spend pressure is real."""
+    t = Task.new("interrupted-real-spend", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="interrupted", tokens_used=2_000_000)
+
+    used_attempts, by_class, excluded = (
+        await store.lifetime_usage_by_class(t.id))
+    assert used_attempts == 1, (
+        "an interrupted attempt with real spend must still count as an "
+        "attempt")
+    assert by_class["tokens_used"] == 2_000_000, (
+        "an interrupted attempt with real spend must still count its "
+        "tokens")
+    assert sum(excluded.values()) == 0
+
+
+async def test_budget_exhausted_blocker_names_both_figures(store):
+    """AC3: when the task itself IS over cap, the BUDGET_EXHAUSTED blocker's
+    evidence must name BOTH this task's own (gated) spend and what its
+    environment burned that was excluded from the cap — never just the
+    former, which would read as if the excluded spend never happened."""
+    t = Task.new("exhausted-plus-infra", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 1_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+    await store.create_task(t)
+    # Genuine spend alone exceeds this deliberately tiny cap: 2 attempts x
+    # (500K tokens_used + 500K cache_read_tokens) = 1.1M weighted (fresh at
+    # 1.0, cache-read at 0.1) against a 1.0M cap.
+    await _spend(store, t.id, attempts=2, tokens_each=1_000_000)
+    # Plus an infra-classified attempt burning real tokens that must show up
+    # as EXCLUDED, not silently absorbed into the task's own figure.
+    aid = await store.create_attempt(t.id, 3)
+    await store.update_attempt(aid, status="failed", infra_failure=1,
+                                tokens_used=3_000_000)
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None and b.category is BlockerCategory.BUDGET_EXHAUSTED
+    assert "1,100,000" in b.evidence, (
+        "the task's own gated weighted spend must be named")
+    assert "Excluded as infra/mechanical/dead-interrupted" in b.evidence
+    assert "3,000,000" in b.evidence, (
+        "the excluded environment spend must be named, not dropped")
+
+
+def test_one_predicate_governs_both_attempt_count_and_token_sums():
+    """AC2: `Store._lifetime_included_sql` must be the ONLY predicate
+    governing both axes — no second, independently-typed condition computed
+    separately for the attempt count vs. the token sums (the exact drift
+    this ticket's defect was: the attempt count had a CASE exclusion, the
+    token SUMs had none).
+
+    Asserted on the SOURCE, not just behaviourally: `_lifetime_included_sql`
+    is called exactly once inside `lifetime_usage_by_class`, bound to one
+    local (`included_sql`), and that local is what the attempt-count
+    SELECT, the included-sum CASE expressions, AND the excluded-sum CASE
+    expressions all reference — never a second `_lifetime_included_sql()`
+    call and never a hand-rolled duplicate condition."""
+    src = inspect.getsource(Store.lifetime_usage_by_class)
+    assert src.count("_lifetime_included_sql()") == 1, (
+        "the predicate must be computed exactly once, not re-derived per "
+        "axis")
+    # Counting bare "included_sql" occurrences is gameable: the method's own
+    # name (`_lifetime_included_sql`) and its docstring/comment mentions
+    # ALSO contain that substring, so a padded count can pass an ablation
+    # that reverted the actual reuse. Assert the three SPECIFIC reuse
+    # sites — the two CASE conditions and the attempt-count SELECT — by
+    # their exact surrounding syntax instead.
+    assert src.count("cond=included_sql") == 2, (
+        "the single computed predicate must be reused, unmodified, as the "
+        "CASE condition for BOTH the included and the excluded token sums")
+    assert src.count("{included_sql}") == 1, (
+        "the single computed predicate must be reused, unmodified, as the "
+        "attempt-count SELECT's CASE condition")
 
 
 async def test_the_raise_option_actually_raises_and_unblocks(store):
@@ -546,7 +718,7 @@ async def test_the_class_split_sees_every_tier_and_column(store):
         cols[f"{tier}output_tokens"] = cols[base]
     await store.update_attempt(aid, **cols)
 
-    attempts, by_class = await store.lifetime_usage_by_class(t.id)
+    attempts, by_class, _excluded = await store.lifetime_usage_by_class(t.id)
     assert attempts == 1
     assert {k: v for k, v in by_class.items() if k != "output_tokens"} == per_class
     # Every output column reached, and none double-counted: an attempt that is

@@ -134,7 +134,7 @@ async def test_a_dead_sdk_session_raises_an_infra_flagged_park(
     assert backend.calls, "the backend never ran — the test proves nothing"
     assert raised.value.infra is True, (
         "a prose-less SDK death must raise an INFRA park, not a wall")
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0, "the attempt must still be spared"
 
     outcome = await orch._park_quota(task, raised.value, repo=repo)

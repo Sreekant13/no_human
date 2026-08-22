@@ -420,7 +420,7 @@ async def test_raw_lifetime_total_does_not_move(tmp_path):
             cache_read_tokens=100, cache_creation_tokens=10,
         )
         n, raw = await store.lifetime_usage("t3")
-        _, by_class = await store.lifetime_usage_by_class("t3")
+        _, by_class, _ = await store.lifetime_usage_by_class("t3")
     finally:
         await store.close()
 
@@ -446,7 +446,7 @@ async def test_unknown_splits_sum_to_no_premium(tmp_path):
 
     store = await Store(db_path).connect()
     try:
-        _, by_class = await store.lifetime_usage_by_class("task-old")
+        _, by_class, _ = await store.lifetime_usage_by_class("task-old")
         n, raw = await store.lifetime_usage("task-old")
     finally:
         await store.close()

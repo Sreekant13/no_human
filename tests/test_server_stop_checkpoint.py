@@ -662,6 +662,6 @@ async def test_a_stop_mid_session_closes_the_row_with_its_spend_and_requeues(
         "sha": row["commit_sha"], "branch": fresh.context["resume_from"]["branch"],
         "by": "server_stop"}
     assert fresh.context["resume_from"]["branch"]
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0, "a stop must not consume a lifetime attempt"
     assert (fresh.blocker or {}).get("category") != "USER_PAUSED"

@@ -629,7 +629,7 @@ async def test_a_quota_wall_in_the_corrective_round_parks_and_spares_the_attempt
     assert rows[0]["status"] == "failed"
     assert rows[0]["failure_reason"].startswith("quota: ")
     assert rows[0]["infra_failure"] == 1
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 0, "a billing wall must not consume a lifetime attempt"
 
 

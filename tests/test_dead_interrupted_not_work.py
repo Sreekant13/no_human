@@ -95,7 +95,7 @@ async def test_dead_attempts_are_excluded_at_the_lifetime_check(store):
         await _dead(store, task.id, n)
     await _real(store, task.id, 9)
 
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 1, (
         "8 dead zero-priced interrupted rows must not be charged")
 
@@ -173,7 +173,7 @@ async def test_interrupted_with_real_spend_still_counts(store):
             aid, status="interrupted", failure_reason=_SUPERSEDED,
             tokens_used=50_000, cache_read_tokens=1_000, cache_creation_tokens=0)
 
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 3, (
         "an interrupted row with real spend must still be charged")
 
@@ -197,7 +197,7 @@ async def test_failed_attempt_always_counts_even_with_zero_tokens(store):
             aid, status="failed",
             tokens_used=0, cache_read_tokens=0, cache_creation_tokens=0)
 
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 3, (
         "a failed attempt must always count, whatever its token columns say")
 
@@ -220,7 +220,7 @@ async def test_in_progress_zero_token_row_still_counts(store):
         "SELECT status FROM attempts WHERE id = ?", (aid,))
     assert row["status"] == "in_progress"
 
-    used_attempts, _ = await store.lifetime_usage_by_class(task.id)
+    used_attempts, _, _ = await store.lifetime_usage_by_class(task.id)
     assert used_attempts == 1, (
         "the running attempt must still consume a lifetime attempt slot")
 
@@ -257,7 +257,7 @@ async def test_weighted_token_cap_math_is_unchanged(store):
     blocker = await orch._check_lifetime_budget(task)
     assert blocker is None, "well under both default caps — must not park"
 
-    _, by_class = await store.lifetime_usage_by_class(task.id)
+    _, by_class, _ = await store.lifetime_usage_by_class(task.id)
     expected_weighted = weighted_tokens(**by_class)
     expected_raw = sum(by_class[n] for n in Store._usage_columns_by_class())
 

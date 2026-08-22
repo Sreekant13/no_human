@@ -2560,8 +2560,12 @@ class Orchestrator:
           it is findable, but the next run branches from the human's sha.
           The row is closed ``interrupted`` with its TRUE spend and
           ``infra_failure=1``: a shutdown is not the coder's failure and does
-          not consume a lifetime attempt (the quota wall's rule); the tokens
-          still count toward the lifetime token ledger.
+          not consume a lifetime attempt (the quota wall's rule); its tokens
+          are excluded from the lifetime BUDGET cap on the same predicate —
+          they are not dropped, they land in ``lifetime_usage_by_class``'s
+          ``excluded`` bucket (`Store._lifetime_included_sql`), still visible
+          to any caller reporting environment spend, just not charged to the
+          task's own figure.
         * **Cheap boundary** (``attempt_id`` None — `_drive` entry, loop top):
           no session is open and nothing is in flight. NOTHING is stamped.
           The checkout sits at base, or at a review-REJECTED tip at the loop
@@ -4757,9 +4761,14 @@ class Orchestrator:
             # 021899de): seven hourly quota-wake retries at ZERO tokens each
             # consumed attempts 2-8 of 9 before the wall lifted — one review
             # FAIL away from BUDGET_EXHAUSTED on a task that did nothing
-            # wrong. The token columns stay as recorded above; only the
-            # attempt COUNT is spared. No breaker bump: the pool-wide pause
-            # is `_park_quota`'s, the breaker is for dead dispatches.
+            # wrong. The token columns stay as recorded above, but
+            # `Store._lifetime_included_sql` now excludes this
+            # `infra_failure=1` row from the lifetime BUDGET cap on the same
+            # predicate that spares its attempt — both axes are spared, not
+            # just the count. Its tokens are not lost: they land in
+            # `lifetime_usage_by_class`'s `excluded` bucket. No breaker bump:
+            # the pool-wide pause is `_park_quota`'s, the breaker is for dead
+            # dispatches.
             quota_reason = _quota_reason(result.final_text or "")
             await self.store.update_attempt(
                 attempt_id, status="failed",
@@ -9932,7 +9941,8 @@ class Orchestrator:
         applied here to keep in sync."""
         if await self._budget_frozen_by_pass(task):
             return False
-        used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
+        used_attempts, by_class, _excluded = (
+            await self.store.lifetime_usage_by_class(task.id))
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         return self._over_lifetime_caps(
             used_attempts, cap_attempts, _weighted_tokens(**by_class), cap_tokens)
@@ -12378,8 +12388,9 @@ class Orchestrator:
         """
         if await self._budget_frozen_by_pass(task):
             return _NO_LIFETIME_CEILING
-        used_life = _weighted_tokens(
-            **(await self.store.lifetime_usage_by_class(task.id))[1])
+        _attempts, included, _excluded = (
+            await self.store.lifetime_usage_by_class(task.id))
+        used_life = _weighted_tokens(**included)
         cap_life = self._lifetime_limits(task)[1]
         return max(cap_life - used_life, 1)
 
@@ -12681,18 +12692,30 @@ class Orchestrator:
         `_budget_frozen_by_pass`'s docstring. The per-attempt `attempt_tokens`
         cap (`BudgetAbort`) is untouched, so a single runaway round still ends.
 
-        The `used_attempts` this reads (`store.lifetime_usage_by_class`)
-        already excludes infra-classified dispatches (`infra_failure = 1`),
-        mechanical rounds (`mechanical_round = 1`), and — INCIDENT
-        2026-08-20 — dead `status = 'interrupted'` rows that burned zero
-        priced work (a worker process that died mid-attempt without closing
-        its row; `Store._zero_priced_work_sql()`). THE BOUNDARY: an
-        interrupted attempt WITH real priced spend still counts toward this
-        cap — the work happened and was lost, and that spend pressure is
-        real. Only the zero-priced interrupted shape is excluded. This is a
-        single chokepoint, not a filter re-applied here: `_at_lifetime_ceiling`
-        reads the exact same `lifetime_usage_by_class` count, so the two
-        gates cannot disagree about what counts.
+        The `used_attempts` AND `used_tokens` this reads
+        (`store.lifetime_usage_by_class`) exclude infra-classified dispatches
+        (`infra_failure = 1`), mechanical rounds (`mechanical_round = 1`), and
+        — INCIDENT 2026-08-20 — dead `status = 'interrupted'` rows that
+        burned zero priced work (a worker process that died mid-attempt
+        without closing its row; `Store._zero_priced_work_sql()`). Both axes
+        are gated by the exact same predicate (`Store._lifetime_included_sql`)
+        — an infra row's tokens used to sum unconditionally even though its
+        attempt was already spared, which let a quota wall or dead SDK
+        dispatch exhaust the TOKEN cap alone; that excluded spend is not
+        discarded, it comes back as `excluded_class` below and is named in
+        this blocker's evidence. THE BOUNDARY: an interrupted attempt WITH
+        real priced spend still counts toward this cap on BOTH axes — the
+        work happened and was lost, and that spend pressure is real. Only the
+        zero-priced interrupted shape is excluded. This is a single
+        chokepoint, not a filter re-applied here: `_at_lifetime_ceiling` reads
+        the exact same `lifetime_usage_by_class` split, so the two gates
+        cannot disagree about what counts.
+
+        Scope note: this gate bounds a single task's own lifetime spend only.
+        No fleet-level or all-time pool ceiling is added here (a related,
+        larger proposal — PR #605 — was rejected specifically for adding one;
+        see `Store._lifetime_included_sql`'s docstring for what still bounds
+        a task whose every attempt is infra-classified).
         """
         if await self._budget_frozen_by_pass(task):
             self.emit(
@@ -12701,7 +12724,8 @@ class Orchestrator:
                 frozen_by_review_pass=True,
             )
             return None
-        used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
+        used_attempts, by_class, excluded_class = (
+            await self.store.lifetime_usage_by_class(task.id))
         used_tokens = _weighted_tokens(**by_class)
         # The three ADDEND classes only. `by_class` also carries
         # `output_tokens`, which is a SLICE of `tokens_used` rather than a
@@ -12712,6 +12736,16 @@ class Orchestrator:
         # RAW figure this blocker prints as the reconcilable one.
         raw_tokens = sum(by_class[n] for n in Store._usage_columns_by_class())
         breakdown = _class_breakdown(**by_class)
+        # The mirror: spend `lifetime_usage_by_class` excluded from the cap
+        # (infra-classified dispatches, mechanical rounds, dead-interrupted
+        # rows) — not the task's own spend against the cap, but real tokens
+        # the ENVIRONMENT burned. Reported here, never silently dropped, so
+        # `nh status`/the drawer can show "X weighted excluded as infra"
+        # instead of a figure that looks like the task ran for free.
+        excluded_tokens = _weighted_tokens(**excluded_class)
+        excluded_raw = sum(
+            excluded_class[n] for n in Store._usage_columns_by_class())
+        excluded_breakdown = _class_breakdown(**excluded_class)
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         # The shared predicate — see `_over_lifetime_caps`. This gate and the
         # advisory `_at_lifetime_ceiling` used to hold separate copies of it.
@@ -12742,6 +12776,11 @@ class Orchestrator:
                 raw_fresh=by_class["tokens_used"],
                 raw_cache_read=by_class["cache_read_tokens"],
                 raw_cache_creation=by_class["cache_creation_tokens"],
+                # Structured, not in the 60-char headline: the excluded
+                # (infra/mechanical/dead-interrupted) spend this task's
+                # environment burned, still surfaced rather than dropped.
+                excluded_tokens_weighted=excluded_tokens,
+                excluded_tokens_raw=excluded_raw,
             )
             return None
         over = (
@@ -12763,7 +12802,14 @@ class Orchestrator:
                 # to fresh input, summed over every role registered in
                 # `db.USAGE_ROLES` (coder, reviewer, planner, utility,
                 # supervisor, distill).
-                f"By class: {breakdown}"
+                f"By class: {breakdown} "
+                # AC3: the blocker must name BOTH figures — this task's own
+                # (gated) spend above, and what its environment burned that
+                # is NOT charged here (a quota wall or a dead SDK dispatch
+                # must not read as if this task overspent when it did not).
+                f"Excluded as infra/mechanical/dead-interrupted (not charged "
+                f"to this cap): {excluded_tokens:,} cost-weighted tokens "
+                f"({excluded_raw:,} raw). By class: {excluded_breakdown}."
                 + self._spend_shape_note(task)
             ),
             used_attempts=used_attempts, used_tokens=used_tokens, over=over,
@@ -12938,8 +12984,8 @@ class Orchestrator:
         """
         if await self._budget_frozen_by_pass(task):
             return None
-        used_attempts, by_class = await self.store.lifetime_usage_by_class(
-            task.id
+        used_attempts, by_class, excluded_class = (
+            await self.store.lifetime_usage_by_class(task.id)
         )
         used_tokens = _weighted_tokens(**by_class)
         _cap_attempts, cap_tokens = self._lifetime_limits(task)
@@ -12972,7 +13018,10 @@ class Orchestrator:
                 f"tokens ({used_tokens:,}/{cap_tokens:,} spent, "
                 f"{used_attempts} attempts); minimum viable attempt cost: "
                 f"{floor:,} cost-weighted tokens ({provenance}); by class so "
-                f"far: {_class_breakdown(**by_class)}. The next attempt's "
+                f"far: {_class_breakdown(**by_class)}. Excluded as "
+                f"infra/mechanical/dead-interrupted (not charged to this "
+                f"cap): {_weighted_tokens(**excluded_class):,} cost-weighted "
+                f"tokens. The next attempt's "
                 "fixed startup (attempt_distill + implement prompt + skills "
                 "+ map) is re-accumulated before its first model turn does "
                 "any work, so starting one here is guaranteed to "

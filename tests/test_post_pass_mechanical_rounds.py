@@ -258,7 +258,15 @@ async def test_a_later_review_fail_re_arms_the_cap(store):
 
 async def test_mechanical_rounds_still_count_their_tokens(store):
     """Accounting honesty: a mechanical round's real spend is still money —
-    only the attempt tally is spared. Stamps `mechanical=True` directly
+    only the attempt tally is spared, and only from the GATED (included) sum:
+    the unified predicate (`Store._lifetime_included_sql`) that governs the
+    attempt count now governs the token sums too (no second, independently-
+    typed definition), so a mechanical round's tokens move to the EXCLUDED
+    bucket, not to `by_class["tokens_used"]` — the same shape as an
+    infra-classified or dead-interrupted row. The all-in raw total
+    (`lifetime_usage`) still reconstructs from included + excluded, so every
+    other surface (`nh status`, the drawer) keeps seeing this spend; only the
+    lifetime-budget CAP is spared it. Stamps `mechanical=True` directly
     (rather than through `_mechanical_round`) since this test is about what
     the chokepoint DOES with the flag, not about the predicate that sets it —
     that is covered by the other tests in this file."""
@@ -268,11 +276,14 @@ async def test_mechanical_rounds_still_count_their_tokens(store):
     mech_id = await store.create_attempt(t.id, 9, mechanical=True)
     await store.update_attempt(mech_id, tokens_used=500_000)
 
-    attempts, by_class = await store.lifetime_usage_by_class(t.id)
+    attempts, by_class, excluded = await store.lifetime_usage_by_class(t.id)
     assert attempts == 8, "the mechanical attempt must not count toward the cap"
-    assert by_class["tokens_used"] >= 500_000, (
-        "the mechanical attempt's real spend must still be counted")
+    assert by_class["tokens_used"] < 500_000, (
+        "the mechanical attempt's tokens must not count toward the GATED sum")
+    assert excluded["tokens_used"] >= 500_000, (
+        "the mechanical attempt's real spend must still be reported, as excluded")
 
     total_attempts, total_tokens = await store.lifetime_usage(t.id)
     assert total_attempts == 8
-    assert total_tokens >= 500_000
+    assert total_tokens >= 500_000, (
+        "the all-in raw total must still reflect the mechanical spend")

@@ -281,7 +281,7 @@ async def test_the_raw_total_excludes_the_output_slice(store):
         aid, tokens_used=1_000, output_tokens=400,
         cache_read_tokens=100, cache_creation_tokens=10)
 
-    _, by_class = await store.lifetime_usage_by_class(t.id)
+    _, by_class, _ = await store.lifetime_usage_by_class(t.id)
     _, raw = await store.lifetime_usage(t.id)
 
     assert raw == 1_110
