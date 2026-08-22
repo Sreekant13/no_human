@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from no_human.agent.claude_backend import AgentResult
+from no_human.agent.claude_backend import AgentEvent, AgentResult
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
@@ -405,3 +405,153 @@ async def test_the_timeout_checkpoint_survives_a_repairable_manifest_refusal(
     assert last["status"] == "failed", last
     assert last["commit_sha"], "the repaired WIP checkpoint sha must be recorded"
     assert _SHA_RE.match(last["commit_sha"]), last["commit_sha"]
+
+
+class _SteadyProgressBackend:
+    """Streams a progress event every ``interval`` for ``rounds`` rounds —
+    total run time comfortably exceeds ``attempt_timeout_s`` — then returns a
+    normal, productive result. Proves the timeout bounds INACTIVITY, not the
+    session's total wall clock: the old `asyncio.wait_for(..., timeout=...)`
+    measured elapsed time since the call STARTED and would have cancelled
+    this (6 * 0.12s = 0.72s total, well past the 0.25s ceiling); the
+    inactivity watchdog never sees a gap wider than 0.12s between events, so
+    it never fires."""
+
+    def __init__(self, interval, rounds, mutate):
+        self.interval = interval
+        self.rounds = rounds
+        self.mutate = mutate
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        for _ in range(self.rounds):
+            await asyncio.sleep(self.interval)
+            if on_event:
+                on_event(AgentEvent("tool_use", tool_name="Edit",
+                                    tool_input={"file_path": "calc.py"}))
+        self.mutate(cwd)
+        return AgentResult(final_text="done", num_turns=2, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_steady_progress_survives_past_the_timeout_window(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """AC1 (first half): a coder run that keeps emitting progress events for
+    LONGER than `attempt_timeout_s` must NOT be cancelled. RED under the old
+    wall-clock `asyncio.wait_for` bound (0.72s total elapsed > 0.25s
+    ceiling); GREEN here because every inter-event gap stays under the
+    ceiling."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.25
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        )
+
+    backend = _SteadyProgressBackend(interval=0.12, rounds=6, mutate=mutate)
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome
+    attempts = await store.list_attempts(t.id)
+    assert not any(
+        "timed out" in (a["failure_reason"] or "").lower() for a in attempts
+    ), attempts
+
+
+class _UsageThenSilentBackend:
+    """Streams N "usage" events (real spend), then goes silent forever — no
+    further event, no return. Proves the inactivity-cancel path records the
+    TRUE streamed spend, not the pre-run zero: a cancelled `backend.run`
+    never delivers a final `AgentResult` for the abort handler to read."""
+
+    def __init__(self, usage_tokens):
+        self.usage_tokens = usage_tokens
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        for tokens in self.usage_tokens:
+            if on_event:
+                on_event(AgentEvent("usage", meta={"tokens_used": tokens}))
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(30)  # goes silent — never returns, never emits again
+
+
+async def test_streamed_usage_is_recorded_on_inactivity_cancel(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """AC2: spend streamed before a later cancellation is recorded on the
+    attempt row as the SUM of the streamed usage events."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    usage_tokens = [50, 75, 40]
+    orch = Orchestrator(store, cfg.data, _UsageThenSilentBackend(usage_tokens),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status in (
+        TaskStatus.FAILED, TaskStatus.ESCALATED, TaskStatus.BLOCKED), outcome
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt recorded"
+    first = attempts[0]
+    assert first["tokens_used"] == sum(usage_tokens), first
+
+
+async def test_timeout_checkpoint_event_when_nothing_to_checkpoint(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """AC3: the timeout branch emits a `checkpoint` event even when there is
+    NOTHING to commit — a silent skip must be visible, not just the
+    WIP-PARTIAL branch (covered elsewhere)."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 1
+    events: list = []
+    orch = Orchestrator(store, cfg.data, _HangBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    checkpoints = [e for e in events if e["kind"] == "checkpoint"]
+    assert checkpoints, "no checkpoint event emitted on the no-changes branch"
+    assert any("no uncommitted changes to checkpoint" in e["text"]
+               for e in checkpoints), checkpoints
+
+
+async def test_failed_wip_checkpoint_commit_becomes_advisory_event(
+    bare_repo, tmp_path, store, monkeypatch  # noqa: F811
+):
+    """AC3: when the WIP-PARTIAL checkpoint commit itself fails, that failure
+    must be visible as an `advisory` event, not only a `log.warning` nobody
+    watching the event stream ever sees."""
+    from no_human.core import orchestrator as orch_mod
+
+    def _boom(repo_arg, edited, commit_msg, on_repair=None):
+        raise RuntimeError("simulated checkpoint commit failure")
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair", _boom)
+
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 1
+    events: list = []
+    orch = Orchestrator(store, cfg.data, _HangAfterEditBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    advisories = [e for e in events if e["kind"] == "advisory"]
+    assert advisories, "checkpoint-commit failure never surfaced as an advisory event"
+    assert any("checkpoint" in e["text"].lower() for e in advisories), advisories

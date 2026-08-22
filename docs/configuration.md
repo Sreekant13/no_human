@@ -470,13 +470,25 @@ ui_evidence:
 
 ## Timeouts read straight from your config
 
-Two wall-clock ceilings are read the same way and default generously so a
-legitimately long run is never cut off:
+Two ceilings are read the same way and default generously so a legitimately
+long run is never cut off, but they bound different things:
 
-- `bounds.attempt_timeout_s` (default 3600) — one coder attempt. It was the
-  single unbounded call before it existed.
+- `bounds.attempt_timeout_s` (default 3600) — one coder attempt, bounded by
+  INACTIVITY, not by the attempt's total wall clock (B20 follow-up). Every
+  progress event the coder session emits (tool use, agent text, a subagent
+  round, a context compaction, a streamed usage update) resets the clock, so
+  a backend that keeps producing events is never cancelled by this however
+  many hours it legitimately runs — only a backend that produces NOTHING at
+  all for the full window is. `max_turns` remains the only bound on
+  productive work. On expiry the failure reason names the window and the
+  last-progress timestamp, e.g. "no coder progress for 3600s (last progress
+  at 2026-08-22T07:23:37Z)"; spend already streamed in before the cutoff is
+  recorded on the attempt, not lost. It was the single unbounded call before
+  it existed.
 - `bounds.shadow_timeout_s` (default 1800) — one shadow/bench run in the
-  throwaway sandbox.
+  throwaway sandbox. This one IS a plain wall clock — it bounds a
+  disposable eval/bench sandbox run, not a coder attempt whose partial
+  progress must survive a cutoff.
 
 ## Keys the doc gate cannot see
 

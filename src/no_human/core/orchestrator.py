@@ -505,6 +505,27 @@ class BudgetAbort(RuntimeError):
     """
 
 
+class InactivityTimeout(TimeoutError):
+    """The coder turn produced no progress event for ``bounds.attempt_timeout_s``.
+
+    `bounds.attempt_timeout_s` bounds INACTIVITY, not the session's wall
+    clock (B20-follow-up): a backend that keeps streaming tool_use/text/
+    usage/subagent events — a genuinely long, productive high-effort attempt
+    — is never cancelled by this, however many hours it runs; only a
+    backend that stops producing events entirely, for the full timeout, is.
+    `max_turns` remains the only bound on productive work. Subclasses
+    ``TimeoutError`` so it still matches the existing
+    ``except (asyncio.TimeoutError, TimeoutError)`` handler.
+    """
+
+    def __init__(self, timeout_s: float, last_progress_wall: float | None):
+        self.timeout_s = timeout_s
+        self.last_progress_wall = last_progress_wall
+        super().__init__(
+            f"no coder progress for {timeout_s:.0f}s"
+        )
+
+
 @dataclass
 class TaskOutcome:
     task: Task
@@ -1347,8 +1368,18 @@ class Orchestrator:
         """The coder session's PreCompact hook (`_make_compact_hook`). Bumps
         the per-attempt counter `cache_burn` events report (AC2 — the
         observable that proves the AC1 config fix actually fires) and keeps
-        emitting the human-readable timeline event this replaced."""
+        emitting the human-readable timeline event this replaced.
+
+        Also counts as coder progress for the inactivity watchdog
+        (`_await_coder_turn`): a compaction is the backend doing real work
+        mid-session, not a stall, and it does not flow through `_agent_sink`
+        (it is a separate PreCompact hook), so without this a long attempt
+        that happens to compact right as the timeout window closes would
+        read as inactive despite being mid-turn.
+        """
         self._attempt_compactions = getattr(self, "_attempt_compactions", 0) + 1
+        self._last_progress_at = time.monotonic()
+        self._last_progress_wall = time.time()
         self.emit("compaction", f"context compaction fired ({trigger})",
                    compactions=self._attempt_compactions)
 
@@ -1808,6 +1839,16 @@ class Orchestrator:
         # because the worker pool reuses this Orchestrator.
         if role != CODER_ROLE:
             return
+        # Inactivity watchdog (B20 follow-up): ANY event from the coder's own
+        # session counts as progress, whatever its kind — a stall is the
+        # ABSENCE of an event, not a specific one, so this runs before the
+        # per-kind branches below (including the early `return` for "usage").
+        # `_last_progress_at` is monotonic — immune to a system clock step —
+        # and is what `_await_coder_turn` polls; `_last_progress_wall` is a
+        # wall-clock stamp kept only so a human-readable failure_reason can
+        # name WHEN the backend last spoke.
+        self._last_progress_at = time.monotonic()
+        self._last_progress_wall = time.time()
         # Cooperative cancellation (`nh task pause`). The watcher coroutine sets
         # the reason; this is the implementer's next tool boundary, so raising
         # here unwinds the SDK session with the working tree intact for the WIP
@@ -1977,6 +2018,53 @@ class Orchestrator:
                     "(work checkpointed, the loop retries with fresh context)",
                 )
                 raise StuckAbort(hard)
+
+    async def _await_coder_turn(self, coro, timeout_s: float):
+        """Await the coder's backend session, bounded by INACTIVITY, not by
+        the session's total wall clock (B20 follow-up).
+
+        `bounds.attempt_timeout_s` used to wrap this call in
+        ``asyncio.wait_for``, which measures elapsed time since the call
+        STARTED — so a genuinely productive hour-long attempt (387 tool
+        calls, 6 subagent rounds, 9 compactions, continuously making
+        progress) was killed at exactly the timeout and mislabeled as a hung
+        backend. `_agent_sink` (and `_on_coder_compact`) stamp
+        ``self._last_progress_at`` on every coder-role event, whatever its
+        kind; this polls that stamp instead of the call's start time, so a
+        backend that keeps producing events is never cancelled, however long
+        it runs — only a backend that produces NOTHING for the full timeout
+        is. `max_turns` remains the only bound on productive work.
+
+        Polls rather than sleeping once for `timeout_s`: each progress event
+        pushes `_last_progress_at` forward, so a single fixed sleep computed
+        at call time would still expire under a productive backend. There is
+        no cheaper signal to wait on — progress arrives via a synchronous
+        callback from inside the backend's own coroutine, not through
+        anything awaitable.
+        """
+        self._last_progress_at = time.monotonic()
+        self._last_progress_wall = time.time()
+        task = asyncio.ensure_future(coro)
+        try:
+            while not task.done():
+                elapsed = time.monotonic() - self._last_progress_at
+                remaining = timeout_s - elapsed
+                if remaining <= 0:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise InactivityTimeout(
+                        timeout_s, getattr(self, "_last_progress_wall", None)
+                    )
+                # Capped poll interval: a long attempt must still notice a
+                # cancellation/stop-server exception raised out of a LATER
+                # `_agent_sink` call reasonably promptly, not only at the
+                # next progress event.
+                done, _ = await asyncio.wait({task}, timeout=min(remaining, 1.0))
+            return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
 
     def _reviewer_sink(self, event: AgentEvent) -> None:
         """Forward reviewer-internal agent events with source='reviewer'."""
@@ -4302,19 +4390,22 @@ class Orchestrator:
         # we checkpoint, so the WIP commit is made under the operator's env, not
         # the agent's.
         cancelled: str | None = None
-        # A coder turn is bounded only by max_turns (turn COUNT), never by wall
-        # clock, so a hung SDK subprocess (auth/quota/network stall at 0% CPU)
-        # would wedge the attempt forever — the exact wedge that killed a dogfood
-        # shadow run. The advisory/judge calls already guard this (_bounded_run);
-        # the coder turn was the one unbounded call (B20). Generous default so a
-        # legitimately long high-effort attempt is never cut off; override via
-        # bounds.attempt_timeout_s.
+        # A coder turn is bounded only by max_turns (turn COUNT) and by
+        # INACTIVITY, never by the session's total wall clock, so a hung SDK
+        # subprocess (auth/quota/network stall at 0% CPU) would wedge the
+        # attempt forever — the exact wedge that killed a dogfood shadow run
+        # — while a backend that keeps streaming progress is never cut off
+        # however long it legitimately runs. The advisory/judge calls already
+        # guard this (_bounded_run); the coder turn was the one unbounded
+        # call (B20). `bounds.attempt_timeout_s` names the inactivity window;
+        # `_await_coder_turn` is what enforces it, against
+        # `self._last_progress_at` rather than this call's start time.
         attempt_timeout_s = float(
             (self.config.get("bounds") or {}).get("attempt_timeout_s") or 3600
         )
         try:
             try:
-                result = await asyncio.wait_for(
+                result = await self._await_coder_turn(
                     self.backend.run(
                         prompt,
                         cwd=repo.path,
@@ -4325,7 +4416,7 @@ class Orchestrator:
                         on_compact=self._on_coder_compact,
                         **extra,
                     ),
-                    timeout=attempt_timeout_s,
+                    attempt_timeout_s,
                 )
             finally:
                 # Remove per-attempt user-skill copies before anything else —
@@ -4345,12 +4436,26 @@ class Orchestrator:
                                            timeout=60, cwd=str(repo.path))
                         except Exception:  # noqa: BLE001 — teardown is best-effort
                             log.warning("env_teardown command failed: %s", cmd[:80])
-        except (asyncio.TimeoutError, TimeoutError):
-            # A hung coder turn (B20): fail the ATTEMPT honestly instead of
-            # wedging forever. Mirror StuckAbort — checkpoint partial work,
-            # record the TRUE spend, and let the bounded loop retry with fresh
-            # context, then escalate. wait_for already cancelled backend.run, so
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            # An INACTIVE coder turn (B20 follow-up): `_await_coder_turn`
+            # only raises this after `attempt_timeout_s` seconds with NO
+            # progress event at all, never merely because the session ran
+            # long — a backend that keeps streaming tool_use/text/usage/
+            # subagent events is never cancelled here, however many hours it
+            # runs. Fail the ATTEMPT honestly instead of wedging forever.
+            # Mirror StuckAbort — checkpoint partial work, record the TRUE
+            # spend (accumulated live in `_agent_sink` as events streamed in,
+            # not read off a final result a cancelled run never produces),
+            # and let the bounded loop retry with fresh context, then
+            # escalate. `_await_coder_turn` already cancelled backend.run, so
             # the inner `finally` above restored the env and ran teardown.
+            last_progress_wall = getattr(exc, "last_progress_wall", None)
+            if last_progress_wall is not None:
+                last_progress_str = datetime.fromtimestamp(
+                    last_progress_wall, tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                last_progress_str = "never (no coder event was ever seen)"
             wip_sha = ""
             if repo.has_changes():
                 try:
@@ -4361,12 +4466,15 @@ class Orchestrator:
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
                               f"({wip_commit.files_changed} files preserved)")
                 except Exception as commit_exc:  # noqa: BLE001
-                    log.warning("WIP checkpoint on attempt-timeout failed: %s",
-                                commit_exc)
+                    self._advisory(
+                        f"WIP checkpoint on attempt-timeout failed: {commit_exc}")
+            else:
+                self.emit("checkpoint", "no uncommitted changes to checkpoint")
             await self._record_wip_checkpoint(
                 task, wip_sha, repo, stopped_because="attempt timeout")
-            detail = (f"{_ATTEMPT_TIMEOUT_DETAIL} {attempt_timeout_s:.0f}s — a hung "
-                      "backend turn (no coder-turn progress); failed honestly "
+            detail = (f"{_ATTEMPT_TIMEOUT_DETAIL} {attempt_timeout_s:.0f}s — no "
+                      f"coder progress for {attempt_timeout_s:.0f}s (last "
+                      f"progress at {last_progress_str}); failed honestly "
                       "instead of wedging (B20)")
             u = self._attempt_usage
             await self.store.update_attempt(
