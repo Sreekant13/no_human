@@ -4544,7 +4544,9 @@ class Orchestrator:
                     "quota_pause",
                     "fleet paused — 3 consecutive zero-token/auth SDK "
                     "failures across distinct tasks")
-            raise QuotaExhausted(infra_reason)
+            # `infra=True`: the park spares the attempt, the breaker above
+            # decides the fleet — the pool clock is NOT armed by this park.
+            raise QuotaExhausted(infra_reason, infra=True)
 
         # Refusal → fail-fast (Broker). A model refusal is a COMPLETED turn the
         # agent declined (stop_reason="refusal", is_error False, no diff) — so it
@@ -6564,6 +6566,8 @@ class Orchestrator:
             if not resets_at:
                 continue
             blocker = sibling.blocker if isinstance(sibling.blocker, dict) else {}
+            if blocker.get("infra"):
+                continue  # a dead SDK session, not a wall — corroborates nothing
             theirs = blocker.get("auth_profile")
             if theirs and mine and theirs != mine:
                 continue  # a DIFFERENT profile's wall — not corroboration for mine
@@ -7486,7 +7490,7 @@ class Orchestrator:
                         "quota_pause",
                         "fleet paused — 3 consecutive zero-token/auth SDK "
                         "failures across distinct tasks")
-                raise QuotaExhausted(reason)
+                raise QuotaExhausted(reason, infra=bool(infra))
 
         if not repo.has_changes():
             return None
@@ -8783,6 +8787,11 @@ class Orchestrator:
             # behind the old profile's park. The prose above names it for
             # humans; this names it for code.
             "auth_profile": profile,
+            # The KIND of park, as a field the scheduler and the reviewer's
+            # corroboration read: an infra park (dead SDK session) spares the
+            # task's attempt but is not a billing wall — it arms no pool
+            # clock and corroborates no other task's bare-shape death.
+            "infra": bool(getattr(exc, "infra", False)),
         }
         # Columns only (blocker, wake_check_at): `update_task` would rewrite
         # the whole context blob from this in-memory copy and drop whatever

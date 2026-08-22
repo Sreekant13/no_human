@@ -501,6 +501,11 @@ def _make_compact_hook(on_compact: Callable[[str], None]) -> Callable[..., Await
     return hook
 
 
+# One stdout JSON line from the CLI. 32 MiB: generous against any single tool
+# result or resume replay, still a bound (a runaway line cannot eat memory).
+SDK_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+
+
 class ClaudeBackend:
     """Drives one Agent SDK session per call to :meth:`run`."""
 
@@ -710,6 +715,13 @@ class ClaudeBackend:
             model=self.model,
             cwd=str(cwd),
             max_turns=max_turns,
+            # The SDK's transport defaults to a 1 MB cap on ONE stdout JSON
+            # line and kills the session when the CLI exceeds it ("JSON
+            # message exceeded maximum buffer size"). A large tool result or
+            # a resumed session's replay crosses that. INCIDENT 2026-08-22
+            # (task c8d1a30d): a session died at turn 1 with zero tokens on
+            # exactly this, after 65 tool calls of real work.
+            max_buffer_size=SDK_MAX_BUFFER_BYTES,
             permission_mode=self.permission_mode,
             effort=effort,
             resume=resume,

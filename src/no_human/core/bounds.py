@@ -329,8 +329,18 @@ class QuotaExhausted(Exception):
     RETRY_AFTER_S = 3600
 
     def __init__(self, message: str = "subscription quota exhausted",
-                 resets_at: str | None = None):
+                 resets_at: str | None = None, *, infra: bool = False):
         super().__init__(message)
+        # What KIND of wall this is. ``infra=True`` is the prose-less SDK /
+        # transport death (`_infra_sdk_failure`): the TASK is parked the same
+        # way — it did no work and must not be charged an attempt — but the
+        # POOL must not be: a single dead session is not a billing wall, and
+        # the fleet response to dead sessions is the 3-strike infra breaker,
+        # not an hour-long pause. INCIDENT (2026-08-22, task c8d1a30d): one
+        # SDK stream died on a >1 MB JSON line ("infrastructure, not work")
+        # and the scheduler armed a 60-minute 'quota' pause on the whole pool
+        # with 12 tasks queued and a free worker.
+        self.infra = infra
         # DEFAULTED HERE, not at the call site, so no raise site can produce a
         # park that never wakes. With `resets_at=None`, TWO mechanisms silently
         # did nothing: the wake watcher resumes a PAUSED_QUOTA task only when

@@ -593,6 +593,8 @@ class Scheduler:
             if resets is None:
                 continue
             blocker = task.blocker if isinstance(task.blocker, dict) else {}
+            if blocker.get("infra"):
+                continue                      # a dead session, not a wall
             theirs = blocker.get("auth_profile")
             if theirs and mine and theirs != mine:
                 continue                      # another profile's wall
@@ -1701,7 +1703,16 @@ class Scheduler:
             self._running[task.id] = orch
             outcome = await orch.run_task(task)
             # 7.4: a quota park pauses the whole pool until the reset time.
-            if outcome is not None and outcome.status == TaskStatus.PAUSED_QUOTA:
+            # An INFRA park (dead SDK session, `blocker.infra`) is the
+            # task's to sleep off, not the pool's: the 3-strike breaker in
+            # `_tick` is the fleet response to dead sessions. Arming the
+            # clock here on one of them idled a free worker for an hour
+            # under a 12-deep queue (2026-08-22, task c8d1a30d).
+            parked_blocker = (outcome.task.blocker
+                              if outcome is not None
+                              and isinstance(outcome.task.blocker, dict) else {})
+            if (outcome is not None and outcome.status == TaskStatus.PAUSED_QUOTA
+                    and not parked_blocker.get("infra")):
                 resets = _parse_iso(getattr(outcome.task, "wake_check_at", None))
                 if resets is not None:
                     self._quota_cooldown_until = resets
