@@ -1615,12 +1615,40 @@ async def cancel_task(
             "cancel", prior_status=prior_status, prior_blocker=prior_blocker,
             reason=reason, actor="operator:api"),
     )
-    # Cancel must STOP the work, not just flip the status. A running task's SDK
-    # (claude) and pytest subprocesses live under its worktree and would keep
-    # churning + holding resources otherwise (a cancelled task left 3 orphans).
-    # The 32-hex task id appears in those command lines, so kill by it. Best-
-    # effort — never let cleanup failure break the cancel response.
+    # Cancel must STOP the work, not just flip the status. First: the reliable
+    # path. If THIS server's scheduler owns a live orchestrator for this task,
+    # `request_task_cancel` cancels the asyncio.Task wrapping the coder's
+    # `backend.run(...)` directly — the existing attempt-timeout unwind then
+    # closes the attempt row with its checkpoint and true spend. This does
+    # NOT depend on the task id appearing in any process's argv, which is the
+    # defect being fixed here: the Agent SDK's bundled `claude` process
+    # carries no task id, so the pkill below alone matched nothing and left
+    # it running for the rest of the attempt.
+    sched = _sched(request)
+    stopped = bool(sched is not None and sched.request_task_cancel(task.id, reason))
+    # Best-effort fallback for anything pkill CAN see (e.g. a pytest
+    # subprocess spawned under the worktree) — kept unconditionally since it
+    # is harmless when nothing matches, but it is no longer the primary
+    # signal `cancel_stopped_session`/`cancel_session_not_found` is based on:
+    # pkill's own exit code cannot distinguish "matched and killed" from "no
+    # match" (`_kill_task_processes` treats both as success), so it cannot
+    # honestly report what it stopped.
     await _kill_task_processes(task.id)
+    # `source="orchestrator"` (not `_emit_task_event`'s hardcoded "human"):
+    # this reports what the SYSTEM did in response to the human's cancel, a
+    # distinct fact from the human_cancel event above — conflating the two
+    # under source="human" broke the one-human-event-per-verb invariant
+    # `test_every_board_endpoint_emits_its_shared_human_event` guards.
+    stop_kind = "cancel_stopped_session" if stopped else "cancel_session_not_found"
+    stop_text = (
+        f"cancel stopped the running coder session for task {task_id[:8]}"
+        if stopped else
+        f"no live in-process coder session found for task {task_id[:8]}"
+    )
+    stop_ev = {"source": "orchestrator", "kind": stop_kind, "text": stop_text,
+               "ts": time.time()}
+    await store.save_events(task.id, [stop_ev])
+    await _mgr.broadcast({"type": "task_event", "task_id": task.id, "event": stop_ev})
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
                           "tasks": [t.model_dump() for t in tasks]})

@@ -105,6 +105,39 @@ def _server_owns_worker(config) -> bool:
         return _pidfile_owner_alive()
 
 
+def _post_server_cancel(config, task_id: str, reason: str) -> bool:
+    """POST /api/tasks/{task_id}/cancel to the running server, so `nh task
+    cancel` hard-stops a live coder session through the exact same path the
+    board's cancel button uses (`cancel_task` → `Scheduler.request_task_cancel`
+    → `Orchestrator.request_task_cancel` cancelling the coder's backend.run
+    task directly) instead of only ever raising the cooperative DB flag below,
+    which a backend that never emits an SDK event would never notice.
+
+    Returns True on any 2xx response. False — never raises past here — for
+    anything short of that, including the case `_server_owns_worker`'s
+    docstring already calls out: `nh serve` binds no HTTP socket, so a caller
+    that got here via the pidfile fallback has no endpoint to reach at all.
+    The caller falls back to the pre-existing cooperative-only message.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    srv = config.get("server", {}) or {}
+    host = srv.get("host", "127.0.0.1")
+    port = srv.get("port", 8420)
+    body = _json.dumps({"reason": reason}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://{host}:{port}/api/tasks/{task_id}/cancel",
+        data=body, method="POST", headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return False
+
+
 def _pidfile_owner_alive() -> bool:
     """True when NO_HUMAN_HOME/nh.pid names a process that is alive.
 
@@ -2008,9 +2041,21 @@ def task_cancel(task_id, reason):
             await store.request_cancel(t.id, reason)
 
             if _server_owns_worker(config) and t.status in _ACTIVE_STATES:
-                # The attempt is mid-flight and the server owns the status. It
-                # checkpoints the work and parks the task; forcing FAILED from
-                # here would race it and throw the work away.
+                # The attempt is mid-flight and the server owns the status.
+                # POST to the server's own cancel endpoint first — it hard-
+                # stops a live coder session within one scheduler tick instead
+                # of only waiting on the cooperative flag raised above (which
+                # a backend that never emits an SDK event would never notice)
+                # — and it is what flips the task to FAILED with its
+                # checkpoint, so no second "again once it has stopped" call is
+                # needed. Falls back to the old cooperative-only message when
+                # there is no HTTP endpoint to reach (`nh serve` binds none).
+                if _post_server_cancel(config, t.id, reason):
+                    console.print(
+                        f"[red]cancelled[/] {t.id[:8]} — the server stopped "
+                        f"the running session and closed the attempt."
+                    )
+                    return
                 console.print(
                     f"[yellow]cancel requested[/] {t.id[:8]} — the running attempt "
                     f"will checkpoint and stop within a few seconds, then park as "

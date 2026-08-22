@@ -1227,6 +1227,19 @@ class Orchestrator:
     _cancel_reason: tuple[str, str] | None = None
     _active_task_id: str | None = None
     _active_branch: str | None = None
+    # Set by `request_task_cancel` immediately before force-cancelling
+    # `_active_backend_task`, so the except-clause in `_run_attempt` can tell
+    # a deliberate hard cancel's CancelledError apart from an unrelated one
+    # (e.g. process shutdown cancelling the whole per-task coroutine) and
+    # never swallow the latter.
+    _cancel_hard: bool = False
+    # The asyncio.Task wrapping the coder's `backend.run(...)` call, live only
+    # while a coder session is actually running (set/cleared in
+    # `_await_coder_turn`). `request_task_cancel` cancels THIS task directly — not
+    # the outer per-task coroutine the scheduler owns — so a hard cancel can
+    # never land on an unrelated suspension point (a checkpoint commit, a DB
+    # write).
+    _active_backend_task: asyncio.Task | None = None
 
     # Transcript diet (M3): a plan inlined in the prompt is cache-read on every
     # turn of the session. Short plans inline whole (guaranteed adherence, cost
@@ -2041,10 +2054,17 @@ class Orchestrator:
         no cheaper signal to wait on — progress arrives via a synchronous
         callback from inside the backend's own coroutine, not through
         anything awaitable.
+
+        Publishes the wrapped task as `self._active_backend_task` for the
+        duration of the call, so `request_task_cancel` can cancel THIS
+        session directly (the hard-cancel path) rather than only being able
+        to raise `CancelRequested` cooperatively from `_agent_sink`, which a
+        backend that never emits an event would never see.
         """
         self._last_progress_at = time.monotonic()
         self._last_progress_wall = time.time()
         task = asyncio.ensure_future(coro)
+        self._active_backend_task = task
         try:
             while not task.done():
                 elapsed = time.monotonic() - self._last_progress_at
@@ -2065,6 +2085,8 @@ class Orchestrator:
         except asyncio.CancelledError:
             task.cancel()
             raise
+        finally:
+            self._active_backend_task = None
 
     def _reviewer_sink(self, event: AgentEvent) -> None:
         """Forward reviewer-internal agent events with source='reviewer'."""
@@ -2462,6 +2484,39 @@ class Orchestrator:
         self._server_stopping = True
         if self._active_task_id:
             self._cancel_reason = (self._active_task_id, SERVER_STOP_REASON)
+
+    def request_task_cancel(self, task_id: str, reason: str) -> bool:
+        """Hard-stop THIS orchestrator's live coder session for `task_id`, now.
+
+        The twin of `request_server_stop`, but terminal rather than a
+        requeue: a human explicitly cancelled, so the attempt closes FAILED
+        with its checkpoint and true spend (the `asyncio.CancelledError`
+        branch in `_run_attempt`), not parked for a later resume.
+
+        Called from the SAME event loop the scheduler runs on (the API
+        handler and the scheduler share one process/loop under `nh serve`,
+        `Scheduler.request_task_cancel` only reaches an orchestrator that is
+        in `Scheduler._running`), so cancelling `_active_backend_task`
+        directly is safe — no polling flag is needed to get "into the loop",
+        we are already running on it. This is what lets cancel interrupt a
+        backend that never emits an event (unlike the cooperative
+        `_cancel_reason`/`_agent_sink` path a pause relies on): the SDK
+        stream is what a `CancelledError` unwinds, not merely a check the
+        stream has to run into.
+
+        Returns True when a live backend task was actually cancelled here;
+        False when this orchestrator has no in-flight session for `task_id`
+        right now (wrong task, or between attempts) — the caller then knows
+        to fall back to a process-tree kill or report `cancel_session_not_found`.
+        """
+        if task_id != self._active_task_id:
+            return False
+        self._cancel_reason = (task_id, reason)
+        if self._active_backend_task is not None and not self._active_backend_task.done():
+            self._cancel_hard = True
+            self._active_backend_task.cancel()
+            return True
+        return False
 
     async def _honor_server_stop(
         self, task: Task, repo: GitRepo | None, branch: str | None,
@@ -4489,6 +4544,50 @@ class Orchestrator:
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         except CancelRequested as exc:
             cancelled = str(exc)
+        except asyncio.CancelledError:
+            # `request_task_cancel` cancelled `_active_backend_task` directly —
+            # the hard-cancel path (a human explicitly cancelled the task),
+            # distinct from the cooperative pause/server-stop signal
+            # `_agent_sink` watches for via `CancelRequested` above. An
+            # unrelated cancellation (e.g. process shutdown cancelling the
+            # whole per-task coroutine this except sits in) must still
+            # propagate — only swallow the one this orchestrator itself
+            # triggered, tracked by `_cancel_hard`.
+            if not self._cancel_hard:
+                raise
+            self._cancel_hard = False
+            reason = self._cancel_reason[1] if self._cancel_reason else "cancelled"
+            wip_sha = ""
+            if repo.has_changes():
+                try:
+                    wip_commit = self._checkpoint_commit(
+                        repo, f"[WIP-PARTIAL] {self._commit_message(task)}"
+                    )
+                    wip_sha = wip_commit.sha
+                    self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
+                              f"({wip_commit.files_changed} files preserved)")
+                except Exception as commit_exc:  # noqa: BLE001
+                    log.warning("WIP checkpoint on hard cancel failed: %s",
+                                commit_exc)
+            await self._record_wip_checkpoint(
+                task, wip_sha, repo, stopped_because="cancelled")
+            detail = f"cancelled: {reason}"
+            u = self._attempt_usage
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=detail,
+                commit_sha=wip_sha or None, tokens_used=u["tokens_used"],
+                output_tokens=u["output_tokens"],
+                cache_read_tokens=u["cache_read_tokens"],
+                cache_creation_tokens=u["cache_creation_tokens"],
+                **self._pop_aux_usage(),
+            )
+            self.emit("agent_error", detail, error_class="cancelled")
+            # off_ramp=True: a human explicitly cancelled — `_drive`'s retry
+            # test (`status != FAILED or off_ramp`) would otherwise start a
+            # fresh attempt on the very next loop iteration, in the same
+            # `run_task` call, silently undoing the cancel it just honoured.
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail,
+                              off_ramp=True)
         except StuckAbort as exc:
             # Deterministic runaway (B2 #1): fail the ATTEMPT — checkpoint the
             # work, record the true spend, and let the bounded loop retry with

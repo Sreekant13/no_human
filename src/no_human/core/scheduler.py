@@ -1960,6 +1960,28 @@ class Scheduler:
                            f"asked {asked} running task(s) to checkpoint and requeue")
         return asked
 
+    def request_task_cancel(self, task_id: str, reason: str) -> bool:
+        """Hard-stop `task_id`'s live coder session right now, if this
+        scheduler is the one running it (`Orchestrator.request_task_cancel`).
+
+        The cancel-side twin of `request_stop_checkpoints`, but targeted at
+        one task and terminal rather than a requeue. Returns False — never
+        raises — when this scheduler has no in-flight session for `task_id`
+        (wrong process, or between attempts): the caller then knows to fall
+        back to a process-tree kill or report `cancel_session_not_found`.
+        """
+        orch = self._running.get(task_id)
+        if orch is None:
+            return False
+        hook = getattr(orch, "request_task_cancel", None)
+        if hook is None:
+            return False
+        try:
+            return bool(hook(task_id, reason))
+        except Exception as exc:  # noqa: BLE001 — a bad hook must not crash cancel
+            log.warning("task cancel request failed for %s: %s", task_id[:8], exc)
+            return False
+
     async def drain(self, *, grace_s: float | None = None) -> bool:
         """Wait for in-flight tasks to finish — bounded by ``grace_s``
         (default `concurrency.stop_grace_s`, 60 s). Returns True when every
