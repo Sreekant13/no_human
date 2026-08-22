@@ -7,11 +7,6 @@ Two artifacts, two homes:
 | `no_human-<version>.dmg` (~145 MB) | the macOS desktop app, with the frozen `nh` server inside it | **GitHub Releases** | free, unmetered bandwidth, `electron-updater` speaks it natively |
 | `no_human-<version>-py3-none-any.whl` / `.tar.gz` (~1 MB) | the `nh` command line | **PyPI** (`pip install no-human`) | free, the only place `pip` looks |
 
-**Stale as of 2026-08-22:** versions 0.1.0 through 0.1.4 ARE published, to PyPI
-(`no-human`) and to GitHub Releases, by `.github/workflows/publish-pypi.yml`
-(Trusted Publishing). Read the rest of this file as a record of the decision,
-not as current state. The original text follows.
-
 Nothing here has been published. Every build script passes `--publish never`,
 and `desktop/packagedFiles.test.mjs` fails the suite if one stops doing so.
 The exact publish commands are in [§5](#5-the-commands-that-actually-publish).
