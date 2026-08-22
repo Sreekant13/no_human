@@ -4399,9 +4399,9 @@ async def onboarding_confirm_repo(
 
 
 async def _gather_history(days: int) -> tuple[list, dict[str, int]]:
-    """Combine conversation history from every available source: Windsurf  # term-ok: real IDE names, functional
-    (best-effort — needs a running IDE) AND Claude Code (read from disk, always
-    available). Returns (transcripts, per-source counts)."""
+    """Combine conversation history from every available source: the IDE
+    transcript extractor (best-effort — needs a running IDE) AND Claude Code
+    (read from disk, always available). Returns (transcripts, per-source counts)."""
     from ..history.extractor import extract_transcripts, IDENotRunningError
     from ..history.claude_code import extract_claude_code_transcripts
 
@@ -4428,8 +4428,9 @@ async def _gather_history(days: int) -> tuple[list, dict[str, int]]:
 
 @app.post("/api/onboarding/history/extract")
 async def onboarding_history_extract(request: Request) -> dict[str, Any]:
-    """Count extractable transcripts across all sources (Windsurf + Claude  # term-ok: real IDE names
-    Code) and the user's skills. Honest when a source is empty (no fake data)."""
+    """Count extractable transcripts across every available source (the IDE
+    transcript extractor and Claude Code) plus the user's skills. Honest when a
+    source is empty — an empty source reports zero, never fabricated data."""
     from ..history.skills import discover_skills
     transcripts, sources = await _gather_history(30)
     skills = await asyncio.to_thread(discover_skills)
