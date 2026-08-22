@@ -1681,6 +1681,62 @@ _LIVE_SERVER_REASON = (
 # Any git/forge command that mutates history or a remote. A read-only session
 # (planner, aggregator, reviewer) explores and reports; it never writes. Dropping
 # the blanket `git merge` ban would otherwise have let a reviewer commit.
+# A GLOBAL OPTION BEFORE THE SUBCOMMAND DEFEATS AN ADJACENCY REGEX.
+# `gh -R owner/repo pr merge 7 --squash` merges the PR and was ALLOW in EVERY
+# session mode; `git -C . commit -am x` and `git -C . push` were ALLOW in a
+# read-only session. Both patterns below require the verb to sit immediately
+# after the binary, and `-R`/`-C`/`-c`/`--work-tree` slide in front of it.
+#
+# This file already knew the shape twice over. `_git_subcommand` exists a few
+# hundred lines down precisely to skip git's own options, and
+# tests/test_guard.py already asserts `git -C /repo stash` and
+# `git -c user.name=x stash pop` are denied by the worktree-safe family. The
+# merge and read-only families never got the same treatment. Found 2026-08-22
+# by a reviewer checking a README sentence, not by a sweep of the guard.
+#
+# The regexes below are KEPT and the argv checks are added ALONGSIDE them —
+# additive, never a replacement. That is not a style preference: deleting a
+# lexical rule in favour of an argv one is exactly how eight spellings of
+# `nh merge-stack run` regressed earlier today.
+
+#: gh/glab options that sit before the subcommand and take a value.
+_FORGE_GLOBAL_OPT_WITH_ARG = frozenset({
+    "-R", "--repo", "--hostname", "-H", "--host",
+})
+
+#: git subcommands a read-only session must not run.
+_GIT_WRITE_SUBCOMMANDS = frozenset({
+    "commit", "push", "merge", "rebase", "cherry-pick", "revert", "am",
+    "apply", "tag", "reset", "restore", "stash", "branch", "checkout",
+    "switch",
+})
+
+#: (noun, verb) pairs on gh/glab that write, and the subset that MERGES.
+_FORGE_WRITE_PAIRS = {
+    ("pr", "create"), ("pr", "merge"), ("pr", "close"), ("pr", "edit"),
+    ("pr", "ready"), ("pr", "review"),
+    ("mr", "create"), ("mr", "merge"), ("mr", "close"), ("mr", "update"),
+}
+_FORGE_MERGE_PAIRS = {("pr", "merge"), ("mr", "merge")}
+
+
+def _forge_subcommand(argv: list[str]) -> tuple[str, str]:
+    """(noun, verb) for a `gh`/`glab` argv, skipping the tool's own global
+    options and their values. `gh -R o/r pr merge 7` -> ("pr", "merge")."""
+    words: list[str] = []
+    i = 1
+    while i < len(argv) and len(words) < 2:
+        tok = argv[i]
+        if tok.startswith("-"):
+            i += 2 if tok in _FORGE_GLOBAL_OPT_WITH_ARG else 1
+            continue
+        words.append(tok)
+        i += 1
+    while len(words) < 2:
+        words.append("")
+    return words[0], words[1]
+
+
 _GIT_WRITE = re.compile(
     r"\bgit\s+(?:commit|push|merge|rebase|cherry-pick|revert|am|apply|tag"
     r"|reset|restore|stash|branch|checkout|switch)\b"
@@ -2013,6 +2069,28 @@ def _git_subcommand(argv: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def _forge_invocations(cmd: str) -> list[list[str]]:
+    """Every `gh`/`glab` argv in ``cmd``, found the way `_git_invocations`
+    finds git: split on shell separators, strip `VAR=value` and wrappers, and
+    read `basename(argv[0])`. A global option before the subcommand no longer
+    hides the verb, because the verb is read from argv rather than matched
+    next to the binary."""
+    found: list[list[str]] = []
+    for seg in _CMD_SEP.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        argv = _strip_wrappers(
+            tokens, is_extra_target=lambda n: n in {"gh", "glab"})
+        if argv and PurePosixPath(argv[0]).name in {"gh", "glab"}:
+            found.append(argv)
+    return found
+
+
 def _git_invocations(cmd: str, _depth: int = 0) -> list[tuple[str, list[str]]]:
     """Every `git ...` invocation in ``cmd``, as (segment, argv).
 
@@ -2276,6 +2354,26 @@ def evaluate(
     # 3. Shell command policy.
     if tool_name == "Bash":
         cmd = str(tool_input.get("command", ""))
+        if readonly:
+            # argv-shaped, alongside the regexes below: `git -C . commit -am x`
+            # and `git -C . push` were ALLOW in a read-only session, and
+            # `_git_subcommand` — which skips exactly these options — has been
+            # in this file the whole time.
+            for _seg, gargv in _git_invocations(cmd):
+                sub, _rest = _git_subcommand(gargv)
+                if sub in _GIT_WRITE_SUBCOMMANDS:
+                    return GuardDecision(
+                        False,
+                        f"read-only session: git/forge write blocked: {cmd}. "
+                        "Read the repo and report; you do not change it.",
+                    )
+            for fargv in _forge_invocations(cmd):
+                if _forge_subcommand(fargv) in _FORGE_WRITE_PAIRS:
+                    return GuardDecision(
+                        False,
+                        f"read-only session: git/forge write blocked: {cmd}. "
+                        "Read the repo and report; you do not change it.",
+                    )
         if readonly and (_GIT_WRITE.search(cmd) or _FORGE_WRITE.search(cmd)):
             return GuardDecision(
                 False,
@@ -2307,6 +2405,17 @@ def evaluate(
         # `_approve_denial` below covers the product's own CLI, the
         # in-process paths and the local API — all argv-shaped. This one stays
         # lexical: it matches forge spellings whose grammar we do not own.
+        # argv-shaped, alongside the regex: `gh -R owner/repo pr merge 7`
+        # merged the PR in every session mode, because `_FORGE_MERGE` wants
+        # the verb next to the binary.
+        for fargv in _forge_invocations(cmd):
+            if _forge_subcommand(fargv) in _FORGE_MERGE_PAIRS:
+                return GuardDecision(
+                    False,
+                    "merging a pull/merge request is blocked — the agent never "
+                    "merges. Open the PR, push your fixes to its branch, and "
+                    "stop. A human merges it (`nh approve`).",
+                )
         if _FORGE_MERGE.search(cmd):
             return GuardDecision(
                 False,

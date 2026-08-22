@@ -1168,6 +1168,82 @@ def test_approve_denial_does_not_overcorrect():
         assert d.allow, f"must stay allowed: {cmd} -> {d.reason}"
 
 
+def test_a_global_option_does_not_hide_the_forge_merge():
+    """`gh -R owner/repo pr merge 7 --squash` MERGED THE PR and was ALLOW in
+    every session mode, because `_FORGE_MERGE` wants the verb immediately after
+    the binary and `-R` slides in front of it. Constraint #2's own rule,
+    defeated by one flag.
+
+    This file already asserted the same shape for the worktree-safe family —
+    `git -C /repo stash`, `git -c user.name=x stash pop` — and `_git_subcommand`
+    has existed the whole time to skip exactly these options. The merge family
+    never got it. Found 2026-08-22 by a reviewer checking a README sentence."""
+    for readonly in (False, True):
+        for cmd in (
+            "gh -R owner/repo pr merge 7 --squash",
+            "gh --repo owner/repo pr merge 7",
+            "gh --hostname git.example.com pr merge 7",
+            "glab -R owner/repo mr merge 12",
+            "gh pr merge 7 --squash",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+    # reading through the same flag stays allowed
+    for cmd in ("gh -R owner/repo pr view 7", "gh -R owner/repo pr list",
+                "gh pr view 7 --comments"):
+        assert _ev("Bash", {"command": cmd}).allow, cmd
+
+
+def test_the_read_only_regex_is_not_redundant_with_the_argv_check():
+    """The argv check added alongside it does NOT subsume it. Measured: with
+    the regex disabled, 42 of 196 wrapper x verb cases went ALLOW — command
+    substitutions, backticks and an escaped space, none of which the argv path
+    reaches because they do not tokenise to a `git` argv[0].
+
+    The number is attributed, not guessed: 28 of 182 wrapper x verb cases are
+    DENY with the regex and ALLOW without it, and every one is a substitution.
+    A first pass at this test also counted `git\\ commit`, which is ALLOW either
+    way — a pre-existing gap, not evidence for this rule. Checking which side of
+    the mutation each case actually falls on is the difference between a test
+    that pins something and a test that looks like it does.
+
+    Pinned because a mutation deleting the regex left the whole suite green,
+    and "green on my corpus" is not "redundant" — the corpus simply held the
+    wrapper axis fixed. Deleting a lexical rule because an argv rule seemed to
+    cover it is how eight spellings of `nh merge-stack run` regressed earlier
+    today."""
+    for cmd in ("$(git commit -am x)", "`git push origin HEAD`",
+                "$(git merge --squash feat)", "`git reset --hard`"):
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, readonly=True)
+        assert not d.allow, f"read-only must deny: {cmd!r}"
+
+
+def test_a_global_option_does_not_hide_a_read_only_git_write():
+    """Same shape, other rule: `git -C . commit -am x` and `git -C . push` were
+    ALLOW in a READ-ONLY session — the planner, aggregator, researcher and
+    reviewer all run in one. `_GIT_WRITE` requires the subcommand next to
+    `git`."""
+    for cmd in ("git -C . commit -am x", "git -C . push origin HEAD",
+                "git -c user.name=z commit -am x",
+                "git --work-tree=. commit -am x",
+                "git --git-dir=.git commit -am x",
+                "git -C . merge --squash feat",
+                "git commit -am x",
+                "gh -R owner/repo pr create --title x --body y"):
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, readonly=True)
+        assert not d.allow, f"read-only must deny: {cmd!r}"
+    # ...and reading through the same flags is untouched
+    for cmd in ("git -C . log --oneline", "git -C . status",
+                "git -c core.pager=cat diff", "git --git-dir=.git show HEAD"):
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, readonly=True)
+        assert d.allow, f"read-only must allow: {cmd!r} -> {d.reason}"
+
+
 def test_forge_merge_family_denied_in_both_modes():
     """Guards get tested in one direction only (documented failure class) —
     so pin the merge family in coder mode AND readonly mode explicitly,
