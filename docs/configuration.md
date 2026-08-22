@@ -111,9 +111,9 @@ llm:
   review_timeout_seconds: 1500    # wall-clock per review session; a round that
                                   # dies on this wall escalates UNREVIEWED
   code_review_timeout_seconds: 1800  # same, for `nh review` on a whole PR diff
-  local_model: null               # NOT LIVE YET — see llm.local_* below
-  local_base_url: null            # e.g. http://localhost:8000 (not live yet)
-  local_cli_path: null            # null ⇒ the SDK-bundled CLI (not live yet)
+  local_model: null              — see llm.local_* below
+  local_base_url: null            # e.g. http://localhost:8000
+  local_cli_path: null            # null ⇒ the SDK-bundled CLI
 
 database:
   path: ~/.no_human/no_human.db   # SQLite (WAL). No Postgres/Redis.
@@ -381,10 +381,11 @@ numbers and paths are not validated — `http://localhost:8000` and
 config, the key never does. If the local server enforces a key, it goes in
 `~/.no_human/.env` as `LOCAL_LLM_API_KEY`, never in `config.yaml`.
 `local_cli_path` is optional; `null` uses the SDK-bundled CLI.
-**These keys are not live yet.** They are validated and scrubbed, but the coder
-seam that would run against a local server has not landed — setting
-`worker.backend: local` today fails at task start with
-`unknown coding backend 'local'`.
+**These keys are live.** `local` is in `SUPPORTED_BACKENDS`
+(`agent/backend.py:256`) and `make_backend` has a real branch for it
+(`backend.py:448`); `worker.backend: local` resolves. It fails only when
+`llm.local_base_url` / `llm.local_model` are unset, or when the URL is not a
+loopback/RFC1918 address (`config.assert_local_backend_mode`).
 
 ## `learning:` — memory lifecycle
 
