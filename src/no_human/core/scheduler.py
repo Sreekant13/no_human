@@ -403,6 +403,11 @@ class Scheduler:
         self.max_workers = max(1, int(max_workers))
         self.wake = wake_watcher
         self._inflight: set[str] = set()
+        # Rows `unclaimable_orphans()` found on the run that just decided NOT
+        # to report drained (`run_forever(until_empty=True)`) — read by the
+        # CLI so it can name the row(s) without re-querying. Empty whenever
+        # the last `--until-empty` run drained cleanly, or hasn't run yet.
+        self.drain_blocked_by: list[dict] = []
         # Ids this process has already emitted an unended `waiting_for_slot`
         # event for — in-memory dedupe so a continuous wait produces exactly
         # one event, not one per tick. In-memory is correct and sufficient: a
@@ -977,6 +982,65 @@ class Scheduler:
             return True      # row itself is young — no query needed
         ev_ts = await self.store.last_event_ts(t.id)
         return ev_ts is not None and time.time() - ev_ts < self._STRANDED_GRACE_S
+
+    async def _activity_age_s(self, t) -> float:
+        """Seconds since *t*'s newest persisted activity — row `updated_at`
+        OR the newest `task_event`, whichever is more recent — the same two
+        signals `_row_is_live` reads, as a number instead of a bool. Used
+        only for the "how long until claimable" estimate below; never by
+        `_row_is_live` or `_recover_orphans`, which stay unchanged.
+
+        `last_event_ts` failing is treated as age `0.0` (the full grace still
+        applies) — fail toward waiting, never toward "drained".
+        """
+        age = self._row_age_s(t.updated_at)
+        try:
+            ev_ts = await self.store.last_event_ts(t.id)
+        except Exception:  # noqa: BLE001 — an estimate must not raise
+            return 0.0
+        if ev_ts is not None:
+            age = min(age, max(0.0, time.time() - ev_ts))
+        return age
+
+    async def unclaimable_orphans(self) -> list[dict]:
+        """Mid-run rows (`_ORPHANABLE`) neither claimable nor owned by this
+        process — the gap `queue_is_drained` used to read as "nothing left".
+
+        A row here is either a crash orphan younger than `_STRANDED_GRACE_S`
+        (so `_recover_orphans` has deliberately not touched it yet — a live
+        sibling's row must not be clobbered) or is owned by a THIRD process
+        this scheduler has no visibility into. Under `--until-empty`,
+        `_claim_pool_lease` has already refused to boot beside a live
+        sibling, so either way the row is UNKNOWN, not drained. This method
+        deliberately does NOT call `_row_is_live` — a young mid-run row is
+        BY CONSTRUCTION indistinguishable from a live one (that is the whole
+        defect this fixes), so classifying by liveness would just reintroduce
+        the fail-open reading. Every non-excluded row here is counted as
+        work, full stop.
+
+        Excluded, because something else already accounts for them:
+        - `plan_gate.correcting(t)` rows — a human's plan correction sits in
+          PLANNING waiting to be re-planned; `_claimable` already claims it
+          (mirrors `_recover_orphans`'s own first filter, so the two agree on
+          what a mid-run row *is*).
+        - `t.id in self._inflight` — this process owns it; `queue_is_drained`
+          already counts `_inflight` separately.
+        """
+        out = []
+        for status in self._ORPHANABLE:
+            for t in await self.store.list_tasks(status):
+                if plan_gate.correcting(t):
+                    continue
+                if t.id in self._inflight:
+                    continue
+                age = await self._activity_age_s(t)
+                out.append({
+                    "task_id": t.id,
+                    "status": status.value,
+                    "seconds_until_claimable": max(
+                        0.0, self._STRANDED_GRACE_S - age),
+                })
+        return out
 
     async def _recover_orphans(self, *, startup: bool = True) -> None:
         """Crash/strand recovery. A task found in one of `_ORPHANABLE`'s
@@ -1772,7 +1836,33 @@ class Scheduler:
             await self.tick()
             # After the tick, so a task dispatched this pass is already in
             # `_inflight` and an empty queue can never be read mid-dispatch.
-            if until_empty and await self.queue_is_drained():
+            if until_empty and not self._inflight and not await self._claimable():
+                stranded = await self.unclaimable_orphans()
+                if stranded:
+                    # Nothing claimable and nothing in-flight, but a mid-run
+                    # row exists that this process does not own — UNKNOWN,
+                    # not drained (see `unclaimable_orphans`'s docstring).
+                    # Exit non-zero instead of looping: the intake answer for
+                    # this fix is "refuse and say why", not "wait it out" —
+                    # a retry only narrows the window in which UNKNOWN reads
+                    # as OK, it does not change the reading.
+                    self.drain_blocked_by = stranded
+                    for row in stranded:
+                        log.warning(
+                            "not drained: task %s is %s with no worker "
+                            "attached in this process — it is either a "
+                            "crash orphan or owned elsewhere, and becomes "
+                            "claimable in %.0fs (_STRANDED_GRACE_S=%.0f). "
+                            "Refusing to report the queue drained.",
+                            row["task_id"][:8], row["status"],
+                            row["seconds_until_claimable"],
+                            self._STRANDED_GRACE_S)
+                    self._on_event(
+                        "drain_blocked",
+                        "; ".join(
+                            f"task {row['task_id'][:8]} is {row['status']}, "
+                            f"claimable in {row['seconds_until_claimable']:.0f}s"
+                            for row in stranded))
                 stop.set()
                 break
             try:
@@ -1796,12 +1886,20 @@ class Scheduler:
             log.exception("pool lease: clearing the heartbeat failed")
 
     async def queue_is_drained(self) -> bool:
-        """Nothing running, nothing left to claim — the drain's exit condition.
+        """Nothing running, nothing left to claim, and nothing UNKNOWN — the
+        drain's exit condition.
 
         Also the CLI's after-the-fact check: a run that stopped on a SIGNAL
         with work still queued did NOT drain, and must not report that it did.
+
+        A mid-run row nothing here owns (`unclaimable_orphans`) is UNKNOWN —
+        it may be a live sibling's row or a crash orphan still inside its
+        grace — and UNKNOWN is counted as work: this predicate never reports
+        drained on evidence it does not have.
         """
-        return not self._inflight and not await self._claimable()
+        return (not self._inflight
+                and not await self._claimable()
+                and not await self.unclaimable_orphans())
 
     async def failed_dispatched(self) -> list[str]:
         """Ids this process dispatched whose task ended ``TaskStatus.FAILED``.

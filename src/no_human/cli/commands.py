@@ -3478,9 +3478,13 @@ async def _monday_poll_loop(poller, stop, poll_interval: int) -> None:
               help="Work the queue, then exit instead of running forever "
                    "(cron/CI). Exits 0 when nothing is claimable and nothing "
                    "is in flight, 1 if any task this run dispatched ended "
-                   "FAILED or the drain was cut short by a signal. Parked "
-                   "tasks (blocked/awaiting-input/escalated/paused-quota) are "
-                   "not claimable: they end the drain and do not fail it.")
+                   "FAILED or the drain was cut short by a signal, 2 if a "
+                   "mid-run row exists that no worker in this process owns "
+                   "(a crash orphan, or one owned elsewhere) and is not yet "
+                   "claimable — named in the output with the seconds until "
+                   "it becomes claimable. Parked tasks (blocked/awaiting-"
+                   "input/escalated/paused-quota) are not claimable: they "
+                   "end the drain and do not fail it.")
 def serve(max_workers, until_empty):
     """Run the concurrent scheduler daemon (Phase 7): drain pending + resumed
     tasks into a bounded worker pool, each task in its own git worktree, running
@@ -3715,6 +3719,21 @@ def serve(max_workers, until_empty):
                 err.print(f"[red]{len(failed)} task(s) FAILED[/] "
                           + ", ".join(t[:8] for t in failed))
                 return 1
+            # Checked BEFORE the generic `queue_is_drained` signal check
+            # below: `queue_is_drained` is now also False for a stranded row
+            # (see scheduler.py), so if this branch ran second the operator
+            # would get "stopped before the queue drained (signalled)" — a
+            # false claim, since nothing signalled this run.
+            stranded = list(getattr(sched, "drain_blocked_by", None)
+                             or await sched.unclaimable_orphans())
+            if stranded:
+                for row in stranded:
+                    err.print(
+                        f"[red]not drained[/] task {row['task_id'][:8]} is "
+                        f"{row['status']} with no worker attached in this "
+                        f"process — claimable in "
+                        f"{row['seconds_until_claimable']:.0f}s")
+                return 2
             if not await sched.queue_is_drained():
                 err.print("[red]stopped before the queue drained[/] "
                           "(signalled) — work is still claimable")

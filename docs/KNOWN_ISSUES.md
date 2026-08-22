@@ -142,6 +142,24 @@ lifetime budget now ENDS the task in FAILED rather than parking it, so
 Nothing about `--until-empty` changed — the same one field, `task.status`, is
 still read; what changed is which status a budget cross produces.)
 
+*(Amended 2026-08-22, follow-up to an independent review of PR #585.* `queue_is_drained`
+read `_inflight` and `_claimable()` but not a third case: a mid-run row
+(`CONTEXT`/`PLANNING`/`REVIEWING`/`TESTING`) that no worker in *this* process
+owns — a crash orphan, or a row a sibling process is or was driving — and that
+is younger than `_STRANDED_GRACE_S` (900s), so `_recover_orphans` won't touch
+it yet either. Nothing was live, nothing was claimable, so the old check
+reported `0` — "drained" — while that row was still mid-run. Exit 1 is
+unchanged and still means FAILED-dispatched or a signal cutting off claimable
+work; a **new exit 2** means neither: the queue is not drained, it is
+*unknown*, because a row exists that this process cannot claim and cannot yet
+prove abandoned. `--until-empty` does not wait out the grace to find out — it
+exits 2 immediately, naming the task id and the seconds remaining until the
+row becomes claimable (once the grace lapses, the usual orphan-recovery sweep
+picks it up on the next boot). Automation that treated exit 0 as "safe to
+tear down the pool" was the actual bug this closes; `_STRANDED_GRACE_S`,
+`_row_is_live`, and `_recover_orphans` are untouched — only `queue_is_drained`
+and the `--until-empty` exit path gained the missing case.)
+
 Separately, `nh stop --timeout` defaulted to 3s — shorter than one
 Agent SDK turn, so it SIGKILLed the drain SIGTERM had just requested — and now
 defaults to 30s.

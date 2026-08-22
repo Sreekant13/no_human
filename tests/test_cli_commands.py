@@ -2148,6 +2148,25 @@ def test_serve_until_empty_exit_code_is_the_drains_verdict(tmp_path, monkeypatch
     assert result.exit_code == 1, result.output
 
 
+def test_serve_until_empty_documents_the_not_yet_claimable_exit_code():
+    """The operator contract for the stranded-row exit code is pinned in the
+    flag's own --help text, not only in docs (MEDIUM-1 follow-up on #585) —
+    a cron/CI operator scripting on exit codes reads `nh serve --help`, not
+    the repo's markdown."""
+    import re
+
+    params = {p.name: p for p in cli.commands["serve"].params}
+    help_text = params["until_empty"].help
+
+    assert re.search(r"\b2\b", help_text), (
+        f"help text never names exit code 2: {help_text!r}")
+    assert "claimable" in help_text.lower(), (
+        f"help text never explains what code 2 means: {help_text!r}")
+    # And the existing 0/1 contract must still be documented alongside it.
+    assert re.search(r"\b0\b", help_text)
+    assert re.search(r"\b1\b", help_text)
+
+
 # --------------------------------------------------------------------------- #
 # nh stop                                                                      #
 # --------------------------------------------------------------------------- #

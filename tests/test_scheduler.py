@@ -2012,3 +2012,149 @@ async def test_a_cooldown_does_not_carry_the_open_wait_across_the_pause(store):
 
     hold.set()
     await sched.wait_idle()
+
+
+# --------------------------------------------------------------------------- #
+# `--until-empty` fail-closed on a non-live orphanable row (follow-up on      #
+# PR #585 / task e037008e's `_row_is_live` — MEDIUM-1)                        #
+# --------------------------------------------------------------------------- #
+
+
+async def test_until_empty_refuses_to_report_drained_on_a_young_mid_run_orphan(store):
+    """A REVIEWING row with a fresh `updated_at` (inside the 900s grace) and
+    no worker attached in THIS process is a crash orphan or a live sibling's
+    row — either way `_row_is_live` correctly leaves it alone, but that must
+    not read as "queue drained". `run_forever` must still RETURN (no hang):
+    the fix is refuse-and-say-why, not wait-it-out."""
+    stranded = Task.new("mid-run orphan", repo_path="/tmp/x")
+    await store.create_task(stranded)
+    await store.set_status(stranded, TaskStatus.REVIEWING, validate=False)
+
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    stop = asyncio.Event()
+
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True), 10.0)
+
+    assert stop.is_set(), "run_forever must still return, not hang"
+    assert await sched.queue_is_drained() is False, (
+        "a non-live orphanable row must not read as a drained queue")
+    assert len(sched.drain_blocked_by) == 1, (
+        f"expected exactly the one stranded row, got {sched.drain_blocked_by}")
+    row = sched.drain_blocked_by[0]
+    assert row["task_id"] == stranded.id
+    assert row["status"] == "reviewing"
+    assert 0 < row["seconds_until_claimable"] <= Scheduler._STRANDED_GRACE_S, (
+        f"expected a bound inside the grace window, got {row}")
+
+
+async def test_the_drain_block_names_the_row_and_the_seconds_until_it_is_claimable(
+        store, caplog):
+    """The operator-visible signal (log + on_event) must name the specific
+    row and a seconds figure — not just say 'not drained'."""
+    import logging
+
+    stranded = Task.new("mid-run orphan", repo_path="/tmp/x")
+    await store.create_task(stranded)
+    await store.set_status(stranded, TaskStatus.TESTING, validate=False)
+
+    events: list[tuple[str, str]] = []
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2,
+                       on_event=lambda k, t: events.append((k, t)))
+    stop = asyncio.Event()
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.wait_for(
+            sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True),
+            10.0)
+
+    short_id = stranded.id[:8]
+    blocked = [e for e in events if e[0] == "drain_blocked"]
+    assert blocked, f"no drain_blocked event emitted; got {events}"
+    text = blocked[0][1]
+    assert short_id in text
+    assert "testing" in text
+    assert any(c.isdigit() for c in text), f"no seconds figure in: {text!r}"
+
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(short_id in m and "testing" in m for m in warnings), (
+        f"log did not name the row: {warnings}")
+    assert any(any(c.isdigit() for c in m) for m in warnings), (
+        f"log did not carry a seconds figure: {warnings}")
+    assert any("not drained" in m.lower() for m in warnings), (
+        f"log must say the queue is NOT drained, not just 'wait': {warnings}")
+
+
+async def test_until_empty_still_drains_and_exits_with_no_stranded_row(store):
+    """Negative control: with no non-live orphanable row, --until-empty
+    drains and exits exactly as before this fix."""
+    fake = FakeOrch(store)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2)
+    await _mk_tasks(store, 3)
+    stop = asyncio.Event()
+
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True), 10.0)
+
+    assert len(fake.started) == 3
+    assert await sched.queue_is_drained() is True
+    assert sched.drain_blocked_by == []
+
+
+async def test_a_mid_run_row_this_process_owns_is_not_counted_as_stranded(store):
+    """A mid-run row THIS process dispatched (tracked in `_inflight`) is not
+    an unknown — `queue_is_drained` already counts `_inflight` separately,
+    so `unclaimable_orphans` must not double-count it."""
+    owned = Task.new("owned mid-run", repo_path="/tmp/x")
+    await store.create_task(owned)
+    await store.set_status(owned, TaskStatus.REVIEWING, validate=False)
+
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    sched._inflight.add(owned.id)
+
+    assert await sched.unclaimable_orphans() == []
+
+
+async def test_a_plan_correction_row_is_not_counted_as_stranded(store):
+    """A plan-approval correction (`plan_gate.correcting`) sitting in
+    PLANNING is claimable work (`_claimable` picks it up), not an unknown
+    orphan — it must not be double-counted by `unclaimable_orphans`."""
+    from no_human.core import plan_gate
+
+    corrected = Task.new("plan correction", repo_path="/tmp/x")
+    corrected.context = {plan_gate.CONTEXT_KEY: {
+        "state": plan_gate.STATE_CORRECTING,
+        "correction": "fix the config path",
+        "corrected_at": "2026-08-20T00:00:00+00:00",
+        "approved_at": None,
+    }}
+    await store.create_task(corrected)
+    await store.set_status(corrected, TaskStatus.PLANNING, validate=False)
+    assert plan_gate.correcting(corrected)
+
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    assert await sched.unclaimable_orphans() == []
+    claimable_ids = [t.id for t in await sched._claimable()]
+    assert corrected.id in claimable_ids, (
+        "a correction must still be claimed through `_claimable`, unchanged")
+
+
+async def test_row_is_live_and_the_grace_are_unchanged_by_the_drain_gate(store):
+    """AC3: this fix must not touch `_row_is_live` or `_STRANDED_GRACE_S` —
+    they behave exactly as PR #585 left them."""
+    assert Scheduler._STRANDED_GRACE_S == 900.0
+
+    fresh = Task.new("fresh mid-run", repo_path="/tmp/x")
+    await store.create_task(fresh)
+    await store.set_status(fresh, TaskStatus.REVIEWING, validate=False)
+
+    aged = Task.new("aged mid-run", repo_path="/tmp/x")
+    await store.create_task(aged)
+    await store.set_status(aged, TaskStatus.REVIEWING, validate=False)
+    await _age_row(store, aged.id, seconds=Scheduler._STRANDED_GRACE_S + 60)
+    aged = await store.find_task(aged.id)  # re-read: `_age_row` back-dates the
+                                            # DB row, not this in-memory object
+
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    assert await sched._row_is_live(fresh) is True
+    assert await sched._row_is_live(aged) is False

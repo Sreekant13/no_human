@@ -332,10 +332,20 @@ overnight; wake up to open PRs and review with `nh review` / `nh approve` as
 in step 7 — **merge always stays a human action**, `nh serve` never merges.
 
 From cron or CI, add `--until-empty`: same pool, same graceful drain, but it
-stops once nothing is claimable and nothing is in flight, and exits `1` if a
-task it ran ended FAILED (or a signal cut the drain short). Parked tasks —
+stops once nothing is claimable and nothing is in flight. Parked tasks —
 blocked, awaiting input, escalated, quota-paused — end the drain without
-failing it; they are waiting for you, not broken.
+failing it; they are waiting for you, not broken. The exit code tells the
+automation what happened:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Drained: nothing claimable, nothing in flight, nothing unaccounted for. |
+| `1` | A task this run dispatched ended FAILED, or the drain was cut short by a signal while work was still claimable. |
+| `2` | A mid-run row exists that no worker in this process owns — a crash orphan, or a row a different process is (or was) driving — and it is not yet claimable. The queue is **not** drained; it is unknown. The output names the task and the seconds remaining until it becomes claimable (once past `_STRANDED_GRACE_S`, 900s, the next boot's orphan sweep recovers it). |
+
+`--until-empty` never waits out that 900s grace itself — it exits `2`
+immediately and names the row, so a cron/CI operator sees why, rather than
+silently reporting `0` while the row is still mid-run.
 
 ---
 
