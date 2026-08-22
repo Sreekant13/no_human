@@ -1059,7 +1059,16 @@ async def test_the_gate_prompt_names_the_same_sha_the_round_stamps(store, tmp_pa
     stamps onto `review_history` — otherwise the prompt and the record can
     (and did) cite different commits. Remove `reviewed_sha=reviewed_sha,
     reviewed_branch=reviewed_branch` from `_run_review`'s `_run_reviewer(...)`
-    call and this goes red at the first assertion with a KeyError."""
+    call and this goes red at the first assertion with a KeyError.
+
+    The trailing `_build_review_prompt(...)` call below is a BUILDER-level
+    check only — it calls the builder directly with a self-computed sha, so
+    it cannot see whether `AdversarialReviewer.review()`'s own gate branch
+    (`reviewer.py:2278-2297`) still forwards `reviewed_sha`/`reviewed_branch`
+    to that builder. That link is guarded separately by
+    `test_reviewer.py::test_gate_review_hands_the_backend_a_prompt_naming_the_reviewed_sha`,
+    which drives `review()` through a fake backend and asserts on the prompt
+    the backend actually receives."""
     from .test_e2e_orchestrator import FakeBackend, _config
     from no_human.review.reviewer import ReviewDecision as RD, _build_review_prompt
     from no_human.review.selfcheck import ChecklistItem as CI
@@ -1114,10 +1123,20 @@ async def test_the_already_satisfied_gate_prompt_names_the_same_sha_the_round_st
     — the exact same contract `_run_review` upholds for a diff round. Before
     this fix `_build_already_satisfied_prompt` accepted no
     `reviewed_sha`/`reviewed_branch` params at all, so the round record cited
-    a commit the prompt never named. Remove `reviewed_sha=reviewed_sha,
-    reviewed_branch=reviewed_branch` from `_build_already_satisfied_prompt`'s
-    call inside `AdversarialReviewer.review()`'s `already_satisfied` branch
-    and this goes red at the final assertion."""
+    a commit the prompt never named.
+
+    This test pins the ORCHESTRATOR-level wiring: `_gate_already_satisfied`
+    resolves a sha once, passes it to `review()` as `reviewed_sha`/
+    `reviewed_branch`, and the SAME sha is stamped onto the round it passes.
+    The trailing `_build_already_satisfied_prompt(...)` call below is a
+    BUILDER-level check only — it calls the builder directly with a
+    self-computed sha, so it cannot see whether `AdversarialReviewer.review()`'s
+    own already_satisfied branch (`reviewer.py:2206-2213`) still forwards
+    `reviewed_sha`/`reviewed_branch` to that builder. That link is guarded
+    separately by
+    `test_reviewer.py::test_already_satisfied_review_hands_the_backend_a_prompt_naming_the_reviewed_sha`,
+    which drives `review()` through a fake backend and asserts on the prompt
+    the backend actually receives."""
     from no_human.review.reviewer import ReviewDecision as RD
     from no_human.review.reviewer import _build_already_satisfied_prompt
     from no_human.review.selfcheck import ChecklistItem as CI

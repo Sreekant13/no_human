@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -596,6 +597,30 @@ class FakeBackend:
             final_text=self._final_text,
             num_turns=3, is_error=False,
             tokens_used=200, session_id="fake", stop_reason="end_turn",
+        )
+
+
+class PromptRecordingBackend:
+    """Like `FakeBackend`, but RECORDS the prompt string `review()` actually
+    hands the backend. #597's already_satisfied/gate guards
+    (`test_pr_body_truthfulness.py`) called the prompt builders directly with
+    a self-computed sha, so they stayed green even when `review()`'s own call
+    sites stopped passing `reviewed_sha`/`reviewed_branch` through — they
+    never observed what the backend was actually given. Tests using this
+    class assert against `self.prompts`, never against a builder called a
+    second time, so they catch that class of regression."""
+
+    def __init__(self, final_text: str):
+        self.prompts: list[str] = []
+        self._final_text = final_text
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None):
+        self.prompts.append(prompt)
+        return AgentResult(
+            final_text=self._final_text,
+            num_turns=1, is_error=False,
+            tokens_used=10, session_id="fake", stop_reason="end_turn",
         )
 
 
@@ -1428,3 +1453,123 @@ async def test_code_review_mode_carries_its_own_larger_window(
     await configured.review(Task.new("Review PR"), repo_path=simple_repo,
                             diff_override="+ x = 1\n", mode="code_review")
     assert seen and seen[0] == 909, seen
+
+
+# --------------------------------------------------------------------------- #
+# nh67: review() must hand the BACKEND a prompt naming the reviewed sha —      #
+# not just build one if asked to directly. See PromptRecordingBackend above.   #
+# --------------------------------------------------------------------------- #
+
+async def test_already_satisfied_review_hands_the_backend_a_prompt_naming_the_reviewed_sha(
+    simple_repo,
+):
+    """`AdversarialReviewer.review()`'s `already_satisfied` branch
+    (`reviewer.py:2206-2213`) must actually pass `reviewed_sha`/
+    `reviewed_branch` through to `_build_already_satisfied_prompt` — not just
+    accept them as parameters. `test_pr_body_truthfulness.py`'s
+    already_satisfied wiring test calls `_build_already_satisfied_prompt`
+    directly with a self-computed sha, so it cannot see whether `review()`
+    itself still forwards those kwargs; only the prompt the BACKEND actually
+    receives, captured here via `PromptRecordingBackend`, can. Removing
+    `reviewed_sha=reviewed_sha, reviewed_branch=reviewed_branch` from that
+    call (`reviewer.py:2211-2212`) turns this red."""
+    sha = subprocess.run(
+        ["git", "-C", str(simple_repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    output = _block(True, [
+        {"label": "mul(a,b) implemented", "passed": True, "evidence": "calc.py:3"},
+    ])
+    backend = PromptRecordingBackend(output)
+    reviewer = AdversarialReviewer(backend=backend)
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+
+    await reviewer.review(
+        t, repo_path=simple_repo, mode="already_satisfied",
+        claim_report=(
+            "ALREADY-SATISFIED\n"
+            "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:3\n"
+        ),
+        reviewed_sha=sha, reviewed_branch="main",
+    )
+
+    assert backend.prompts, "review() never called the backend"
+    assert f"You are reviewing {sha[:7]}" in backend.prompts[0], (
+        "the already_satisfied prompt review() hands the backend does not "
+        "name the reviewed sha — reviewer.py:2211-2212 must still pass "
+        "reviewed_sha to _build_already_satisfied_prompt")
+    assert "(branch main)" in backend.prompts[0], (
+        "the already_satisfied prompt review() hands the backend does not "
+        "name the reviewed branch — reviewer.py:2211-2212 must still pass "
+        "reviewed_branch to _build_already_satisfied_prompt")
+
+
+async def test_gate_review_hands_the_backend_a_prompt_naming_the_reviewed_sha(
+    simple_repo,
+):
+    """The gate twin of the test above. `AdversarialReviewer.review()`'s gate
+    branch (`reviewer.py:2278-2297`) must actually pass `reviewed_sha`/
+    `reviewed_branch` through to `_build_review_prompt`.
+    `test_pr_body_truthfulness.py`'s gate wiring test calls
+    `_build_review_prompt` directly with a self-computed sha, so it cannot
+    see whether `review()` itself still forwards those kwargs; only the
+    prompt the BACKEND actually receives, captured here, can. Removing
+    `reviewed_sha=reviewed_sha, reviewed_branch=reviewed_branch` from that
+    call (`reviewer.py:2295-2296`) turns this red."""
+    sha = subprocess.run(
+        ["git", "-C", str(simple_repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    output = _block(True, [
+        {"label": "mul(a,b) implemented", "passed": True, "evidence": "calc.py:3"},
+    ])
+    backend = PromptRecordingBackend(output)
+    reviewer = AdversarialReviewer(backend=backend)
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+
+    await reviewer.review(
+        t, repo_path=simple_repo, mode="gate",
+        diff_override="--- a/calc.py\n+++ b/calc.py\n+x\n",
+        reviewed_sha=sha, reviewed_branch="main",
+    )
+
+    assert backend.prompts, "review() never called the backend"
+    assert f"You are reviewing {sha[:7]}" in backend.prompts[0], (
+        "the gate prompt review() hands the backend does not name the "
+        "reviewed sha — reviewer.py:2295-2296 must still pass reviewed_sha "
+        "to _build_review_prompt")
+    assert "(branch main)" in backend.prompts[0], (
+        "the gate prompt review() hands the backend does not name the "
+        "reviewed branch — reviewer.py:2295-2296 must still pass "
+        "reviewed_branch to _build_review_prompt")
+
+
+def test_pr_body_truthfulness_no_longer_claims_a_mutation_it_cannot_detect():
+    """nh67 AC3. `test_pr_body_truthfulness.py`'s already_satisfied and gate
+    wiring tests used to claim (falsely) that mutating `review()`'s call
+    sites to the prompt builders would turn THEM red — it can't, because both
+    call the builder directly with a self-computed sha, never observing what
+    `review()` hands the backend. That claim must be replaced with an
+    accurate cross-reference to the tests above, which are what actually
+    catch that mutation. This reads `test_pr_body_truthfulness.py`'s own
+    source rather than asserting against anything computed in this test, so
+    it goes red if the cross-reference is missing (as it was before this
+    fix) and green once the docstrings name these two tests."""
+    text = (Path(__file__).parent / "test_pr_body_truthfulness.py").read_text()
+
+    assert (
+        "test_already_satisfied_review_hands_the_backend_a_prompt_naming_the_reviewed_sha"
+        in text
+    ), (
+        "test_pr_body_truthfulness.py no longer cross-references the test "
+        "that actually guards review()'s already_satisfied branch "
+        "(reviewer.py:2211-2212) — restore the pointer added for nh67 AC3")
+    assert (
+        "test_gate_review_hands_the_backend_a_prompt_naming_the_reviewed_sha"
+        in text
+    ), (
+        "test_pr_body_truthfulness.py no longer cross-references the test "
+        "that actually guards review()'s gate branch (reviewer.py:2295-2296) "
+        "— restore the pointer added for nh67 AC3")
