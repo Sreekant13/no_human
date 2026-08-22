@@ -5217,7 +5217,11 @@ class Orchestrator:
             # (max_attempts) — the tamper guard still fires first on every round,
             # so the worker cannot weaken tests to satisfy the reviewer.
             await self._record_review_feedback(
-                task, failed, decision.suggested_next, attempt_n=attempt_n)
+                task, failed, decision.suggested_next, attempt_n=attempt_n,
+                # `_run_review` (above) already concluded this round via
+                # `_conclude_review_round` — read the same stamp back rather
+                # than re-deriving it, so the two routes cannot drift.
+                review_round=(task.context or {}).get("review_round_seq"))
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         await self.store.update_attempt(
             attempt_id,
@@ -7998,13 +8002,18 @@ class Orchestrator:
             # review findings on a diff. Detail differs from _NO_CHANGES_DETAIL
             # on purpose: a refuted claim resets the zero-diff streak and gets
             # the normal bounded retries.
+            #
+            # This route reviews via `self.reviewer.review` directly, NOT via
+            # `_run_review`, so nothing has appended this round to
+            # `review_history` yet — conclude the round explicitly (on the
+            # never-truncated `review_round_seq` counter, not on
+            # `len(review_history)`, which collides once that list has been
+            # trimmed) so the feedback is stamped with the round it belongs to.
+            fail_round = await self._conclude_review_round(
+                task, decision, sha=reviewed_sha)
             await self._record_review_feedback(
                 task, failed, decision.suggested_next, attempt_n=attempt_n,
-                # This route reviews via `self.reviewer.review` directly, NOT
-                # via `_run_review`, so nothing appended this round to
-                # review_history: the round is one PAST what that list holds.
-                review_round=len(
-                    (task.context or {}).get("review_history") or []) + 1)
+                review_round=fail_round)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         # A PASS here is a review-only round (no new commit): the branch head
         # this round actually judged, resolved at review start, exactly as
@@ -8015,6 +8024,7 @@ class Orchestrator:
         # forever (f27f3b73). Fail closed: an unresolvable head stamps an empty
         # sha, which `_rounds_for_head` already skips, so the round stays
         # unmatched rather than lying about what it reviewed.
+        await self._conclude_review_round(task, decision, sha=reviewed_sha)
         await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         await self.store.update_attempt(
             attempt_id, review_checklist=decision.as_dict(), review_passed=1,
@@ -9049,6 +9059,45 @@ class Orchestrator:
         task.context = ctx
         await self.store.update_task(task)
 
+    async def _conclude_review_round(
+        self, task: Task, decision, *, sha: str = "",
+    ) -> int:
+        """Stamp the round this decision belongs to on an independent,
+        never-truncated counter, and record whether it passed.
+
+        ``review_history`` (above) is a bounded, truncated audit log — its
+        own ``"round"`` field is ``len(history) + 1`` computed BEFORE the
+        append, off a list already capped at ``_REVIEW_HISTORY_ROUNDS * 2``
+        entries. Once truncation has fired once, ``len(history)`` before
+        every later append is pinned at that cap forever, so every
+        subsequent round restamps the SAME number — a genuine collision,
+        not merely "round numbers get large". Any currency predicate built
+        on that field (e.g. "is this finding from before the newest PASS?")
+        can therefore wrongly suppress a real new FAIL whose stamped round
+        happens to equal an older PASS's.
+
+        ``ctx["review_round_seq"]`` avoids this: it increments by exactly 1
+        on every round conclusion (PASS or FAIL) and is never trimmed, so it
+        cannot collide for the life of the task. ``ctx["review_pass_round"]``
+        records the newest round number that PASSED, and
+        ``ctx["review_last_round_sha"]`` the sha that round judged — read by
+        `_record_review_feedback`'s write-side stamp and by
+        `prompt_blocks.current_review_feedback`'s currency predicate.
+
+        Does not itself write to the store — callers invoke this immediately
+        before `_append_review_history` (which does persist) or before
+        `_record_review_feedback` (same), so the mutation rides the same
+        write rather than costing an extra round trip.
+        """
+        ctx = task.context or {}
+        round_no = int(ctx.get("review_round_seq") or 0) + 1
+        ctx["review_round_seq"] = round_no
+        ctx["review_last_round_sha"] = (sha or "").strip()
+        if bool(decision.passed):
+            ctx["review_pass_round"] = round_no
+        task.context = ctx
+        return round_no
+
     # ------------------------ tamper adjudication -------------------------- #
 
     def _tamper_adjudication_enabled(self) -> bool:
@@ -9254,6 +9303,40 @@ class Orchestrator:
         return tamper_adjudication.Adjudication.from_dict(
             (decision.stages or {}).get(tamper_adjudication.STAGE_KEY))
 
+    def _resolve_review_round_and_sha(
+        self, ctx: dict, review_round: int | None,
+    ) -> tuple[int, str]:
+        """The ``(round, sha)`` stamp for a review-feedback write.
+
+        Prefers the sha from the round ``_conclude_review_round`` already
+        concluded THIS call — matched by round number, so a stale leftover
+        from an earlier round is never misapplied. Falls back to the last
+        entry of ``review_history`` (tolerating the string form the store
+        can hand back, mirroring ``_passing_review_shas`` at :8620) for
+        callers that appended history directly without going through the
+        helper — e.g. a unit test exercising `_record_review_feedback` in
+        isolation. When neither is available the round is still self-bumped
+        off ``review_round_seq`` so the stamp is never left unset.
+        """
+        seq = ctx.get("review_round_seq")
+        round_no = review_round if review_round is not None else int(seq or 0) + 1
+        sha = ""
+        if seq is not None and round_no == seq:
+            sha = str(ctx.get("review_last_round_sha") or "").strip()
+        if not sha:
+            history = ctx.get("review_history")
+            if isinstance(history, str):
+                try:
+                    import ast
+                    history = ast.literal_eval(history)
+                except (ValueError, SyntaxError):
+                    history = None
+            if isinstance(history, list) and history:
+                last = history[-1]
+                if isinstance(last, dict):
+                    sha = str(last.get("sha") or "").strip()
+        return round_no, sha
+
     async def _record_review_feedback(
         self, task: Task, failed_items: list,
         suggested_next: str | None = None,
@@ -9271,8 +9354,17 @@ class Orchestrator:
         slice made it vanish between the review and the next attempt's prompt
         with no trace it ever existed. Per-finding *length* is still bounded,
         but visibly, in `prompt_blocks.build_resume_digest` via
-        `fit_finding_text` — never here, and never silently."""
+        `fit_finding_text` — never here, and never silently.
+
+        Each entry is also stamped with the round + sha it was raised on
+        (`_resolve_review_round_and_sha`), and `ctx["review_feedback_round"]`
+        records the same round — this is what lets
+        `prompt_blocks.current_review_feedback` tell a genuinely current FAIL
+        apart from one a later PASS has already superseded, without touching
+        `review_feedback` itself (approach B: stamp + filter at read time,
+        never clear at write time)."""
         ctx = task.context or {}
+        round_no, sha = self._resolve_review_round_and_sha(ctx, review_round)
         ctx["review_feedback"] = [
             {
                 "label": i.label,
@@ -9280,9 +9372,12 @@ class Orchestrator:
                 "comment": i.comment,
                 "file": i.file,
                 "line": i.line,
+                "round": round_no,
+                "sha": sha,
             }
             for i in (failed_items or [])
         ]
+        ctx["review_feedback_round"] = round_no
         if suggested_next:
             ctx["review_suggested_next"] = suggested_next
         task.context = ctx
@@ -9294,7 +9389,7 @@ class Orchestrator:
         # through, so a third route cannot forget to learn.
         await self._propose_review_learning(
             task, ctx["review_feedback"], attempt_n=attempt_n,
-            review_round=review_round)
+            review_round=round_no)
 
     async def _propose_review_learning(
         self, task: Task, findings: list[dict], *, attempt_n: int | None = None,
@@ -10429,6 +10524,7 @@ class Orchestrator:
                 cache_creation_tokens=verifier_tok["cache_creation"],
                 output_tokens=(verifier_tok["output"] if verifier_output_seen else None),
             )
+            await self._conclude_review_round(task, decision, sha=reviewed_sha)
             await self._append_review_history(task, decision, commit_sha=reviewed_sha)
             self._emit_review(
                 "review", verifiers_summary_line(verifier_results),
@@ -10499,6 +10595,7 @@ class Orchestrator:
         verdict = "PASS" if decision.passed else "FAIL"
         # The head the reviewer was told it was reviewing — resolved before the
         # gate ran (above), not re-resolved here where HEAD may have moved on (C4).
+        await self._conclude_review_round(task, decision, sha=reviewed_sha)
         await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         # The citation rule fired: hallucinated locations tried to block the
         # gate and were demoted. Loud on the board — this is the reviewer-FP

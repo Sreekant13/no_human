@@ -26,6 +26,11 @@ Terminology (established from the repo, not invented here):
   next attempt's implement prompt. Its sections are read from
   ``task.context``: ``review_feedback``, ``review_suggested_next``,
   ``attempt_log``, ``send_back_feedback``, ``handoff``, ``ci_failure``.
+  ``review_feedback``/``review_suggested_next`` are round-scoped: both this
+  reader and ``build_distilled_state`` read them through
+  ``current_review_feedback``, which drops a FAIL round's findings once a
+  LATER round has PASSED, so a since-fixed round is never re-injected into a
+  future attempt's prompt as if still outstanding.
 * **Distilled attempt-state doc**: ``build_distilled_state`` (this module) —
   the attempt N>1 replacement for re-accumulated context (repo map + gathered-
   context digest). Produced by ``Orchestrator._distill_attempt_state`` and
@@ -436,6 +441,53 @@ def build_playbook_block(playbook: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def current_review_feedback(task: Task) -> tuple[list[dict], int]:
+    """The reviewer findings that still describe the CURRENT round — the
+    single predicate both readers below (and ``build_distilled_state``)
+    apply, so a stale FAIL round's findings cannot be injected into a
+    prompt after a later round has PASSED.
+
+    ``Orchestrator._record_review_feedback`` overwrites ``review_feedback``
+    wholesale on every FAIL (never appends), stamping the round it was
+    raised on both onto each entry and onto the scalar
+    ``ctx["review_feedback_round"]``. ``Orchestrator._conclude_review_round``
+    stamps ``ctx["review_pass_round"]`` with the newest round that PASSED.
+    Both are set on an independent, never-truncated counter
+    (``review_round_seq``) — never on ``len(review_history)``, which is a
+    BOUNDED, truncated list and collides once trimmed (the mechanism a prior
+    fix attempt missed). A FAIL round's findings are current until a LATER
+    round passes; once ``review_pass_round >= review_feedback_round`` they
+    describe an attempt that has since been fixed and accepted, and
+    presenting them to a future attempt as still outstanding is false
+    provenance that stacks unnecessary corrections (PLAN.md Part 22).
+
+    Neither key is set on legacy/test data that never went through
+    ``_record_review_feedback`` — that degrades to "no round known", and the
+    findings render unchanged (the fast path that keeps every pre-existing
+    caller of ``review_feedback`` byte-identical).
+    """
+    ctx = task.context or {}
+    fb = ctx.get("review_feedback") or []
+    if not isinstance(fb, list):
+        fb = []
+    omitted = ctx.get("review_feedback_omitted") or 0
+    fb_round = ctx.get("review_feedback_round")
+    pass_round = ctx.get("review_pass_round")
+    if fb_round is None or pass_round is None:
+        return fb, omitted
+    try:
+        superseded = int(pass_round) >= int(fb_round)
+    except (TypeError, ValueError):
+        superseded = False
+    if not superseded:
+        return fb, omitted
+    # Fully superseded — the omitted-count sentence is a property of the same
+    # stale round, so it must not survive on its own either (an "… and N more
+    # blocking finding(s)" sentence with zero rendered findings would
+    # reintroduce the same false provenance in miniature).
+    return [], 0
+
+
 def build_resume_digest(task: Task) -> str:
     """Seed a resumed task's fresh session with the prior blocker report and
     any human reply (22.5) — not a stale, bloated context. Pure: reads only
@@ -494,7 +546,10 @@ def build_resume_digest(task: Task) -> str:
             "Reviewer/human send-back feedback to address:\n"
             + "\n".join(f"  - {f.get('message', '')}" for f in feedback[-3:])
         )
-    review_fb = ctx.get("review_feedback") or []
+    # Round-scoped: a FAIL round's findings are only current until a LATER
+    # round PASSES (`current_review_feedback`) — a superseded round must not
+    # be injected into a future attempt's prompt as if still outstanding.
+    review_fb, omitted = current_review_feedback(task)
     if review_fb:
         # Every blocking finding is rendered — no [:6]-style slice here. Only
         # the per-finding comment is bounded, and only visibly (AC 1/2): short
@@ -509,7 +564,6 @@ def build_resume_digest(task: Task) -> str:
             lines.append(f"  - {f.get('label', '')}{f' ({loc})' if loc else ''}: {detail}")
         # AC: a dropped finding must be COUNTED and SHOWN, never silent —
         # mirrors review_verdict_text's "... and N more blocking finding(s)".
-        omitted = ctx.get("review_feedback_omitted") or 0
         if omitted:
             lines.append(
                 f"  - … and {omitted} more blocking finding(s) were recorded "
@@ -521,8 +575,11 @@ def build_resume_digest(task: Task) -> str:
             "skip, or delete any test to satisfy the reviewer:\n"
             + "\n".join(lines)
         )
+    # Gated on `review_fb` (not the raw ctx key): the suggested-next sentence
+    # is written by the same FAIL branch as the findings it accompanies, so a
+    # superseded round's stale sentence must not outlive its findings either.
     suggested_next = ctx.get("review_suggested_next")
-    if suggested_next:
+    if suggested_next and review_fb:
         parts.append(
             f"Reviewer's suggested focus for this retry: {suggested_next}"
         )
@@ -745,8 +802,9 @@ def build_distilled_state(
     section (the last one rendered), never criteria or findings.
     """
     ctx = task.context or {}
-    review_fb = ctx.get("review_feedback") or []
-    omitted = ctx.get("review_feedback_omitted") or 0
+    # Round-scoped, same predicate as `build_resume_digest` (AC3): a FAIL
+    # round's findings must not outlive a later PASS in either reader.
+    review_fb, omitted = current_review_feedback(task)
 
     tried = _distill_tried_section(task)
     failed = _distill_failed_section(task, last_detail)
