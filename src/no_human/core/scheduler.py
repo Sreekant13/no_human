@@ -387,6 +387,48 @@ class SiblingSchedulerRunning(RuntimeError):
             f"first, or wait for its heartbeat to go stale")
 
 
+class PoolLeaseUnreadable(RuntimeError):
+    """Raised by `Scheduler._claim_pool_lease` when the heartbeat row cannot
+    be read after `_LEASE_READ_ATTEMPTS` tries.
+
+    The rule this enforces: an unreadable lease row is a FAILURE, not an
+    empty lease. A read error means UNKNOWN, not "nobody holds it" — treating
+    the two as the same thing is exactly the fail-open bug this exception
+    exists to close (a transient DB blip used to be read as "vacant" and the
+    claim wrote over whatever the true holder's row said). The fallback here
+    is never "assume nobody holds it": on exhaustion this process refuses to
+    claim the pool and does not boot.
+    """
+
+    def __init__(self, *, attempts: int, error: Exception):
+        self.attempts = attempts
+        self.error = error
+        super().__init__(
+            f"pool lease: could not read the heartbeat row after "
+            f"{attempts} attempt(s) ({error!r}) — refusing to claim the "
+            f"pool lease and not booting (scheduler.py: an unreadable row "
+            f"is a failure, not an empty lease)")
+
+
+class PoolLeaseLost(RuntimeError):
+    """Raised by `Scheduler._claim_pool_lease` when the CAS write does not
+    land — the row we read is not the row that is there now.
+
+    Either a sibling won the race between our read and our write (in which
+    case the fresh row names who), or the write itself raised. Either way, a
+    claim we cannot PROVE landed is not a claim: this process does not treat
+    "I tried to write" as "I own the lease" and does not boot.
+    """
+
+    def __init__(self, *, reason: str, error: Exception | None = None):
+        self.reason = reason
+        self.error = error
+        suffix = f" ({error!r})" if error is not None else ""
+        super().__init__(
+            f"pool lease: claim write did not land — {reason}{suffix} — "
+            f"refusing to claim the pool lease and not booting")
+
+
 class Scheduler:
     def __init__(
         self,
@@ -487,6 +529,15 @@ class Scheduler:
         self._last_dispatch_at: float | None = None
         self._last_claimable_count: int | None = None
         self._crash_times: deque = deque(maxlen=500)
+        # Set (to the failure reason) the moment a per-tick lease REFRESH
+        # fails — never by the startup claim, which raises instead of
+        # setting a flag. Once set, `tick()` stops dispatching immediately
+        # (guard at its top) and `run_forever` exits the loop: a scheduler
+        # that cannot prove it still holds the lease has lost the authority
+        # to dispatch, and continuing would be exactly the fail-open bug
+        # this module exists to close, one level up (per-tick instead of
+        # at-boot).
+        self._lease_lost: str | None = None
         self._db_view_stale = False
         self._db_stale_since: float | None = None
         self._status_write_failures = 0
@@ -782,6 +833,23 @@ class Scheduler:
     # genuinely stranded row otherwise waits forever, so fifteen minutes
     # costs little, while a live out-of-process run's longest silent stretch
     # (a full-suite pytest inside review) must fit under it.
+    #
+    # RECONCILIATION with `_HEARTBEAT_STALE_S` below: the two constants
+    # answer different questions about the same table and are DELIBERATELY
+    # different, not an oversight. This one asks "may I requeue this row" —
+    # requeueing a row a live sibling still owns is destructive (incident
+    # 6408aba0), so it is generous: a row younger than this may still be
+    # live, so never touch it. The other asks "may I take over the lease
+    # itself", where a stale value costs only a loud, safe refusal to boot —
+    # so it is short. The DOCUMENTED, DELIBERATE consequence of the gap: a
+    # holder that is alive but quiet (wedged, suspended, or just slow) for
+    # more than `_HEARTBEAT_STALE_S` (300s) can have its LEASE taken over by
+    # a new boot while this sweep would still call its mid-run rows live
+    # (they stay untouched for a further 600s). Closing that gap by
+    # refusing takeover for any same-host pid `pid_alive` reports alive is
+    # NOT done here: it would change the PR #585 takeover behaviour that
+    # `tests/test_status_clobber.py::test_a_stale_sibling_heartbeat_is_taken_over`
+    # pins (a live parent pid at age 600s IS taken over there, on purpose).
     _STRANDED_GRACE_S = 900.0
 
     # `_claim_pool_lease` only: how old a sibling's heartbeat may be before
@@ -793,7 +861,21 @@ class Scheduler:
     # out the whole window before the new one will boot, and that failure
     # mode is loud (an explicit refusal to start) rather than silent, so
     # erring toward a shorter wait costs less.
+    #
+    # See the reconciliation note on `_STRANDED_GRACE_S` above: this value
+    # is a THIRD of that one, on purpose, and the gap it opens (a live-but-
+    # quiet holder can lose the LEASE well before its mid-run rows would be
+    # considered orphaned) is a documented, deliberate deferral — not fixed
+    # here because it would change the PR #585 takeover test this fix must
+    # leave unedited and green.
     _HEARTBEAT_STALE_S = 300.0
+
+    # `_claim_pool_lease`'s read step only: how many times to retry a read
+    # that raised before refusing to claim. Bounded and short — this
+    # accommodates a genuinely transient DB hiccup without turning an
+    # unreadable row into a long stall before the honest refusal.
+    _LEASE_READ_ATTEMPTS = 3
+    _LEASE_READ_BACKOFF_S = 0.05
 
     async def _is_terminal_row(self, task) -> bool:
         """Re-read the live row; terminal = DONE, or FAILED with a cancel
@@ -855,6 +937,31 @@ class Scheduler:
                   "dispatching attempt 1", task.id[:8], ctx.get("base_branch"))
         return True
 
+    async def _read_heartbeat_with_retry(self) -> dict | None:
+        """Read the id=1 heartbeat row, retrying a bounded number of times on
+        exception before giving up. A read failure is UNKNOWN, not "no row"
+        — the caller must never treat the two as the same thing (that is the
+        fail-open bug `PoolLeaseUnreadable` exists to close), so this raises
+        rather than returning `None` on exhaustion."""
+        last_exc: Exception | None = None
+        for attempt in range(1, self._LEASE_READ_ATTEMPTS + 1):
+            try:
+                return await self.store.read_scheduler_heartbeat()
+            except Exception as exc:  # noqa: BLE001 — retried below, then raised
+                last_exc = exc
+                log.warning(
+                    "pool lease: read attempt %d/%d failed: %s",
+                    attempt, self._LEASE_READ_ATTEMPTS, exc)
+                if attempt < self._LEASE_READ_ATTEMPTS:
+                    await asyncio.sleep(
+                        self._LEASE_READ_BACKOFF_S * 2 ** (attempt - 1))
+        log.error(
+            "pool lease: could not read the heartbeat row after %d "
+            "attempt(s) — refusing to claim the pool lease and not booting",
+            self._LEASE_READ_ATTEMPTS)
+        raise PoolLeaseUnreadable(
+            attempts=self._LEASE_READ_ATTEMPTS, error=last_exc)
+
     async def _claim_pool_lease(self) -> None:
         """Refuse to boot this pool while a sibling scheduler's heartbeat on
         this same database is live — the primary defense for incident
@@ -863,7 +970,7 @@ class Scheduler:
         requeue a row a live sibling still owns.
 
         A single-row (`id=1`) heartbeat table is the leader marker. Reading
-        it:
+        it (bounded-retry: `_read_heartbeat_with_retry`):
           - no row, or a row already stamped with OUR (pid, host) — claim/
             refresh it and return; `started_at` is carried forward from the
             existing row on a refresh so it still names when THIS run
@@ -880,18 +987,27 @@ class Scheduler:
         different host means nothing here and is never treated as dead on
         that evidence alone.
 
-        Fails OPEN on a read/write error (logs and continues) rather than
-        blocking boot on a lease table problem — the `_row_is_live` check in
-        `_recover_orphans` is the fallback layer for exactly that case.
+        FAILS CLOSED, on both ends of this call:
+          - a read that never succeeds raises `PoolLeaseUnreadable` — an
+            unreadable row is a failure, never "vacant", so nothing below
+            this point ever writes. `nh serve`/`nh start` catch this
+            alongside `SiblingSchedulerRunning` and print the reason in red,
+            then exit 1 — the operator sees WHY, not a traceback and a
+            silently duplicate-claimed pool.
+          - the write is a CAS (`Store.cas_scheduler_heartbeat`), conditioned
+            on the row still being exactly what was read. If it does not
+            land — the row moved under us — this process does NOT retry the
+            write blindly (the winner may be a live sibling that now
+            legitimately owns the lease): it re-reads once and either raises
+            `SiblingSchedulerRunning` (a live interloper won the race) or
+            `PoolLeaseLost` (anything else changed). A CAS write that raises
+            is likewise `PoolLeaseLost`, not a swallowed warning — a claim
+            this process cannot PROVE landed is not a claim.
         """
         my_pid = os.getpid()
         my_host = platform.node()
         now = time.time()
-        try:
-            row = await self.store.read_scheduler_heartbeat()
-        except Exception:  # noqa: BLE001 — fail open, sweep is the fallback
-            log.exception("pool lease: reading the heartbeat failed — booting anyway")
-            row = None
+        row = await self._read_heartbeat_with_retry()
 
         mine = row is not None and row["pid"] == my_pid and row["host"] == my_host
         if row is not None and not mine:
@@ -904,10 +1020,32 @@ class Scheduler:
         started_at = (row["started_at"] if mine
                       else datetime.now(timezone.utc).isoformat())
         try:
-            await self.store.write_scheduler_heartbeat(
-                pid=my_pid, host=my_host, started_at=started_at, ts=now)
-        except Exception:  # noqa: BLE001 — the lease is advisory once claimed
-            log.exception("pool lease: writing the heartbeat failed")
+            landed = await self.store.cas_scheduler_heartbeat(
+                pid=my_pid, host=my_host, started_at=started_at, ts=now,
+                expect=row)
+        except Exception as exc:  # noqa: BLE001 — cannot prove the claim landed
+            raise PoolLeaseLost(
+                reason="the CAS write raised", error=exc) from exc
+        if landed:
+            return
+
+        # The row was not what we read any more — re-read ONCE (never a
+        # blind retry of the write) to say exactly what happened.
+        current = await self._read_heartbeat_with_retry()
+        if current is not None:
+            current_mine = (current["pid"] == my_pid
+                             and current["host"] == my_host)
+            if not current_mine:
+                age = now - float(current["ts"])
+                sibling_dead = (current["host"] == my_host
+                                 and not pid_alive(int(current["pid"])))
+                if age < self._HEARTBEAT_STALE_S and not sibling_dead:
+                    raise SiblingSchedulerRunning(
+                        pid=int(current["pid"]), host=current["host"],
+                        age_s=age)
+        raise PoolLeaseLost(
+            reason=f"expected row {row!r}, found {current!r} after the CAS "
+                   f"write was rejected")
 
     async def _reconcile_terminal_task_attempts(self) -> None:
         """Startup-only: retire attempt rows left open on tasks that finished.
@@ -1399,6 +1537,13 @@ class Scheduler:
             # at their last values and they all read healthy. Their content is
             # not evidence any more, and saying so first is the honest report.
             idle_reason = "tick_loop_stalled"
+        elif self._lease_lost:
+            # A per-tick refresh failure — this scheduler is UNLEASED and
+            # `tick()` has been returning `[]` ever since. Outranks
+            # `db_view_stale`/`claimable`/every normal-operation state below
+            # for the same reason `tick_loop_stalled` does: once the lease is
+            # lost, nothing downstream of it is evidence of normal idleness.
+            idle_reason = "lease_lost"
         elif self._db_view_stale:
             # A CONFIRMED observation, so it outranks the probe-failure case
             # below (an ABSENCE of information) and every normal state. The
@@ -1447,6 +1592,7 @@ class Scheduler:
             "seconds_since_last_tick": (
                 None if since_tick is None else round(since_tick, 1)),
             "tick_stalled": tick_stalled,
+            "lease_lost": self._lease_lost,
             "never_ticked": never_ticked_too_long,
             "seconds_since_start": round(time.time() - self._created_at, 1),
             "tick_stall_threshold_s": stall_after,
@@ -1511,6 +1657,14 @@ class Scheduler:
     async def tick(self, *, now: datetime | None = None) -> list[str]:
         """One scheduling pass: resume parked tasks, then dispatch up to the free
         slots. Returns the task ids started this tick."""
+        if self._lease_lost:
+            # A prior tick's refresh already lost the lease — no orphan
+            # sweep, no wake tick, no dispatch this tick or ANY later one.
+            # A scheduler that cannot prove it still holds the lease has no
+            # authority to touch the queue at all; `run_forever` is the one
+            # that actually stops the loop, but every tick between "lost"
+            # and "stopped" must be a strict no-op.
+            return []
         now = now or datetime.now(timezone.utc)
         self._last_tick_at = time.time()
         # BEFORE anything reads the queue. Every decision below this line is
@@ -1520,13 +1674,22 @@ class Scheduler:
         # Refresh, not re-claim: a sibling that outlives this loop's poll
         # interval must never see our heartbeat go stale and take the lease
         # while we are still running. `_claim_pool_lease`'s own-(pid,host)
-        # branch is exactly this refresh — best-effort, must never stall a
-        # tick over a lease-table hiccup (the startup call already got the
-        # loud, propagating check; this one is maintenance).
+        # branch is exactly this refresh — the startup call already got the
+        # loud, propagating check; this one, on failure, marks the pool
+        # UNLEASED rather than swallowing a warning and continuing to
+        # dispatch: a holder that cannot refresh its lease has lost it, and
+        # silently soldiering on is exactly the fail-open bug this fix
+        # exists to close, one level up (per-tick instead of at-boot).
         try:
             await self._claim_pool_lease()
-        except Exception as exc:  # noqa: BLE001 — refresh must not kill the pool
-            log.warning("pool lease refresh failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — reported below, not swallowed
+            self._lease_lost = str(exc)
+            log.error(
+                "pool lease LOST (%s) — this scheduler is UNLEASED and "
+                "will stop dispatching; a sibling may now claim the pool",
+                exc)
+            self._on_event("pool_lease_lost", str(exc))
+            return []
         if self.wake is not None:
             try:
                 # Pass the claimed set so the stuck-active sweep judges only
@@ -1848,6 +2011,13 @@ class Scheduler:
             log.warning("quota cooldown recovery failed: %s", exc)
         while not stop.is_set():
             await self.tick()
+            if self._lease_lost:
+                # `tick()` already logged/emitted the loss and has been
+                # returning `[]` since — stop the loop rather than spin
+                # unleased forever. `drain()` below still requeues whatever
+                # was in-flight before the lease was lost.
+                stop.set()
+                break
             # After the tick, so a task dispatched this pass is already in
             # `_inflight` and an empty queue can never be read mid-dispatch.
             if until_empty and not self._inflight and not await self._claimable():

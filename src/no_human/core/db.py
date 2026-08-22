@@ -3763,6 +3763,49 @@ class Store:
         await self.db.commit()
 
     @serialized_write
+    async def cas_scheduler_heartbeat(
+        self, *, pid: int, host: str, started_at: str, ts: float,
+        expect: dict | None,
+    ) -> bool:
+        """Conditional claim/refresh: write the id=1 row ONLY if it is still
+        exactly what the caller read (`expect`), or still absent
+        (`expect=None`) — the CAS half of `Scheduler._claim_pool_lease`'s
+        fail-closed rewrite (see that docstring). Unlike
+        `write_scheduler_heartbeat`'s unconditional upsert, a caller here has
+        already read a row (or its absence) and must not blindly overwrite
+        whatever is there NOW if it moved since that read.
+
+        Returns whether the write landed. `False` means the row changed
+        between the caller's read and this call — the caller has LOST the
+        race and must not retry blindly (re-reading and re-deciding is the
+        only correct response, since the winner may now be a live sibling
+        that owns the lease legitimately).
+        """
+        if expect is None:
+            cur = await self.db.execute(
+                """INSERT INTO scheduler_heartbeat (id, pid, host, started_at, ts)
+                     SELECT 1, :pid, :host, :started_at, :ts
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM scheduler_heartbeat WHERE id = 1)""",
+                {"pid": pid, "host": host, "started_at": started_at, "ts": ts},
+            )
+        else:
+            cur = await self.db.execute(
+                """UPDATE scheduler_heartbeat
+                     SET pid = :pid, host = :host,
+                         started_at = :started_at, ts = :ts
+                   WHERE id = 1 AND pid = :e_pid AND host = :e_host
+                     AND ts = :e_ts""",
+                {
+                    "pid": pid, "host": host, "started_at": started_at, "ts": ts,
+                    "e_pid": expect["pid"], "e_host": expect["host"],
+                    "e_ts": expect["ts"],
+                },
+            )
+        await self.db.commit()
+        return cur.rowcount == 1
+
+    @serialized_write
     async def clear_scheduler_heartbeat(self, pid: int) -> None:
         """Release the lease on a clean shutdown — ownership-guarded (mirrors
         `cli/commands.py`'s `_release_pid_lock`): only deletes the row if
