@@ -5,8 +5,9 @@ until 2026-08-01; nothing here was deleted, only moved off a page whose job is
 to get you to a first task.
 
 Three gates, and one input they run on. All of it is code, not prompt
-instructions, and the two deterministic gates run before a reviewer token is
-spent.
+instructions, and the two deterministic gates run before the review gate does.
+(The tamper guard's adjudicator runs on the reviewer tier, so a flagged attempt
+does spend reviewer-tier tokens — just not on the gate review.)
 
 ## The pipeline
 
@@ -14,7 +15,7 @@ spent.
 ticket ──► context ──► plan ──► implement ──► review ──► test ──► PR ──► you merge
               │                      │           │         │
               │                      │           │         └── local runner + optional CI
-              │                      │           └── fresh-context reviewer, edits refused
+              │                      │           └── fresh-context reviewer, edit tools refused
               │                      └── Claude Agent SDK, your credential, your checkout
               └── grep, git log, past sessions
 ```
@@ -33,11 +34,25 @@ the model. The PR lands in `awaiting_approval` and waits.
 ## An adversarial reviewer that is not the author
 
 [`src/no_human/review/reviewer.py`](../src/no_human/review/reviewer.py) opens a
-fresh Agent SDK session whose guard refuses the file-edit tools (Write, Edit,
-NotebookEdit, MultiEdit), every git or forge mutation, and subagents — Bash itself
-stays, so a shell redirection is not prevented, only reviewed after the fact —
-on a different model from the
-implementer by default (an Opus-tier reviewer over the Sonnet-tier coder —
+fresh Agent SDK session whose `Write`, `Edit`, `NotebookEdit` and `MultiEdit`
+tools are refused, along with the direct git and forge write commands.
+
+Three things that refusal is NOT, because this page is where someone decides
+whether to rely on it. Bash is not refused, so a shell redirection can still
+write a file, and [`review/reviewer.py`](../src/no_human/review/reviewer.py)'s
+own module docstring says so rather than implying otherwise. The refusal happens **at the tool call**, in a PreToolUse
+guard that reads a command line — so it is a cost, not a proof, and a spelling
+it does not model gets through. A global option before the subcommand is one
+such spelling and, measured on 2026-08-22, `git -C . commit` and
+`git -C . push origin <branch>` are both still allowed in a review session.
+Staging is not a global-option case at all: `git add` is absent from the
+write-verb list, so plain `git add -A` is allowed too. And nothing re-reads the tree after the reviewer runs, so a write
+that did get through would be what the test gate then scores.
+
+Treat this as the layer it is. The control that would make the property
+structural belongs at the act, and is tracked separately.
+
+It runs on a different model from the implementer by default (an Opus-tier reviewer over the Sonnet-tier coder —
 the current IDs are `llm.review_model` and `llm.primary_model` in
 [`DEFAULT_CONFIG`](../src/no_human/config.py)), and tells it to refute
 "done". It returns a checklist of findings with `file`, `line` and severity — a
@@ -107,8 +122,13 @@ the `e2e/` tree.
 takes the tests the coder says demonstrate its change, copies them into a
 worktree at the merge base, and requires them to **fail there** and **pass on
 the new tree**. A bugfix whose test also passes on the unfixed code has proved
-nothing. Default mode is `advisory`, which still enforces for a Python bugfix
-(`repro_gate.mode` in [`DEFAULT_CONFIG`](../src/no_human/config.py)).
+nothing. Default mode is `advisory`, which still enforces for a Python bugfix — where
+"Python" means the coder's edits reached `.py` files **through the edit tools**,
+since that is the hook the check reads, so a `.py` file written by `sed` or a
+heredoc is not bound. `repro_gate.mode: required` drops both conditions and
+enforces for every kind and every change (`repro_gate.mode` in
+[`DEFAULT_CONFIG`](../src/no_human/config.py), which says the same in its own
+words).
 
 ## Merge-ready policy
 
@@ -166,8 +186,24 @@ into one of eleven categories — `MISSING_ACCESS`, `AMBIGUITY`, `SCOPE_EXPLOSIO
 `IMPOSSIBLE`, `QUOTA`, `BUDGET_EXHAUSTED` and five more
 ([`src/no_human/blockers/taxonomy.py`](../src/no_human/blockers/taxonomy.py)) —
 and either parks with a wake condition or escalates with a structured report and
-one specific question. `nh blocked` lists what is parked; `nh reply <id>
-"answer"` resumes it. Routing per category: [blockers.md](blockers.md).
+one specific question.
+
+With one exception, and it is not a rare one: an exhausted budget. Under
+`budget.exhaustion_terminal` — the default — `BUDGET_EXHAUSTED` takes a route of
+its own, ahead of every other, that ends the task `failed` and asks nothing. The
+structured record is still written, with a root-cause hypothesis, evidence and a
+wake condition; what it does not carry is a question, because there is no answer
+you could give that would buy more budget. So it does not park, it does not
+notify, and `nh blocked` does not list it — `nh status` shows it failed, and the
+record is on the task. Set `budget.exhaustion_terminal: false` and it escalates
+instead: the route becomes `ESCALATED` with a notification
+(`blockers/taxonomy.py`) and the blocker is written with a question and its
+raise/stop options (`core/orchestrator.py`, `config.py`'s `budget` section).
+`Route.parked` is still false — but `ESCALATED` IS one of the CLI's parked
+states, so unlike the terminal route this one does show up in `nh blocked`
+and `nh reply <id>` resumes it.
+
+`nh blocked` lists what is parked; `nh reply <id> "answer"` resumes it. Routing per category: [blockers.md](blockers.md).
 
 An honest escalation costs a minute to triage. A confident wrong diff costs an
 hour to review.
@@ -251,8 +287,31 @@ hour to review.
 
 `gh pr merge`, `glab mr merge` and the equivalent REST calls are denied before
 they execute (`_FORGE_MERGE` in
-[`agent/guard.py`](../src/no_human/agent/guard.py)), and pushes to `main`,
-`master` and `release/*` are denied too, by `_push_targets_protected` and
-`evaluate` in `agent/guard.py`; the default patterns are `git.never_push_to` in
-[`DEFAULT_CONFIG`](../src/no_human/config.py). The full safety model, including
-the one-billing-path-per-run rule, is in [security.md](security.md).
+[`agent/guard.py`](../src/no_human/agent/guard.py)) — for the spellings the
+matcher models, with the caveat from the reviewer section above, which applies
+here in the same words: the modelled set is not closed. `_FORGE_MERGE` anchors
+on `gh pr merge` / `glab mr merge`, so a global option between the binary and
+the subcommand walks past it — measured on 2026-08-22 in both session modes,
+`gh --repo <o/r> pr merge <n>`, `gh -R <o/r> pr merge <n>` and
+`glab -R <o/r> mr merge <n>` are all allowed. Treat the matcher as a cost on
+the obvious spellings, not as the door: the control that closes it is a check
+at the act, not a longer pattern.
+
+Pushes to `main`, `master` and `release/*` are refused too, and that rule has
+a second enforcement point, which is the part worth knowing. The first is
+`_push_targets_protected` in `agent/guard.py`: it looks for a protected branch
+name **anywhere** in the argv of a push, so an option before the subcommand does
+not hide it — `git -C . push origin main` is refused by the same rule as
+`git push origin main`. But it is still lexical, and lexical analysis cannot
+resolve shell expansion: `git push origin $(echo main)` reaches `main` carrying
+no token that reads as `main`. A push whose branch comes out of an expansion is
+therefore refused outright rather than parsed — measurably so, along with
+`B=main; git push origin $B` — and below even that there is a `pre-push` hook
+installed into every agent worktree ([`vcs/push_hook.py`](../src/no_human/vcs/push_hook.py)),
+which git runs *below* the expansion — it is handed the refspec git has already
+resolved, and sees `refs/heads/main` however the command was spelled. That is
+what a control at the act looks like, and it is why the protected-branch rule is
+on firmer ground than the merge ban above. The default patterns are
+`git.never_push_to` in [`DEFAULT_CONFIG`](../src/no_human/config.py). The full
+safety model, including the one-billing-path-per-run rule, is in
+[security.md](security.md).

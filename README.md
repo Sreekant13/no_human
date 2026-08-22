@@ -23,17 +23,24 @@
 The AI coding factory you <ins>**can trust**</ins>:
 
 - **A plan before any code**, from the ticket plus what it finds in your repo.
-- **An adversarial review.** A different model, fresh context, read-only tools,
-  told to refute "done". You get a pass/fail checklist citing file and line —
-  never a numeric self-score.
+  When planning fails, the coder is told it is working without one; when the
+  change is judged trivial the plan is skipped without telling the coder, by
+  design — the skip is still stated in the run's event stream.
+- **An adversarial review.** A different model, in a session that never saw the
+  coder's transcript, told to refute "done". You get a pass/fail checklist
+  citing file and line — never a numeric self-score.
 - **A tamper guard.** Deleted tests, new skips, an assertion turned into a
-  tautology — blocked before a reviewer token is spent.
-- **Proof the fix fixed the bug.** For a bug fix, the tests offered as evidence
-  must fail at the merge base and pass on the new tree — the reproduction gate
-  enforces that, and you can require it for every change.
-- **Your tests run**, locally and optionally through your CI.
-- **An honest stop.** When it cannot finish, it parks with one specific question
-  instead of inventing a plausible diff.
+  tautology — counted mechanically before the review gate runs, then justified
+  against your acceptance criteria or the attempt stops.
+- **Proof the fix fixed the bug.** The tests offered as evidence must fail at
+  the merge base and pass on the new tree — the reproduction gate runs both.
+  Out of the box that binds a Python bug fix; `repro_gate.mode: required` binds
+  every kind and every change.
+- **Your tests run**, locally and optionally through your CI — and a PR that
+  found no test command says **NOT RUN** on its face.
+- **An honest stop.** When it cannot finish it stops and says why — a specific
+  question when your answer would unblock it, a structured record when it has
+  simply run out of budget — never an invented plausible diff.
 
 ## Install
 
