@@ -15,6 +15,17 @@ is deliberately narrow: one judgment, no tools, no stages, and it fails
 closed on any ambiguous input (a user-authored YAML file, an arbitrary
 diff, or a model's free text). It is not yet wired into the review gate —
 that is a follow-up ticket.
+
+A ``no_verdict`` result gets exactly ONE bounded retry (mirroring
+``reviewer.py``'s own retry-then-``ReviewerUnavailable`` pattern rather than
+inventing a second policy). If the retry also reaches no verdict, the
+result is additionally marked ``unavailable=True``: the caller
+(``orchestrator.py``'s ``_run_review``) must treat that as an infra/config
+signal to escalate, NEVER as a coder-facing high-severity finding — the
+verdict still renders as "not satisfied" (fail-closed is unchanged), but it
+must not be billed to the coder as a defect nobody found. See
+``_classify_unavailable`` for the transport-failure vs. malformed-response
+distinction used to word the escalation message.
 """
 
 from __future__ import annotations
@@ -60,6 +71,11 @@ class Verifier:
     paths: tuple[str, ...]
     severity: str = "high"
     source: str = "repo"
+    # Where this rule was authored (the file `load_verifiers` read it from).
+    # Populated at load time so a "no verdict" message can name it — a rule
+    # that never parses is a config problem, and the operator fixing it needs
+    # to know WHICH file to edit, not just which id.
+    source_file: str = ""
 
 
 @dataclass
@@ -81,12 +97,21 @@ class VerifierResult:
     tokens_used: int = 0
     raw_output: str = ""
     no_verdict: bool = False
+    # True only when a `no_verdict` result survived the one bounded retry
+    # `run_verifiers` gives it. This is the infra/config signal: the round
+    # must escalate (`ReviewerUnavailable`), never fail closed as a coder
+    # finding — the exact anti-pattern `reviewer.py`'s docstring names. The
+    # pre-existing "no matching hunks in the diff" no_verdict case never
+    # calls the judge at all, so it can never become `unavailable`: retrying
+    # a deterministic diff-filter result would not change the outcome.
+    unavailable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "verifier_id": self.verifier_id,
             "passed": self.passed,
             "no_verdict": self.no_verdict,
+            "unavailable": self.unavailable,
             "evidence": self.evidence,
             "file": self.file,
             "line": self.line,
@@ -174,6 +199,7 @@ def _build_verifier(
         paths=tuple(paths),
         severity=severity,
         source=source,
+        source_file=origin,
     )
     return verifier, None
 
@@ -481,6 +507,17 @@ def parse_result(
 
 
 def to_checklist_item(result: VerifierResult) -> ChecklistItem:
+    if result.unavailable:
+        # Never charge the coder for a defect nobody found: an unavailable
+        # judge is an infra/config signal, not a review finding, so it is
+        # advisory severity — it still renders as not-passed (never "OK"),
+        # it just does not block on its own. The caller (orchestrator) is
+        # what actually escalates this round instead of failing it.
+        severity = "low"
+    elif result.no_verdict:
+        severity = "high"
+    else:
+        severity = result.severity
     return ChecklistItem(
         label=f"rule:{result.verifier_id}",
         passed=result.passed,
@@ -488,7 +525,7 @@ def to_checklist_item(result: VerifierResult) -> ChecklistItem:
         file=result.file,
         line=result.line,
         comment=result.comment,
-        severity="high" if result.no_verdict else result.severity,
+        severity=severity,
     )
 
 
@@ -509,6 +546,73 @@ def _coerce_judge_outcome(outcome: Any) -> tuple[str, int]:
     return raw_output, tokens_used
 
 
+async def _judge_once(
+    judge: Callable[[str], Awaitable[Any]],
+    prompt: str,
+    verifier: Verifier,
+    files_checked: list[str],
+) -> VerifierResult:
+    try:
+        outcome = await judge(prompt)
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)) or not isinstance(
+            exc, Exception
+        ):
+            raise
+        return VerifierResult(
+            verifier_id=verifier.id,
+            passed=False,
+            evidence=f"no verdict: judge raised {type(exc).__name__}",
+            file="",
+            line=0,
+            comment="",
+            severity=verifier.severity,
+            files_checked=files_checked,
+            raw_output="",
+            no_verdict=True,
+        )
+    raw_output, tokens_used = _coerce_judge_outcome(outcome)
+    result = parse_result(raw_output, verifier, files_checked)
+    result.tokens_used = tokens_used
+    return result
+
+
+def _classify_unavailable(
+    retry_result: VerifierResult, first_result: VerifierResult, verifier: Verifier
+) -> VerifierResult:
+    """Builds the final result once BOTH the first call and the one bounded
+    retry reached no verdict. Distinguishes two causes, per the task spec:
+    a transport failure (judge raised, or produced no text at all — nothing
+    to fix in the rule itself) from a malformed rule/confused judge (the
+    judge answered but never emitted a parseable verdict — a config problem
+    the operator can fix, so name the verifier id and the file it lives in).
+    """
+    detail = retry_result.evidence or first_result.evidence
+    responded = bool(retry_result.raw_output.strip() or first_result.raw_output.strip())
+    if responded:
+        message = (
+            f"no verdict after retry: verifier {verifier.id!r} "
+            f"(defined in {verifier.source_file or 'unknown source'}) never "
+            f"produced a parseable verdict — {detail}"
+        )
+    else:
+        message = f"no verdict after retry: judge unavailable — {detail}"
+    return VerifierResult(
+        verifier_id=retry_result.verifier_id,
+        passed=False,
+        evidence=message,
+        file=retry_result.file,
+        line=retry_result.line,
+        comment=retry_result.comment,
+        severity=retry_result.severity,
+        files_checked=retry_result.files_checked,
+        tokens_used=retry_result.tokens_used,
+        raw_output=retry_result.raw_output,
+        no_verdict=True,
+        unavailable=True,
+    )
+
+
 async def run_verifiers(
     judge: Callable[[str], Awaitable[Any]],
     *,
@@ -516,11 +620,15 @@ async def run_verifiers(
     diff_text: str,
     read_file: Callable[[str], str | None],
     changed_paths: list[str],
+    retry_judge: Callable[[str], Awaitable[Any]] | None = None,
 ) -> list[VerifierResult]:
+    retry = retry_judge if retry_judge is not None else judge
     results: list[VerifierResult] = []
     for verifier in select(verifiers, changed_paths):
         hunks, files = filter_diff(diff_text, verifier.paths)
         if not hunks:
+            # Deterministic diff-filter outcome — no judge call is ever made,
+            # so a retry cannot change it. Stays no_verdict, never unavailable.
             results.append(
                 VerifierResult(
                     verifier_id=verifier.id,
@@ -545,31 +653,18 @@ async def run_verifiers(
                 file_texts[path] = text
         files_checked = list(file_texts)
         prompt = build_prompt(verifier, hunks, file_texts)
-        try:
-            outcome = await judge(prompt)
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)) or not isinstance(
-                exc, Exception
-            ):
-                raise
-            results.append(
-                VerifierResult(
-                    verifier_id=verifier.id,
-                    passed=False,
-                    evidence=f"no verdict: judge raised {type(exc).__name__}",
-                    file="",
-                    line=0,
-                    comment="",
-                    severity=verifier.severity,
-                    files_checked=files_checked,
-                    raw_output="",
-                    no_verdict=True,
-                )
-            )
-            continue
-        raw_output, tokens_used = _coerce_judge_outcome(outcome)
-        result = parse_result(raw_output, verifier, files_checked)
-        result.tokens_used = tokens_used
+
+        result = await _judge_once(judge, prompt, verifier, files_checked)
+        if result.no_verdict:
+            # One bounded retry, mirroring reviewer.py's ReviewerUnavailable
+            # shape: a single no-verdict judge call is not yet a finding, it
+            # might just be a hiccup. Only a SECOND no-verdict escalates.
+            retry_result = await _judge_once(retry, prompt, verifier, files_checked)
+            retry_result.tokens_used += result.tokens_used
+            if retry_result.no_verdict:
+                result = _classify_unavailable(retry_result, result, verifier)
+            else:
+                result = retry_result
         results.append(result)
     return results
 

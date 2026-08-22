@@ -25,6 +25,7 @@ from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task
 from no_human.notify.slack import SlackNotifier
 from no_human.review.reviewer import ReviewDecision as RD
+from no_human.review.reviewer import ReviewerUnavailable
 from no_human.review.selfcheck import ChecklistItem as CI
 from no_human.vcs.git import GitRepo
 
@@ -67,9 +68,15 @@ VERIFIER_YAML = (
 
 
 def _ok_json(*, passed: bool, evidence: str = "e", file: str = "", line: int = 0) -> str:
+    return _ok_json_for("no-todo", passed=passed, evidence=evidence, file=file, line=line)
+
+
+def _ok_json_for(
+    verifier_id: str, *, passed: bool, evidence: str = "e", file: str = "", line: int = 0,
+) -> str:
     return (
         "VERIFIER_JSON_START\n"
-        f'{{"verifier_id": "no-todo", "passed": {"true" if passed else "false"}, '
+        f'{{"verifier_id": {json.dumps(verifier_id)}, "passed": {"true" if passed else "false"}, '
         f'"evidence": {json.dumps(evidence)}, "file": {json.dumps(file)}, '
         f'"line": {line}, "comment": "c"}}\n'
         "VERIFIER_JSON_END"
@@ -77,10 +84,14 @@ def _ok_json(*, passed: bool, evidence: str = "e", file: str = "", line: int = 0
 
 
 class FakeReviewer:
-    """Both chokepoints, independently counted. `bounded_outcome` is either
-    a plain string (final_text, wrapped into an `AgentResult`) or a 2-tuple
-    ``(AgentResult | None, reason)`` returned verbatim — the latter is how a
-    test simulates the backend timing out (`(None, "timed out")`)."""
+    """Both chokepoints, independently counted. `bounded_outcome` is either:
+      - a plain string (final_text, wrapped into an `AgentResult`),
+      - a 2-tuple ``(AgentResult | None, reason)`` returned verbatim — how a
+        test simulates the backend timing out (`(None, "timed out")`), or
+      - a LIST of either of the above, consumed one entry per `_run_bounded`
+        call (the last entry repeats once the list is exhausted) — how a
+        test sequences "no verdict, then a real verdict" across the judge's
+        one bounded retry."""
 
     _on_event = None
 
@@ -93,10 +104,14 @@ class FakeReviewer:
 
     async def _run_bounded(self, prompt, repo_path, *, max_turns, timeout, on_event):
         self.bounded_calls += 1
-        if isinstance(self.bounded_outcome, tuple):
-            return self.bounded_outcome
+        outcome = self.bounded_outcome
+        if isinstance(outcome, list):
+            idx = min(self.bounded_calls - 1, len(outcome) - 1)
+            outcome = outcome[idx]
+        if isinstance(outcome, tuple):
+            return outcome
         result = AgentResult(
-            final_text=self.bounded_outcome, num_turns=1, is_error=False,
+            final_text=outcome, num_turns=1, is_error=False,
             tokens_used=500, session_id="s", stop_reason="end_turn",
             cache_read_tokens=10, cache_creation_tokens=5, output_tokens=100,
         )
@@ -172,7 +187,15 @@ async def test_a_failing_verifier_ends_the_round_before_the_reviewer(store, tmp_
     assert round_1["sha"] == repo.head_sha()
 
 
-async def test_no_verdict_fails_closed(store, tmp_path):
+async def test_no_verdict_escalates_instead_of_failing_the_round(store, tmp_path):
+    """This used to be `test_no_verdict_fails_closed`, and its old name told
+    the whole bug: a judge that never reaches a verdict was rendered as a
+    FAILING checklist item — a defect nobody found, billed to the coder as
+    one to fix. That is the exact anti-pattern `reviewer.py`'s
+    `ReviewerUnavailable` exists to stop for the agentic reviewer; this test
+    now asserts the verifier gate mirrors it: one bounded retry, and if the
+    retry ALSO reaches no verdict, the round escalates (raises) instead of
+    returning a failing `ReviewDecision`."""
     work = _repo_with_a_verifier(tmp_path, VERIFIER_YAML)
     repo = GitRepo(work)
     reviewer = FakeReviewer((None, "timed out"))
@@ -182,13 +205,100 @@ async def test_no_verdict_fails_closed(store, tmp_path):
     await store.create_task(task)
     attempt_id = await store.create_attempt(task.id, 1)
 
+    with pytest.raises(ReviewerUnavailable):
+        await orch._run_review(task, repo, attempt_id, base="main")
+
+    assert reviewer.bounded_calls == 2, (
+        "one bounded retry — not zero (would skip the retry) and not more "
+        "(would keep retrying an unavailable judge forever)")
+    assert reviewer.review_calls == 0, (
+        "an unavailable verifier must never reach the agentic reviewer")
+
+
+async def test_no_verdict_then_a_real_verdict_uses_the_retry_result(store, tmp_path):
+    """The retry is not decorative: if it comes back with an actual verdict,
+    that verdict is what governs the round — the round must NOT escalate,
+    and (since the verifier is satisfied) must proceed to the agentic
+    reviewer exactly as if the first call had succeeded."""
+    work = _repo_with_a_verifier(tmp_path, VERIFIER_YAML)
+    repo = GitRepo(work)
+    reviewer = FakeReviewer([(None, "timed out"), _ok_json(passed=True)])
+    orch = _orch(store, tmp_path, reviewer)
+
+    task = Task.new("t", repo_path=str(work))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
     decision = await orch._run_review(task, repo, attempt_id, base="main")
 
-    assert decision.passed is False
-    assert reviewer.review_calls == 0
-    (item,) = decision.checklist
-    assert item.label == "rule:no-todo"
-    assert item.severity == "high"
+    assert reviewer.bounded_calls == 2, "the retry is the second bounded call"
+    assert reviewer.review_calls == 1, (
+        "a verdict recovered on retry is a satisfied verifier — the round "
+        "must proceed to the agentic reviewer, not escalate")
+    assert decision.passed is True
+    assert decision.verifiers[0]["passed"] is True
+    assert decision.verifiers[0]["unavailable"] is False
+    assert decision.verifiers[0]["no_verdict"] is False
+
+
+MIXED_VERIFIER_YAML = (
+    "verifiers:\n"
+    "  - id: no-todo\n"
+    "    statement: The diff introduces no TODO comments.\n"
+    "    paths: ['**/*.py']\n"
+    "    severity: high\n"
+    "  - id: other-rule\n"
+    "    statement: Some other rule entirely.\n"
+    "    paths: ['**/*.py']\n"
+    "    severity: medium\n"
+)
+
+
+async def test_a_genuine_failure_is_never_swallowed_by_an_unavailable_sibling(
+    store, tmp_path,
+):
+    """A round can have BOTH a genuinely failing verifier and one that never
+    reaches a verdict (even after retry). The genuine failure must still
+    fail the round — an early/naive "any unavailable verifier escalates"
+    check would silently drop it on the floor just because another rule in
+    the same round happened to be unavailable. The unavailable rule must
+    stay visible (advisory), never rendered as passing, and the round must
+    NOT raise `ReviewerUnavailable` — a real finding exists, so this is a
+    genuine review FAIL, not an infra escalation."""
+    work = _repo_with_a_verifier(tmp_path, MIXED_VERIFIER_YAML)
+    repo = GitRepo(work)
+    # Verifiers run in YAML order: "no-todo" gets one call (genuine failure,
+    # parseable JSON, no retry needed); "other-rule" then gets two calls
+    # (first + retry), both with no parseable marker — unavailable.
+    reviewer = FakeReviewer([
+        _ok_json_for("no-todo", passed=False, evidence="found a TODO", file="src.py", line=1),
+        "no marker in this response at all",
+        "still no marker on the retry",
+    ])
+    orch = _orch(store, tmp_path, reviewer)
+
+    task = Task.new("t", repo_path=str(work))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    decision = await orch._run_review(task, repo, attempt_id, base="main")
+
+    assert decision.passed is False, "a genuine failure must still fail the round"
+    assert reviewer.review_calls == 0, (
+        "a failing round (genuine or not) never reaches the agentic reviewer")
+    assert reviewer.bounded_calls == 3
+
+    by_label = {item.label: item for item in decision.checklist}
+    assert by_label["rule:no-todo"].passed is False
+    assert by_label["rule:no-todo"].severity == "high", (
+        "the genuine failure keeps its authored severity, unaffected by the "
+        "unavailable sibling")
+    assert by_label["rule:other-rule"].passed is False, (
+        "an unavailable rule must never render as satisfied, even when "
+        "folded into a failing round")
+    assert by_label["rule:other-rule"].severity == "low", (
+        "an unavailable rule is advisory — it must not itself have failed "
+        "the round (the no-todo rule did)")
 
 
 async def test_no_yaml_skips_and_runs_the_reviewer(store, tmp_path):

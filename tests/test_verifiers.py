@@ -126,10 +126,16 @@ def test_public_surface_is_exactly_the_documented_names():
 
     sig = inspect.signature(mod.run_verifiers)
     params = sig.parameters
-    assert list(params) == ["judge", "verifiers", "diff_text", "read_file", "changed_paths"]
+    # `retry_judge` is new (the bounded-retry fix): additive and optional,
+    # defaulting to None (meaning "reuse `judge` itself"), so every existing
+    # single-arg call site is untouched.
+    assert list(params) == [
+        "judge", "verifiers", "diff_text", "read_file", "changed_paths", "retry_judge",
+    ]
     assert params["judge"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
-    for kw in ("verifiers", "diff_text", "read_file", "changed_paths"):
+    for kw in ("verifiers", "diff_text", "read_file", "changed_paths", "retry_judge"):
         assert params[kw].kind == inspect.Parameter.KEYWORD_ONLY
+    assert params["retry_judge"].default is None
 
     sig = inspect.signature(mod.summary_line)
     assert list(sig.parameters) == ["results"]
@@ -684,6 +690,11 @@ async def test_run_verifiers_one_judge_raises_others_unaffected():
     assert by_id["c"].passed is True and by_id["c"].no_verdict is False
     assert by_id["b"].no_verdict is True
     assert "RuntimeError" in by_id["b"].evidence
+    # A raise on the first call gets one bounded retry (no `retry_judge` was
+    # given, so it reuses `judge` itself); raising again on retry means the
+    # judge is unavailable, not that a genuine finding exists — this must
+    # never be billed to the coder as a defect (see run_verifiers's retry).
+    assert by_id["b"].unavailable is True
 
 
 async def test_run_verifiers_skips_unreadable_files_and_read_file_exceptions():
@@ -729,6 +740,10 @@ async def test_run_verifiers_no_matching_hunks_yields_no_verdict_without_calling
     assert len(results) == 1
     assert results[0].no_verdict is True
     assert called is False
+    # No judge call was ever made, so a retry could not change anything —
+    # this deterministic diff-filter outcome must stay `unavailable=False`
+    # (never escalate; it is not an infra/config signal at all).
+    assert results[0].unavailable is False
 
 
 async def test_run_verifiers_only_runs_selected_verifiers():
@@ -768,6 +783,178 @@ async def test_run_verifiers_tolerates_a_malformed_judge_return():
     assert len(results) == 1
     assert results[0].tokens_used == 0
     assert results[0].no_verdict is True
+    # Same malformed return on the retry (this test gives no `retry_judge`,
+    # so the retry reuses the same always-malformed `judge`) — still no
+    # verdict after the bounded retry, so this must be flagged `unavailable`.
+    assert results[0].unavailable is True
+
+
+# --------------------------------------------------------------------------
+# 50-55. run_verifiers — bounded retry on no_verdict (escalation semantics)
+# --------------------------------------------------------------------------
+#
+# Precedent: `reviewer.py` never lets a review round that reached no verdict
+# render as a failing, coder-facing finding — it raises `ReviewerUnavailable`
+# after one bounded retry so the task escalates honestly instead of billing
+# an attempt for a defect nobody found. These tests pin the equivalent
+# contract at the `run_verifiers` layer: `result.unavailable` is the signal
+# the orchestrator uses to escalate instead of failing the round (exercised
+# at the orchestrator level in test_verifiers_gate.py); here we pin exactly
+# when it gets set, and that it never gets set for a genuine, first-call
+# verdict.
+
+
+async def test_run_verifiers_no_verdict_twice_is_unavailable_not_a_high_severity_fail():
+    """TEST (a): a transport-style no-verdict (judge produced no text at all,
+    on both the first call and the retry) must come back `unavailable=True`
+    — and render (via `to_checklist_item`) as advisory, NOT as a blocking
+    high-severity finding. That rendering is exactly what used to bill the
+    coder for a defect nobody found."""
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    calls = 0
+
+    async def judge(prompt):
+        nonlocal calls
+        calls += 1
+        return "", 0  # no text at all — the orchestrator's judge() shape for "unavailable"
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert calls == 2, "one bounded retry, not more"
+    (result,) = results
+    assert result.no_verdict is True
+    assert result.unavailable is True
+    assert result.passed is False, "an unavailable rule must never read as satisfied"
+
+    item = to_checklist_item(result)
+    assert item.passed is False, "the RENDERED row must never show as passing"
+    assert item.severity == "low", (
+        "unavailable is advisory, not a blocking high-severity finding — "
+        "the exact anti-pattern this fix exists to stop")
+
+
+async def test_run_verifiers_no_verdict_once_then_a_verdict_uses_the_retry():
+    """TEST (b): the retry is not decorative — a verdict recovered on the
+    second call is what governs the result, and exactly one extra judge
+    call is made (not more)."""
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    calls = 0
+
+    async def judge(prompt):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "", 0
+        return _ok_json("a", passed=True), 7
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert calls == 2
+    (result,) = results
+    assert result.no_verdict is False
+    assert result.unavailable is False
+    assert result.passed is True
+
+
+async def test_run_verifiers_no_marker_twice_names_the_verifier_id_and_source_file():
+    """TEST (c): when the judge DOES respond (non-empty text) but never emits
+    a parseable marker, on both the first call and the retry, that is a
+    malformed-rule/confused-judge signal — a config problem the operator can
+    fix, so the message must name which rule and which file to look at."""
+    v = Verifier(
+        id="weird-rule", statement="s", paths=("src/**/*.py",),
+        source_file=".no_human/verifiers.yaml",
+    )
+
+    async def judge(prompt):
+        return "I have thoughts, but no marker here.", 3
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    (result,) = results
+    assert result.unavailable is True
+    assert result.passed is False, "an unavailable rule must never read as satisfied"
+    assert "weird-rule" in result.evidence
+    assert ".no_human/verifiers.yaml" in result.evidence
+
+    # TEST (d): the rendered checklist row, not just the raw flag.
+    item = to_checklist_item(result)
+    assert item.passed is False
+    assert item.severity == "low"
+
+
+async def test_run_verifiers_a_genuine_first_call_failure_never_retries():
+    """TEST (e), unit-level regression: a real, parseable failing verdict on
+    the FIRST call must fail exactly as before the retry existed — no
+    retry fires, and the result is never marked `unavailable`."""
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    calls = 0
+
+    async def judge(prompt):
+        nonlocal calls
+        calls += 1
+        return _ok_json("a", passed=False, file="src/a.py", line=1), 9
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert calls == 1, "a genuine verdict on the first call must never trigger a retry"
+    (result,) = results
+    assert result.passed is False
+    assert result.no_verdict is False
+    assert result.unavailable is False
+
+
+async def test_run_verifiers_retry_judge_argument_is_used_when_given():
+    """The orchestrator passes a distinct `retry_judge` (a shorter-timeout
+    call) — confirm `run_verifiers` actually calls IT for the retry, not the
+    first `judge` again."""
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    primary_calls = 0
+    retry_calls = 0
+
+    async def judge(prompt):
+        nonlocal primary_calls
+        primary_calls += 1
+        return "", 0
+
+    async def retry_judge(prompt):
+        nonlocal retry_calls
+        retry_calls += 1
+        return _ok_json("a", passed=True), 1
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+        retry_judge=retry_judge,
+    )
+    assert primary_calls == 1
+    assert retry_calls == 1
+    (result,) = results
+    assert result.passed is True
+    assert result.unavailable is False
 
 
 # --------------------------------------------------------------------------

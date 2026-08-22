@@ -148,9 +148,11 @@ def test_every_rendered_truth_pin_has_backing_evidence(store, tmp_path):
 
 def _verifier_dict(*, verifier_id: str, passed: bool, evidence: str = "e",
                     file: str = "", line: int = 0,
-                    files_checked: list[str] | None = None) -> dict:
+                    files_checked: list[str] | None = None,
+                    unavailable: bool = False) -> dict:
     return {
         "verifier_id": verifier_id, "passed": passed, "no_verdict": False,
+        "unavailable": unavailable,
         "evidence": evidence, "file": file, "line": line, "comment": "",
         "severity": "high", "files_checked": files_checked or [],
         "tokens_used": 0,
@@ -205,6 +207,74 @@ def test_the_evidence_table_carries_a_verifiers_row(store, tmp_path):
     assert "<details><summary>Verifiers (4)</summary>" in ev
     assert "no-todo" in ev and "no-print" in ev and "c.py:4" in ev
     assert "found a print()" in ev
+
+
+def test_an_unavailable_verifier_renders_distinctly_from_a_genuine_failure(
+    store, tmp_path,
+):
+    """A rule that reached no verdict even after `run_verifiers`'s bounded
+    retry (`unavailable=True`) is an infra/config signal, not a violation —
+    a human reading the PR must be able to tell "unverified" from
+    "violated" per rule, in the rule's own row (task requirement 3). The
+    unavailable-only case must not use the genuine-failure glyph (❌) at
+    either the summary-row or per-item level."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    head_sha = _Commit.sha
+    task.context["verifier_results"] = {
+        head_sha: [
+            _verifier_dict(verifier_id="no-todo", passed=True,
+                            files_checked=["a.py"]),
+            _verifier_dict(verifier_id="flaky-rule", passed=False,
+                            evidence="no verdict after retry: judge unavailable",
+                            unavailable=True),
+        ]
+    }
+    body = orch._pr_body(task, _Commit(), _Result(), receipts=_receipts())
+    ev = body.split("## Evidence\n", 1)[1].split("\n## ", 1)[0]
+    assert "| Verifiers | ⚠️" in ev, (
+        "an unavailable-only round must not render the genuine-failure glyph")
+    assert "❌" not in ev
+    # Per-item: the unavailable rule's own bullet carries the warning glyph,
+    # never the genuine-failure one. Bullets (not the summary table row,
+    # which is checked above) start with "- ".
+    item_lines = [line for line in ev.splitlines()
+                  if "flaky-rule" in line and line.lstrip().startswith("- ")]
+    assert item_lines and all("⚠️" in line and "❌" not in line for line in item_lines)
+
+
+def test_a_genuine_failure_keeps_its_glyph_alongside_an_unavailable_sibling(
+    store, tmp_path,
+):
+    """The mixed case (task requirement / attempt-1 review finding): a
+    genuinely failing rule in the SAME round as an unavailable one must
+    still render with the genuine-failure glyph — the unavailable sibling
+    must never soften or hide it."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    head_sha = _Commit.sha
+    task.context["verifier_results"] = {
+        head_sha: [
+            _verifier_dict(verifier_id="no-print", passed=False,
+                            evidence="found a print()", file="c.py", line=4),
+            _verifier_dict(verifier_id="flaky-rule", passed=False,
+                            evidence="no verdict after retry: judge unavailable",
+                            unavailable=True),
+        ]
+    }
+    body = orch._pr_body(task, _Commit(), _Result(), receipts=_receipts())
+    ev = body.split("## Evidence\n", 1)[1].split("\n## ", 1)[0]
+    assert "| Verifiers | ❌" in ev, (
+        "a genuine failure in the round must keep the genuine-failure glyph")
+    # Per-item bullets (not the summary table row, which lists every failed
+    # id — including the unavailable one — under the shared ❌ glyph): the
+    # genuine failure's own bullet is ❌, the unavailable sibling's is ⚠️.
+    no_print_lines = [line for line in ev.splitlines()
+                       if "no-print" in line and line.lstrip().startswith("- ")]
+    assert no_print_lines and all("❌" in line for line in no_print_lines)
+    flaky_lines = [line for line in ev.splitlines()
+                   if "flaky-rule" in line and line.lstrip().startswith("- ")]
+    assert flaky_lines and all("⚠️" in line and "❌" not in line for line in flaky_lines)
 
 
 def test_a_model_authored_verifier_comment_cannot_inject_a_heading(store, tmp_path):

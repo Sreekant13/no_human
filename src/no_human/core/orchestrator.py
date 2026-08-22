@@ -628,6 +628,17 @@ _MAX_REVIEW_INFRA_PARKS = 3
 #: unbounded loop wearing a cap's clothes.
 _REVIEW_INFRA_PARKS_KEY = "review_infra_parks"
 
+#: A verifier's judge call is one turn over a single rule's worth of diff —
+#: reviewer.py's own retry policy (halve the window, don't double it; see
+#: `_REVIEW_MIN_RETRY_TIMEOUT`) is the model, but its floor (120s) is
+#: calibrated to the reviewer's much longer round timeout and would leave a
+#: verifier retry no shorter — or even longer — than the first call. So this
+#: is its own, proportionally-scaled pair rather than a reuse: half of the
+#: 180s first-call window, floored at 60s so a retry is never trivially short.
+_VERIFIER_TIMEOUT = 180
+_VERIFIER_RETRY_MIN_TIMEOUT = 60
+_VERIFIER_RETRY_TIMEOUT = max(_VERIFIER_RETRY_MIN_TIMEOUT, _VERIFIER_TIMEOUT // 2)
+
 # INCIDENT (2026-08-20 16:54 UTC, personal2 profile): three reviewer sessions
 # — 365b7868, 624c3184, 5ca0e5d8 — died within eleven seconds of each other
 # with the bare, causeless "Claude Code returned an error result: success"
@@ -10872,12 +10883,12 @@ class Orchestrator:
                 except OSError:
                     return None
 
-            async def judge(prompt: str) -> tuple[str, int]:
+            async def _judge_call(prompt: str, timeout: int) -> tuple[str, int]:
                 nonlocal verifier_output_seen
                 result, _reason = await self.reviewer._run_bounded(
-                    prompt, repo.path, max_turns=1, timeout=180, on_event=None)
+                    prompt, repo.path, max_turns=1, timeout=timeout, on_event=None)
                 if result is None:
-                    return "", 0  # parse_result → no_verdict → FAIL CLOSED
+                    return "", 0  # parse_result → no_verdict → one bounded retry
                 verifier_tok["total"] += result.tokens_used or 0
                 verifier_tok["cache_read"] += result.cache_read_tokens or 0
                 verifier_tok["cache_creation"] += result.cache_creation_tokens or 0
@@ -10886,12 +10897,19 @@ class Orchestrator:
                     verifier_tok["output"] += result.output_tokens
                 return (result.final_text or ""), (result.tokens_used or 0)
 
+            async def judge(prompt: str) -> tuple[str, int]:
+                return await _judge_call(prompt, _VERIFIER_TIMEOUT)
+
+            async def retry_judge(prompt: str) -> tuple[str, int]:
+                return await _judge_call(prompt, _VERIFIER_RETRY_TIMEOUT)
+
             verifier_results = await run_verifiers(
                 judge,
                 verifiers=report.verifiers,
                 diff_text=diff_text,
                 read_file=_verifier_read_file,
                 changed_paths=changed,
+                retry_judge=retry_judge,
             )
             verifier_dicts = [r.as_dict() for r in verifier_results]
 
@@ -10905,9 +10923,23 @@ class Orchestrator:
         await self.store.update_task(task)
 
         failed_verifiers = [r for r in verifier_results if not r.passed]
-        if failed_verifiers:
+        # A verifier that is STILL no_verdict after `run_verifiers`'s one
+        # bounded retry (`r.unavailable`) is an infra/config signal, not a
+        # review finding — the exact anti-pattern reviewer.py's
+        # `ReviewerUnavailable` exists to stop: charging the coder an attempt
+        # for a defect nobody found. Split it out from genuine failures so a
+        # round that ALSO has a real violation still fails on that violation
+        # (never silently dropped just because another rule was unavailable),
+        # and a round with ONLY unavailable rules escalates instead.
+        genuinely_failed = [r for r in failed_verifiers if not r.unavailable]
+        unavailable_verifiers = [r for r in failed_verifiers if r.unavailable]
+        if genuinely_failed:
             decision = ReviewDecision(
                 passed=False,
+                # Both kinds stay in the checklist: the unavailable rows render
+                # (via `to_checklist_item`'s "low" severity) as advisory, so
+                # they remain visible on the PR rather than disappearing, while
+                # `genuinely_failed` is what actually fails the round.
                 checklist=[verifier_to_checklist_item(r) for r in failed_verifiers],
                 verifiers=verifier_dicts,
                 tokens_used=verifier_tok["total"],
@@ -10925,6 +10957,26 @@ class Orchestrator:
                 advisory_count=len(decision.advisory_items),
             )
             return decision
+        if unavailable_verifiers:
+            names = ", ".join(sorted(r.verifier_id for r in unavailable_verifiers))
+            self._emit_review(
+                "verifiers_unavailable",
+                f"{len(unavailable_verifiers)} verifier(s) reached no verdict "
+                f"after a bounded retry, and no other verifier this round "
+                f"failed: {names}",
+                advisory=True,
+            )
+            exc = ReviewerUnavailable(
+                f"{len(unavailable_verifiers)} verifier(s) reached no verdict "
+                f"after a bounded retry, and none of the other verifiers this "
+                f"round failed: {names}. Escalating instead of charging the "
+                "coder for a defect nobody found."
+            )
+            exc.tokens_used = verifier_tok["total"]
+            exc.cache_read_tokens = verifier_tok["cache_read"]
+            exc.cache_creation_tokens = verifier_tok["cache_creation"]
+            exc.output_tokens = verifier_tok["output"] if verifier_output_seen else None
+            raise exc
 
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
@@ -18180,8 +18232,22 @@ SIX of them read a checkpoint and TWO do not — but do
         if not results:
             return ""
         pin = evidence.verifiers_pin() or ""
-        failed = [r for r in results if not r.get("passed")]
-        glyph = "❌" if failed else "✅"
+        # A rule that is merely `unavailable` (no verdict after a bounded
+        # retry — judge/infra trouble, or a malformed rule) is NOT the same
+        # as one that was checked and found violated: it must never render
+        # with the same glyph as a genuine failure, or a reader cannot tell
+        # "unverified" from "violated" (task requirement: the PR must say
+        # which happened, per rule).
+        genuinely_failed = [
+            r for r in results if not r.get("passed") and not r.get("unavailable")
+        ]
+        unavailable = [r for r in results if r.get("unavailable")]
+        if genuinely_failed:
+            glyph = "❌"
+        elif unavailable:
+            glyph = "⚠️"
+        else:
+            glyph = "✅"
         row = f"| Verifiers | {glyph} {Orchestrator._inline_cell(pin, None)} |\n"
         items: list[str] = []
         for r in results:
@@ -18197,7 +18263,8 @@ SIX of them read a checkpoint and TWO do not — but do
                     loc = Orchestrator._inline_cell(
                         f"{f}:{ln}" if ln else str(f), None) + " — "
                 comment = Orchestrator._inline_cell(str(r.get("evidence") or ""), None)
-                items.append(f"- ❌ {vid} — {loc}{comment}")
+                item_glyph = "⚠️" if r.get("unavailable") else "❌"
+                items.append(f"- {item_glyph} {vid} — {loc}{comment}")
         k = len(results)
         fold = (f"<details><summary>Verifiers ({k})</summary>\n\n"
                 + "\n".join(items) + "\n\n</details>\n")
