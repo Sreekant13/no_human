@@ -2148,6 +2148,68 @@ def test_serve_until_empty_exit_code_is_the_drains_verdict(tmp_path, monkeypatch
     assert result.exit_code == 1, result.output
 
 
+def test_serve_until_empty_EXITS_2_when_a_row_is_stranded(tmp_path, monkeypatch):
+    """BEHAVIOURAL pin for the exit-2 operator contract, added because the
+    help-text assertion below it is INERT: an independent review of #624
+    deleted the whole `return 2` branch from `commands.py` and the changed
+    test files still reported `224 passed`. A source-text guard cannot see a
+    deleted branch — this drives the real `_go()` and reads the exit code and
+    the message the operator actually gets.
+
+    RED when the branch is removed: the run falls through to the signal check
+    and exits 0 or 1, never 2, and the row id never reaches stderr."""
+    import no_human.cli.commands as cmd_mod
+
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    monkeypatch.setattr(cmd_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+    monkeypatch.setattr(cmd_mod, "_assert_backend_usable", lambda: None)
+    monkeypatch.setattr(cmd_mod, "_acquire_pid_lock", lambda: True)
+    monkeypatch.setattr(cmd_mod, "_release_pid_lock", lambda: None)
+
+    stranded = [{"task_id": "abcd1234ef567890", "status": "reviewing",
+                 "seconds_until_claimable": 842.0}]
+
+    class _Sched:
+        drain_blocked_by = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        async def run_forever(self, *, stop=None, poll_interval=None,
+                              until_empty=False):
+            return None                    # the drain "completes" immediately
+
+        async def failed_dispatched(self):
+            return []                      # no FAILED task -> not exit 1
+
+        async def unclaimable_orphans(self):
+            return stranded                # ONE stranded row -> must be exit 2
+
+        async def queue_is_drained(self):
+            return False                   # as it is whenever a row is stranded
+
+    # `serve` does `from ..core.scheduler import Scheduler` INSIDE the
+    # function, so the name must be patched at its source module.
+    import no_human.core.scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "Scheduler", _Sched)
+    # Store is REAL, against a tmp DB — only the scheduler is stubbed, so the
+    # exit-code path under test is the shipped one.
+
+    # click 8.3 dropped `mix_stderr`; this runner already merges the streams,
+    # so `result.output` carries both the stdout claim and the stderr verdict.
+    result = CliRunner().invoke(cli, ["serve", "--until-empty"])
+
+    assert result.exit_code == 2, (result.exit_code, result.output)
+    combined = result.output
+    assert "abcd1234" in combined, combined       # names the row
+    assert "not drained" in combined, combined    # says what is wrong
+    # And it must NOT claim the queue drained on this path (MEDIUM-2 of the
+    # same review: stdout printed "drained; stopped" immediately above
+    # "not drained ...", re-creating the false signal in the log).
+    assert "drained; stopped" not in combined, combined
+
+
 def test_serve_until_empty_documents_the_not_yet_claimable_exit_code():
     """The operator contract for the stranded-row exit code is pinned in the
     flag's own --help text, not only in docs (MEDIUM-1 follow-up on #585) —

@@ -340,8 +340,8 @@ automation what happened:
 | Exit | Meaning |
 |------|---------|
 | `0` | Drained: nothing claimable, nothing in flight, nothing unaccounted for. |
-| `1` | A task this run dispatched ended FAILED, or the drain was cut short by a signal while work was still claimable. |
-| `2` | A mid-run row exists that no worker in this process owns — a crash orphan, or a row a different process is (or was) driving — and it is not yet claimable. The queue is **not** drained; it is unknown. The output names the task and the seconds remaining until it becomes claimable (once past `_STRANDED_GRACE_S`, 900s, the next boot's orphan sweep recovers it). |
+| `1` | A task this run dispatched ended FAILED, or the drain was cut short by a signal while work was still claimable **and no row was stranded** — a signalled run that also left a stranded row exits `2`, because that check runs first. |
+| `2` | A mid-run row exists that no worker in this process owns — a crash orphan, or a row a different process is (or was) driving — and it is not yet claimable. The queue is **not** drained; it is unknown. The output names the task and the seconds remaining until it becomes claimable (once past `_STRANDED_GRACE_S`, 900s, an orphan-recovery sweep picks it up — but not from this run, which has already exited, and which was refused permission to boot beside a live sibling scheduler: recovery arrives with the next scheduler boot, or from the third process that owns the row if one does). |
 
 `--until-empty` never waits out that 900s grace itself — it exits `2`
 immediately and names the row, so a cron/CI operator sees why, rather than

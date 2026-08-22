@@ -3705,7 +3705,12 @@ def serve(max_workers, until_empty):
             finally:
                 if slack_worker is not None:
                     await asyncio.to_thread(slack_worker.stop)
-            console.print("[dim]drained; stopped[/]")
+            # "drained" is a CLAIM about the queue, so it is made only where
+            # it is true — the exit-0 path below. Saying it here printed
+            # "drained; stopped" immediately above "not drained task ...",
+            # which re-created, in the log, exactly the false signal this
+            # command was fixed to stop giving (task 920228c9, review of #624).
+            console.print("[dim]stopped[/]")
 
             if not until_empty:
                 return 0
@@ -3738,6 +3743,7 @@ def serve(max_workers, until_empty):
                 err.print("[red]stopped before the queue drained[/] "
                           "(signalled) — work is still claimable")
                 return 1
+            console.print("[dim]drained[/]")
             return 0
 
     try:
