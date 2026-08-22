@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,72 @@ from no_human.agent.backend import (
 from no_human.agent.claude_backend import ClaudeBackend
 
 FAKE_ENV = {"OPENAI_API_KEY": "not-a-real-key", "PATH": "/usr/bin:/bin"}
+
+#: `codex exec --help` text for the ACTUALLY installed CLI, verified live
+#: (see docs/BACKENDS.md): codex-cli 0.149.0 does NOT expose
+#: `--ask-for-approval` on `exec` (only the root `codex` command has it), but
+#: does expose `-c, --config <key=value>`. This is the default `_stub_cli`
+#: shape so the whole suite exercises the modern/real code path unless a test
+#: explicitly asks for the legacy one.
+_MODERN_HELP_TEXT = (
+    "codex-exec\n\nUSAGE:\n    codex exec [OPTIONS] [PROMPT]\n\nOPTIONS:\n"
+    "    --json                       Print events as JSONL\n"
+    "    --cd <DIR>                   Set the working directory\n"
+    "    --model <MODEL>              Model to use\n"
+    "    --sandbox <MODE>             read-only | workspace-write | danger-full-access\n"
+    "    -c, --config <key=value>     Override a config value\n"
+    "    --dangerously-bypass-approvals-and-sandbox\n"
+    "                                 Skip both approvals and the sandbox\n"
+)
+
+#: `codex exec --help` text for an OLDER CLI that still has the flag this
+#: backend used to hardcode — used to exercise `approval_args`'s first
+#: (preferred) branch.
+_LEGACY_HELP_TEXT = (
+    "codex-exec\n\nOPTIONS:\n"
+    "    --json\n    --cd <DIR>\n    --model <MODEL>\n    --sandbox <MODE>\n"
+    "    --ask-for-approval <POLICY>  never | on-failure | untrusted\n"
+    "    -c, --config <key=value>\n"
+)
+
+
+#: `codex exec resume --help` text for the ACTUALLY installed CLI, verified
+#: live: neither `--cd` nor `--sandbox` is documented on the resume
+#: subcommand — a resumed thread inherits both from the session it is
+#: resuming. Deliberately narrower than `_MODERN_HELP_TEXT` so a test that
+#: checks resume argv against this fixture would fail if `_command` ever
+#: emitted either flag on the resume branch.
+_MODERN_RESUME_HELP_TEXT = (
+    "codex-exec-resume\n\nUSAGE:\n    codex exec resume [OPTIONS] [THREAD_ID]\n\n"
+    "OPTIONS:\n"
+    "    --json                       Print events as JSONL\n"
+    "    --model <MODEL>              Model to use\n"
+    "    -c, --config <key=value>     Override a config value\n"
+    "    --dangerously-bypass-approvals-and-sandbox\n"
+    "                                 Skip both approvals and the sandbox\n"
+)
+
+
+def _stub_cli(monkeypatch, *, help_text=_MODERN_HELP_TEXT,
+              resume_help_text=_MODERN_RESUME_HELP_TEXT,
+              version="codex-cli 0.149.0", cli="/bin/codex"):
+    """Stub the read-only CLI probes `_command` makes, so no test in
+    this file spawns a real subprocess for them. Defaults mirror the
+    installed CLI this backend was fixed against, live, in this repo.
+
+    `codex_exec_help` is keyed by `resume` because the real CLI documents a
+    DIFFERENT, narrower flag surface for `codex exec resume --help` than for
+    `codex exec --help` — a stub that ignored the kwarg would let a resume-only
+    flag regression pass by validating against the wrong help text."""
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: cli)
+    monkeypatch.setattr(
+        cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            resume_help_text if resume else help_text
+        ),
+    )
+    monkeypatch.setattr(cx, "codex_version",
+                        lambda path, timeout=10.0: version)
 
 
 # --------------------------------------------------------------------------- #
@@ -168,8 +236,13 @@ def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
     under unresolved legal uncertainty, not a sourced prohibition (see the
     module docstring). `preferred_auth_method="apikey"` is what stops the CLI
     falling back to a ChatGPT login that happens to be on the machine, so it
-    is pinned here rather than left to the CLI's default."""
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    is pinned here rather than left to the CLI's default.
+
+    Approval flag: stubbed with the MODERN help text (the actually installed
+    codex-cli 0.149.0, verified live), which has no `--ask-for-approval` on
+    `exec` — so the `--config approval_policy="never"` fallback is what must
+    appear. See `test_approval_args_*` for the flag-selection ladder itself."""
+    _stub_cli(monkeypatch)
     cmd = cx.CodexBackend()._command(Path("/repo"), effort="high", resume=None)
     assert 'preferred_auth_method="apikey"' in cmd
     joined = " ".join(cmd)
@@ -179,21 +252,49 @@ def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
     # boundary left.
     assert "--dangerously-bypass-approvals-and-sandbox" not in joined
     assert "--sandbox" in cmd and "workspace-write" in cmd
-    assert "--ask-for-approval" in cmd and "never" in cmd
+    assert "--ask-for-approval" not in cmd
+    assert 'approval_policy="never"' in cmd
     assert 'model_reasoning_effort="high"' in cmd
+    # AC1's own check, inline: every flag this test's cmd emits appears in the
+    # help text it was resolved against — proves the stub isn't lying to itself.
+    for flag in cx.emitted_flags(cmd):
+        assert flag in _MODERN_HELP_TEXT, flag
+
+
+def test_the_command_uses_ask_for_approval_when_the_installed_cli_still_has_it(
+        monkeypatch):
+    """The other branch of the ladder: an older CLI that still documents
+    `--ask-for-approval` on `exec` gets that flag, not the --config fallback —
+    proving the choice is read from the CLI, not hardcoded either way."""
+    _stub_cli(monkeypatch, help_text=_LEGACY_HELP_TEXT)
+    cmd = cx.CodexBackend()._command(Path("/repo"), effort=None, resume=None)
+    assert "--ask-for-approval" in cmd and "never" in cmd
+    assert 'approval_policy="never"' not in " ".join(cmd)
 
 
 def test_a_readonly_codex_session_gets_the_sandbox_that_enforces_it(monkeypatch):
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     cmd = cx.CodexBackend(readonly=True)._command(
         Path("/repo"), effort=None, resume=None)
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
 
 
 def test_resume_continues_a_thread(monkeypatch):
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     cmd = cx.CodexBackend()._command(Path("/repo"), effort=None, resume="th_1")
     assert cmd[1:4] == ["exec", "resume", "th_1"]
+    # THE repro for this ticket's Blocker 1: `codex exec resume --help`
+    # (verified live) documents neither flag — a resumed thread inherits its
+    # cwd and its sandbox from the session it is resuming. Before the fix,
+    # `_command` emitted both unconditionally and every resumed attempt died
+    # at launch with "unexpected argument", rc=2.
+    assert "--cd" not in cmd
+    assert "--sandbox" not in cmd
+    # Everything else non-resume attempts also get is still present.
+    assert "--json" in cmd
+    assert "--model" in cmd
+    for flag in cx.emitted_flags(cmd):
+        assert flag in _MODERN_RESUME_HELP_TEXT, flag
 
 
 def test_a_missing_openai_key_refuses_rather_than_finding_other_auth():
@@ -225,6 +326,115 @@ def test_a_missing_codex_cli_is_an_absence_with_a_name(monkeypatch):
     with pytest.raises(BackendUnavailable) as exc:
         cx.CodexBackend()._command(Path("/repo"), effort=None, resume=None)
     assert "npm install -g @openai/codex" in str(exc.value)
+
+
+@pytest.mark.skipif(shutil.which("codex") is None,
+                     reason="codex CLI is not installed on PATH")
+def test_every_flag_we_emit_is_accepted_by_the_installed_codex_cli():
+    """THE behavioural test the bug needed: not a fixture of what the CLI's
+    help text says, but the REAL installed binary's help text. This is what
+    would have caught `--ask-for-approval` being dropped from `exec` in
+    codex-cli 0.149.0 before it ever reached a live attempt — the whole
+    fixture-based suite around this test passed throughout that regression,
+    because a fixture only pins what someone remembered to update.
+
+    Checked for BOTH launch shapes: a fresh attempt (`resume=None`) and a
+    resumed one (`resume=<thread-id>`) each build a different argv and
+    `codex exec resume --help` documents a narrower flag surface than
+    `codex exec --help` (no `--cd`, no `--sandbox`) — a CLI that accepts one
+    argv can still reject the other, which is exactly this ticket's
+    Blocker 1."""
+    cx.reset_probe_caches()
+    cli = cx.find_codex_cli()
+    assert cli is not None  # shutil.which already confirmed presence
+    for resume in (None, "th_1"):
+        help_text = cx.codex_exec_help(cli, resume=bool(resume))
+        assert help_text, (
+            f"codex exec {'resume ' if resume else ''}--help produced no "
+            "output to check against"
+        )
+        cmd = cx.CodexBackend(env=FAKE_ENV)._command(
+            Path("/repo"), effort=None, resume=resume)
+        flags = cx.emitted_flags(cmd)
+        assert flags, "vacuous: _command emitted no flags to check"
+        for flag in flags:
+            assert flag in help_text, (
+                f"{flag!r} is not accepted by the installed codex CLI "
+                f"({cx.codex_version(cli)}) per "
+                f"`codex exec {'resume ' if resume else ''}--help`")
+
+
+def test_approval_args_prefers_ask_for_approval_when_the_cli_documents_it():
+    assert cx.approval_args(_LEGACY_HELP_TEXT, "codex-cli 0.42.0") == \
+        ["--ask-for-approval", "never"]
+
+
+def test_approval_args_falls_back_to_config_when_ask_for_approval_is_gone():
+    """The modern (installed, verified) shape: no `--ask-for-approval` on
+    `exec`, but `-c/--config` survives, so the equivalent is expressed through
+    it rather than the sandbox-dropping escape hatch."""
+    result = cx.approval_args(_MODERN_HELP_TEXT, "codex-cli 0.149.0")
+    assert result == ["--config", 'approval_policy="never"']
+
+
+def test_approval_args_never_reaches_for_the_sandbox_dropping_flag():
+    """`--dangerously-bypass-approvals-and-sandbox` also suppresses approval
+    prompts, and it is ALWAYS present when `-c/--config` is — a ladder that
+    preferred it over --config would silently trade away the sandbox, this
+    backend's only real safety boundary. It must never be chosen."""
+    help_text = _MODERN_HELP_TEXT
+    assert "--dangerously-bypass-approvals-and-sandbox" in help_text  # sanity
+    result = cx.approval_args(help_text, "codex-cli 0.149.0")
+    assert "--dangerously-bypass-approvals-and-sandbox" not in result
+
+
+def test_approval_args_refuses_rather_than_hang_on_an_approval_prompt():
+    """Neither flag documented anywhere in --help: raise, naming the CLI
+    version, rather than launch a session that can hang forever waiting for
+    someone at a keyboard that nobody is sitting at."""
+    bare_help = "codex-exec\n\nOPTIONS:\n    --json\n    --model <MODEL>\n"
+    with pytest.raises(BackendUnavailable) as exc:
+        cx.approval_args(bare_help, "codex-cli 0.99.0")
+    assert "codex-cli 0.99.0" in str(exc.value)
+
+
+def test_approval_args_refuses_on_a_missing_or_empty_help_text_too():
+    with pytest.raises(BackendUnavailable) as exc:
+        cx.approval_args(None, "unknown version")
+    assert "unknown version" in str(exc.value)
+
+
+def test_codex_exec_help_and_version_are_probed_once_per_cli_path(monkeypatch):
+    """`_command` runs once per attempt, but a single process launches many
+    attempts; re-spawning `codex --help`/`--version` on every attempt would be
+    a needless subprocess per turn. Cache by resolved CLI path instead."""
+    cx.reset_probe_caches()
+    calls = []
+    real_run = subprocess.run
+
+    def _counting_run(argv, **kw):
+        calls.append(tuple(argv))
+        return real_run(["true"], **{**kw, "capture_output": True, "text": True})
+
+    monkeypatch.setattr(cx.subprocess, "run", _counting_run)
+    cx.codex_exec_help("/bin/codex")
+    cx.codex_exec_help("/bin/codex")
+    cx.codex_version("/bin/codex")
+    cx.codex_version("/bin/codex")
+    help_calls = [c for c in calls if c[1:] == ("exec", "--help")]
+    version_calls = [c for c in calls if c[1:] == ("--version",)]
+    assert len(help_calls) == 1, help_calls
+    assert len(version_calls) == 1, version_calls
+
+
+def test_codex_exec_help_returns_none_when_the_cli_cannot_be_spawned():
+    cx.reset_probe_caches()
+    assert cx.codex_exec_help("/no/such/codex/binary") is None
+
+
+def test_codex_version_falls_back_to_a_placeholder_when_unspawnable():
+    cx.reset_probe_caches()
+    assert cx.codex_version("/no/such/codex/binary") == "unknown version"
 
 
 # --------------------------------------------------------------------------- #
@@ -379,7 +589,7 @@ def _fake_codex(lines: list[dict], *, returncode: int = 0, stderr: bytes = b""):
 def _run(backend, monkeypatch, lines, *, max_turns=40, on_event=None, **kw):
     spawn = _fake_codex(lines, **kw)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     result = asyncio.run(backend.run(
         "do the thing", cwd=Path("/repo"), max_turns=max_turns,
         on_event=on_event))
@@ -555,6 +765,98 @@ def test_a_vendor_error_becomes_a_failed_attempt_not_a_crash(monkeypatch):
     ])
     assert result.is_error is True
     assert "insufficient_quota" in result.final_text
+    # Regression guard: a quota error must NEVER be reclassified as a
+    # model-not-found error — the two need different fixes (billing vs.
+    # llm.codex_model) and conflating them would send an operator chasing
+    # the wrong one.
+    assert cx.model_error_from_failure(
+        {"type": "turn.failed", "error": {"message": "insufficient_quota"}},
+        "gpt-5-codex") is None
+
+
+def test_model_error_from_failure_classifies_the_real_flat_404_shape():
+    """The shape actually observed against the live API, confirmed in a prior
+    session — NOT the nested `{"error": {...}}` shape originally assumed. A
+    normalizer written only against the assumed shape would silently pass
+    this straight through as an opaque `codex reported an error`."""
+    msg = {
+        "type": "error",
+        "message": (
+            "Reconnecting... 2/5 (unexpected status 404 Not Found: "
+            "Model not found gpt-5-codex, url: "
+            "https://api.openai.com/v1/responses, ...)"
+        ),
+    }
+    exc = cx.model_error_from_failure(msg, "gpt-5-codex")
+    assert exc is not None
+    assert isinstance(exc, cx.CodexModelUnavailable)
+    text = str(exc)
+    assert "gpt-5-codex" in text
+    assert "llm.codex_model" in text
+    assert "/v1/responses" in text
+
+
+def test_model_error_from_failure_also_classifies_the_documented_nested_shape():
+    """The originally-documented vendor shape — kept as a second case so a
+    future vendor change back to it (or a different endpoint using it) does
+    not silently stop being caught."""
+    msg = {"type": "turn.failed",
+           "error": {"status": 404, "message": "Model not found: gpt-5-codex"}}
+    exc = cx.model_error_from_failure(msg, "gpt-5-codex")
+    assert exc is not None
+    assert "gpt-5-codex" in str(exc)
+
+
+def test_model_error_from_failure_classifies_the_not_supported_on_chatgpt_shape():
+    """A third real vendor shape (this ticket's send-back review): a bad
+    model id on a ChatGPT/subscription session is not a 404 at all — it is a
+    `turn.failed`, status 400, `invalid_request_error`, with the message
+    "The '<model>' model is not supported when using Codex with a ChatGPT
+    account". Without this pattern, this shape fell through as an opaque
+    `codex reported an error` instead of naming `llm.codex_model` as the
+    thing to fix."""
+    msg = {"type": "turn.failed", "error": {
+        "status": 400,
+        "type": "invalid_request_error",
+        "message": (
+            "The 'gpt-5-codex' model is not supported when using Codex "
+            "with a ChatGPT account"
+        ),
+    }}
+    exc = cx.model_error_from_failure(msg, "gpt-5-codex")
+    assert exc is not None
+    assert isinstance(exc, cx.CodexModelUnavailable)
+    text = str(exc)
+    assert "gpt-5-codex" in text
+    assert "llm.codex_model" in text
+
+
+def test_model_error_from_failure_leaves_unrelated_errors_alone():
+    for msg in (
+        {"type": "turn.failed", "error": {"message": "insufficient_quota"}},
+        {"type": "turn.failed", "error": {"message": "rate_limit_exceeded"}},
+        {"type": "error", "message": "network timeout"},
+        {"type": "turn.failed"},
+        {},
+    ):
+        assert cx.model_error_from_failure(msg, "gpt-5-codex") is None
+
+
+def test_a_model_not_found_run_surfaces_the_typed_error_end_to_end(monkeypatch):
+    """AC3, over the real `run()` path with the real flat-shape JSONL: the
+    bounded loop reads `result.final_text`/`result.api_error_status`, not an
+    exception, so the classification has to survive the trip through
+    `stream()`'s error branch and into the result event's meta."""
+    result, _ = _run(cx.CodexBackend(env=FAKE_ENV, model="gpt-5-codex"),
+                     monkeypatch, [{
+        "type": "error",
+        "message": ("unexpected status 404 Not Found: Model not found "
+                    "gpt-5-codex, url: https://api.openai.com/v1/responses"),
+    }])
+    assert result.is_error is True
+    assert "gpt-5-codex" in result.final_text
+    assert "llm.codex_model" in result.final_text
+    assert result.api_error_status == 404
 
 
 def test_a_nonzero_exit_with_no_json_still_yields_a_result_event(monkeypatch):
@@ -570,7 +872,7 @@ def test_unparseable_and_unknown_records_are_skipped_not_fatal(monkeypatch):
     spawn = _fake_codex([{"type": "item.completed", "item": {
         "id": "i", "type": "agent_message", "text": "ok"}}])
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     # Splice in a banner line and a record of a type nobody here has seen.
     spawn.proc.stdout._lines.insert(0, b"Reading prompt from stdin...\n")
     spawn.proc.stdout._lines.insert(1, b'{"type":"some.future.event","x":1}\n')
@@ -592,7 +894,7 @@ def test_an_unsupported_control_is_refused_never_silently_dropped(
     """A supervisor that never fires is worse than no supervisor, because the
     orchestrator reports that it supervised. Refusing is the only honest
     behaviour available to a backend that cannot run the check."""
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     result = asyncio.run(cx.CodexBackend(env=FAKE_ENV).run(
         "p", cwd=Path("/repo"), max_turns=5, **kwargs))
     assert result.is_error is True
@@ -615,7 +917,7 @@ def test_an_exception_raised_by_on_event_propagates_out_of_run(monkeypatch):
 
     spawn = _fake_codex(_HAPPY)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    _stub_cli(monkeypatch)
     with pytest.raises(_Abort):
         asyncio.run(cx.CodexBackend(env=FAKE_ENV).run(
             "p", cwd=Path("/repo"), max_turns=40, on_event=_sink))
@@ -743,3 +1045,21 @@ def test_every_boolean_capability_is_true_for_claude():
     # …and the check is not vacuous: it really did look at fields.
     assert sum(1 for f in dataclasses.fields(caps)
                if f.type in ("bool", bool)) >= 8
+
+
+# --------------------------------------------------------------------------- #
+# 8. Docs — the verified CLI version and the entitlement rule must be STATED,  #
+#    not just true in code, so an operator reading the docs sees the same     #
+#    ground truth this file's stub help text was built from.                  #
+# --------------------------------------------------------------------------- #
+
+def test_the_docs_state_the_verified_cli_version_and_the_entitlement_rule():
+    docs = (Path(__file__).resolve().parent.parent / "docs" / "BACKENDS.md"
+           ).read_text()
+    assert "codex exec --help" in docs, (
+        "the docs must say flags are probed from the CLI's own --help output")
+    assert "codex-cli 0.149.0" in docs, (
+        "the docs must name the version this backend was verified against")
+    assert "/v1/responses" in docs, (
+        "the docs must state model entitlement needs a billed /v1/responses "
+        "call — a doctor pass is not proof the configured model works")

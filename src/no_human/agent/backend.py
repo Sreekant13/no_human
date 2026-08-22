@@ -500,15 +500,28 @@ def make_backend(
 
 
 #: Default Codex model id. Chosen EXPLICITLY (BUILD item 4) rather than
-#: inherited from a Claude tier, and overridable via ``llm.codex_model``.
-#: ``gpt-5-codex`` is OpenAI's coding-tuned model and the Codex CLI's own
-#: default; naming it here means a future default change is a visible diff
-#: rather than a silent drift in someone else's release notes.
+#: inherited from a Claude tier, and overridable via ``llm.codex_model``. This
+#: is the SOLE source of truth — ``config.py`` and ``doctor.py`` import it
+#: rather than each carrying their own literal (that duplication was itself
+#: part of this ticket's test gap).
 #:
-#: NOT verified against the live API in this change — see the report's
-#: "what I could not check". If OpenAI has retired or renamed this id, the run
-#: fails loudly at the first CLI call with the vendor's own error, which is the
-#: right failure: an absence, named.
+#: The 2026-08-22 review send-back on this ticket reported that
+#: ``gpt-5-codex`` 400s at the first turn on a real installed CLI with "The
+#: 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
+#: account", and proposed replacing the default with ``gpt-5.6-terra``. That
+#: replacement id could NOT be independently confirmed in this change — it is
+#: not a documented OpenAI model id, a non-billed ``GET /v1/models`` listing
+#: is not entitlement even when a name appears in it, and this project's own
+#: rule against spending OpenAI quota on a diagnostic rules out a billed
+#: ``/v1/responses`` call to settle it either way. Shipping an unverified
+#: string as the default would swap one guess for another, so the default
+#: stays ``gpt-5-codex`` here; what this ticket actually fixes for the bad-
+#: model-id case is that the failure is no longer a silent hang or a raw
+#: traceback — see ``model_error_from_failure``'s new "not supported when
+#: using codex" pattern, which turns exactly this 400 into a named
+#: ``CodexModelUnavailable``. Anyone who confirms a working replacement id
+#: (their own account, their own entitlement) sets it via ``llm.codex_model``;
+#: this constant is not the place to encode an unverified guess.
 DEFAULT_CODEX_MODEL = "gpt-5-codex"
 
 __all__ = [

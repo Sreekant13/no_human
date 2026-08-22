@@ -83,6 +83,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -162,6 +163,190 @@ def find_codex_cli(explicit: str | None = None) -> str | None:
         if path.is_file():
             return str(path)
     return None
+
+
+#: Per-process cache for the two read-only CLI probes below, keyed by
+#: resolved CLI path. `_command` runs once per attempt but a single process
+#: can launch many attempts, so this keeps each unique CLI path to one
+#: `--help`/`--version` subprocess spawn for the life of the process rather
+#: than one per attempt. `_HELP_CACHE` is keyed by `(cli, resume)` because
+#: `codex exec resume --help` documents a DIFFERENT, narrower flag surface
+#: than `codex exec --help` (verified live: no `--cd`, no `--sandbox`) — the
+#: two must never share a cache slot.
+_HELP_CACHE: dict[tuple[str, bool], str | None] = {}
+_VERSION_CACHE: dict[str, str] = {}
+
+
+def reset_probe_caches() -> None:
+    """Test-only: clear the per-path help/version caches between cases."""
+    _HELP_CACHE.clear()
+    _VERSION_CACHE.clear()
+
+
+def codex_exec_help(cli: str, *, resume: bool = False, timeout: float = 10.0) -> str | None:
+    """Return ``codex exec [resume] --help``'s combined stdout+stderr, or None.
+
+    Read-only, cached per ``(cli, resume)``. This is how :func:`approval_args`
+    learns which non-interactive flag the INSTALLED binary actually accepts
+    instead of assuming one — codex-cli moved ``--ask-for-approval`` off
+    ``exec`` and onto only the root ``codex`` command at some point before
+    0.149.0 (confirmed live: ``codex exec --help`` lacks it, ``codex --help``
+    has it at ``-a, --ask-for-approval <APPROVAL_POLICY>``), and a hardcoded
+    flag silently started failing every Codex-backed attempt at launch.
+
+    ``resume=True`` probes ``codex exec resume --help`` instead: that
+    subcommand accepts neither ``--cd`` nor ``--sandbox`` (a resumed thread
+    inherits both from the session it is resuming), so the resume argv must be
+    validated against its OWN help text, not the non-resume one.
+    """
+    key = (cli, resume)
+    if key in _HELP_CACHE:
+        return _HELP_CACHE[key]
+    argv = [cli, "exec", "resume", "--help"] if resume else [cli, "exec", "--help"]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        text = combined if combined.strip() else None
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        text = None
+    _HELP_CACHE[key] = text
+    return text
+
+
+def codex_version(cli: str, *, timeout: float = 10.0) -> str:
+    """Return ``codex --version``'s first output line, or a placeholder.
+
+    Read-only, cached per CLI path. Used only for human-facing messages
+    (``nh doctor``, the :class:`BackendUnavailable` raised by
+    :func:`approval_args`) — never parsed for a version comparison, since the
+    flag probe in :func:`codex_exec_help` is the actual source of truth.
+    """
+    if cli in _VERSION_CACHE:
+        return _VERSION_CACHE[cli]
+    version = "unknown version"
+    try:
+        proc = subprocess.run(
+            [cli, "--version"], capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        combined = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if combined:
+            version = combined.splitlines()[0].strip()
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        pass
+    _VERSION_CACHE[cli] = version
+    return version
+
+
+def emitted_flags(cmd: list[str]) -> list[str]:
+    """The flag tokens (not their values) a built argv actually emits.
+
+    A lone ``"-"`` (stdin marker, always the last token) is excluded — it is
+    a positional argument, not a flag, and ``codex exec --help`` never lists
+    it as one.
+    """
+    return [tok for tok in cmd if tok.startswith("-") and tok != "-"]
+
+
+def approval_args(help_text: str | None, version: str) -> list[str]:
+    """Pick the non-interactive-approval flag the installed CLI accepts.
+
+    Resolved from ``codex exec --help``'s own text — never assumed — because
+    the flag moved between CLI versions and a wrong guess is "unexpected
+    argument" (rc=2) at launch, before a single turn runs. Preference order:
+
+      1. ``--ask-for-approval never`` when ``exec`` still documents it.
+      2. ``-c approval_policy="never"`` (the ``--config`` escape hatch) when it
+         doesn't — verified live to be syntactically accepted by codex-cli
+         0.149.0's ``codex exec`` and to actually suppress the interactive
+         prompt (the run proceeds to real turn execution).
+
+    Deliberately NEVER ``--dangerously-bypass-approvals-and-sandbox`` or
+    ``--approve-for-me``-style flags: those remove the ``--sandbox`` boundary
+    too, and the sandbox is this backend's only real prevention (module
+    docstring) — approval-mode compatibility must never be bought by trading
+    it away. If neither known mode is available, raise rather than launch a
+    session that could hang forever on an approval prompt nobody can answer.
+    """
+    text = help_text or ""
+    if "--ask-for-approval" in text:
+        return ["--ask-for-approval", "never"]
+    if "--config" in text or " -c," in text or " -c " in text:
+        return ["--config", 'approval_policy="never"']
+    raise BackendUnavailable(
+        f"the installed `codex` CLI ({version}) exposes neither "
+        "`--ask-for-approval` nor a `--config` escape hatch in `codex exec "
+        "--help` — there is no way to run it non-interactively without "
+        "risking an indefinite hang on an approval prompt (nobody is at the "
+        "keyboard). Upgrade or downgrade the CLI (`npm install -g "
+        "@openai/codex`), then re-run `nh doctor`."
+    )
+
+
+class CodexModelUnavailable(RuntimeError):
+    """``llm.codex_model`` is not entitled on ``/v1/responses`` for this key.
+
+    ``GET /v1/models`` listing a model id is not the same thing as being
+    entitled to call it on ``/v1/responses`` — that can only be learned from
+    a real, billed call, which this backend never makes speculatively.
+    """
+
+
+#: Substrings that show up in a real vendor "this model id doesn't exist for
+#: you" message. Verified live against codex-cli 0.149.0 with an invalid
+#: model id: the CLI does NOT surface a clean, single `turn.failed` with a
+#: structured `error.status` — it emits repeated flat
+#: `{"type": "error", "message": "Reconnecting... N/5 (unexpected status 404
+#: Not Found: Model not found <model>)"}` records and retries indefinitely
+#: rather than terminating the turn. "does not exist" is kept too for the
+#: differently-worded 404 some OpenAI endpoints use for other model
+#: mismatches. "not supported when using codex" is a THIRD shape, measured
+#: live 2026-08-22: a bad model on a ChatGPT/subscription session returns
+#: `turn.failed`, status 400, `invalid_request_error`, message "The '<model>'
+#: model is not supported when using Codex with a ChatGPT account" — not a 404
+#: at all. Deliberately narrow: `insufficient_quota` and other vendor errors
+#: must NOT match any of these (see
+#: test_a_vendor_error_becomes_a_failed_attempt_not_a_crash).
+_MODEL_NOT_FOUND_PATTERNS = (
+    "model not found",
+    "model_not_found",
+    "does not exist",
+    "not supported when using codex",
+)
+
+
+def model_error_from_failure(msg: dict, model: str) -> CodexModelUnavailable | None:
+    """Classify a ``turn.failed``/``error`` JSONL record, or return None.
+
+    Handles BOTH the nested ``{"error": {"message", "status", "type"}}``
+    shape and the flat ``{"type": "error", "message": "..."}`` shape codex
+    actually emits for a 404 (see :data:`_MODEL_NOT_FOUND_PATTERNS`). Pure —
+    no I/O — so it stays testable without a subprocess.
+    """
+    if not isinstance(msg, dict):
+        return None
+    err = msg.get("error")
+    err = err if isinstance(err, dict) else {}
+    status = err.get("status") or err.get("code") or msg.get("status")
+    message = str(err.get("message") or msg.get("message") or "")
+    err_type = str(err.get("type") or "")
+    lowered = message.lower()
+    if not (
+        str(status) == "404"
+        or err_type == "model_not_found"
+        or any(pattern in lowered for pattern in _MODEL_NOT_FOUND_PATTERNS)
+    ):
+        return None
+    return CodexModelUnavailable(
+        f"codex exec rejected the configured model {model!r} (llm.codex_model) "
+        f"as not found — vendor message: {message or 'model not found'!r}. "
+        "`GET /v1/models` listing a model id is not the same as being "
+        "entitled to call it on `/v1/responses`; confirm this OPENAI_API_KEY "
+        "can actually call it, then update llm.codex_model."
+    )
 
 
 @dataclass
@@ -299,29 +484,40 @@ class CodexBackend:
                 "Install it with: npm install -g @openai/codex  (then verify "
                 "with `nh doctor`), or set worker.backend back to 'claude'."
             )
+        is_resume = bool(resume)
         cmd = [cli, "exec"]
-        if resume:
+        if is_resume:
             # `codex exec resume <thread-id>` continues a prior thread.
             cmd += ["resume", resume]
-        cmd += [
-            "--json",
-            "--cd", str(cwd),
-            "--model", self.model,
+        cmd += ["--json"]
+        if not is_resume:
+            # `codex exec resume --help` documents neither of these (verified
+            # live): a resumed thread inherits its cwd and its sandbox from the
+            # session it is resuming, and passing either is `unexpected
+            # argument`, rc=2, before the resumed turn runs.
+            cmd += ["--cd", str(cwd)]
+        cmd += ["--model", self.model]
+        if not is_resume:
             # read-only sessions (were any ever routed here) get the sandbox
             # that actually enforces it; the coder gets workspace-write, which
             # is the strongest sandbox compatible with editing the checkout.
             # `danger-full-access` is never used: an unsandboxed agent with no
             # PreToolUse veto has no safety boundary left at all.
-            "--sandbox", "read-only" if self.readonly else "workspace-write",
-            # Nobody is at the keyboard (§22). An approval prompt in a headless
-            # run is an indefinite hang, not a safety feature.
-            "--ask-for-approval", "never",
+            cmd += ["--sandbox", "read-only" if self.readonly else "workspace-write"]
+        cmd += [
             # THE CONSERVATIVE-PATH GATE, in code: never fall back to a
             # ChatGPT login that happens to exist on this machine. Not a
             # known legal boundary — see the module docstring — but the
             # deliberate choice while that question is unresolved.
             "--config", 'preferred_auth_method="apikey"',
         ]
+        # Nobody is at the keyboard. An approval prompt in a headless run is
+        # an indefinite hang, not a safety feature — but the flag that
+        # suppresses it moved between CLI versions (codex-cli 0.149.0 dropped
+        # `--ask-for-approval` from `exec`), so it is resolved from the
+        # INSTALLED binary's own `codex exec [resume] --help`, never assumed.
+        # See `approval_args`.
+        cmd += approval_args(codex_exec_help(cli, resume=is_resume), codex_version(cli))
         mapped = _EFFORT_MAP.get((effort or "").lower())
         if mapped:
             cmd += ["--config", f'model_reasoning_effort="{mapped}"']
@@ -558,6 +754,7 @@ class CodexBackend:
         failure = ""
         denials: list[str] = []
         stop_reason: str | None = None
+        api_error_status: int | None = None
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), env=env,
@@ -597,10 +794,15 @@ class CodexBackend:
                         msg["msg"].get("type") == "session_configured":
                     session_id = str(msg["msg"].get("session_id") or "") or session_id
                 elif msg.get("type") in ("turn.failed", "error"):
-                    err = msg.get("error") or {}
-                    failure = str(
-                        (err.get("message") if isinstance(err, dict) else None)
-                        or msg.get("message") or "codex reported an error")
+                    model_exc = model_error_from_failure(msg, self.model)
+                    if model_exc is not None:
+                        failure = str(model_exc)
+                        api_error_status = 404
+                    else:
+                        err = msg.get("error") or {}
+                        failure = str(
+                            (err.get("message") if isinstance(err, dict) else None)
+                            or msg.get("message") or "codex reported an error")
 
                 for event in self._translate(msg):
                     if event.kind == "tool_use":
@@ -671,7 +873,7 @@ class CodexBackend:
                 "session_id": session_id,
                 "stop_reason": stop_reason or ("error" if failure else "end_turn"),
                 "denials": denials,
-                "api_error_status": None,
+                "api_error_status": api_error_status,
                 "cache_read_tokens": totals["cache_read_tokens"],
                 "cache_creation_tokens": 0,
                 # No subagents to roll up; 0 here is the true value.

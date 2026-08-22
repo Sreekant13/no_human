@@ -347,6 +347,10 @@ class Diagnosis:
     # Non-blocking notices (resource leaks, prunable leftovers). Deliberately
     # NOT part of `healthy` — an advisory must never fail the doctor gate.
     advisories: list[str] = field(default_factory=list)
+    # The codex coding-backend readiness row (CLI presence, flag compatibility,
+    # OPENAI_API_KEY presence). None-shaped ({"selected": False}, []) unless the
+    # codex backend is actually in play — see `codex_readiness`.
+    codex: dict[str, Any] | None = None
 
     @property
     def healthy(self) -> bool:
@@ -362,9 +366,168 @@ async def _kind_stats(store: Store) -> dict[str, tuple[int, float]]:
     return {row[0]: (row[1], row[2] or 0.0) for row in rows if row[0]}
 
 
+def codex_readiness(
+    config: dict[str, Any] | None, *, requested_by_task: bool
+) -> tuple[dict[str, Any], list[str]]:
+    """Codex coding-backend readiness: CLI presence, flag compatibility, key.
+
+    Returns ``({"selected": False}, [])`` — spawning nothing — unless the codex
+    backend is actually in play: selected globally (``worker.backend``) or
+    requested by at least one live task's ``config.backend`` override. When it
+    IS in play, the subprocess probes this makes (``codex exec --help``,
+    ``codex exec resume --help``, ``codex --version``) are the same read-only,
+    per-process-cached probes ``CodexBackend._command`` itself uses
+    (``codex_backend._HELP_CACHE`` / ``_VERSION_CACHE``) to choose the approval
+    flag — this never spawns a session and never bills a call. BOTH the
+    non-resume and the resume launch shape are checked, because
+    ``codex exec resume`` has its own, narrower flag surface (no ``--cd``, no
+    ``--sandbox`` — verified live) and a CLI that accepts one argv can still
+    reject the other. Model ENTITLEMENT (whether ``llm.codex_model`` is
+    actually callable on ``/v1/responses`` for this key) is a different
+    question that costs a billed request to answer and is never asked here —
+    the row always carries a note saying so.
+
+    Wrapped by the caller in ``try/except Exception`` — a diagnostic must never
+    break ``nh doctor``.
+    """
+    from .agent.backend import BackendUnavailable, resolve_backend_name
+
+    config = config or {}
+    selected = resolve_backend_name(config, role="coder") == "codex"
+    if not (selected or requested_by_task):
+        return {"selected": False}, []
+
+    from .agent.codex_backend import (
+        DEFAULT_CODEX_MODEL,
+        CodexBackend,
+        approval_args,
+        codex_exec_help,
+        codex_version,
+        emitted_flags,
+        find_codex_cli,
+    )
+    from .config import CODEX_API_KEY_VAR, credential_status
+
+    llm = config.get("llm") or {}
+    model = llm.get("codex_model", DEFAULT_CODEX_MODEL)
+    cli = find_codex_cli(llm.get("codex_cli_path"))
+    contradictions: list[str] = []
+    row: dict[str, Any] = {
+        "selected": True,
+        "cli_path": cli,
+        "version": None,
+        "flags_ok": False,
+        "flag_detail": None,
+        "api_key_present": False,
+        "entitlement_note": (
+            f"model entitlement for llm.codex_model={model!r} cannot be "
+            "checked without a billed call to /v1/responses — a listing in "
+            "`GET /v1/models` is not entitlement."
+        ),
+    }
+    if cli is None:
+        contradictions.append(
+            "CODEX BACKEND UNUSABLE: the 'codex' CLI is not on PATH — "
+            "npm install -g @openai/codex"
+        )
+    else:
+        version = codex_version(cli)
+        help_text = codex_exec_help(cli)
+        resume_help_text = codex_exec_help(cli, resume=True)
+        row["version"] = version
+        try:
+            args = approval_args(help_text, version)
+            row["flag_detail"] = " ".join(args)
+            backend = CodexBackend(cli_path=cli)
+            cmd = backend._command(Path.cwd(), effort=None, resume=None)
+            resume_cmd = backend._command(
+                Path.cwd(), effort=None, resume="doctor-probe-thread"
+            )
+            missing = [f for f in emitted_flags(cmd)
+                      if help_text and f not in help_text]
+            # `resume:`-prefixed so a report never conflates a non-resume flag
+            # gap with a resume-only one — they point at different fixes.
+            missing += [
+                f"resume:{f}" for f in emitted_flags(resume_cmd)
+                if resume_help_text and f not in resume_help_text
+            ]
+            if missing:
+                row["flag_detail"] = f"UNSUPPORTED: {', '.join(missing)}"
+                contradictions.append(
+                    f"CODEX CLI INCOMPATIBLE: codex-cli {version} rejects "
+                    f"{', '.join(missing)} — the installed CLI does not "
+                    "accept every flag this build emits. Update codex or "
+                    "check llm.codex_cli_path."
+                )
+            else:
+                row["flags_ok"] = True
+        except BackendUnavailable as exc:
+            row["flag_detail"] = "UNSUPPORTED"
+            contradictions.append(
+                f"CODEX CLI INCOMPATIBLE: codex-cli {version} accepts none "
+                f"of the non-interactive approval modes this build knows — "
+                f"{exc}"
+            )
+
+    # Presence only — the value is never read into the row, a contradiction,
+    # or a log line.
+    row["api_key_present"] = credential_status([CODEX_API_KEY_VAR]).get(
+        CODEX_API_KEY_VAR, False
+    )
+    if not row["api_key_present"]:
+        contradictions.append(
+            "CODEX BACKEND UNUSABLE: no OPENAI_API_KEY on file — codex is "
+            "BYO-API-key only; expected in ~/.no_human/.env (chmod 600) or "
+            "the environment."
+        )
+    return row, contradictions
+
+
 async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagnosis:
     d = Diagnosis()
     d.contradictions.extend(ci_config_problems(config))
+
+    # Codex coding-backend readiness — wrapped so a diagnostic can never break
+    # `nh doctor` (this file's own rule, applied consistently below to every
+    # optional check: an older schema or an unresolvable CLI must not raise).
+    try:
+        requested_by_task = (await store.query_one(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN "
+            "('done', 'failed', 'cancelled') AND LOWER(TRIM(COALESCE("
+            "json_extract(config, '$.backend'), ''))) = 'codex'"
+        ))[0] > 0
+        d.codex, codex_contradictions = codex_readiness(
+            config, requested_by_task=requested_by_task
+        )
+        d.contradictions.extend(codex_contradictions)
+    except Exception as exc:  # noqa: BLE001 — must never CRASH `nh doctor`,
+        # but a crash while codex is actually the selected backend must never
+        # read back as "codex isn't in play" either — that was the exact
+        # silent-failure a prior review flagged here: blanking to
+        # `{"selected": False}` with nothing logged and no advisory, so a
+        # broken readiness probe or store query read as healthy.
+        # `resolve_backend_name` is pure config (no subprocess, no DB), so it
+        # can still answer "is codex selected" even though the probe or the
+        # query above just blew up — and it is itself guarded so a second
+        # failure here still can't crash doctor.
+        from .agent.backend import resolve_backend_name
+
+        try:
+            selected = resolve_backend_name(config or {}, role="coder") == "codex"
+        except Exception:  # noqa: BLE001 — see above; never let this crash either
+            selected = False
+        note = f"codex readiness check raised {exc.__class__.__name__}: {exc}"
+        d.codex = {"selected": selected, "error": str(exc)}
+        if selected:
+            d.contradictions.append(
+                "CODEX READINESS CHECK FAILED: "
+                f"{note} — codex is the selected coding backend but nh doctor "
+                "could not verify it; treat it as unusable until this is "
+                "resolved."
+            )
+        else:
+            d.advisories.append(note)
+
     stats = await _kind_stats(store)
 
     def total(kinds: tuple[str, ...]) -> tuple[int, float]:

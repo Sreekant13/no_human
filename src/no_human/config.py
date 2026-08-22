@@ -25,6 +25,13 @@ from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 
+# `agent/backend.py`'s top-level imports are stdlib-only (verified: no import
+# of this module, directly or transitively, at module scope), so importing
+# its one shared constant here is not circular. This makes it the SOLE source
+# of truth for the Codex default model, rather than a literal duplicated here
+# and in doctor.py.
+from .agent.backend import DEFAULT_CODEX_MODEL
+
 # Home for the user's private token + config. Never inside the repo.
 log = logging.getLogger("no_human.config")
 
@@ -1222,8 +1229,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Claude IDs above are fixed by constraint and mean nothing to Codex,
         # so the Codex model gets its own key and its own default. Overriding
         # this is the supported way to move the Codex tier; nothing else here
-        # changes when it does.
-        "codex_model": "gpt-5-codex",
+        # changes when it does. Value lives in `agent.backend.DEFAULT_CODEX_MODEL`
+        # (see that constant's docstring for why it did not move off `gpt-5-codex`) —
+        # this key is not a second place to change it.
+        "codex_model": DEFAULT_CODEX_MODEL,
         # Codex's `model_reasoning_effort`. None ⇒ let the CLI use its own
         # default. The orchestrator's `effort=` ("low"/"medium"/"high") is
         # mapped onto this per call and takes precedence when it is set.

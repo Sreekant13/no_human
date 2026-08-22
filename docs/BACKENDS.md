@@ -42,6 +42,52 @@ The **mode** lives in config; the **key never does**. `nh` refuses to load a
 config file containing either vendor's API key, and refuses to start with
 `worker.backend: codex` and no `OPENAI_API_KEY` on file.
 
+## CLI compatibility is probed, never assumed
+
+Verified live against **codex-cli 0.149.0**: `--ask-for-approval` — the flag
+this backend used to hardcode — is no longer on `codex exec` at all (it
+survives only on the root `codex` command); `codex exec --help` on that build
+lists `-c, --config <key=value>` instead. Passing the old flag to `exec` is
+`unexpected argument '--ask-for-approval'`, rc=2, before a single turn runs —
+a probe verified the pre-fix argv reproduces exactly that.
+
+So the non-interactive approval flag is resolved from the **installed CLI's
+own `codex exec --help` output**, at the time the command is built — never
+hardcoded, never assumed from a version string. The ladder, in order:
+
+1. `--ask-for-approval never`, when `exec --help` still documents it (older CLIs).
+2. `--config approval_policy="never"`, when it doesn't — verified live to be
+   syntactically accepted by codex-cli 0.149.0's `codex exec` and to actually
+   suppress the interactive prompt (a control run with an unknown config key
+   fails with `unknown configuration field`, so the flag is confirmed
+   *recognised*, not merely silently ignored).
+
+If neither is present in the installed CLI's help text, the backend refuses to
+launch rather than risk an indefinite hang on an approval prompt nobody can
+answer — it never falls back to `--dangerously-bypass-approvals-and-sandbox`
+or any other flag that removes the sandbox boundary. `nh doctor` runs the same
+probe (whenever `worker.backend: codex`, or a live task asks for it) and prints
+a `codex backend` row naming the CLI path, the verified version, which
+approval mode was chosen (or `UNSUPPORTED`), and `OPENAI_API_KEY` presence
+(never its value).
+
+**Resuming a thread is probed separately, because its flag surface is
+narrower.** `codex exec resume <thread-id>` accepts neither `--cd` nor
+`--sandbox` (verified live: `codex exec resume --help` documents neither — a
+resumed thread inherits both from the session it is resuming); the backend
+omits both on the resume launch and validates that argv against
+`codex exec resume --help`, not the non-resume one. A CLI that accepts the
+fresh-attempt argv can still reject the resume one, so `nh doctor` checks and
+reports both independently rather than assuming compatibility transfers.
+
+**Model entitlement is a separate, unchecked question.** `nh doctor`'s codex
+row always carries a note that `llm.codex_model`'s entitlement cannot be
+verified without a **billed** call to `/v1/responses` — a model id appearing
+in `GET /v1/models` is not the same as being entitled to call it on
+`/v1/responses`, and no diagnostic here spends OpenAI quota to find out. If
+the configured model 404s at run time, that surfaces as an ordinary attempt
+failure, not a doctor contradiction.
+
 ## Codex is BYO-API-key only — a conservative choice, not a known prohibition
 
 An earlier version of this section asserted that OpenAI's terms forbid using

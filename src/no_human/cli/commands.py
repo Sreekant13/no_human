@@ -5850,6 +5850,24 @@ def doctor(verbose, verify_auth):
         console.print(f"[bold]coding backend[/] — claude CLI: "
                       f"[{colour}]{cli}[/]")
 
+        # The codex row only appears when the codex backend is actually in
+        # play (worker.backend == "codex", or a live task asked for
+        # --backend codex) — `d.codex` is `{"selected": False}` otherwise and
+        # `codex_readiness` spawned nothing to produce it.
+        if d.codex and d.codex.get("selected"):
+            cx_colour = "green" if d.codex.get("flags_ok") else "red"
+            cx_cli = d.codex.get("cli_path") or "not found"
+            cx_version = d.codex.get("version")
+            cx_version_note = f" ({cx_version})" if cx_version else ""
+            console.print(f"[bold]coding backend[/] — codex CLI: "
+                          f"[{cx_colour}]{cx_cli}[/]{cx_version_note}  "
+                          f"approval: {d.codex.get('flag_detail') or 'UNSUPPORTED'}")
+            key_colour = "green" if d.codex.get("api_key_present") else "red"
+            key_state = "present" if d.codex.get("api_key_present") else "MISSING"
+            console.print(f"                OPENAI_API_KEY: "
+                          f"[{key_colour}]{key_state}[/]  [dim](presence only)[/]")
+            console.print(f"                [dim]{d.codex.get('entitlement_note')}[/]")
+
         if verbose:
             console.print("[bold]mechanism liveness[/] (lifetime firings)")
             for m in d.mechanisms:

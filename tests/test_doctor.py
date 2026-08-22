@@ -14,9 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from no_human.agent import codex_backend as _cx
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 from no_human.doctor import MECHANISMS, diagnose
+
+from tests.test_codex_backend import _MODERN_HELP_TEXT, _MODERN_RESUME_HELP_TEXT
 
 
 @pytest.fixture
@@ -367,6 +370,216 @@ async def test_shipped_default_ci_config_is_silent(store):
 async def test_diagnose_without_config_is_unchanged(store):
     """26 existing callers pass only the store — they must keep working."""
     d = await diagnose(store)
+    assert d.healthy
+
+
+# --------------------------------------------------------------------------- #
+# Codex coding-backend readiness (`doctor.codex_readiness`, wired into         #
+# `diagnose`). The row/contradictions are only produced when the codex        #
+# backend is actually in play — everything below either proves that gate or   #
+# probes what the row says once it fires. CLI probes are stubbed via the same #
+# `_stub_cli`-style helper `tests/test_codex_backend.py` already established, #
+# so nothing here spawns a real subprocess or reaches OpenAI.                 #
+# --------------------------------------------------------------------------- #
+
+_INCOMPATIBLE_HELP_TEXT = (
+    "codex-exec\n\nUSAGE:\n    codex exec [OPTIONS] [PROMPT]\n\nOPTIONS:\n"
+    "    --json                       Print events as JSONL\n"
+    "    --cd <DIR>                   Set the working directory\n"
+    "    --model <MODEL>              Model to use\n"
+    "    --sandbox <MODE>             read-only | workspace-write | danger-full-access\n"
+)
+
+#: A `codex exec resume --help` shape that is otherwise modern (still has
+#: `--config`, so `approval_args` succeeds) but is missing `--model` — a
+#: narrower, resume-only incompatibility distinct from the approval-mode
+#: absence `_INCOMPATIBLE_HELP_TEXT` exercises above.
+_INCOMPATIBLE_RESUME_HELP_TEXT = (
+    "codex-exec-resume\n\nUSAGE:\n    codex exec resume [OPTIONS] [THREAD_ID]\n\n"
+    "OPTIONS:\n"
+    "    --json                       Print events as JSONL\n"
+    "    -c, --config <key=value>     Override a config value\n"
+)
+
+
+async def test_the_codex_row_is_absent_on_a_default_claude_install(
+        store, monkeypatch, isolated_env_file):
+    """The default install never even asks — no CLI probe, no key check."""
+    def _boom(*_a, **_k):
+        raise AssertionError("codex probe ran on an install that never asked for it")
+
+    monkeypatch.setattr(_cx, "find_codex_cli", _boom)
+    monkeypatch.setattr(_cx, "codex_exec_help", _boom)
+    monkeypatch.setattr(_cx, "codex_version", _boom)
+
+    d = await diagnose(store)  # no config ⇒ worker.backend defaults to claude
+    assert d.codex == {"selected": False}
+    assert not any("CODEX" in c for c in d.contradictions), d.contradictions
+    assert d.healthy
+
+
+async def test_the_codex_row_reports_version_flags_and_key_presence_never_the_value(
+        store, monkeypatch, isolated_env_file):
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _MODERN_RESUME_HELP_TEXT if resume else _MODERN_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.149.0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secretvalue")
+
+    d = await diagnose(store, {"worker": {"backend": "codex"}})
+
+    assert d.codex["selected"] is True
+    assert d.codex["version"] == "codex-cli 0.149.0"
+    assert d.codex["flags_ok"] is True
+    assert d.codex["api_key_present"] is True
+    assert d.codex["entitlement_note"]
+    assert "sk-secretvalue" not in repr(d.codex)
+    assert not any("sk-secretvalue" in c for c in d.contradictions)
+    assert not any("sk-secretvalue" in a for a in d.advisories)
+
+
+async def test_an_incompatible_codex_cli_is_a_contradiction_with_the_version(
+        store, monkeypatch, isolated_env_file):
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _MODERN_RESUME_HELP_TEXT if resume else _INCOMPATIBLE_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.99.0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secretvalue")
+
+    d = await diagnose(store, {"worker": {"backend": "codex"}})
+
+    assert d.codex["flags_ok"] is False
+    assert any("CODEX CLI INCOMPATIBLE" in c and "codex-cli 0.99.0" in c
+               for c in d.contradictions), d.contradictions
+    assert not d.healthy
+
+
+async def test_an_incompatible_resume_argv_is_also_a_contradiction(
+        store, monkeypatch, isolated_env_file):
+    """The resume branch has its own, narrower flag surface (no `--cd`, no
+    `--sandbox` — verified live). A CLI that accepts the non-resume argv can
+    still reject the resume one; this is this ticket's Blocker 1, and the
+    doctor check must catch it independently of the non-resume check above."""
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _INCOMPATIBLE_RESUME_HELP_TEXT if resume else _MODERN_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.99.0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secretvalue")
+
+    d = await diagnose(store, {"worker": {"backend": "codex"}})
+
+    # The non-resume argv is fully compatible with `_MODERN_HELP_TEXT`, so
+    # `flags_ok` only goes False because the resume argv was also checked.
+    assert d.codex["flags_ok"] is False
+    assert any("resume:" in c for c in d.contradictions), d.contradictions
+    assert not d.healthy
+
+
+async def test_a_task_that_asks_for_codex_turns_the_row_on(
+        store, monkeypatch, isolated_env_file):
+    """The global config stays claude — a per-task override is enough."""
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _MODERN_RESUME_HELP_TEXT if resume else _MODERN_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.149.0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secretvalue")
+
+    t = Task.new("x", repo_path="/tmp/x")
+    t.config = {"backend": "codex"}
+    await store.create_task(t)
+
+    d = await diagnose(store)  # global config unset ⇒ claude
+    assert d.codex["selected"] is True
+
+
+async def test_a_missing_openai_key_is_a_contradiction_with_a_fix_command(
+        store, monkeypatch, isolated_env_file):
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _MODERN_RESUME_HELP_TEXT if resume else _MODERN_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.149.0")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    d = await diagnose(store, {"worker": {"backend": "codex"}})
+
+    assert d.codex["api_key_present"] is False
+    assert any("~/.no_human/.env" in c for c in d.contradictions), d.contradictions
+    assert not d.healthy
+
+
+async def test_a_codex_readiness_crash_while_selected_is_a_contradiction_not_silence(
+        store, monkeypatch, isolated_env_file):
+    """Pins the exact silent-failure a prior review flagged at doctor.py:508:
+    a crash inside the readiness probe (or the task-lookup query it shares a
+    try-block with) must not blank ``d.codex`` back to ``{"selected": False}``
+    with nothing logged — when codex IS the selected backend, a broken check
+    is itself a contradiction (unhealthy), not a silent "codex isn't in
+    play"."""
+    import no_human.doctor as doctor_mod
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("codex readiness probe exploded")
+
+    monkeypatch.setattr(doctor_mod, "codex_readiness", _boom)
+
+    d = await diagnose(store, {"worker": {"backend": "codex"}})
+
+    assert d.codex is not None
+    assert d.codex["selected"] is True
+    assert "codex readiness probe exploded" in d.codex.get("error", "")
+    assert any(
+        "CODEX READINESS CHECK FAILED" in c for c in d.contradictions
+    ), d.contradictions
+    assert not d.healthy
+
+
+async def test_a_codex_readiness_crash_while_not_selected_is_an_advisory_not_silence(
+        store, monkeypatch, isolated_env_file):
+    """Same crash, but codex is not in play at all (default Claude install,
+    no task requests it): the crash must still be surfaced — as an advisory,
+    since nothing codex-shaped is actually broken for this install — never
+    dropped on the floor, and never a contradiction that would flip a
+    healthy Claude-only install to unhealthy."""
+    import no_human.doctor as doctor_mod
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("store schema too old for the codex task query")
+
+    monkeypatch.setattr(doctor_mod, "codex_readiness", _boom)
+
+    d = await diagnose(store)
+
+    assert d.codex is not None
+    assert d.codex["selected"] is False
+    assert any(
+        "store schema too old" in a for a in d.advisories
+    ), d.advisories
+    assert not any("CODEX" in c for c in d.contradictions), d.contradictions
     assert d.healthy
 
 
