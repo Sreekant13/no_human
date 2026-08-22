@@ -651,3 +651,37 @@ async def test_migration_is_idempotent_on_repeated_connect(tmp_path):
     assert row3["ts"] == row2["ts"]
     assert count3 == count2
     assert non_real == 0
+
+
+async def test_attempts_has_a_verifier_results_column(store):
+    """migrations/0015 (comment-only) documents the column; the actual ALTER
+    lives in `db.py`'s PRAGMA-guarded `att_wanted` dict — this proves the
+    column really exists on a freshly connected store, not just in the
+    migration file's prose."""
+    cols = {row["name"] for row in await store.db.execute_fetchall(
+        "PRAGMA table_info(attempts)")}
+    assert "verifier_results" in cols
+
+
+async def test_verifier_results_round_trips_and_survives_a_reconnect(tmp_path):
+    """The `att_wanted` PRAGMA-guard runs on every connect, same as every
+    other attempts column — a reconnect must not drop or reset a value
+    already written, mirroring the `test_migration_is_idempotent_on_repeated_
+    connect` pattern above for the review-history/task_events case."""
+    db_path = tmp_path / "t.db"
+    s1 = await Store(db_path).connect()
+    t = Task.new("x", repo_path="/tmp/r")
+    await s1.create_task(t)
+    a = await s1.create_attempt(t.id, 1)
+    verifiers = [{"verifier_id": "no-todo", "passed": False,
+                  "no_verdict": False, "evidence": "e", "file": "a.py",
+                  "line": 1, "comment": "c", "severity": "high",
+                  "files_checked": ["a.py"], "tokens_used": 500}]
+    await s1.update_attempt(a, verifier_results=verifiers)
+    await s1.close()
+
+    s2 = await Store(db_path).connect()
+    row = await s2.query_one(
+        "SELECT verifier_results FROM attempts WHERE id = ?", (a,))
+    await s2.close()
+    assert json.loads(row["verifier_results"]) == verifiers

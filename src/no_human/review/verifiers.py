@@ -82,6 +82,20 @@ class VerifierResult:
     raw_output: str = ""
     no_verdict: bool = False
 
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "verifier_id": self.verifier_id,
+            "passed": self.passed,
+            "no_verdict": self.no_verdict,
+            "evidence": self.evidence,
+            "file": self.file,
+            "line": self.line,
+            "comment": self.comment,
+            "severity": self.severity,
+            "files_checked": list(self.files_checked),
+            "tokens_used": self.tokens_used,
+        }
+
 
 # --------------------------------------------------------------------------
 # path normalisation shared by the loader, the selector and the diff filter
@@ -318,6 +332,8 @@ def _resolve_block_path(block: str) -> str | None:
     plus_path: str | None = None
     minus_path: str | None = None
     for line in lines:
+        if line.startswith("@@"):
+            break
         if line.startswith("+++ "):
             plus_path = line[4:].split("\t", 1)[0].strip()
         elif line.startswith("--- "):

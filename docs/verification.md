@@ -47,6 +47,39 @@ reviewer that crashes, times out, or emits no parseable verdict fails closed
 (`_parse_review_output`, `AdversarialReviewer._fast_review` and
 `AdversarialReviewer._agent_review` in `reviewer.py`).
 
+## Verifiers — a recorded verdict per rule
+
+[`src/no_human/review/verifiers.py`](../src/no_human/review/verifiers.py) loads
+project-specific rules from `.no_human/verifiers.yaml` (repo-scoped) and a
+second, global file under `~/.no_human` — each rule a plain-English
+`statement` plus a glob `paths` list and a `severity`. Before the agentic
+reviewer runs, `Orchestrator._run_review` selects the rules whose `paths`
+match the changed files and puts each one, independently, to a fresh
+bounded judge call (max one turn) with the diff and read-only file access.
+Every verdict is recorded — pass or fail, with `evidence`, `file`/`line`
+when it names one, and which files it actually checked — never only the
+failures. A verifier that returns no parseable verdict (a timeout, a crash,
+an unparseable response) fails closed, the same posture as the agentic
+reviewer itself.
+
+The merge into the review decision is monotonic, not advisory noise the
+reviewer can talk itself past: **any** failing verifier ends the round
+before the agentic reviewer ever runs, appearing on the checklist as
+`rule:<verifier id>`. Only when every selected verifier is satisfied does the
+round proceed to the reviewer, and its own findings still apply on top. Every
+verifier verdict is persisted on the attempt row (`attempts.verifier_results`)
+and keyed into `task.context.verifier_results` by the commit SHA it judged,
+so a later attempt's verdicts never overwrite an earlier one's. The same
+verdicts render twice for a human: as a `Verifiers` row in the PR body's
+Evidence table (`core/pr_evidence.py`'s `verifiers_pin()` — `"N of N
+satisfied"` or `"K of N failed — id1, id2"`, folded behind a `<details>` list
+of every rule), and as a per-verifier list in the board's Review tab. No
+`.no_human/verifiers.yaml` (repo or global), verifiers disabled in config, no
+usable diff, or a changed-path set that matches none of the loaded rules all
+skip the step entirely and proceed straight to the agentic reviewer — this is
+an added gate, not a replacement for it, and an empty rule set changes
+nothing about what already ran.
+
 ## Deterministic lint evidence — not a gate, an input
 
 [`src/no_human/review/lint_evidence.py`](../src/no_human/review/lint_evidence.py)

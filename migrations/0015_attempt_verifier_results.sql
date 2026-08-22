@@ -1,0 +1,26 @@
+-- 0015: verifier verdicts, one JSON blob per attempt's review round.
+--
+-- `attempts.verifier_results` holds every `VerifierResult.as_dict()` produced
+-- by this attempt's most recent pass through the gate (review/verifiers.py,
+-- run via core/orchestrator.py::_run_review), as a JSON list. It is written
+-- with the SAME `update_attempt(attempt_id, verifier_results=[...])` call
+-- pattern already used for every other attempt column, which JSON-encodes
+-- list/dict values transparently.
+--
+-- NULLABLE, NO DEFAULT — deliberately, not an oversight. Most existing rows
+-- predate the verifier gate entirely, and a row where no verifier ran must
+-- read as NULL ("nothing to show"), never as '[]' ("verifiers ran and found
+-- nothing"): those are different facts, and a DEFAULT would erase the
+-- difference for every attempt that came before this column existed. A row
+-- where verifiers are configured but produced zero results (e.g. no rule
+-- matched any changed file) is recorded as an explicit '[]', written by the
+-- gate itself, not by a column default.
+--
+-- The column is added defensively in Python (`db.py`'s `att_wanted`, checked
+-- against `PRAGMA table_info(attempts)` before each `ALTER TABLE ... ADD
+-- COLUMN`), not here. `_migrate` executescript's every `migrations/*.sql` file
+-- on EVERY connect with no migration-version tracking, so a literal
+-- `ALTER TABLE attempts ADD COLUMN verifier_results TEXT` in this file would
+-- raise "duplicate column name" and brick the DB on the second connect (see
+-- 0003_task_kind.sql for the same reasoning, applied first). This file is
+-- documentation of the column, not the mechanism that creates it.

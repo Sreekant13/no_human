@@ -792,3 +792,40 @@ export function defaultOpenSection(task) {
   }
   return "system";
 }
+
+// ── Verifiers (review/verifiers.py, VerifierResult.as_dict()) ─────────────
+// Pure formatter over `attempt.verifier_results` — the same shape the PR
+// body's Evidence table row and <details> list render from
+// (core/pr_evidence.py's `verifiers_pin()`), duplicated here rather than
+// imported: this is JS reading a JSON column, not a shared module boundary.
+// Returns null for anything that is not a non-empty array — `undefined`
+// (column never populated for this attempt), `[]` (verifiers ran, matched
+// nothing), and any non-array all render as "nothing to show" rather than
+// an empty section.
+export function verifierRows(results) {
+  if (!Array.isArray(results) || results.length === 0) return null;
+  const total = results.length;
+  const failedIds = results
+    .filter((r) => !r?.passed)
+    .map((r) => String(r?.verifier_id ?? ""))
+    .sort();
+  const summary = failedIds.length
+    ? `${failedIds.length} of ${total} failed — ${failedIds.join(", ")}`
+    : `${total} of ${total} satisfied`;
+  const rows = results.map((r) => {
+    const ok = !!r?.passed;
+    const file = r?.file ?? "";
+    const line = r?.line ?? null;
+    return {
+      id: String(r?.verifier_id ?? ""),
+      ok,
+      filesChecked: Array.isArray(r?.files_checked) ? r.files_checked.length : 0,
+      // Only a failure names a location/comment — a pass has nothing to
+      // point at, and rendering an empty location on every row would read
+      // as "no location was ever recorded" for the passes.
+      location: !ok && file ? (line ? `${file}:${line}` : file) : "",
+      comment: !ok ? String(r?.evidence ?? r?.comment ?? "") : "",
+    };
+  });
+  return { summary, rows };
+}

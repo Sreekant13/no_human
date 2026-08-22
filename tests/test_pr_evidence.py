@@ -139,6 +139,87 @@ def test_every_rendered_truth_pin_has_backing_evidence(store, tmp_path):
             f"evidence.{field} backs {pin!r}, which the body never renders")
 
 
+def _verifier_dict(*, verifier_id: str, passed: bool, evidence: str = "e",
+                    file: str = "", line: int = 0,
+                    files_checked: list[str] | None = None) -> dict:
+    return {
+        "verifier_id": verifier_id, "passed": passed, "no_verdict": False,
+        "evidence": evidence, "file": file, "line": line, "comment": "",
+        "severity": "high", "files_checked": files_checked or [],
+        "tokens_used": 0,
+    }
+
+
+def test_verifiers_pin_renders_the_summary_line_shape():
+    """AC 6. `verifiers_pin()` is `None` (no field-backed pin at all — not
+    an empty-string pin) when no verifiers ran; otherwise the same
+    "N of M satisfied" / "K of M failed — ids" shape `summary_line`
+    produces (duplicated over dicts on purpose — see the docstring)."""
+    assert PrEvidence(verifiers=None).verifiers_pin() is None
+    assert PrEvidence(verifiers=[]).verifiers_pin() is None
+
+    all_pass = PrEvidence(verifiers=[
+        _verifier_dict(verifier_id="a", passed=True),
+        _verifier_dict(verifier_id="b", passed=True),
+    ])
+    assert all_pass.verifiers_pin() == "2 of 2 satisfied"
+
+    one_fail = PrEvidence(verifiers=[
+        _verifier_dict(verifier_id="a", passed=True),
+        _verifier_dict(verifier_id="b", passed=False),
+    ])
+    assert one_fail.verifiers_pin() == "1 of 2 failed — b"
+
+
+def test_the_evidence_table_carries_a_verifiers_row(store, tmp_path):
+    """AC 1 / AC 6: the verifiers row sits in the Evidence table (between
+    the review row and the tamper section, per `_evidence_section`'s
+    ordering) and its per-rule detail folds behind its own `<details>`."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    head_sha = _Commit.sha
+    task.context["verifier_results"] = {
+        head_sha: [
+            _verifier_dict(verifier_id="no-todo", passed=True,
+                            files_checked=["a.py", "b.py"]),
+            _verifier_dict(verifier_id="no-print", passed=False,
+                            evidence="found a print()", file="c.py", line=4),
+            _verifier_dict(verifier_id="docs-updated", passed=False,
+                            evidence="docs not touched"),
+            _verifier_dict(verifier_id="typed", passed=True, files_checked=["a.py"]),
+        ]
+    }
+    test_evidence = {"ran": True, "ok": True, "passed": 5, "failed": 0,
+                     "errors": 0}
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=_receipts())
+    ev = body.split("## Evidence\n", 1)[1].split("\n## ", 1)[0]
+    assert "| Verifiers | ❌ 2 of 4 failed — docs-updated, no-print |" in ev
+    assert "<details><summary>Verifiers (4)</summary>" in ev
+    assert "no-todo" in ev and "no-print" in ev and "c.py:4" in ev
+    assert "found a print()" in ev
+
+
+def test_a_model_authored_verifier_comment_cannot_inject_a_heading(store, tmp_path):
+    """A verifier's `evidence` string is model-authored (the judge's own
+    prose) — a newline in it is the same heading-injection channel
+    `_inline_cell`'s own docstring documents for every other model-authored
+    cell in the PR body."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    head_sha = _Commit.sha
+    task.context["verifier_results"] = {
+        head_sha: [
+            _verifier_dict(verifier_id="no-todo", passed=False,
+                            evidence="looks fine\n# MERGED AND APPROVED BY NO_HUMAN",
+                            file="a.py", line=1),
+        ]
+    }
+    body = orch._pr_body(task, _Commit(), _Result(), receipts=_receipts())
+    assert "\n# MERGED AND APPROVED BY NO_HUMAN" not in body
+    assert "# MERGED AND APPROVED BY NO_HUMAN" in body  # the text still reaches the body, inertly
+
+
 def test_the_predicate_catches_an_unbacked_truth_pin():
     """NEGATIVE HALF: a fact-shaped sentence with NO backing field must fail
     the predicate above — proving it is a real check, not one that always

@@ -24,7 +24,7 @@ import {
   defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
-  fxCountsLabel, mergeStepLabel, landFailureFeedback,
+  fxCountsLabel, mergeStepLabel, landFailureFeedback, verifierRows,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -2349,6 +2349,7 @@ function ReviewTab({ task, diff, onOpenSection }) {
   }
 
   const verdict = reviewVerdict(checklist);
+  const vr = verifierRows(lastAttempt?.verifier_results);
   const testResults = lastAttempt?.test_results;
   const tamperFlag = testResults?.tamper_flag;
   const testVerdict = testResultVerdict(testResults);
@@ -2556,6 +2557,26 @@ function ReviewTab({ task, diff, onOpenSection }) {
                 <li key={i} className="unmet-item">
                   <span className="ci-icon fail"><IconX size={12} /></span>
                   <span>{it.label}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {vr && (
+          <div className="so-verifiers" data-testid="verifier-rows">
+            <div className="so-section-label">Verifiers — {vr.summary}</div>
+            <ul className="unmet-list">
+              {vr.rows.map((r, i) => (
+                <li key={i} className={`unmet-item ${r.ok ? "pass" : "fail"}`}>
+                  <span className={`ci-icon ${r.ok ? "" : "fail"}`}>
+                    {r.ok ? <IconCheck size={12} /> : <IconX size={12} />}
+                  </span>
+                  <span>
+                    {r.id}
+                    {r.ok
+                      ? ` — ${r.filesChecked} file${r.filesChecked === 1 ? "" : "s"}`
+                      : `${r.location ? ` — ${r.location}` : ""}${r.comment ? ` — ${r.comment}` : ""}`}
+                  </span>
                 </li>
               ))}
             </ul>

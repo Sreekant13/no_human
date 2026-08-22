@@ -64,7 +64,7 @@ from ..blockers import (
     user_pause_blocker,
 )
 from ..ci.base import CIResult, HumanGatedCI
-from ..config import active_auth_profile
+from ..config import NO_HUMAN_HOME, active_auth_profile
 from ..history.skills import discover_skills
 from ..intake.classify import kind_criteria_mismatch
 from ..intake.split_proposal import generate_split_proposal
@@ -82,6 +82,13 @@ from ..review.reviewer import (
     findings_from_checklist,
 )
 from ..review.selfcheck import ChecklistItem
+from ..review.verifiers import (
+    load_verifiers,
+    run_verifiers,
+    select as select_verifiers,
+    summary_line as verifiers_summary_line,
+    to_checklist_item as verifier_to_checklist_item,
+)
 from ..testing import ownership, runner
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
@@ -10066,6 +10073,111 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 — advisory label only
             reviewed_branch = ""
 
+        # Verifiers: deterministic, YAML-authored rules (review/verifiers.py)
+        # run BEFORE the agentic reviewer, so a failing rule ends the round
+        # without spending reviewer tokens. The merge into the round is
+        # monotonic — a passing verifier adds nothing to the checklist, only a
+        # failing one (no_verdict included: a rule that never reached a
+        # verdict fails closed) does. `before_ref` is resolved once, here, and
+        # reused below for the existing `_run_reviewer` kwarg (one merge-base
+        # call, not two — the existing C4 comment's rule applied to this new
+        # caller too).
+        before_ref = self._review_base(repo, base) if repo is not None else "HEAD~1"
+        verifier_dicts: list[dict[str, Any]] = []
+        verifier_results: list = []
+        verifier_tok = {"total": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
+        verifier_output_seen = False
+        skip_reason: str | None = None
+        report = None
+        diff_text = ""
+        changed: list[str] = []
+
+        if not (self.config.get("verifiers") or {}).get("enabled", True):
+            skip_reason = "disabled"
+        elif repo is None:
+            skip_reason = "no repo checkout"
+        else:
+            report = load_verifiers(repo.path, home=NO_HUMAN_HOME)
+            for problem in report.problems:
+                self._emit_review("verifiers_load", problem, advisory=True)
+            if not report.verifiers:
+                skip_reason = "no verifiers configured"
+
+        if skip_reason is None:
+            try:
+                diff_text = repo.diff(before_ref)
+                changed = repo.changed_files(before_ref)
+            except Exception:  # noqa: BLE001 — an unreadable diff must not crash the gate
+                skip_reason = "diff unavailable"
+
+        if skip_reason is None and not select_verifiers(report.verifiers, changed):
+            skip_reason = "none selected for the changed paths"
+
+        if skip_reason is not None:
+            self._emit_review(
+                "verifiers_skipped", f"verifiers skipped: {skip_reason}",
+                reason=skip_reason,
+            )
+        else:
+            def _verifier_read_file(path: str) -> str | None:
+                try:
+                    return (repo.path / path).read_text(errors="replace")
+                except OSError:
+                    return None
+
+            async def judge(prompt: str) -> tuple[str, int]:
+                nonlocal verifier_output_seen
+                result, _reason = await self.reviewer._run_bounded(
+                    prompt, repo.path, max_turns=1, timeout=180, on_event=None)
+                if result is None:
+                    return "", 0  # parse_result → no_verdict → FAIL CLOSED
+                verifier_tok["total"] += result.tokens_used or 0
+                verifier_tok["cache_read"] += result.cache_read_tokens or 0
+                verifier_tok["cache_creation"] += result.cache_creation_tokens or 0
+                if result.output_tokens is not None:
+                    verifier_output_seen = True
+                    verifier_tok["output"] += result.output_tokens
+                return (result.final_text or ""), (result.tokens_used or 0)
+
+            verifier_results = await run_verifiers(
+                judge,
+                verifiers=report.verifiers,
+                diff_text=diff_text,
+                read_file=_verifier_read_file,
+                changed_paths=changed,
+            )
+            verifier_dicts = [r.as_dict() for r in verifier_results]
+
+        # Persist regardless of outcome: a re-review overwrites its own
+        # attempt row and its own sha-keyed context entry, never another
+        # round's — nothing here is destructive.
+        await self.store.update_attempt(attempt_id, verifier_results=verifier_dicts)
+        ctx = task.context or {}
+        ctx.setdefault("verifier_results", {})[reviewed_sha] = verifier_dicts
+        task.context = ctx
+        await self.store.update_task(task)
+
+        failed_verifiers = [r for r in verifier_results if not r.passed]
+        if failed_verifiers:
+            decision = ReviewDecision(
+                passed=False,
+                checklist=[verifier_to_checklist_item(r) for r in failed_verifiers],
+                verifiers=verifier_dicts,
+                tokens_used=verifier_tok["total"],
+                cache_read_tokens=verifier_tok["cache_read"],
+                cache_creation_tokens=verifier_tok["cache_creation"],
+                output_tokens=(verifier_tok["output"] if verifier_output_seen else None),
+            )
+            await self._append_review_history(task, decision, commit_sha=reviewed_sha)
+            self._emit_review(
+                "review", verifiers_summary_line(verifier_results),
+                passed=False,
+                failed_count=len(decision.failed_items),
+                blocking_count=len(decision.blocking_items),
+                advisory_count=len(decision.advisory_items),
+            )
+            return decision
+
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
             # Single reviewer chokepoint; confirmed_rules is set inside it from
@@ -10078,7 +10190,7 @@ class Orchestrator:
                 held_out_output=held_result.output if held_result else "",
                 profile_context=profile_ctx,
                 prior_rounds=self._review_continuity(task),
-                before_ref=self._review_base(repo, base),
+                before_ref=before_ref,
                 # 0a: the artifact a "the PR body contains X" criterion refers to.
                 # Empty when the forge was unreachable, in which case such a criterion
                 # fails HONESTLY rather than impossibly.
@@ -10098,7 +10210,30 @@ class Orchestrator:
             return ReviewDecision(
                 passed=False,
                 checklist=[ChecklistItem("reviewer run", False, f"reviewer crashed: {exc}")],
+                verifiers=verifier_dicts,
+                tokens_used=verifier_tok["total"],
+                cache_read_tokens=verifier_tok["cache_read"],
+                cache_creation_tokens=verifier_tok["cache_creation"],
+                output_tokens=(verifier_tok["output"] if verifier_output_seen else None),
             )
+
+        # Fold verifiers into the round the reviewer actually judged: the
+        # gate already passed them (a failure would have returned above,
+        # before the reviewer ever ran), so this is purely additive
+        # record-keeping — see `ReviewDecision.verifiers`'s docstring.
+        # `_record_review_usage` (:6243) is a SET the CALLER runs once this
+        # function returns — folding here, not a second DB write, is what
+        # keeps reviewer + verifier spend from clobbering each other.
+        decision.verifiers = verifier_dicts
+        decision.tokens_used = (decision.tokens_used or 0) + verifier_tok["total"]
+        decision.cache_read_tokens = (
+            (decision.cache_read_tokens or 0) + verifier_tok["cache_read"]
+        )
+        decision.cache_creation_tokens = (
+            (decision.cache_creation_tokens or 0) + verifier_tok["cache_creation"]
+        )
+        if verifier_output_seen:
+            decision.output_tokens = (decision.output_tokens or 0) + verifier_tok["output"]
 
         verdict = "PASS" if decision.passed else "FAIL"
         # The head the reviewer was told it was reviewing — resolved before the
@@ -16861,6 +16996,7 @@ SIX of them read a checkpoint and TWO do not — but do
             tamper=self._tamper_data(task),
             tests=test_evidence,
             review_verdict=self._review_verdict_data(task, head_sha=head_sha, repo=repo),
+            verifiers=((task.context or {}).get("verifier_results") or {}).get(head_sha),
             ci_state=(task.context or {}).get("ci_status"),
         )
 
@@ -16889,12 +17025,13 @@ SIX of them read a checkpoint and TWO do not — but do
                 task, test_evidence=test_evidence, head_sha=head_sha, repo=repo)
         review = self._review_evidence_section(
             task, head_sha=head_sha, repo=repo, evidence=evidence)
+        verifiers = self._verifiers_evidence_section(evidence)
         tamper = self._tamper_adjudication_section(task, evidence=evidence)
         tests = self._test_evidence_section(evidence.tests)
         ci = ""
         if evidence.ci_state:
             ci = f"| CI | {self._inline_cell(str(evidence.ci_state), None)} |\n"
-        rows, after = self._split_rows(review + tamper + tests + ci)
+        rows, after = self._split_rows(review + verifiers + tamper + tests + ci)
         if not rows:
             return ""
         return ("## Evidence\n| Check | Result |\n|---|---|\n" + rows
@@ -17185,6 +17322,50 @@ SIX of them read a checkpoint and TWO do not — but do
         fold = (f"<details><summary>{k} finding{'s' if k != 1 else ''} raised "
                 "and addressed across review rounds</summary>\n\n"
                 + "\n".join(f"- {a}" for a in addressed) + "\n\n</details>\n")
+        return row + fold
+
+    @staticmethod
+    def _verifiers_evidence_section(evidence: PrEvidence) -> str:
+        """The deterministic verifier verdicts (review/verifiers.py), in the
+        PR body's Evidence table. Renders EXCLUSIVELY from
+        ``evidence.verifiers`` / ``evidence.verifiers_pin()`` — the row's
+        text IS the pin, never re-derived here, so the summary line and the
+        per-rule list below it cannot drift apart the way two independent
+        renderings of the same fact did before (see
+        `_review_evidence_section`'s precedent). "" when no verifiers ran
+        for this head — never a row for an empty list.
+
+        Every model-authored cell (a rule's own id, the file path it
+        reports, its ``evidence`` string extracted from the diff/repo) goes
+        through `_inline_cell`: that text did not come from a human, and a
+        single newline in it is the same heading-injection channel the
+        `<h1>` incident at `_inline_cell`'s own docstring describes.
+        """
+        results = evidence.verifiers
+        if not results:
+            return ""
+        pin = evidence.verifiers_pin() or ""
+        failed = [r for r in results if not r.get("passed")]
+        glyph = "❌" if failed else "✅"
+        row = f"| Verifiers | {glyph} {Orchestrator._inline_cell(pin, None)} |\n"
+        items: list[str] = []
+        for r in results:
+            vid = Orchestrator._inline_cell(str(r.get("verifier_id") or ""), None)
+            if r.get("passed"):
+                n = len(r.get("files_checked") or [])
+                items.append(f"- ✅ {vid} — {n} file{'s' if n != 1 else ''}")
+            else:
+                loc = ""
+                f = r.get("file")
+                ln = r.get("line")
+                if f:
+                    loc = Orchestrator._inline_cell(
+                        f"{f}:{ln}" if ln else str(f), None) + " — "
+                comment = Orchestrator._inline_cell(str(r.get("evidence") or ""), None)
+                items.append(f"- ❌ {vid} — {loc}{comment}")
+        k = len(results)
+        fold = (f"<details><summary>Verifiers ({k})</summary>\n\n"
+                + "\n".join(items) + "\n\n</details>\n")
         return row + fold
 
     #: How many recorded commands are shown WITH their captured output, and how

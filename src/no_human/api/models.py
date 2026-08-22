@@ -19,6 +19,13 @@ class AttemptOut(BaseModel):
     pr_url: str | None = None
     review_passed: int | None = None
     review_checklist: dict | None = None
+    # Every deterministic verifier verdict from this attempt's gate round
+    # (review/verifiers.py's VerifierResult.as_dict(), via
+    # Orchestrator._run_review) — a JSON list, or None when no verifiers ran
+    # for this attempt. `list_attempts` is `SELECT *` (db.py), so no route
+    # change was needed to surface the new `attempts.verifier_results`
+    # column; this model is the only place it must be named.
+    verifier_results: list | None = None
     test_results: dict | None = None
     ci_pipeline_id: str | None = None
     ci_pipeline_url: str | None = None
@@ -60,6 +67,7 @@ class AttemptOut(BaseModel):
             pr_url=row.get("pr_url"),
             review_passed=row.get("review_passed"),
             review_checklist=_json(row.get("review_checklist")),
+            verifier_results=_json(row.get("verifier_results")),
             test_results=_json(row.get("test_results")),
             ci_pipeline_id=row.get("ci_pipeline_id"),
             ci_pipeline_url=row.get("ci_pipeline_url"),

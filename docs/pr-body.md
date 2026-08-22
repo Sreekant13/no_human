@@ -18,6 +18,7 @@ attempt's gate outputs:
 | Check | What the cell is |
 |---|---|
 | Independent review | the fresh-context reviewer's verdict on *this* commit and the number of rounds it took. A round that judged a different commit of the task is not counted. Findings earlier rounds raised, and the coder addressed, are folded under the table. |
+| Verifiers | present only when at least one project verifier rule (`.no_human/verifiers.yaml`) was selected for this commit's changed files — `"N of N satisfied"` or `"K of N failed — id1, id2"` (`core/pr_evidence.py`'s `verifiers_pin()`), never re-derived from the per-rule list. Every rule's verdict, not only the failures, is folded under the table: `✅ id — n files` for a pass, `❌ id — file:line — comment` for a fail. A failing verifier blocked the reviewer from running at all this round — see [verification.md](verification.md#verifiers--a-recorded-verdict-per-rule). |
 | Test-change guard | present only when the tamper guard fired and an independent adjudicator waived it as required by the ticket; its reasoning is printed under the table. |
 | Tests | the orchestrator's own run of the project's tests on the final tree — counts, or `NOT RUN` with the reason. Failing test names are folded under the table. |
 | CI | the forge's CI state for the branch, when one is known. |

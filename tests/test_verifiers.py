@@ -15,6 +15,7 @@ from no_human.review.verifiers import (
     LoadReport,
     Verifier,
     VerifierResult,
+    _resolve_block_path,
     build_prompt,
     filter_diff,
     load_verifiers,
@@ -436,6 +437,39 @@ def test_filter_diff_drops_an_unresolvable_block_without_crashing():
     kept, matched = filter_diff(weird, ["*"])
     assert kept == ""
     assert matched == []
+
+
+# --------------------------------------------------------------------------
+# 28b. _resolve_block_path — carry-over fix: only header lines before the
+# first @@ hunk marker (or the diff --git line) are eligible.
+# --------------------------------------------------------------------------
+
+
+def test_a_content_line_beginning_with_plus_plus_is_not_read_as_a_file_header():
+    block = (
+        "diff --git a/src/x.py b/src/x.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/x.py\n"
+        "+++ b/src/x.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " def f():\n"
+        "     return 1\n"
+        "+++ foo\n"
+    )
+    assert _resolve_block_path(block) == "src/x.py"
+
+
+def test_header_paths_after_the_first_hunk_marker_are_ignored():
+    block = (
+        "diff --git a/src/x.py b/src/x.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/x.py\n"
+        "+++ b/src/x.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " def f():\n"
+        "+++ b/evil.py\n"
+    )
+    assert _resolve_block_path(block) == "src/x.py"
 
 
 # --------------------------------------------------------------------------

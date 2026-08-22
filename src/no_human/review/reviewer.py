@@ -373,6 +373,11 @@ class ReviewDecision:
     # tier. None (not 0) when the session reported no usage block: the
     # attempt column it lands in is nullable for exactly that reason.
     output_tokens: int | None = None
+    # Every verifier that ran this round (`VerifierResult.as_dict()`), pass or
+    # fail. Empty when no verifiers were configured/selected, or the gate is
+    # disabled — never populated with a fail already turned into a checklist
+    # item elsewhere, so this is purely additive record-keeping.
+    verifiers: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
@@ -410,6 +415,7 @@ class ReviewDecision:
             d["suggested_next"] = self.suggested_next
         if self.goal is not None:
             d["goal"] = self.goal
+        d["verifiers"] = list(self.verifiers)
         return d
 
 

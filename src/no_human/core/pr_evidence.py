@@ -39,6 +39,10 @@ class PrEvidence:
     * ``review_verdict`` — the independent reviewer's verdict trail:
       ``{"rounds": int, "verdict": str, "addressed": [...], "unmatched":
       bool}``, or ``None`` when no round has judged this head.
+    * ``verifiers`` — every deterministic verifier verdict from this head's
+      gate round (`review/verifiers.py`'s ``VerifierResult.as_dict()``), or
+      ``None`` when no verifiers were configured/selected for this head —
+      never an empty list standing in for "not run".
     * ``ci_state`` — CI/annotation state for this attempt, or ``None`` before
       CI has reported anything.
     """
@@ -47,6 +51,7 @@ class PrEvidence:
     tamper: list[dict[str, Any]] | None = None
     tests: dict[str, Any] | None = None
     review_verdict: dict[str, Any] | None = None
+    verifiers: list[dict[str, Any]] | None = None
     ci_state: Any = None
 
     def has(self, field: str) -> bool:
@@ -86,6 +91,22 @@ class PrEvidence:
             return None
         return f"| CI | {self.ci_state} |"
 
+    def verifiers_pin(self) -> str | None:
+        """Re-implemented over dicts, not `verifiers.summary_line`: this
+        module's own boundary is "never import the review package", and that
+        holds for the verifiers module too — the shape is duplicated here on
+        purpose rather than crossing it.
+        """
+        if not self.verifiers:
+            return None
+        total = len(self.verifiers)
+        failed = sorted(
+            v.get("verifier_id", "") for v in self.verifiers if not v.get("passed")
+        )
+        if not failed:
+            return f"{total} of {total} satisfied"
+        return f"{len(failed)} of {total} failed — {', '.join(failed)}"
+
     def truth_pins(self) -> dict[str, str]:
         """``{backing field name: exact fact sentence}`` for every truth pin
         this object can justify. A PR body must never render a measured-fact
@@ -96,6 +117,7 @@ class PrEvidence:
         pins: dict[str, str] = {}
         for field, pin in (
             ("review_verdict", self.review_verdict_pin()),
+            ("verifiers", self.verifiers_pin()),
             ("repro", self.repro_count_pin()),
             ("tests", self.tests_summary_pin()),
             ("ci_state", self.ci_state_pin()),

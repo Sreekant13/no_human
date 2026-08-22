@@ -933,6 +933,13 @@ class Store:
             "review_tokens_used": "INTEGER DEFAULT 0",
             "review_cache_read_tokens": "INTEGER DEFAULT 0",
             "review_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # Every verifier verdict from this round's gate (see
+            # migrations/0015_attempt_verifier_results.sql for why the ALTER
+            # lives here and not in a .sql file): a JSON list of
+            # `VerifierResult.as_dict()`, nullable, no DEFAULT — most rows
+            # predate verifiers and NULL, not "[]", is the honest record of
+            # "no verifier ran for this attempt".
+            "verifier_results": "TEXT",
             # PLANNING burn (single planner, MoA proposers, aggregator): ran on
             # separate readonly backends and was persisted NOWHERE — the docs
             # even claimed it lived "inside the coder's session" (ARCH_REVIEW

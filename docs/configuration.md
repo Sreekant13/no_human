@@ -446,6 +446,16 @@ off; a small prose-only change skips it automatically regardless. Like
 `lint.command` and `tests.command`, the `intake` section is not written into
 the defaults file: set it yourself to change the behaviour.
 
+## Verifiers
+
+`verifiers.enabled` (default **true**) is the kill switch for the
+path-scoped verifier gate described in
+[verification.md](verification.md#verifiers--a-recorded-verdict-per-rule):
+set it `false` to skip straight to the agentic reviewer even when
+`.no_human/verifiers.yaml` (repo or global) defines rules. The `verifiers`
+section is not written into the defaults file; set it yourself to change the
+behaviour, the same as `lint.command` and `tests.command` above.
+
 ## Timeouts read straight from your config
 
 Two wall-clock ceilings are read the same way and default generously so a
