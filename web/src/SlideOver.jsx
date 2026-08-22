@@ -1966,6 +1966,7 @@ const EVENT_LABELS = {
   pr_closed: "PR closed",
   pr_feedback: "PR feedback",
   pr_feedback_skipped: "Bot comments ignored",
+  pr_feedback_deferred: "PR feedback deferred",
   commit_refused: "Commit refused (attempt failed honestly)",
   manifest_repaired: "Manifest pins re-approved by the pipeline",
   pr_ci_red: "PR CI red",

@@ -79,6 +79,12 @@ _CI_INFRA_RE = re.compile(
     r"spending limit needs to be increased"
 )
 
+# Sentinel returned by `_check_approval_pr_comments(resume=False)`: comments
+# were injected into `send_back_feedback` and the cursor advanced, but no
+# resume was performed — the caller (`_check_open_pr`) owns the single resume
+# for this tick. Never leaks out of `_check_open_pr` itself.
+_COMMENTS_INJECTED = "_comments_injected"
+
 
 def parse_duration(text: str) -> timedelta | None:
     """Parse ``2h`` / ``30m`` / ``48h`` / ``1d`` into a timedelta, or None."""
@@ -1435,7 +1441,11 @@ class WakeWatcher:
            on record for it (`_pr_closed_answered`) — `ESCALATED` is not a
            terminal status here, so without both guards a still-CLOSED PR
            re-fires this rung every tick, defeating a human's own repair.
-        3. **Textual conflict with main** (SCRUM-41) → bounded rebase loop:
+        3. **New human comments** (existing B4 path) → injected into
+           `send_back_feedback` FIRST, in inject-only mode (no resume of its
+           own this tick) — see the rung-ordering comment below for why this
+           runs ahead of rung 4 instead of swapping places with it outright.
+        4. **Textual conflict with main** (SCRUM-41) → bounded rebase loop:
            CI stays green through a conflict (it only runs the PR's own
            branch), so this is the one rung that polls `mergeable` directly.
            UNKNOWN is GitHub still computing (notably right after the rebase
@@ -1443,8 +1453,9 @@ class WakeWatcher:
            CONFLICTING sends the rebase instruction back, bounded like the
            CI-fix rounds; past the cap the conflict is handed to the human.
            Live occurrence: PR #26 conflicted with #25 and sat invisible
-           until a human tried to merge it.
-        4. **New human comments** → inject + revise (existing B4 path).
+           until a human tried to merge it. This rung (or the fallback below,
+           if it does not act) issues the tick's single resume, carrying any
+           comments rung 3 injected along with its own findings.
         5. **Red CI on the PR head** → bounded fix loop: fetch the failing
            check's log, feed it back, resume onto the PR branch. Rounds are
            counted per distinct failure *signature* — a re-run of the same red
@@ -1586,12 +1597,77 @@ class WakeWatcher:
         # previous refresh measured stays.
         await observe_pr(self.store, task.id, url, forge_state=state)
 
+        # RUNG PRECEDENCE (bugfix: a human comment was skipped for the whole
+        # tick whenever the conflict rung acted first — task 1e5583dc / PR
+        # #593, measured 2026-08-21: the human's 3.5k-char findings landed at
+        # 20:47:10Z, the conflict rung resumed at 20:47:41Z with ONLY its own
+        # 208-char rebase notice in send_back_feedback, and the comment rung
+        # — the sole place that advances `pr_comment_since` — never ran).
+        #
+        # CHOSEN: run the comment rung FIRST but in INJECT-ONLY mode
+        # (resume=False), then let the conflict rung's own resume (or the
+        # fallback resume just below it, when the conflict rung does not act
+        # at all) carry BOTH payloads in one coder round. This is preferred
+        # over a bare order swap, which would make the conflict rung lose its
+        # precedence outright: the conflict rung is the only one that can
+        # terminate the tick correctly (mechanical derived-artefact
+        # resolution, shipped-first completion, the round bound and its
+        # escalation), and a comment-triggered resume ahead of it would open
+        # a coder round against a PR that still cannot merge — silently
+        # skipping that whole ladder for a tick.
+        #
+        # WHAT THE COMMENT RUNG GIVES UP: it no longer owns its own resume
+        # once a conflict is live — whether (and how) the tick resumes is
+        # decided below, so the coder sees findings + rebase notice in ONE
+        # attempt instead of two, burning one fewer round than today.
+        # WHAT THE CONFLICT RUNG GIVES UP: nothing about its own decisions —
+        # only that its send_back_feedback entry is no longer guaranteed to
+        # be the tick's only one.
+        pending = await self._check_approval_pr_comments(task, pr=pr, resume=False)
+        if pending is not None and pending != _COMMENTS_INJECTED:
+            return pending
+        injected = pending == _COMMENTS_INJECTED
+
         acted = await self._check_pr_conflict(task, url, state, branch=pr.branch)
         if acted:
+            if injected and acted != "resumed":
+                # The conflict rung ended the tick WITHOUT resuming (it took
+                # a terminal or backoff path of its own — escalation,
+                # mechanical resolution, shipped-first completion, dead-
+                # resume backoff/park), so the findings injected above were
+                # not carried into any coder round this tick. Whether they
+                # are still reachable later depends on what the conflict rung
+                # just did to the task, not on which string it returned: a
+                # DONE task (ship-first completion) will never resume again,
+                # so its context — and the findings sitting in it — are gone
+                # for good, while every OTHER outcome here leaves the task
+                # non-DONE, so the same context (and cursor) is still there
+                # for whatever resumes it next.
+                if task.status is TaskStatus.DONE:
+                    defer_text = (
+                        f"{task.id[:8]} human PR findings were injected into "
+                        f"send_back_feedback, but the PR shipped before any "
+                        f"coder round consumed them (outcome {acted!r}); the "
+                        f"task is DONE and will never resume again, so the "
+                        f"findings are unconsumed for good — a human should "
+                        f"review them directly on the PR"
+                    )
+                else:
+                    defer_text = (
+                        f"{task.id[:8]} human PR findings were injected into "
+                        f"send_back_feedback but no coder round consumed "
+                        f"them this tick: the conflict rung ended the tick "
+                        f"with {acted!r} — the findings stay queued for the "
+                        f"next resume"
+                    )
+                await self._emit(task, "pr_feedback_deferred", defer_text)
             return acted
-        acted = await self._check_approval_pr_comments(task, pr=pr)
-        if acted:
-            return acted
+        if injected:
+            # No conflict this tick (MERGEABLE/UNKNOWN): the conflict rung
+            # did not act at all, so the comment rung's own resume — deferred
+            # above — happens here instead.
+            return await self._resume(task)
+
         acted = await self._check_pr_ci(task, url)
         if acted:
             return acted
@@ -2280,7 +2356,7 @@ class WakeWatcher:
         return outcome, await self._resume(task)
 
     async def _check_approval_pr_comments(
-        self, task: Task, *, pr: Any = None,
+        self, task: Task, *, pr: Any = None, resume: bool = True,
     ) -> str | None:
         """Poll an awaiting-approval PR for NEW human comments (B4).
 
@@ -2295,6 +2371,14 @@ class WakeWatcher:
         omitted — direct calls, including existing tests — this resolves its
         own, which degrades to the old ``ctx["pr_watch"]``-only behaviour for
         any task that has one.
+
+        ``resume`` (keyword-only, default ``True`` — every existing direct
+        call keeps today's behaviour byte-for-byte): when ``False``, a fresh
+        human comment is still injected into ``send_back_feedback`` and the
+        cursor still advances, but no resume is performed — the method
+        returns ``_COMMENTS_INJECTED`` instead, and the CALLER
+        (``_check_open_pr``) owns the tick's single resume. See the rung
+        -ordering comment in ``_check_open_pr`` for why.
         """
         ctx = task.context or {}
         if pr is None:
@@ -2361,8 +2445,17 @@ class WakeWatcher:
         await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(human)} new PR comment(s)")
 
         if rounds > self.max_revision_rounds:
+            # Precedence kept even in inject-only mode: the revision cap is
+            # this rung's OWN terminal decision, so it escalates regardless of
+            # `resume` — the caller must never resume a task this rung just
+            # decided to hand to a human.
             await self._escalate_revisions(task, rounds)
             return "escalated_revisions"
+        if not resume:
+            # Inject-only mode (see the precedence comment in
+            # _check_open_pr): the findings are in send_back_feedback and the
+            # cursor has moved; the CALLER owns the single resume this tick.
+            return _COMMENTS_INJECTED
         return await self._resume(task)
 
     async def _escalate_revisions(self, task: Task, rounds: int) -> None:
