@@ -6436,8 +6436,8 @@ class Orchestrator:
         if short_sha:
             heading += f" on `{short_sha}`"
         subtitle = (
-            '_A different model, fresh context, file-edit tools and git/forge '
-            'writes refused, told to refute "done". This is the checklist the gate decided on; '
+            '_A different model, fresh context, commit, push and merge refused '
+            'at the tool call, told to refute "done". This is the checklist the gate decided on; '
             'no_human never merges — a human does._'
         )
         lines = [Orchestrator.REVIEW_CHECKLIST_MARKER, heading, subtitle, ""]
