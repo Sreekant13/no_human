@@ -168,7 +168,7 @@ def test_cap_is_40_rows_and_says_how_many_more():
     assert "(5 more not shown)" in body
 
 
-# ─────────────────── every model-authored cell is _inline_cell'd ─────────── #
+# ─────────────────── every model-authored cell is _table_cell'd ─────────── #
 
 
 def test_severity_survives_the_same_injection_label_does():
@@ -200,6 +200,100 @@ def test_label_with_a_heading_stays_on_one_row():
     lines_with_it = [ln for ln in body.splitlines() if "normal text" in ln]
     assert len(lines_with_it) == 1
     assert lines_with_it[0].count("|") >= 4
+
+
+def test_a_pipe_in_a_label_does_not_add_a_column():
+    """A literal `|` inside a GFM table cell ENDS the cell — unescaped, a
+    finding label like `pipe | here` (a regex, a shell pipeline, a type
+    union) silently shifts every column after it and drops the last cell
+    off the row.
+
+    NOTE the repro's `note` key is not what the Note cell reads: `_checklist_
+    note_cell` reads `item["comment"]`/`item["evidence"]`, never `item["note"]`
+    — that is why the ORIGINAL repro's control row showed an empty Note. Here
+    both the control and the hostile item drive `comment=`, so the control's
+    Note cell is legitimately populated, not blank.
+    """
+    control = _item(label="plain", comment="ab")
+    hostile = _item(label="pipe | here", comment="a|b")
+    control_row = Orchestrator._checklist_row(control)
+    hostile_row = Orchestrator._checklist_row(hostile)
+    control_seps = control_row.replace("\\|", "").count("|")
+    assert control_seps == 5, control_row
+    hostile_seps = hostile_row.replace("\\|", "").count("|")
+    assert hostile_seps == control_seps, hostile_row
+    assert "pipe \\| here" in hostile_row, hostile_row
+    assert "a\\|b" in hostile_row, hostile_row
+
+
+def test_a_pipe_survives_end_to_end_in_the_posted_comment():
+    """Same property as the row-level test above, but through the actual
+    posted comment body, and covering ALL FOUR cells (severity, label, file,
+    comment) now that `_checklist_row` routes every one of them through
+    `_table_cell`."""
+    hostile = _item(label="pipe | here", severity="hi|gh", file="a|b.py",
+                     line=3, comment="c|d")
+    decision = _decision(passed=False, items=[hostile])
+    body = Orchestrator._review_checklist_comment(
+        Task.new("t", repo_path="/r"), decision, head_sha="abc1234", rounds=1)
+    # NOT "here" — the header's "Where" column name contains it too.
+    row_lines = [ln for ln in body.splitlines() if "pipe" in ln]
+    assert len(row_lines) == 1, row_lines
+    row = row_lines[0]
+    assert row.startswith("| ❌"), row
+    header_seps = "| Severity | Finding | Where | Note |".count("|")
+    assert row.replace("\\|", "").count("|") == header_seps, row
+    assert "pipe \\| here" in row, row
+    assert "hi\\|gh" in row, row
+    assert "a\\|b.py" in row, row
+    assert "c\\|d" in row, row
+
+
+def test_a_backslash_escaped_pipe_is_not_escaped_twice():
+    """The escape must be idempotent: a label that already contains a
+    backslash-escaped pipe (`a\\|b`) must stay `a\\|b`, never become the
+    doubly-escaped `a\\\\|b` — a literal backslash followed by a LIVE column
+    break, which is the same defect one layer down."""
+    row = Orchestrator._checklist_row(_item(label=r"a\|b"))
+    assert "a\\|b" in row, row
+    assert "a\\\\|b" not in row, row
+    for value in ("a|b", r"a\|b", "||", "plain"):
+        once = Orchestrator._table_cell(value)
+        twice = Orchestrator._table_cell(once)
+        assert twice == once, (value, once, twice)
+
+
+def test_inline_cell_does_not_escape_pipes():
+    """Pins that the fix is ADDITIVE: `_inline_cell` itself must keep
+    passing raw pipes through unescaped for its non-table callers."""
+    assert Orchestrator._inline_cell("a|b") == "a|b"
+    assert Orchestrator._inline_cell("normal\n# x") == "normal # x"
+
+
+def test_table_cell_is_inline_cell_plus_only_the_pipe_escape():
+    for value in ("# heading text", "<h1>PWNED</h1>", "line1\nline2\nline3",
+                  "x" * 200):
+        assert Orchestrator._table_cell(value) == Orchestrator._inline_cell(value)
+    long_value = "y" * 200
+    assert (Orchestrator._table_cell(long_value, limit=None)
+            == Orchestrator._inline_cell(long_value, limit=None))
+    assert len(Orchestrator._table_cell(long_value, limit=None)) == 200
+
+
+def test_composed_cells_are_idempotent_under_inline_cell():
+    """`_checklist_row` runs `_table_cell` (= `_inline_cell` + pipe escape)
+    over cells that already went through `_inline_cell` once inside
+    `_severity_cell`/`_where_cell`/`_checklist_note_cell`. That double
+    application is only safe if `_inline_cell` is idempotent on its own
+    output — this pins the assumption directly rather than trusting it."""
+    for hostile in ("x\n# heading", "<h1>PWNED</h1>", "-bullet"):
+        item = _item(severity=hostile, file=hostile, line=1, comment=hostile)
+        sev_out = Orchestrator._severity_cell(item)
+        assert Orchestrator._inline_cell(sev_out) == sev_out, sev_out
+        where_out = Orchestrator._where_cell(item)
+        assert Orchestrator._inline_cell(where_out) == where_out, where_out
+        note_out = Orchestrator._checklist_note_cell(item)
+        assert Orchestrator._inline_cell(note_out) == note_out, note_out
 
 
 # ─────────────────── shared-fixture: verdict/rounds match _review_verdict_data ─ #

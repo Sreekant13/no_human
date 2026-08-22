@@ -6587,10 +6587,11 @@ class Orchestrator:
 
     @staticmethod
     def _checklist_row(item: dict) -> str:
-        label = Orchestrator._inline_cell(str(item.get("label") or ""))
-        return (f"| {Orchestrator._severity_cell(item)} | {label} | "
-                f"{Orchestrator._where_cell(item)} | "
-                f"{Orchestrator._checklist_note_cell(item)} |")
+        cell = Orchestrator._table_cell
+        label = cell(str(item.get("label") or ""))
+        return (f"| {cell(Orchestrator._severity_cell(item))} | {label} | "
+                f"{cell(Orchestrator._where_cell(item))} | "
+                f"{cell(Orchestrator._checklist_note_cell(item))} |")
 
     @staticmethod
     def _checklist_table(items: list[dict]) -> list[str]:
@@ -6621,8 +6622,9 @@ class Orchestrator:
         summary. This comment is the full checklist behind that row.
 
         Every model-authored cell (label, severity, file, note) is routed
-        through `_inline_cell` — see `_severity_cell`'s docstring for why
-        severity needs the same guard as everything else.
+        through `_table_cell` (`_inline_cell` plus the GFM table `|` escape)
+        — see `_severity_cell`'s docstring for why severity needs the same
+        guard as everything else.
         """
         decoded = Orchestrator._decode_checklist_decision(decision)
         unreadable = Orchestrator._checklist_unreadable(decision)
@@ -17136,6 +17138,32 @@ SIX of them read a checkpoint and TWO do not — but do
             text = text[:cut] + "\\" + text[cut:]
         text = Orchestrator._demote_html_headings(text)
         return text if limit is None else text[:limit]
+
+    # A literal `|` ENDS a GFM table cell — unlike a line break or a heading,
+    # `_inline_cell` never guarded against it because most of its callers
+    # (PR body sections) are not table cells. Matches an OPTIONAL preceding
+    # backslash so the substitution is idempotent: `a\|b` stays `a\|b`
+    # rather than becoming `a\\|b` (an escaped backslash followed by a LIVE
+    # column break — the same defect one layer down).
+    _TABLE_PIPE = re.compile(r"\\?\|")
+
+    @staticmethod
+    def _table_cell(value, limit: "int | None" = 160) -> str:
+        """`_inline_cell` plus the GFM table escape: a literal `|` inside a
+        table cell ends the cell, so a model-authored regex, shell pipeline
+        or `a | b` type union silently shifted every column after it and
+        dropped the last cell off the row. `\\|` renders as a literal pipe
+        on GitHub.
+
+        Escaping runs AFTER `_inline_cell` (so after its own slice to
+        `limit`) — the added backslashes are ours, not the model's, and do
+        not count against `limit`.
+
+        `_inline_cell` keeps its non-table callers unchanged; this is a new
+        wrapper around it, not a change to it.
+        """
+        return Orchestrator._TABLE_PIPE.sub(
+            r"\\|", Orchestrator._inline_cell(value, limit=limit))
 
     @staticmethod
     def _demote_html_headings(line: str) -> str:
