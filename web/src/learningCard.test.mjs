@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { eventLabel } from "./eventLabels.js";
 import {
   BULK_CONFIRM_CAP,
   bulkConfirmIds,
@@ -244,7 +245,7 @@ test("every new class the learning UI renders has a CSS rule", () => {
 test("the timeline renders the injected rule titles, not just the count", () => {
   assert.match(slideOverJsx, /kind === "knowledge_accessed"/,
     "knowledge_accessed still falls through to the catch-all one-liner");
-  assert.match(slideOverJsx, /knowledge_accessed:\s*"Knowledge applied"/,
+  assert.equal(eventLabel("knowledge_accessed"), "Knowledge applied",
     "the event still renders its raw kind as a label");
   const block = slideOverJsx.slice(slideOverJsx.indexOf("function KnowledgeApplied"));
   assert.match(block.slice(0, 2000), /event\.injected/,

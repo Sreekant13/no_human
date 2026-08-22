@@ -11,6 +11,7 @@ findings this tick) emits a named `pr_feedback_deferred` event."""
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -199,27 +200,81 @@ async def test_no_deferral_event_when_the_round_actually_started(store):
     )
 
 
-def test_the_deferral_kind_is_labelled_on_the_board_and_counted_by_doctor():
-    from pathlib import Path
+def test_the_deferral_kind_is_counted_on_doctors_pr_watch_ladder():
+    """`nh doctor` must attribute the deferral to the PR-watch ladder itself.
 
-    import no_human.doctor as doctor_mod
+    This replaces a guard that took an 800-character SOURCE window from
+    ``src.index("pr_watch_ladder")`` and asserted the kind appeared somewhere
+    inside it. That window spans three MECHANISMS entries (pr_watch_ladder,
+    pr_watch_heartbeat, ci_gate_integration) before running into a following
+    comment, so the assertion
+    passed with the kind registered on a NEIGHBOURING mechanism and removed
+    from this one -- verified by mutation on 2026-08-22, which is the exact
+    regression it claimed to prevent. MECHANISMS is a module-level structure,
+    so the entry is looked up by name, the way doctor.py itself does it.
+    """
+    from no_human.doctor import MECHANISMS
 
-    slideover = Path(__file__).resolve().parents[1] / "web" / "src" / "SlideOver.jsx"
-    text = slideover.read_text()
-    assert "pr_feedback_deferred:" in text, (
-        "the board must map the raw kind to a human-readable label instead "
-        "of falling back to the raw kind string"
+    kinds = next(k for name, k, _ in MECHANISMS if name == "pr_watch_ladder")
+    assert "pr_feedback_deferred" in kinds, (
+        "nh doctor's pr_watch_ladder mechanism must count pr_feedback_deferred; "
+        f"it counts {kinds}"
     )
 
-    src = inspect.getsource(doctor_mod)
-    assert "pr_watch_ladder" in src
-    # The MECHANISMS table is a module-level structure; find the tuple that
-    # names pr_watch_ladder's own event kinds and assert the new kind is in it
-    # rather than re-deriving the whole table by hand.
-    idx = src.index("pr_watch_ladder")
-    window = src[idx: idx + 800]
-    assert "pr_feedback_deferred" in window, (
-        "nh doctor's pr_watch_ladder mechanism must count pr_feedback_deferred"
+
+# The board-label half of the old assertion now lives in
+# web/src/eventLabels.test.mjs, which IMPORTS the mapping and asserts the kind
+# resolves to a human label. The guard here read SlideOver.jsx as text and
+# matched "pr_feedback_deferred:", which passed with the mapping commented out.
+
+
+def test_every_pr_watch_ladder_kind_has_a_board_label():
+    """Every kind the PR-watch ladder counts must render as a human label.
+
+    This check lives in pytest rather than in the JS suite because MECHANISMS
+    is the authoritative list and it is Python. A hardcoded mirror on the JS
+    side drifts silently: the first version of the JS test named eight kinds
+    while the ladder counts twelve, so commenting out `escalated_ci`'s label
+    left a live board defect with the whole JS suite green.
+
+    Fails CLOSED: an unreadable or unrecognisable map is a failure, not a skip.
+    """
+    from pathlib import Path
+
+    from no_human.doctor import MECHANISMS
+
+    labels = Path(__file__).resolve().parents[1] / "web" / "src" / "eventLabels.js"
+    assert labels.is_file(), f"{labels} is missing — the board label map moved"
+    text = labels.read_text()
+
+    # This guard owns exactly one question — WHICH kinds must have a label —
+    # because MECHANISMS is the authoritative list and it is Python.
+    #
+    # It deliberately does NOT judge the label's VALUE. A regex over this file
+    # reads SOURCE TEXT while the board reads a decoded string, so a Python
+    # value-check passes on `"\t"` / `"\u200b"` / `"\n"` (non-empty in source,
+    # blank on the board) and is blind to an `Object.assign(EVENT_LABELS, ...)`
+    # override after the literal — a reviewer defeated an earlier version with
+    # exactly those. Judging the value in the wrong language also made a legal
+    # template-literal reformat FAIL a correct tree. The value check therefore
+    # lives in web/src/eventLabels.test.mjs, which imports the map and sees the
+    # decoded, post-override string. Splitting it that way deletes that whole
+    # family rather than patching it case by case.
+    #
+    # A commented-out mapping does not match, which is the point: a commented
+    # mapping is an ABSENT mapping. The optional quote allows `"escalated_ci":`.
+    keys = set(re.findall(
+        r"^\s{2}\"?([A-Za-z_][A-Za-z0-9_]*)\"?:", text, re.M))
+    assert len(keys) > 20, (
+        f"only {len(keys)} label key(s) parsed out of {labels.name} — the map's "
+        "shape changed and this guard can no longer see it"
+    )
+
+    kinds = next(k for name, k, _ in MECHANISMS if name == "pr_watch_ladder")
+    missing = [k for k in kinds if k not in keys]
+    assert not missing, (
+        "pr_watch_ladder kind(s) with no board label, so the timeline renders "
+        f"the raw snake_case kind: {missing}"
     )
 
 

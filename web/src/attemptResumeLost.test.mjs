@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { eventLabel } from "./eventLabels.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -61,8 +62,12 @@ test("the orchestrator's loss event has a human label on the timeline", () => {
     orchestrator.includes('self.emit("resume_checkpoint_lost"'),
     "the orchestrator must emit the loss event",
   );
-  assert.ok(
-    /resume_checkpoint_lost:\s*"[^"]+"/.test(slideOver),
-    "SlideOver's event label map must name the kind",
+  // Asserted against the imported map, not SlideOver.jsx's text: the label
+  // moved to eventLabels.js on 2026-08-22, and a regex over source passed even
+  // when the mapping was commented out.
+  assert.notEqual(
+    eventLabel("resume_checkpoint_lost"),
+    "resume_checkpoint_lost",
+    "the event label map must name the kind",
   );
 });

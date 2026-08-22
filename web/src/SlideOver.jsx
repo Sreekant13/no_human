@@ -7,6 +7,7 @@ import {
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
+import { eventLabel } from "./eventLabels.js";
 import {
   CANCEL_TITLE, CANCEL_BODY, CANCEL_CONFIRM_LABEL, CANCEL_KEEP_LABEL,
   CANCEL_REASON_PLACEHOLDER, REASON_MAX, submitCancel,
@@ -1906,89 +1907,6 @@ function fmtTs(epoch) {
   if (!epoch) return "";
   const d = new Date(epoch * 1000);
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-const EVENT_LABELS = {
-  kind: "Task type",
-  state: "Status",
-  context_gather: "Context",
-  context: "Context",
-  profile: "Profile",
-  ci_backend: "CI",
-  attempt_start: "Attempt",
-  attempt_failed: "Attempt failed",
-  supervisor: "Supervisor",
-  commit: "Commit",
-  lint: "Lint",
-  tests: "Tests",
-  tamper: "Tamper check",
-  review_start: "Review",
-  review: "Review result",
-  review_error: "Review error",
-  agent_error: "Agent error",
-  stuck: "Stuck",
-  failed: "Failed",
-  bounds: "Bounds",
-  tool_use: "Tool",
-  agent_text: "Agent",
-  thinking: "Reasoning",
-  supervisor_decision: "Supervisor",
-  // env setup/teardown (Item 2)
-  env_setup: "Env setup",
-  env_setup_failed: "Env setup failed",
-  env_teardown: "Env teardown",
-  // the learning loop, applied (S3-B2)
-  knowledge_accessed: "Knowledge applied",
-  // skills & subagents (Items 3, 4)
-  skills_materialized: "Skills loaded",
-  skills_loaded: "Skills",
-  // investigation report (Item 1)
-  investigation_report: "Investigation report",
-  // checkpoint & resume (existing, unlabelled)
-  checkpoint: "Checkpoint",
-  resume_wip: "Resume WIP",
-  resume_checkpoint_lost: "Checkpoint lost",
-  // compound tasks / lead agent (Item 5)
-  decompose: "Decompose",
-  compound_done: "Compound done",
-  quality_gate: "Quality gate",
-  quality_gate_failed: "Quality gate failed",
-  unblock: "Unblock",
-  retry: "Retry",
-  escalate: "Escalate",
-  // subagent events
-  subagent_start: "Subagent",
-  subagent_progress: "Subagent",
-  subagent_done: "Subagent done",
-  review_posted: "Review posted to PR",
-  // post-PR watcher ladder (blockers/wake.py) — merged/comments/CI/Enterprise CI
-  merged: "PR merged",
-  pr_closed: "PR closed",
-  pr_feedback: "PR feedback",
-  pr_feedback_skipped: "Bot comments ignored",
-  pr_feedback_deferred: "PR feedback deferred",
-  commit_refused: "Commit refused (attempt failed honestly)",
-  manifest_repaired: "Manifest pins re-approved by the pipeline",
-  pr_ci_red: "PR CI red",
-  pr_ci_infra: "PR CI red (infra — not acted on)",
-  pr_ci_advisory: "PR CI red (advisory mode)",
-  escalated_ci: "CI escalated",
-  escalated_revisions: "Revisions escalated",
-  escalated_timeout: "Park timeout",
-  resumed: "Resumed",
-  wake_tick: "Watcher heartbeat",
-  state_repaired: "State repaired",
-  // Enterprise CI integration gate (M6)
-  ci_gate_trigger: "Enterprise CI triggered",
-  ci_gate_poll: "Enterprise CI running",
-  ci_gate_pass: "Enterprise CI passed",
-  ci_gate_fail: "Enterprise CI failed",
-  ci_gate_blocked: "Enterprise CI blocked",
-  ci_gate_refused: "Enterprise CI refused",
-};
-
-function eventLabel(kind) {
-  return EVENT_LABELS[kind] || kind;
 }
 
 function fmtDuration(secs) {
