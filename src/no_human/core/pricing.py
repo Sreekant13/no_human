@@ -48,14 +48,17 @@ Two limits, so this paragraph does not read as a clean bill of health:
     there would assert those attempts emitted no output at all.
   * The output premium is resolved PER MODEL, from the recorded model id —
     see ``MODEL_PRICES_USD_PER_MTOK`` and ``output_extra_weight``. What that
-    lookup returns today, for every model in the table, is 4.0: every Claude
-    model Anthropic publishes prices for bills output at exactly 5x input
-    ($5/$25 Opus, $3/$15 Sonnet, $1/$5 Haiku, $10/$50 Fable). An earlier
+    lookup returns for every CLAUDE model in the table is a uniform 4.0: every
+    Claude model Anthropic publishes prices for bills output at exactly 5x
+    input ($5/$25 Opus, $3/$15 Sonnet, $1/$5 Haiku, $10/$50 Fable). An earlier
     version of this paragraph said "Sonnet and Haiku bill at their own in/out
     ratios" in a way that implied those ratios DIFFER from Opus's. They do not.
     The table is keyed per model so that a future model which breaks the 5:1
-    pattern prices correctly the day its id first appears in the ledger — not
-    because any of today's ids disagree.
+    pattern prices correctly the day its id first appears in the ledger — and
+    one now has: the OpenAI ids sourced for the Codex backend (see the ``#:``
+    block below the table) do NOT share the 5:1 ratio, so this lookup no
+    longer returns 4.0 "for every model in the table" as a whole — see
+    "THE OPENAI SIDE" below for what that changes and what stays true.
 
 THE MODEL-BLINDNESS THAT REMAINS, stated plainly so it is not mistaken for
 solved. The output PREMIUM is now per model; the fresh-input RATE is not. One
@@ -76,6 +79,36 @@ same fresh rate rather than 1.25x, and carries no output premium whatsoever.
 The claim this docstring used to make — that cost.js "prices per model and per
 class" and is "the place to go for a real invoice estimate" — was false on
 both counts. Treat any dollar figure it prints as a floor, not an estimate.
+
+THE OPENAI SIDE, added when the Codex backend went live. Every ``gpt-*`` row
+in ``MODEL_PRICES_USD_PER_MTOK`` is a per-token USD rate read from an
+OpenAI-hosted pricing page (see the ``#:`` block above the table for the exact
+URL, date, and row per id — never guessed, never interpolated from a sibling).
+None of them share the Anthropic family's 5:1 ratio: ``gpt-5.3-codex`` is 8:1,
+so its ``output_extra_weight`` (7.0) is ABOVE ``OUTPUT_EXTRA_WEIGHT`` (4.0).
+That means "the fallback is never cheaper than any priced model" now only
+holds within the Claude family it was derived from — a genuinely unpriced
+OpenAI id (one this table has no row for) is priced by the 4.0 fallback, which
+is *cheaper* than several of the priced OpenAI ids actually cost. That is a
+known, visible gap: an id in that state is surfaced by
+``unknown_pricing_models()`` rather than silently under-priced, which is the
+reporting improvement this whole change exists to make for the ids it CAN
+price, and the honest limit for the ones it still cannot.
+
+A run billed by a flat ChatGPT subscription plan gets NO row here and no
+per-token price at all — not ``0.0`` (that would price its output at nothing,
+the exact inert-brake defect the fallback exists to prevent) and not a
+sentinel (every consumer of this dict would have to learn a new shape).
+``gpt-5.5`` and ``gpt-5.6-terra`` are reachable BOTH as a priced Platform-API
+id and as a flat-plan ChatGPT session; the row above prices the *id*, not the
+billing mode, so a subscription-billed run of either id is over-stated by
+whatever this table charges its API-priced sibling — a known residual,
+recorded rather than silently fixed, because ``attempts.models`` does not
+record which mode paid for a run and teaching this lookup to care is ticket
+``d35aa60e``'s auth-mode-plumbing territory, not this one's. An id that is
+ONLY reachable on a flat plan, with no Platform-API price published at all,
+gets no row either and falls to the visible ``OUTPUT_EXTRA_WEIGHT`` fallback,
+surfaced the same way — an honest gap, never a fabricated dollar figure.
 """
 
 from __future__ import annotations
@@ -111,7 +144,7 @@ OUTPUT_EXTRA_WEIGHT = 4.0
 #: from" is the difference between a price table and a guess. Every value below
 #: is from Anthropic's published model/pricing table as carried by the bundled
 #: ``claude-api`` skill (``SKILL.md`` § Current Models, cached 2026-06-24; the
-#: live pages are ``platform.claude.com/docs/en/about-claude/models/overview``
+#: live page is ``https://platform.claude.com/docs/en/about-claude/models/overview``
 #: and ``.../docs/en/pricing``). No value here is inferred, interpolated, or
 #: extrapolated from a sibling model.
 #:
@@ -135,6 +168,29 @@ OUTPUT_EXTRA_WEIGHT = 4.0
 #: has ever appeared in this ledger and none is reachable from `config.py`'s
 #: four tiers. Adding ids this product cannot emit would be padding the table
 #: to make it look more per-model than it is.
+#:
+#: --- OpenAI (Codex backend) ---
+#: Published OpenAI Platform-API LIST prices, USD per million tokens, for the
+#: "short context" (<272K tokens) tier — the same tier every existing Codex
+#: coding attempt runs in. Sourced from OpenAI's own hosted pricing page,
+#: https://developers.openai.com/api/docs/pricing (the page
+#: ``platform.openai.com/docs/pricing`` redirects to), read 2026-08-23. Only
+#: ids `codex exec` actually resolved on 2026-08-22 (per ticket d35aa60e's
+#: measurement) are listed; no id is added on a sibling-model guess.
+#:
+#:   gpt-5.3-codex   $1.75 / $14.00   https://developers.openai.com/api/docs/pricing, "Codex" row under Specialized models, read 2026-08-23
+#:   gpt-5.4         $2.50 / $15.00   https://developers.openai.com/api/docs/pricing, "gpt-5.4 (<272K context length)" row, read 2026-08-23
+#:   gpt-5.5         $5.00 / $30.00   https://developers.openai.com/api/docs/pricing, "gpt-5.5 (<272K context length)" row, read 2026-08-23
+#:   gpt-5.6-terra   $2.00 / $12.00   https://developers.openai.com/api/docs/pricing, "gpt-5.6-terra" row (short-context column), read 2026-08-23
+#:
+#: Deliberately ABSENT (OpenAI): ``gpt-5-codex`` — the current
+#: `llm.codex_model` default — plus ``gpt-5.1-codex``, ``gpt-5.1-codex-max``,
+#: and ``gpt-5.2-codex``. All four returned "Model not found" through
+#: `codex exec` when measured 2026-08-22, and none appears on the pricing page
+#: fetched 2026-08-23 either: they are retired, not merely unlisted, and a row
+#: for a retired id would price a model nothing can ever bill again. See the
+#: module docstring ("THE OPENAI SIDE") for the subscription-billing case,
+#: which also gets no row here.
 MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
@@ -143,6 +199,11 @@ MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    # --- OpenAI (Codex backend) --- see the "#:" block above for citations.
+    "gpt-5.3-codex": (1.75, 14.00),
+    "gpt-5.4": (2.50, 15.00),
+    "gpt-5.5": (5.00, 30.00),
+    "gpt-5.6-terra": (2.00, 12.00),
 }
 
 #: Every model id that reached `output_extra_weight` and was not in the table,
@@ -181,9 +242,12 @@ def output_extra_weight(model: str | None) -> float:
     has never been recorded at all) and any id absent from the table both fall
     back to ``OUTPUT_EXTRA_WEIGHT`` = 4.0 — the premium every model Anthropic
     currently publishes charges, and the value this whole file used before it
-    was keyed per model. It is conservative in the only direction that matters:
-    it is the HIGHEST premium in the table, so an unknown tier is never priced
-    below a known one, and it can never be 0. A 0 or a missing multiplier here
+    was keyed per model. It was the HIGHEST premium in the table while the
+    table was Anthropic-only; it no longer is — ``gpt-5.3-codex`` publishes
+    8:1 (premium 7.0), so an UNRECORDED OpenAI model id is priced BELOW its
+    true rate by this fallback (see the module docstring: that residual is
+    known and deliberate until the fallback is keyed per backend). What the
+    fallback still guarantees is that it can never be 0. A 0 or a missing multiplier here
     would price unknown output at nothing, which is the precise defect that
     once left a per-attempt brake inert on 27 of 27 tasks.
 

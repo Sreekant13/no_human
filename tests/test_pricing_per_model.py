@@ -73,28 +73,46 @@ async def store(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_the_published_ratios_are_all_five_to_one():
-    """The load-bearing fact behind "this change moves no number".
+    """The load-bearing fact behind "this change moves no number" — for the
+    Claude family only. The OpenAI rows added for the Codex backend do NOT
+    hold this ratio (`gpt-5.3-codex` is 8:1); that break is covered by
+    `tests/test_pricing.py`, not here. Scoping this test to `claude-*` keeps
+    it pinning the fact it was written to pin, rather than failing the moment
+    a differently-shaped model is added to the table.
 
-    If Anthropic ever ships a model at a different in:out ratio, this test
-    fails and whoever adds it is forced to notice that the premium is no longer
-    uniform — which is the moment the per-model keying starts earning its keep
-    and the moment the brake-shift question has to be re-asked.
+    If Anthropic ever ships a Claude model at a different in:out ratio, this
+    test fails and whoever adds it is forced to notice that the premium is no
+    longer uniform — which is the moment the per-model keying starts earning
+    its keep and the moment the brake-shift question has to be re-asked.
     """
-    for model, (price_in, price_out) in MODEL_PRICES_USD_PER_MTOK.items():
+    claude_ids = [m for m in MODEL_PRICES_USD_PER_MTOK if m.startswith("claude-")]
+    assert claude_ids, "no claude- ids in the table — nothing was checked"
+    for model in claude_ids:
+        price_in, price_out = MODEL_PRICES_USD_PER_MTOK[model]
         assert price_out == pytest.approx(price_in * 5.0), model
         assert output_extra_weight(model) == pytest.approx(4.0), model
 
 
 def test_the_fallback_is_never_cheaper_than_any_priced_model():
-    """The conservatism property, stated as an invariant rather than a comment.
+    """The conservatism property, stated as an invariant rather than a comment
+    — scoped correctly now that it is no longer universally true.
 
-    An unknown tier must not be cheaper than a known one, or "don't record the
-    model" becomes a way to buy budget. Holds trivially today (everything is
-    4.0); it is here so that adding a cheaper-output model to the table without
-    revisiting the fallback fails loudly.
+    Within the Claude family it still holds trivially (everything is 4.0), so
+    that half stays here as a regression pin. It does NOT hold globally any
+    more: the OpenAI rows added for the Codex backend include premiums ABOVE
+    the fallback (`gpt-5.3-codex` is 7.0 > 4.0), by design — see
+    `core/pricing.py`'s module docstring ("THE OPENAI SIDE"). What must still
+    hold, and is asserted here instead, is that every priced non-Claude row's
+    premium is strictly positive (never free output) and that an id genuinely
+    absent from the table — priced or not, Claude or not — still takes the
+    fallback exactly.
     """
     for model in MODEL_PRICES_USD_PER_MTOK:
-        assert output_extra_weight(model) <= OUTPUT_EXTRA_WEIGHT, model
+        if model.startswith("claude-"):
+            assert output_extra_weight(model) <= OUTPUT_EXTRA_WEIGHT, model
+        else:
+            assert output_extra_weight(model) > 0.0, model
+    assert output_extra_weight("a-model-id-not-in-the-table") == OUTPUT_EXTRA_WEIGHT
 
 
 def test_prices_are_positive_so_no_row_can_price_output_at_nothing():
