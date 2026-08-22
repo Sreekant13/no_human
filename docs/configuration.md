@@ -27,6 +27,7 @@ changes in code and not here fails the suite.
 | `usage_ledger.retention_days` | `90` | Age past which `unattributed_usage` rows are rolled up (not deleted — totals stay exact, per-row `ts`/`task_id` detail is lost); `0` disables compaction |
 | `approve_merge.enabled` | `true` | Whether `nh approve` lands the PR itself — squash the branch into one commit, push the default branch, close the PR. `false` records the approval and leaves the merge to you; neither is a failure |
 | `approve_merge.test_timeout_seconds` | `1800` | Wall-clock seconds the change-scoped test run that gates a landing gets. Exceeding it fails the landing at the test step, so nothing is pushed |
+| `review.post_checklist_comment` | `true` | Post the independent reviewer's checklist (verdict, rounds, every finding with severity and `file:line`) as its own PR comment, once per commit. `false` skips posting — the checklist still lives in the DB and the PR body's one-row summary, just not as its own comment |
 
 Review depth scales with diff size: a gate review of a diff at or under
 `max_diff_lines` changed lines runs SINGLE-TURN, no tools — the diff, the full

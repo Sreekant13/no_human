@@ -1579,6 +1579,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # gate on purpose; even then the skip is announced on the board.
         "allow_advisory": False,
     },
+    "review": {
+        # no-human-67: the independent reviewer's checklist (verdict, rounds,
+        # every finding with severity and file:line), posted ONCE as its own
+        # PR comment via the same idempotent `post_to_pr_once` marker
+        # discipline as the verification-receipts comment. True by default —
+        # the whole point is that a PR reader sees the checklist without
+        # digging into the DB. False skips posting (an event still fires).
+        "post_checklist_comment": True,
+    },
     "onboarding": {"completed": False},
     "profile": {
         # Megaplan P1 (full autonomy). By default a profile drives a task only

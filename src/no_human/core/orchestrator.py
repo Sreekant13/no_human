@@ -76,6 +76,7 @@ from ..notify.slack import SlackNotifier
 from ..review import selfcheck, tamper_adjudication
 from ..review.reviewer import (
     REVIEW_SESSION_ERROR_MARKER as _SESSION_ERROR_BLOCKER_MARKER,
+    ADVISORY_SEVERITIES,
     AdversarialReviewer,
     ReviewDecision,
     ReviewerUnavailable,
@@ -5869,6 +5870,7 @@ class Orchestrator:
         # integration layers) in the PR body. Read-only; best-effort.
         test_evidence: dict | None = None
         attempt_n: int | None = None
+        review_checklist_raw: "str | dict | None" = None
         try:
             for a in await self.store.list_attempts(task.id):
                 if a.get("id") == attempt_id:
@@ -5879,6 +5881,11 @@ class Orchestrator:
                     # H8: which attempt delivered this — the same row already
                     # carries it, and no PR body has ever said.
                     attempt_n = a.get("attempt_number")
+                    # no-human-67: the checklist the PR-comment reader needs —
+                    # THIS attempt's own stored review, not the compact
+                    # per-round trail in task.context (that one is labels-only
+                    # and is what `_review_verdict_data` already renders).
+                    review_checklist_raw = a.get("review_checklist")
                     break
         except Exception as exc:  # noqa: BLE001 — evidence never blocks the PR
             self._advisory(f"test evidence missing from PR body: {exc}")
@@ -6029,6 +6036,36 @@ class Orchestrator:
         await self._post_verification_comment(task, pr.url, receipts,
                                               test_evidence=test_evidence)
 
+        # no-human-67: the independent reviewer's own checklist, posted once as
+        # its own PR comment — today it only lived in the DB and the PR body's
+        # folded one-row summary (`_review_evidence_section`). Only when a
+        # round actually judged THIS head (the same `rounds`-in-dict guard
+        # `_review_evidence_section` uses) is there anything true to post.
+        review_verdict = self._review_verdict_data(
+            task, head_sha=pre_push_sha, repo=repo)
+        if isinstance(review_verdict, dict) and "rounds" in review_verdict:
+            if review_checklist_raw is None:
+                # The verdict trail matched this head but THIS attempt row
+                # carries no checklist — a human-gated resume delivers on a
+                # fresh row (`_resume_human_gated`) and never copies the
+                # reviewed row's checklist onto it. Posting from an empty
+                # checklist would render "FAILED … no findings recorded"
+                # under a body whose Evidence row says PASSED (independent
+                # review of this change reproduced exactly that). Two
+                # sources that can disagree must not both speak: skip, and
+                # say why.
+                self._advisory(
+                    "review checklist comment not posted: the delivering "
+                    "attempt row carries no review checklist (resumed "
+                    "delivery); the PR body's Evidence row is the record")
+                self.emit("review_comment",
+                          "no checklist on the delivering attempt row",
+                          status="skipped")
+            else:
+                await self._post_review_checklist_comment(
+                    task, pr.url, review_checklist_raw,
+                    head_sha=pre_push_sha, rounds=review_verdict["rounds"])
+
         # PR-F Gate 3: open PRs for linked repos that had changes committed.
         linked_pr_urls: list[str] = []
         gh_hosts = self.config.get("git", {}).get("github_hosts")
@@ -6133,6 +6170,230 @@ class Orchestrator:
         else:
             self._advisory(
                 f"verification comment not posted ({mode}): {res.get('error', '')}")
+        return bool(res.get("ok"))
+
+    #: Idempotency marker for the independent reviewer's checklist comment —
+    #: same discipline as VERIFICATION_COMMENT_MARKER above: checked before the
+    #: write, set by the write itself, and lives ON THE FORGE rather than in
+    #: `task.context`.
+    REVIEW_CHECKLIST_MARKER = "<!-- no_human:review-checklist -->"
+
+    #: Row cap for the checklist comment — same discipline as
+    #: `_verification_section`'s caps: state what was dropped, never hide it.
+    _CHECKLIST_MAX_ROWS = 40
+
+    @staticmethod
+    def _decode_checklist_decision(decision: str | dict | None) -> dict:
+        """Tolerantly decode a STORED `attempts.review_checklist` field.
+
+        no-human-67 attempt #2 was FAILED in part because this exact
+        string-vs-dict decode, inlined at the `_finalize` call site, had no
+        test at all. It is a real decode point (not "should never happen"):
+        the column round-trips through JSON in the store.
+        """
+        if isinstance(decision, str):
+            try:
+                decision = json.loads(decision) if decision else {}
+            except (ValueError, TypeError):
+                decision = {}
+        return decision if isinstance(decision, dict) else {}
+
+    @staticmethod
+    def _checklist_unreadable(decision: str | dict | None) -> bool:
+        """True when a NON-EMPTY stored checklist string failed to decode —
+        the one case `_decode_checklist_decision`'s tolerant `{}` would
+        otherwise render as a success-shaped "no findings recorded"."""
+        if not isinstance(decision, str) or not decision.strip():
+            return False
+        try:
+            return not isinstance(json.loads(decision), dict)
+        except (ValueError, TypeError):
+            return True
+
+    @staticmethod
+    def _checklist_items(decision: str | dict | None) -> list[dict]:
+        """Every item in the final round's checklist, in original order —
+        including PASSED ones. Deliberately NOT
+        `review.reviewer.findings_from_checklist`: that helper drops passed
+        items and splits blocking/advisory for a different consumer (the PR
+        body's folded "addressed" list of what earlier rounds caught). The
+        checklist COMMENT must show every row the final round recorded,
+        passed included, so a human sees what the reviewer actually checked.
+        """
+        decoded = Orchestrator._decode_checklist_decision(decision)
+        items = decoded.get("items")
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, dict)]
+
+    @staticmethod
+    def _severity_cell(item: dict) -> str:
+        """`✅` for a passed item, else `❌ {severity}` (or bare `❌` when the
+        reviewer left severity unclassified).
+
+        🔴 no-human-67 attempt #2 was FAILED because this cell was built as
+        `item['severity'].strip().lower()` interpolated straight into
+        `❌ {sev}` with NO guard — unlike label/file/note, which already went
+        through `_inline_cell`. Severity is just as model-authored as any
+        other checklist field and gets exactly the same treatment here.
+        """
+        if item.get("passed"):
+            return "✅"
+        sev = Orchestrator._inline_cell(
+            str(item.get("severity") or ""), limit=40).strip().lower()
+        return f"❌ {sev}" if sev else "❌"
+
+    @staticmethod
+    def _where_cell(item: dict) -> str:
+        """`file:line` when both are set, `file` alone when line is 0/unset,
+        `—` when neither is set."""
+        file = Orchestrator._inline_cell(str(item.get("file") or ""), limit=120)
+        try:
+            line = int(item.get("line") or 0)
+        except (TypeError, ValueError):
+            line = 0
+        if not file:
+            return "—"
+        return f"`{file}:{line}`" if line else f"`{file}`"
+
+    @staticmethod
+    def _checklist_note_cell(item: dict) -> str:
+        note = item.get("comment") or item.get("evidence") or ""
+        return Orchestrator._inline_cell(str(note))
+
+    @staticmethod
+    def _checklist_row(item: dict) -> str:
+        label = Orchestrator._inline_cell(str(item.get("label") or ""))
+        return (f"| {Orchestrator._severity_cell(item)} | {label} | "
+                f"{Orchestrator._where_cell(item)} | "
+                f"{Orchestrator._checklist_note_cell(item)} |")
+
+    @staticmethod
+    def _checklist_table(items: list[dict]) -> list[str]:
+        """A `| Severity | Finding | Where | Note |` table for *items*, capped
+        at `_CHECKLIST_MAX_ROWS` with a stated overflow count — never a silent
+        truncation."""
+        cap = Orchestrator._CHECKLIST_MAX_ROWS
+        shown, rest = items[:cap], items[cap:]
+        out = ["| Severity | Finding | Where | Note |", "|---|---|---|---|"]
+        out.extend(Orchestrator._checklist_row(i) for i in shown)
+        if rest:
+            out.append(f"\n({len(rest)} more not shown)")
+        return out
+
+    @staticmethod
+    def _review_checklist_comment(
+        task: Task, decision: str | dict | None, *,
+        head_sha: str = "", rounds: int = 0,
+    ) -> str:
+        """The independent reviewer's checklist, rendered as its own PR
+        comment body (marker included as the first line — `post_to_pr_once`
+        requires the marker to already be embedded in the body it guards).
+
+        Renders from the DELIVERY attempt's own stored `review_checklist`
+        (*decision*), NOT `task.context["review_history"]` — that compact,
+        labels-only trail is what `_review_verdict_data` /
+        `_review_evidence_section` already render into the PR body's one-row
+        summary. This comment is the full checklist behind that row.
+
+        Every model-authored cell (label, severity, file, note) is routed
+        through `_inline_cell` — see `_severity_cell`'s docstring for why
+        severity needs the same guard as everything else.
+        """
+        decoded = Orchestrator._decode_checklist_decision(decision)
+        unreadable = Orchestrator._checklist_unreadable(decision)
+        items = Orchestrator._checklist_items(decoded)
+        blocking = [i for i in items if not i.get("passed") and
+                    (str(i.get("severity") or "").strip().lower()
+                     not in ADVISORY_SEVERITIES)]
+        passed_items = [i for i in items if i.get("passed")]
+        advisory = [i for i in items if not i.get("passed") and
+                    (str(i.get("severity") or "").strip().lower()
+                     in ADVISORY_SEVERITIES)]
+
+        # A stored checklist that does not decode is NOT "no findings": the
+        # reviewer may have recorded findings this comment cannot show. Say
+        # so in the heading and the body, never a success-shaped blank.
+        verdict = ("UNREADABLE" if unreadable
+                   else "PASSED" if decoded.get("passed") else "FAILED")
+        round_word = "round" if rounds == 1 else "rounds"
+        heading = f"## Independent review — {verdict} ({rounds} {round_word})"
+        short_sha = (head_sha or "").strip()[:7]
+        if short_sha:
+            heading += f" on `{short_sha}`"
+        subtitle = (
+            '_A different model, fresh context, read-only tools, told to '
+            'refute "done". This is the checklist the gate decided on; '
+            'no_human never merges — a human does._'
+        )
+        lines = [Orchestrator.REVIEW_CHECKLIST_MARKER, heading, subtitle, ""]
+
+        main = blocking + passed_items
+        if unreadable:
+            lines.append("_the stored review checklist could not be decoded "
+                         "— treat this comment as MISSING evidence, not as a "
+                         "clean review; the verdict row in the PR body is "
+                         "rendered from a separate record_")
+            return "\n".join(lines) + "\n"
+        if not main and not advisory:
+            lines.append("_no findings recorded_")
+            return "\n".join(lines) + "\n"
+        if main:
+            lines.extend(Orchestrator._checklist_table(main))
+        else:
+            lines.append("_no blocking or passed findings recorded_")
+
+        if advisory:
+            plural = "s" if len(advisory) != 1 else ""
+            lines.append("")
+            lines.append(
+                f"<details><summary>{len(advisory)} advisory finding{plural} "
+                f"(low/nit — never blocking)</summary>")
+            lines.append("")
+            lines.extend(Orchestrator._checklist_table(advisory))
+            lines.append("")
+            lines.append("</details>")
+        return "\n".join(lines) + "\n"
+
+    async def _post_review_checklist_comment(
+        self, task: Task, pr_url: str, decision: str | dict | None, *,
+        head_sha: str = "", rounds: int = 0,
+    ) -> bool:
+        """Post the independent reviewer's checklist as its own PR comment.
+        Never raises — a comment never blocks delivery. Gated by
+        `review.post_checklist_comment` (default True); `False` skips with an
+        event rather than silently doing nothing."""
+        if not pr_url:
+            return False
+        if not self.config.get("review", {}).get("post_checklist_comment", True):
+            self.emit("review_comment", "disabled by config", status="skipped")
+            return False
+        from ..vcs.comment_poster import post_to_pr_once
+        try:
+            # Rendering is INSIDE the try, same reasoning as
+            # `_post_verification_comment`: it walks coder-controlled text, and
+            # a raise here would escape AFTER the PR is already open.
+            if Orchestrator._checklist_unreadable(decision):
+                self._advisory(
+                    "review checklist comment: the stored checklist could not "
+                    "be decoded — posting it as UNREADABLE, not as clean")
+            body = Orchestrator._review_checklist_comment(
+                task, decision, head_sha=head_sha, rounds=rounds)
+            res = await asyncio.to_thread(
+                post_to_pr_once, pr_url, body, self.REVIEW_CHECKLIST_MARKER)
+        except Exception as exc:  # noqa: BLE001 — a comment never blocks delivery
+            self._advisory(f"review checklist comment not posted: {exc}")
+            return False
+        mode = res.get("mode")
+        if res.get("ok") and mode == "skipped_duplicate":
+            self.emit("review_comment", f"already present on {pr_url}",
+                      status="skipped")
+        elif res.get("ok"):
+            self.emit("review_comment", f"posted to {pr_url}", status="posted")
+        else:
+            self._advisory(
+                f"review checklist comment not posted ({mode}): "
+                f"{res.get('error', '')}")
         return bool(res.get("ok"))
 
     # --------------------------- off-ramps --------------------------------- #

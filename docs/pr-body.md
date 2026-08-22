@@ -51,6 +51,25 @@ six sentences on what the log cannot attest — the full list is below.
 **Footer** — attempt number, branch pair, and the standing rule: no_human
 never merges. A human reviews and merges, or runs `nh approve <task>`.
 
+## The review checklist comment
+
+The PR body's **Evidence** table carries one row for the independent
+review — a verdict and a round count. The full checklist behind that row
+(every finding the fresh-context reviewer recorded on the delivered commit,
+each with its severity and `file:line`) is posted once as its own PR
+comment, right after the "How I verified this" comment, marked with
+`<!-- no_human:review-checklist -->` so a second run never duplicates it.
+Blocking and failed findings are listed first, then passed checks, then
+advisory (`low`/`nit` — never blocking) findings folded behind a
+`<details>` disclosure. Every model-authored cell — label, severity, file,
+note — goes through the same neutralising pass as the rest of this
+document before it is interpolated, so a finding cannot render a live
+heading or break out of its table row. Controlled by
+`review.post_checklist_comment` (default on) — see
+[configuration.md](configuration.md). Like every other PR comment here,
+posting never blocks delivery: a forge error or a duplicate is logged and
+the PR stands regardless.
+
 ## Why there is no PASS/FAIL badge on the command log
 
 Deciding whether an exit status belongs to the program that was checked
