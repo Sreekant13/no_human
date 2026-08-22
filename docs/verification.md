@@ -14,7 +14,7 @@ spent.
 ticket ──► context ──► plan ──► implement ──► review ──► test ──► PR ──► you merge
               │                      │           │         │
               │                      │           │         └── local runner + optional CI
-              │                      │           └── fresh-context reviewer, read-only
+              │                      │           └── fresh-context reviewer, edits refused
               │                      └── Claude Agent SDK, your credential, your checkout
               └── grep, git log, past sessions
 ```
@@ -33,7 +33,10 @@ the model. The PR lands in `awaiting_approval` and waits.
 ## An adversarial reviewer that is not the author
 
 [`src/no_human/review/reviewer.py`](../src/no_human/review/reviewer.py) opens a
-fresh Agent SDK session with read-only tools, on a different model from the
+fresh Agent SDK session whose guard refuses the file-edit tools (Write, Edit,
+NotebookEdit, MultiEdit), every git or forge mutation, and subagents — Bash itself
+stays, so a shell redirection is not prevented, only reviewed after the fact —
+on a different model from the
 implementer by default (an Opus-tier reviewer over the Sonnet-tier coder —
 the current IDs are `llm.review_model` and `llm.primary_model` in
 [`DEFAULT_CONFIG`](../src/no_human/config.py)), and tells it to refute

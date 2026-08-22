@@ -46,8 +46,10 @@ Git is owned by the orchestrator, never the LLM: branch, commit (as
 `no_human <no-human@acme.com>`, distinct from you), push, open PR. The
 PreToolUse guard blocks `git merge`, force-push, `rm -rf`, and writes to
 `forbidden_paths`. `never_push_to` (`main`, `master`, `release/*`) is refused at
-the git layer. During review the backend runs **read-only**: all write tools are
-blocked unconditionally.
+the git layer. During review the guard refuses the file-edit tools (Write, Edit,
+NotebookEdit, MultiEdit), every git or forge mutation, and subagents; Bash stays,
+so a shell redirection is not prevented by the guard — a change the reviewer
+leaves in the tree is a gate-integrity question, not a tool one.
 
 ## 4. Trust only verifiable signals
 

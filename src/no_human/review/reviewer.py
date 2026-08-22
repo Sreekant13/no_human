@@ -2,8 +2,9 @@
 
 A fresh-context Agent SDK session told to *find faults and refute "done."*
 Runs as the configured ``llm.review_model`` (a different model from the
-implementer) with a read-only guard so it can inspect the repo but cannot
-modify it.
+implementer) under a guard that refuses file-edit tools, git/forge writes and
+subagents; Bash stays for inspection, so the guard does not make the session
+unable to modify the tree — it makes editing tools unavailable to it.
 
 Contract:
   - Returns a pass/fail ``ReviewDecision`` with evidence-backed ``ChecklistItem``s.
@@ -1296,7 +1297,8 @@ def _build_code_review_prompt(
         "For each finding, cite the specific file:line from the diff or file.\n\n"
         "Rules:\n"
         "  - You MAY use read/search tools to inspect full files for context.\n"
-        "  - Do NOT modify any files. This is a read-only review.\n"
+        "  - Do NOT modify any files: this review is read-only by contract — the\n"
+        "    guard refuses editing tools, and a change you leave in the tree is a defect.\n"
         "  - Pass/fail only. No numeric scores.\n"
         "  - Classify each finding with a severity: critical, high, medium, low, nit.\n"
         "  - 'passed: true' means ALL criteria are demonstrably met and no\n"
@@ -2066,7 +2068,7 @@ def _apply_refutations(
 
 
 class AdversarialReviewer:
-    """Fresh-context reviewer session — read-only, told to refute 'done.'"""
+    """Fresh-context reviewer session — file edits and git/forge writes refused, told to refute 'done.'"""
 
     def __init__(
         self,
