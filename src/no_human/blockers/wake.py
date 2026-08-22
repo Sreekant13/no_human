@@ -756,7 +756,8 @@ class WakeWatcher:
             # same window.
             return "wake_backoff_pending"
 
-        verdict, streak, dead_ids = await self._dead_resume_verdict(task, now=now)
+        verdict, streak, dead_ids, retry_reason = await self._dead_resume_verdict(
+            task, now=now)
         if verdict == "backoff":
             await self._backoff_dead_resume(
                 task, streak, dead_ids,
@@ -808,10 +809,26 @@ class WakeWatcher:
                 "last_resume_at": patch["resumed_at"], "backoff_until": None,
             }
         else:
-            # A real dispatch (human, or a proceed with nothing dead on the
-            # table) resets the dead-resume streak and re-anchors the window
-            # at THIS resume: only attempts started at or after it count
-            # toward the next streak evaluation.
+            # verdict == "proceed": a real dispatch (human, a fresh/no-anchor
+            # task, a window with nothing dead on the table, or a window
+            # whose attributed rows did real priced work before they were
+            # attributed) resets the dead-resume streak and re-anchors the
+            # window at THIS resume: only attempts started at or after it
+            # count toward the next streak evaluation. An attributed-only
+            # window that is ALSO dead-shaped (a quota wall, a dead SDK
+            # session — 0 priced tokens, <=1 turn) is NOT evidence of health
+            # and must not land here while a ladder exists to protect:
+            # `_dead_resume_verdict` routes that case to "retry" instead, so
+            # this reset only ever fires when there is nothing to lose —
+            # either no rows at all, an attributed-only window with no prior
+            # streak, or an attributed row that did real work despite being
+            # attributed (attribution says WHY an attempt ended, not whether
+            # it did anything first — a wall landing after a genuine session
+            # is exactly as healthy as any other real dispatch). Resetting
+            # on a dead-shaped attributed row WOULD be evidence-free: it
+            # would launder the ladder away and let an environment
+            # alternating a death-blind dead dispatch with an attributed
+            # wall run forever without ever reaching the park.
             patch["wake_dead_resumes"] = {
                 "streak": 0, "attempt_ids": [],
                 "last_resume_at": patch["resumed_at"], "backoff_until": None,
@@ -822,10 +839,23 @@ class WakeWatcher:
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
         event_text = f"{task.id[:8]} wake condition satisfied"
         if verdict == "retry":
-            event_text += (
-                f" — re-dispatch after dead-resume backoff #{streak}/"
-                f"{self.DEAD_RESUME_PARK_STREAK}"
-            )
+            if retry_reason == "attributed_wall":
+                # No backoff window was ever armed for this rung — an
+                # attributed wall (quota/session, not death-blind) carried an
+                # existing dead-resume ladder forward. Saying "after
+                # dead-resume backoff" here would claim a timer fired when
+                # none did; MEDIUM finding from the 2026-08-22 review.
+                event_text += (
+                    f" — re-dispatch after an attributed wall carried "
+                    f"dead-resume streak #{streak}/"
+                    f"{self.DEAD_RESUME_PARK_STREAK} forward (no backoff "
+                    f"window involved)"
+                )
+            else:
+                event_text += (
+                    f" — re-dispatch after dead-resume backoff #{streak}/"
+                    f"{self.DEAD_RESUME_PARK_STREAK}"
+                )
         await self._emit(task, "resumed", event_text)
         return "resumed"
 
@@ -838,15 +868,30 @@ class WakeWatcher:
 
     async def _dead_resume_verdict(
         self, task: Task, *, now: datetime,
-    ) -> tuple[str, int, list[str]]:
+    ) -> tuple[str, int, list[str], str | None]:
         """Whether the machine resume due right now would repeat a dead
-        pattern. Returns ``(verdict, streak, dead_attempt_ids)`` where
-        ``verdict`` is ``"proceed"`` (streak 0, resume normally), ``"retry"``
-        (a backoff window expired with no NEW dead attempt since it was set —
+        pattern. Returns ``(verdict, streak, dead_attempt_ids, retry_reason)``
+        where ``verdict`` is ``"proceed"`` (streak 0, resume normally),
+        ``"retry"`` (either: the window's dead rows are ALL already counted
+        toward the ladder, so nothing NEW was tried since it was last
+        evaluated — note `prior_ids` only becomes non-empty via
+        `_backoff_dead_resume`, which always arms a window, so by the time
+        this arm is reachable in the real loop one has been set — or the
+        window since the last resume
+        contains rows, EVERY one of them is attributed, and every one is
+        also dead-shaped (0 priced tokens AND <= 1 turn — `_is_dead`, not
+        "did no priced work": an attributed row with 0 tokens but several
+        turns RESETS the ladder), with an existing ladder to protect;
         dispatch now, carrying the ladder forward, instead of counting this
-        tick), ``"backoff"`` (streak 1-2, defer instead of resuming) or
-        ``"park"`` (streak >= DEAD_RESUME_PARK_STREAK, escalate instead of
-        resuming).
+        tick), ``"backoff"`` (streak 1-2, defer instead of
+        resuming) or ``"park"`` (streak >= DEAD_RESUME_PARK_STREAK, escalate
+        instead of resuming). ``retry_reason`` is only meaningful when
+        ``verdict == "retry"``: ``"expired_backoff"`` (the window's dead
+        rows were all already counted) or ``"attributed_wall"``
+        (an attributed dead-shaped row
+        carried the ladder forward) — `_resume` uses it to phrase the
+        "resumed" event honestly instead of always claiming a backoff timer
+        fired. It is ``None`` for every other verdict.
 
         🔴 THE STREAK USED TO ADVANCE ON EVERY CONSECUTIVE EVALUATION that
         reached this point with only dead evidence on the table — not only
@@ -870,6 +915,85 @@ class WakeWatcher:
         sees rows started after it. Only a genuinely new dead attempt row
         advances the streak.
 
+        🔴 SAME RE-ANCHORING ALSO CREATES A SECOND WAY TO LOSE THE LADDER: an
+        attributed-only window (see the ``attributed``/``relevant`` split
+        below) also returns ``"retry"`` when there is an existing ladder to
+        protect, rather than ``"proceed"``. Re-anchoring `last_resume_at` at
+        every retry dispatch means a previously-counted dead row falls out
+        of scope the moment the loop re-dispatches into it; if that next
+        window then contains only an attributed wall, treating it as
+        `"proceed"` would silently reset the streak to 0 even though nothing
+        healthy happened — an environment alternating a death-blind dead
+        dispatch with an attributed wall would then never reach `"park"`.
+        An attributed row is evidence the environment blocked, not evidence
+        the worker is healthy, so it is neutral BY DEFAULT: it carries the
+        ladder forward instead of resetting it. That neutrality holds only
+        while the attributed row is ALSO dead-shaped (0 priced tokens, <=1
+        turn) — a wall that lands AFTER real priced work (a long session cut
+        off mid-run by a quota) is evidence the worker IS healthy despite
+        being attributed, and still resets the streak like any other real
+        dispatch; attribution alone must never become a shield for an
+        unrelated ladder. This holds per ROW, not per window: a window that
+        mixes an unattributed dead-blind row with an attributed row that did
+        real work is exactly as healthy as a window with only the real-work
+        row in it — the dead-blind row didn't do anything either way, and a
+        streak can never be advanced by evidence that is contradicted by
+        something else in the very same window. So the check is ANY row
+        (attributed or not) did real work resets, never "ALL rows must be
+        dead to avoid resetting" — the latter would let a real-work row
+        sitting beside an unrelated dead-blind row be outvoted.
+
+        🔴 THE LADDER'S ONLY "STAYS FLAT" STATE IS BOUNDED BY DISPATCH, NOT BY
+        TIME: an attributed-only window never leaves the loop idle — `retry`
+        makes `_resume` dispatch immediately, so every tick that carries the
+        ladder forward also produces a fresh attempt. That attempt is either
+        a new dead row (streak advances toward `park`), real work (streak
+        resets to 0), or another attributed wall (carries again). No
+        attributed-only carry leaves the streak unresolved without an attempt
+        being made — a `wake_backoff` window does, but that window is bounded
+        by its own timer (`wake_poll_interval * 2**(streak-1)`, capped at
+        `DEAD_RESUME_BACKOFF_CAP`), not by this ladder. So a long attributed
+        run is not the loop stalling — it is the loop working, one fresh
+        attempt per tick, against an environment that keeps walling. That is
+        why no separate time-based expiry is added.
+
+        Do NOT justify this with `max_park`: it does not bound this run. Two
+        earlier drafts of this paragraph said things about it that execution
+        refuted, so state only what is true, and only as far as it is true:
+        **the timeout is reached only by a tick that DECLINES to resume**, and
+        a ladder carried by `retry` resumes on every tick, so it never gets
+        there however old the blocker is. ("Carried" means the `retry` verdict
+        specifically. Inside a `wake_backoff` window the ladder is preserved
+        too and the tick does not resume — and that tick CAN reach the
+        timeout, exactly as the rule above says a non-resuming tick may: for
+        a `quota_refreshed` park it does, because arming the backoff pushes
+        `wake_check_at`, which is the very thing that condition tests, so the
+        window unsatisfies the condition and control falls through to
+        `max_park`. Measured. Do not read this paragraph as covering that
+        state.)
+
+        Nothing stronger. In particular NOT "a satisfied condition always
+        returns before the timeout" — that was the second wrong draft. The
+        `pr_comment_on` rung above deliberately does the opposite: when the
+        injection delivers nothing it does not resume and FALLS THROUGH to the
+        `max_park` check (its own comment says so), which is a satisfied
+        condition reaching the timeout. The predicate is resume-or-not, never
+        satisfied-or-not.
+
+        (A second, independent reason `max_park` cannot bound a carried
+        ladder — NOT exercised by the fixture below, so do not cite the
+        fixture for it: the real quota park rebuilds the blocker dict with a
+        fresh `raised_at` every time it parks, so the 48h measures one
+        continuous park, never a park→resume→park run.)
+
+        `test_blockers.py` pins that OUTCOME, and its control, in one fixture named
+        `..._long_attributed_run_is_bounded_by_dispatch_not_time`: 60
+        simulated days of walls never escalate and every tick dispatches, and
+        then the SAME `raised_at` — 61 days old by then, and already past the
+        48h `max_park` from day 2 onward — escalates immediately once its
+        condition stops being satisfied. Only the resume-and-return kept it
+        alive. The bound is dispatch, not the calendar.
+
         Fails OPEN on any error (DB blip, malformed state): a healthy task
         must never be backed off or parked by a bug in this bookkeeping.
         """
@@ -879,12 +1003,13 @@ class WakeWatcher:
                 # No prior resume, or the last one was a human's — the human
                 # reset case (Intake Q3: with no human action ever, there is
                 # no `resume_from` either, so a fresh task also proceeds).
-                return "proceed", 0, []
+                return "proceed", 0, [], None
             state = ctx.get("wake_dead_resumes") or {}
+            prior_ids = list(state.get("attempt_ids") or [])
             last_resume_at = _parse_iso(state.get("last_resume_at"))
             if last_resume_at is None:
                 # Nothing to judge against yet — fail open rather than guess.
-                return "proceed", 0, []
+                return "proceed", 0, [], None
             rows = await self.store.list_attempts(task.id)
             # `started_at` is SQLite `datetime('now')` — second-resolution, no
             # fractional part (db.py). `last_resume_at` is `now_iso()` —
@@ -909,13 +1034,38 @@ class WakeWatcher:
             # task f8efad06): 2c8f23ff, 0986460c, f8de9cdf and e037008e each
             # had exactly ONE such row (the weekly/session wall) and were
             # escalated "after 3 consecutive dead machine resumes" anyway.
+            #
+            # An attributed-only window is NOT the same case as an EMPTY
+            # window and the two must not collapse into the same verdict.
+            # `_resume` re-anchors `last_resume_at` at every re-dispatch (the
+            # retry rung's own fix), so a previously-counted dead row falls
+            # out of scope the instant the loop re-dispatches into it. If the
+            # very next window then contains nothing but an attributed wall
+            # — no new dead attempt, but also no healthy one — returning
+            # `proceed` here would LAUNDER the ladder away: an environment
+            # alternating a death-blind dead dispatch with an attributed wall
+            # would never accumulate a streak, and the breaker — whose whole
+            # purpose is to stop blindly repeating a dead pattern — would be
+            # inert exactly where it is needed most (2026-08-21 was walled
+            # all day). A wall is evidence the ENVIRONMENT blocked, not
+            # evidence the WORKER is healthy, so it is NEUTRAL BY DEFAULT: it
+            # carries any existing ladder forward (`retry`) instead of
+            # resetting it. But "attributed" only means the loop knows WHY
+            # the attempt ended — it says nothing about whether the attempt
+            # did work before it hit that wall. A wall that lands AFTER real
+            # priced work (a long session that then hits a mid-run quota
+            # cutoff) is still evidence the worker is healthy, so it must
+            # still reset like any other real dispatch — attribution alone
+            # must never become a shield for an unrelated backoff/park
+            # ladder. That check is over EVERY row in the window, attributed
+            # or not — a window can never be "outvoted" into counting as
+            # dead evidence by an unrelated dead-blind row sitting beside a
+            # row that did real work. Only a truly empty window (no rows at
+            # all since the resume — a dispatch gap, not evidence of
+            # anything) or a window containing ANY row — attributed or not —
+            # that did real priced work still resets the streak to 0.
+            attributed = [row for row in relevant if row.get("infra_failure")]
             relevant = [row for row in relevant if not row.get("infra_failure")]
-            if not relevant:
-                # A healthy dispatch creates its attempt row moments after
-                # `_resume` flips the task to IMPLEMENTING; absence here is
-                # not evidence of death, just of a row not written yet — or
-                # every row since the resume was an attributed wall park.
-                return "proceed", 0, []
             usage_cols = self.store._usage_columns()
 
             def _is_dead(row: dict) -> bool:
@@ -923,11 +1073,36 @@ class WakeWatcher:
                 turns = int(row.get("turns_used") or 0)
                 return priced == 0 and turns <= 1
 
-            if not all(_is_dead(row) for row in relevant):
-                # Any attempt that did real work resets the streak.
-                return "proceed", 0, []
+            # Real work ANYWHERE in the window — attributed or not — resets
+            # the streak. Checked across BOTH lists before branching on
+            # `relevant`'s emptiness: an unattributed dead-blind row must
+            # never suppress the reset a real-work attributed row (a wall
+            # landing after genuine work) earns on its own, and a real-work
+            # unattributed row must never be shadowed by an unrelated
+            # attributed wall in the same window either.
+            if any(not _is_dead(row) for row in relevant) or any(
+                not _is_dead(row) for row in attributed
+            ):
+                return "proceed", 0, [], None
+
+            if not relevant:
+                if attributed and prior_ids:
+                    # The window had rows, but every one was attributed AND
+                    # dead-shaped (0 priced tokens, <=1 turn, checked above)
+                    # — an ordinary quota/session wall with no work behind
+                    # it — and there is an existing ladder to protect: carry
+                    # it forward as `retry` (see the comment above) instead
+                    # of resetting it — `_resume` will re-dispatch on
+                    # `retry`, which re-anchors the window without
+                    # laundering streak or attempt_ids.
+                    return "retry", len(prior_ids), prior_ids, "attributed_wall"
+                # Either no rows at all since the resume (a dispatch gap —
+                # the attempt row simply hasn't been written yet, or this is
+                # a human/no-anchor resume) or an attributed-only window with
+                # no prior ladder to protect — nothing to carry, so this
+                # behaves like an ordinary proceed.
+                return "proceed", 0, [], None
             dead_ids = sorted({str(row["id"]) for row in relevant})
-            prior_ids = list(state.get("attempt_ids") or [])
             new_ids = [i for i in dead_ids if i not in prior_ids]
             if not new_ids:
                 # The backoff window expired, but every dead row on the table
@@ -938,15 +1113,15 @@ class WakeWatcher:
                 # `streak`/`prior_ids` are carried unchanged, structurally
                 # `len(prior_ids)` — the invariant `_park_dead_resumes`'s
                 # message text relies on.
-                return "retry", len(prior_ids), prior_ids
+                return "retry", len(prior_ids), prior_ids, "expired_backoff"
             merged_ids = prior_ids + new_ids
             streak = len(merged_ids)
             verdict = "park" if streak >= self.DEAD_RESUME_PARK_STREAK else "backoff"
-            return verdict, streak, merged_ids
+            return verdict, streak, merged_ids, None
         except Exception:  # noqa: BLE001 — fail open, never park on a bug
             log.warning(
                 "dead-resume verdict failed for %s", task.id[:8], exc_info=True)
-            return "proceed", 0, []
+            return "proceed", 0, [], None
 
     async def _backoff_dead_resume(
         self, task: Task, streak: int, dead_ids: list[str], *,

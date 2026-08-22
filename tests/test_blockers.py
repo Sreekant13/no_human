@@ -1381,6 +1381,25 @@ async def _dispatched_then_died(store, task, n, *, wake_at=None):
     return dead_id
 
 
+async def _dispatched_then_walled(store, task, n, *, wake_at=None):
+    """Mirror of `_dispatched_then_died`, but the re-dispatch hits an
+    ATTRIBUTED wall instead of dying blind: a fresh attempt row with a known
+    cause (`infra_failure=1`, 1 turn, 0 priced tokens — the same shape as a
+    quota park), then the task re-parks BLOCKED with its wake condition
+    intact, never touching `wake_dead_resumes` (which the previous
+    `_resume`/`_backoff_dead_resume` call already wrote and the next tick
+    must read back unchanged)."""
+    wall_id = await store.create_attempt(task.id, n)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+    task.wake_check_at = wake_at
+    await store.update_task_columns(task)
+    await store.set_status(task, TaskStatus.BLOCKED, validate=False)
+    return wall_id
+
+
 def _dead_resume_blocked_task_kwargs(now):
     return dict(
         status=TaskStatus.BLOCKED,
@@ -1683,6 +1702,126 @@ async def test_escalation_names_one_attempt_id_per_streak_point(store):
 
 
 @pytest.mark.asyncio
+async def test_alternating_dead_and_attributed_wall_still_reaches_the_park(store):
+    """Found by the independent review of PR #596 (task f8efad06): #596
+    re-anchors `last_resume_at` at every retry re-dispatch (correctly — that
+    is what let the earlier 'timer tick counts as a death' defect be fixed),
+    which means a previously-counted dead row falls out of scope the moment
+    the loop re-dispatches into it. If the very next window then contains
+    ONLY an attributed wall (no new dead attempt, but also no healthy one),
+    the old code treated that as `"proceed"` and reset the ladder to streak
+    0 / ids [] — so an environment alternating a death-blind dead dispatch
+    with an attributed wall never reached the park; `max_park` (48h) was the
+    only bound left. RED on main at step 3: main resets streak to 0 / ids []
+    there instead of carrying [dead_id_1] forward."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(store, t, at=anchor)
+    dead_id_1 = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+    # `create_attempt` stamps `started_at` off the REAL wall clock (db.py),
+    # not this test's frozen `now` — but every retry re-dispatch below
+    # re-anchors `last_resume_at` via `now_iso()`, which is ALSO the real
+    # wall clock (wake.py). Left alone, dead_id_1's real creation instant
+    # and step 2's real re-anchor instant can land in the same SQLite
+    # second, and the intentional tie-inclusion at that boundary (the
+    # `last_resume_floor` comment above) would then keep dead_id_1
+    # "relevant" forever by accident — masking exactly the defect this
+    # test exists to catch. Backdate it to the frozen `now` (2026-06-22),
+    # unambiguously earlier than any real-wall-clock re-anchor by design,
+    # so falling out of scope at step 3 is deterministic, not a wall-clock
+    # race. It still satisfies step 1's window (`>= floor(anchor)`).
+    await store.update_attempt(dead_id_1, started_at=now.isoformat())
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+
+    # 1: dead dispatch #1 -> streak 0 -> 1, backs off.
+    actions = await watcher.tick(now=now)
+    assert (t.id, "wake_backoff") in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+    assert refreshed.context["wake_dead_resumes"]["streak"] == 1
+    backoff_until_1 = datetime.fromisoformat(
+        refreshed.context["wake_dead_resumes"]["backoff_until"])
+
+    # 2: past the backoff window -> retry-dispatch, streak still 1 (nothing
+    # new tried yet since the backoff was armed), ids [dead_1].
+    now2 = backoff_until_1 + timedelta(seconds=1)
+    actions = await watcher.tick(now=now2)
+    assert (t.id, "resumed") in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 1
+    assert dead_state["attempt_ids"] == [dead_id_1]
+
+    # 3: that re-dispatch hits an attributed wall #2 (quota), not a
+    # death-blind failure. THE RED ASSERTION: the window since the retry
+    # contains only the wall row, and main's `proceed` on empty `relevant`
+    # wipes the streak-1 ladder here even though nothing healthy happened.
+    await _dispatched_then_walled(store, t, 2)
+    actions = await watcher.tick(now=now2)
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 1
+    assert dead_state["attempt_ids"] == [dead_id_1]
+
+    # 4: a genuinely new dead attempt #3 after that retry -> streak 1 -> 2.
+    dead_id_3 = await _dispatched_then_died(store, t, 3)
+    actions = await watcher.tick(now=now2)
+    assert (t.id, "wake_backoff") in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_3]
+    backoff_until_2 = datetime.fromisoformat(dead_state["backoff_until"])
+
+    # 5: past window 2 -> retry-dispatch, streak still 2; that re-dispatch
+    # hits attributed wall #4 -> still carried, not reset.
+    now3 = backoff_until_2 + timedelta(seconds=1)
+    actions = await watcher.tick(now=now3)
+    assert (t.id, "resumed") in actions, actions
+    refreshed = await store.get_task(t.id)
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_3]
+
+    await _dispatched_then_walled(store, t, 4)
+    actions = await watcher.tick(now=now3)
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_3]
+
+    # 6: a THIRD genuinely new dead attempt #5 -> streak 2 -> 3, parks
+    # honestly instead of resuming a 4th time.
+    dead_id_5 = await _dispatched_then_died(store, t, 5)
+    actions = await watcher.tick(now=now3)
+    assert (t.id, "parked_dead_resumes") in actions, actions
+    assert (t.id, "resumed") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.ESCALATED
+    assert refreshed.blocker["dead_resume_streak"] == 3
+    assert refreshed.blocker["dead_resume_attempt_ids"] == [
+        dead_id_1, dead_id_3, dead_id_5,
+    ]
+    assert dead_id_1 in refreshed.blocker["question"]
+    assert dead_id_3 in refreshed.blocker["question"]
+    assert dead_id_5 in refreshed.blocker["question"]
+    # No wall attempt id ever named — the wall rows were never dead-resume
+    # evidence, only carried-forward context for the existing ladder.
+    # The wake condition must never be silently dropped by the park.
+    assert refreshed.blocker["wake_condition"] == "after:2h"
+
+
+@pytest.mark.asyncio
 async def test_the_2c8f23ff_recorded_state_replays_as_proceed(store):
     """Built as an in-test fixture from the values quoted in the task
     description (2026-08-21 incident, task 2c8f23ff) — never read or point a
@@ -1834,6 +1973,153 @@ async def test_machine_resume_that_did_real_work_resets_the_streak(
 
 
 @pytest.mark.asyncio
+async def test_real_work_beside_an_attributed_wall_still_resets_the_streak(store):
+    """Negative control for the fix above: an attributed wall row is neutral
+    (it must not launder a ladder away), but it must not become a shield
+    either — a genuinely healthy dispatch sharing the SAME window still
+    resets the streak to 0 exactly as today, wall row or not.
+    `test_machine_resume_that_did_real_work_resets_the_streak` remains the
+    pure-healthy control (no wall row in the picture)."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(
+        store, t, at=anchor, streak=1, attempt_ids=["prior-dead-id"])
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+    await _dead_attempt(store, t, 2, turns=5, tokens=1200)
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 0
+    assert dead_state["attempt_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_attributed_wall_that_did_real_work_resets_the_streak(store):
+    """BLOCKING finding from the independent review of the fix above:
+    `infra_failure=1` means the loop knows WHY an attempt ended, not that
+    the attempt did nothing before it ended. A quota wall that lands AFTER a
+    long, priced session (turns/tokens both nonzero) is still evidence the
+    worker is healthy and must reset the streak exactly like any other real
+    dispatch — carrying the ladder forward here would let a task that is
+    merely quota-blocked, not dead, false-escalate. This is the single-row,
+    attributed-only-window case `test_real_work_beside_an_attributed_wall_
+    still_resets_the_streak` does not cover (there the healthy row is a
+    SEPARATE, non-attributed row sharing the window)."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(
+        store, t, at=anchor, streak=1, attempt_ids=["prior-dead-id"])
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=60, tokens_used=400_000,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 0
+    assert dead_state["attempt_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_dead_row_beside_a_wall_that_did_real_work_still_resets_the_streak(
+    store,
+):
+    """NEW gap surfaced by the 2026-08-22 review: a window can contain BOTH
+    an unattributed dead-blind row (no attribution, no work) AND an
+    attributed row that did real work (a wall landing after a long, priced
+    session), in the SAME window. The dead-blind row must never outvote the
+    real-work row into counting the window as dead evidence — "did anything
+    in this window do real work" has to span BOTH the attributed and
+    unattributed rows, not just the unattributed ones. Pre-fix,
+    `_dead_resume_verdict` only re-checked `relevant` (the unattributed list)
+    for real work once `attributed` rows were filtered out of it, so this
+    exact mix silently ignored the wall's real work and counted the
+    dead-blind row toward the streak (backoff) instead of resetting —
+    `test_an_attributed_wall_that_did_real_work_resets_the_streak` only
+    covers the single-row case (nothing else in the window)."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(
+        store, t, at=anchor, streak=1, attempt_ids=["prior-dead-id"])
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=60, tokens_used=400_000,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+    await _dead_attempt(store, t, 2, turns=0, tokens=0)
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    assert (t.id, "wake_backoff") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 0
+    assert dead_state["attempt_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_dead_resume_retry_after_attributed_wall_names_the_wall_not_a_timer(
+    store,
+):
+    """MEDIUM finding from the 2026-08-22 review: the retry dispatch that
+    follows an attributed-only window never had a backoff window armed for
+    it — there is nothing to expire, the ladder was carried straight from a
+    prior dead attempt across the wall — so the "resumed" event must not
+    claim a "dead-resume backoff" timer fired.
+    `test_an_expired_dead_resume_backoff_redispatches_instead_of_recounting`
+    is the sibling case that DOES have a real expired backoff window and
+    keeps the timer phrasing."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    await _machine_resumed(
+        store, t, at=anchor, streak=1, attempt_ids=["prior-dead-id"])
+    wall_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        wall_id, status="failed", turns_used=1, tokens_used=0,
+        infra_failure=1,
+        failure_reason="quota: You've hit your weekly limit · resets 6pm")
+
+    watcher = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    actions = await watcher.tick(now=now)
+
+    assert (t.id, "resumed") in actions, actions
+    refreshed = await store.get_task(t.id)
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 1
+    assert dead_state["attempt_ids"] == ["prior-dead-id"]
+    events = await store.list_events(t.id)
+    resumed_events = [e for e in events if e.get("kind") == "resumed"]
+    assert len(resumed_events) == 1
+    text = resumed_events[0]["text"]
+    assert "attributed wall" in text
+    assert "dead-resume backoff #" not in text
+
+
+@pytest.mark.asyncio
 async def test_no_attempt_row_since_last_resume_is_not_a_dead_resume(store):
     """No attempt row started at/after `last_resume_at` yet is a legitimate
     dispatch gap (the orchestrator hasn't picked the resumed task up), not
@@ -1944,3 +2230,211 @@ def test_routing_stagnation_turns_it_into_a_learning_proposal():
         "a parked route would NOT reach _propose_learning; the learning "
         "consequence pinned here depends on parked=False"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_long_attributed_run_is_bounded_by_dispatch_not_time(store):
+    """The 2026-08-22 review recorded a DECISION — the dead-resume ladder gets
+    no time-based expiry — and justified it with a claim that is false: "an
+    unbounded run of attributed walls is bounded by `max_park` upstream". It
+    is not, and the reason is structural: the `max_park` timeout is reached
+    only by a tick that DECLINES to resume. For the `after:` condition this
+    fixture uses, `WakeWatcher._evaluate` returns `_resume`'s result and never
+    reaches the check. A ladder carried by `retry` resumes on every tick, so
+    the timeout is not reached here, however old the blocker is. Claim only
+    that much: a satisfied condition CAN reach the timeout — the
+    `pr_comment_on` fall-through does exactly that — and two earlier drafts of
+    this fixture's prose were refuted for claiming otherwise. (A second,
+    independent reason, NOT exercised here: the real quota park rebuilds the
+    blocker with a fresh `raised_at` on every park, so the 48h clock measures
+    one continuous park, not a park->resume->park run.)
+
+    The control at the end is what makes this a measurement rather than an
+    assertion: the SAME task, with the SAME `raised_at` — 61 days old by then,
+    over thirty times `max_park`, and already past it from day 2 of the loop
+    onward — escalates on `escalated_timeout` the moment its condition stops
+    being satisfied. So the age was sufficient to time out for all but the
+    first pinned day; only the resume-and-return kept it alive. That is the
+    whole refutation in one fixture.
+
+    The precise rule this pins is resume-or-not, NOT satisfied-or-not: a
+    satisfied condition can still reach the timeout (the `pr_comment_on`
+    fall-through does exactly that). Nothing here should be read as covering
+    that path.
+
+    The real bound is dispatch: every carrying tick spends a fresh attempt.
+    The row that MADE it a carry was necessarily dead-shaped (`_is_dead`: 0
+    priced tokens AND <= 1 turn — not merely "did no priced work"),
+    but the attempt it then spends is unconstrained — if that one does real
+    work the next tick resets the streak to 0, which is the design, not an
+    exception. So a long attributed run is the loop working against a walling
+    environment, not the loop stalling. The closing assertions also prove the
+    ladder stays LIVE rather than going inert across those 60 days."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    # `raised_at` is stamped ONCE, three hours before day 0 by the helper,
+    # and never refreshed below — that "never refreshed" is the load-bearing
+    # half, and the control at the end re-reads it to prove it.
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    raised_at = datetime.fromisoformat(t.blocker["raised_at"])
+    dead_id_1 = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+    # Backdate it for the reason `..._still_reaches_the_park` documents at
+    # length: `create_attempt` stamps `started_at` off the REAL wall clock,
+    # and every re-dispatch re-anchors `last_resume_at` off the real clock
+    # too, so left alone dead_id_1 stays "relevant" forever and every carry
+    # below takes the `expired_backoff` rung instead of `attributed_wall`.
+    # A 2026-08-22 review PROVED that: with this line absent, deleting all
+    # 60 walls left the run byte-identical -- the walls were decorative and
+    # the rung this fixture is named for was never reached.
+    await store.update_attempt(dead_id_1, started_at=now.isoformat())
+    await _machine_resumed(
+        store, t, at=anchor, streak=1, attempt_ids=[dead_id_1])
+
+    cfg = _cfg(wake_poll_interval="10m")
+    watcher = WakeWatcher(store, cfg)
+    dispatches = 0
+    for day in range(1, 61):
+        at = now + timedelta(days=day)
+        await _dispatched_then_walled(store, t, day + 1)
+        actions = await watcher.tick(now=at)
+
+        assert (t.id, "resumed") in actions, (day, actions)
+        assert (t.id, "escalated_timeout") not in actions, (day, actions)
+        assert (t.id, "parked_dead_resumes") not in actions, (day, actions)
+        assert (t.id, "wake_backoff") not in actions, (day, actions)
+        dispatches += 1
+        refreshed = await store.get_task(t.id)
+        assert refreshed.status == TaskStatus.IMPLEMENTING, day
+        dead_state = refreshed.context["wake_dead_resumes"]
+        assert dead_state["streak"] == 1, (day, dead_state)
+        assert dead_state["attempt_ids"] == [dead_id_1], (day, dead_state)
+
+    # The bound is dispatch: one fresh attempt per carrying tick.
+    assert dispatches == 60
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status != TaskStatus.ESCALATED
+    assert (refreshed.blocker or {}).get("dead_resume_streak") is None
+
+    # The ladder is live, not inert: a real dead attempt still counts.
+    end = now + timedelta(days=61)
+    dead_id_2 = await _dispatched_then_died(store, t, 62)
+    actions = await watcher.tick(now=end)
+    assert (t.id, "wake_backoff") in actions, actions
+    refreshed = await store.get_task(t.id)
+    dead_state = refreshed.context["wake_dead_resumes"]
+    assert dead_state["streak"] == 2
+    assert dead_state["attempt_ids"] == [dead_id_1, dead_id_2]
+
+    # CONTROL: the blocker is now 61 days old — >30x `max_park` — and has been
+    # since early in the loop. Keep that same `raised_at`, swap only the
+    # condition for one that is NOT satisfied, and the timeout fires at once.
+    assert end - raised_at > 30 * watcher.max_park
+    stale = await store.get_task(t.id)
+    stale.blocker = {**stale.blocker, "wake_condition": "pr_merged:org/repo#7"}
+    stale.wake_check_at = None
+    await store.update_task_columns(stale)
+    await store.set_status(stale, TaskStatus.BLOCKED, validate=False)
+
+    async def never_merges(ref):
+        return False
+
+    timeout_watcher = WakeWatcher(store, cfg, pr_merged=never_merges)
+    actions = await timeout_watcher.tick(now=end)
+    assert (t.id, "escalated_timeout") in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.ESCALATED
+    assert refreshed.blocker["timed_out"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turns,seed_ladder,expected",
+    [
+        # The rung fires: dead-shaped attributed row, and a ladder to protect.
+        (1, True, ("retry", 1, "LADDER", "attributed_wall")),
+        # `prior_ids` empty -> nothing to carry, so the rung must NOT fire even
+        # though the row is attributed and dead-shaped. Kills a mutant that
+        # drops `prior_ids` from `if attributed and prior_ids:`.
+        (1, False, ("proceed", 0, [], None)),
+        # One turn past the boundary -> not dead-shaped, so the real-work reset
+        # wins. Kills a mutant that widens `turns <= 1` to `turns <= 2`.
+        (2, True, ("proceed", 0, [], None)),
+    ],
+)
+async def test_the_attributed_rung_needs_a_dead_shaped_row_and_a_ladder(
+    store, turns, seed_ladder, expected,
+):
+    """The attributed rung (`wake.py`'s `if attributed and prior_ids:`) fires on
+    a conjunction, and each case below breaks exactly one half of it.
+
+    `_is_dead` is `priced == 0 AND turns <= 1` — not "did no priced work". All
+    three rows here have 0 priced tokens, so that weaker predicate cannot tell
+    them apart; the turn count and the presence of a ladder are what decide.
+
+    WHY THESE THREE, stated precisely because two earlier versions of this test
+    were refuted for adding nothing: a 2026-08-22 review measured every mutant
+    of `_is_dead` and of this rung against the whole file, and found the cases
+    it then contained were killed by `test_machine_resume_that_did_real_work_
+    resets_the_streak` anyway — zero marginal coverage. These two survive the
+    entire file today:
+      * `seed_ladder=False` — attributed and dead-shaped, but `prior_ids` is
+        empty, so there is nothing to carry and the rung must NOT fire. Kills a
+        mutant that drops `prior_ids` from the conjunction.
+      * `turns=2` — one past the boundary, so the row is not dead-shaped and the
+        real-work reset wins. Kills a mutant that widens `turns <= 1`.
+
+    THE ABLATION MATRIX, measured rather than assumed — an earlier version of
+    this paragraph claimed "the FIRST case only" and was refuted:
+
+        ablated element        [1-True]  [1-False]  [2-True]
+        infra_failure=1        FAIL      FAIL       pass
+        old_id backdate        FAIL      FAIL       pass
+        _machine_resumed seed  FAIL      pass       pass
+        status="failed"        pass      pass       pass
+
+    So the flag and the backdate are load-bearing in BOTH `seed_ladder` cases,
+    inert only for `turns=2` (which never reaches the rung anyway). Dropping
+    either makes `relevant` non-empty so the rung is skipped, but the verdict
+    that results differs and the difference matters: without the FLAG both
+    seeded cases return `backoff`; without the BACKDATE, `[1-False]` returns
+    `backoff` while `[1-True]` takes the `expired_backoff` rung instead,
+    because its only dead row is already in `prior_ids` so `new_ids` is empty.
+    That is the same `expired_backoff`-vs-`attributed_wall` distinction the
+    traps below depend on, which is why this paragraph does not flatten it.
+
+    TWO TRAPS THIS RECORDS so nobody trims the setup later:
+    * the backdate is what EMPTIES `relevant`, and case 2's whole reason to
+      exist is the `prior_ids` half of the rung's conjunction. Remove the
+      backdate and that mutant goes unexercised — mutant and clean code both
+      return `('backoff', 1, [old_id], None)`.
+    * removing the `_machine_resumed` seed makes case 2 PASS SILENTLY, because
+      `resume_from.by != "wake"` returns before the rung is reached. A green
+      test there would mean nothing. That is the same shape as the decorative
+      rows a review found in this file twice before.
+
+    `status="failed"` is inert in all three — nothing reads it — and is kept
+    only because the helper rows around it set it."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    anchor = (now - timedelta(hours=1)).isoformat()
+    t = await _park(store, **_dead_resume_blocked_task_kwargs(now))
+    old_id = await _dead_attempt(store, t, 1, turns=0, tokens=0)
+    # Out of the judged window, so `relevant` is empty and the ATTRIBUTED rung
+    # is the one under test. Load-bearing for BOTH seed_ladder cases — see the
+    # matrix in the docstring; an earlier version of this comment said
+    # seed_ladder=True only, which measurement refuted.
+    await store.update_attempt(old_id, started_at="2025-05-18T12:00:00+00:00")
+    await _machine_resumed(
+        store, t, at=anchor,
+        streak=1 if seed_ladder else 0,
+        attempt_ids=[old_id] if seed_ladder else [],
+    )
+    wid = await store.create_attempt(t.id, 2)
+    await store.update_attempt(wid, status="failed", turns_used=turns,
+                               tokens_used=0, infra_failure=1,
+                               failure_reason="quota wall")
+    w = WakeWatcher(store, _cfg(wake_poll_interval="10m"))
+    fresh = await store.get_task(t.id)
+    v = await w._dead_resume_verdict(fresh, now=now)
+    want = tuple(expected)
+    ids = [old_id] if want[2] == "LADDER" else want[2]
+    assert (v[0], v[1], v[2], v[3]) == (want[0], want[1], ids, want[3]), v
