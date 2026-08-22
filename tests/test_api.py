@@ -151,6 +151,79 @@ async def test_list_tasks_survives_naive_updated_at(client, store):
     assert corrupt_card["wall_seconds"] >= 0
 
 
+@pytest.mark.asyncio
+async def test_merge_ready_field_reads_the_verdict_for_the_current_head(client, store):
+    """`TaskSummaryOut.merge_ready` reads `task.context.merge_policy[<latest
+    attempt's commit_sha>].ready` — not any older sha's verdict, and not
+    `None` misread as `False`."""
+    t = await _seed_task(store, title="Ready one")
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, commit_sha="c" * 40)
+    t.context = await store.merge_context(t.id, {
+        "merge_policy": {"c" * 40: {"ready": True, "summary": "ready — 1 of 1 rules satisfied"}}})
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    (item,) = r.json()
+    assert item["merge_ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_merge_ready_field_is_none_for_a_different_sha(client, store):
+    """A verdict stamped for an OLDER commit must not read as ready for the
+    sha sitting in the attempt row now."""
+    t = await _seed_task(store, title="Stale verdict")
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, commit_sha="d" * 40)
+    t.context = await store.merge_context(t.id, {
+        "merge_policy": {"e" * 40: {"ready": True, "summary": "ready — 1 of 1 rules satisfied"}}})
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    (item,) = r.json()
+    assert item["merge_ready"] is None
+
+
+@pytest.mark.asyncio
+async def test_merge_ready_field_is_none_when_never_evaluated(client, store):
+    t = await _seed_task(store, title="No verdict yet")
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, commit_sha="f" * 40)
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    (item,) = r.json()
+    assert item["merge_ready"] is None
+
+
+@pytest.mark.asyncio
+async def test_merge_ready_query_filter_returns_only_ready_tasks(client, store):
+    """`?merge_ready=1` is a truthy-only filter: not-ready and
+    never-evaluated tasks are both excluded, and the unfiltered list still
+    carries all three."""
+    ready = await _seed_task(store, title="Ready")
+    aid_ready = await store.create_attempt(ready.id, 1)
+    await store.update_attempt(aid_ready, commit_sha="1" * 40)
+    ready.context = await store.merge_context(ready.id, {
+        "merge_policy": {"1" * 40: {"ready": True, "summary": "ready — 1 of 1 rules satisfied"}}})
+
+    not_ready = await _seed_task(store, title="Not ready")
+    aid_not_ready = await store.create_attempt(not_ready.id, 1)
+    await store.update_attempt(aid_not_ready, commit_sha="2" * 40)
+    not_ready.context = await store.merge_context(not_ready.id, {
+        "merge_policy": {"2" * 40: {"ready": False, "summary": "not ready — 1 of 1 rules failed: tests_ran_and_passed"}}})
+
+    never_evaluated = await _seed_task(store, title="Never evaluated")
+    aid_never = await store.create_attempt(never_evaluated.id, 1)
+    await store.update_attempt(aid_never, commit_sha="3" * 40)
+
+    r = await client.get("/api/tasks", params={"merge_ready": 1})
+    assert r.status_code == 200
+    titles = {t["title"] for t in r.json()}
+    assert titles == {"Ready"}
+
+    r_all = await client.get("/api/tasks")
+    assert r_all.status_code == 200
+    assert {t["title"] for t in r_all.json()} == {"Ready", "Not ready", "Never evaluated"}
+
+
 def test_wall_seconds_naive_treated_as_utc():
     from no_human.api.models import _wall_seconds
 

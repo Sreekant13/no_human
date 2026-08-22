@@ -418,6 +418,16 @@ class TaskSummaryOut(BaseModel):
     # so this defaults to None and `_board_tasks` fills it; the frontend falls
     # back to its own copy of the routing when the field is absent.
     lane: str | None = None
+    # The merge-ready policy verdict (core/merge_policy.py) for the task's
+    # CURRENT head — `task.context.merge_policy[<latest attempt's commit_sha>]
+    # .ready`, keyed the same way `_finalize` persists it and `verifier_results`
+    # already is. None when there is no commit yet, or no verdict was ever
+    # computed/persisted for that exact sha (a verdict stamped for an OLDER
+    # commit must not read as ready for this one — the sha key is what makes
+    # a stale verdict read as absent, because nothing re-evaluates it:
+    # `nh approve`, the only merge path, never reads this field).
+    # ADVISORY ONLY: nothing reads this field to merge anything.
+    merge_ready: bool | None = None
 
     @classmethod
     def from_task(
@@ -476,6 +486,19 @@ class TaskSummaryOut(BaseModel):
             total_review_cache_read = _rsum("review_cache_read_tokens")
             total_review_cache_creation = _rsum("review_cache_creation_tokens")
         total_aux_tokens, total_aux_cache_read, total_aux_cache_creation = _aux_totals(attempts)
+        # Same "latest attempt with a recorded commit_sha" lookup `get_diff`
+        # uses for the PR diff — the current head as far as no_human's own
+        # recorded state goes, which is also the sha `_finalize` persisted
+        # the verdict under.
+        merge_ready = None
+        if attempts:
+            for a in reversed(attempts):
+                sha = a.get("commit_sha")
+                if sha:
+                    mp = ((task.context or {}).get("merge_policy") or {}).get(sha)
+                    if isinstance(mp, dict) and "ready" in mp:
+                        merge_ready = bool(mp.get("ready"))
+                    break
         return cls(
             id=task.id,
             external_id=task.external_id,
@@ -516,6 +539,7 @@ class TaskSummaryOut(BaseModel):
             pr_conflict_rounds=_coerce_round_count(
                 (task.context or {}).get("pr_conflict_rounds")),
             max_pr_conflict_rounds=max_pr_conflict_rounds,
+            merge_ready=merge_ready,
         )
 
 

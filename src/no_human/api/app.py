@@ -605,8 +605,19 @@ def _record_feature_used(request: Request, name: str) -> None:
 
 
 @app.get("/api/tasks", response_model=list[TaskSummaryOut])
-async def list_tasks(request: Request) -> list[TaskSummaryOut]:
-    return await _board_tasks(_store(request), scheduler=_sched(request))
+async def list_tasks(
+    request: Request,
+    merge_ready: bool | None = Query(default=None),
+) -> list[TaskSummaryOut]:
+    tasks = await _board_tasks(_store(request), scheduler=_sched(request))
+    if merge_ready:
+        # Truthy-only filter (?merge_ready=1): the merge-ready policy is
+        # advisory ("this row is not ready" and "this row was never
+        # evaluated" both read `merge_ready is not True`), so there is no
+        # useful "?merge_ready=0" query to distinguish from the unfiltered
+        # list — every other task already IS that.
+        tasks = [t for t in tasks if t.merge_ready is True]
+    return tasks
 
 
 @app.post("/api/tasks", response_model=TaskSummaryOut, status_code=201)

@@ -90,13 +90,20 @@ _PIN_PATTERNS = [
     re.compile(r"\d+ commands? recorded"),
     re.compile(r"(?:PASS|FAIL) — \d+ passed, \d+ failed, \d+ errors"),
     re.compile(r"\| CI \| [^|]+ \|"),
+    # The merge-policy row's pin is `PolicyVerdict.summary` (see
+    # `PrEvidence.merge_policy_pin`) — NOT the whole rendered row (unlike the
+    # CI pattern above, whose pin IS the whole row) — so this pattern
+    # captures just the summary text after the glyph, matching what
+    # `truth_pins()` actually stores.
+    re.compile(r"\| Merge policy \| \S+ ((?:not )?ready — [^|\n]+) \|"),
 ]
 
 
 def _pins_in_body(body: str) -> list[str]:
     found: list[str] = []
     for pat in _PIN_PATTERNS:
-        found.extend(m.group(0) for m in pat.finditer(body))
+        for m in pat.finditer(body):
+            found.append(m.group(1) if m.groups() else m.group(0))
     return found
 
 
@@ -249,7 +256,7 @@ def test_evidence_gathered_once_backs_every_section(store, tmp_path):
     ]}
     evidence = orch._gather_evidence(task, head_sha="a" * 40)
     assert evidence.review_verdict == {
-        "rounds": 1, "verdict": "PASSED", "addressed": []}
+        "rounds": 1, "verdict": "PASSED", "addressed": [], "advisory_count": 0}
 
     task.context = {"review_history": [
         {"round": 1, "sha": "a" * 40, "passed": True, "blocking": []},
@@ -304,6 +311,52 @@ def test_the_pr_body_char_count_drops_at_least_10_percent_when_collapsed(
     assert visible < total
     reduction = (total - visible) / total
     assert reduction >= 0.10, f"only a {reduction:.1%} reduction: {body!r}"
+
+
+def test_the_merge_policy_row_renders_from_a_real_policyverdict(store, tmp_path):
+    """DEFECT 2's fix: `_PIN_PATTERNS` (and the pin-backing predicate above)
+    must actually exercise a REAL `PolicyVerdict.as_dict()` — not just the
+    review/tests/CI rows — so a vacuous pin-coverage gap (a merge-policy row
+    nobody ever renders in this suite) cannot hide behind the other patterns.
+    A real 3-rule, all-passing verdict must render the exact row and fold
+    `_merge_policy_evidence_section` promises.
+    """
+    from no_human.core.merge_policy import PolicyVerdict, RuleVerdict
+
+    verdict = PolicyVerdict(
+        ready=True,
+        rules=(
+            RuleVerdict(name="review_passed", passed=True, detail="PASSED — 2 rounds"),
+            RuleVerdict(name="tests_ran_and_passed", passed=True, detail="5 passed, 0 failed"),
+            RuleVerdict(name="tamper_guard_clear", passed=True, detail="guard never fired"),
+        ),
+        source="default",
+    )
+    assert verdict.summary == "ready — 3 of 3 rules satisfied"
+
+    orch = _orch(store, tmp_path)
+    task = _task()
+    test_evidence = {"ran": True, "ok": True, "passed": 5, "failed": 0,
+                     "errors": 0}
+    receipts = _receipts()
+    head_sha = _Commit.sha
+    evidence = orch._gather_evidence(
+        task, test_evidence=test_evidence, receipts=receipts,
+        head_sha=head_sha, merge_policy=verdict.as_dict())
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts,
+                         merge_policy=verdict.as_dict())
+
+    ev = body.split("## Evidence\n", 1)[1].split("\n## ", 1)[0]
+    assert "| Merge policy | ✅ ready — 3 of 3 rules satisfied |" in ev
+    assert "<details><summary>Merge-ready policy (3 rules, source: default)</summary>" in ev
+    assert "review_passed" in ev and "tamper_guard_clear" in ev
+
+    # ...and the pin predicate this module holds actually sees it: the row's
+    # pin must be a value of `evidence.truth_pins()`.
+    pins_rendered = _pins_in_body(body)
+    assert "ready — 3 of 3 rules satisfied" in pins_rendered
+    assert "ready — 3 of 3 rules satisfied" in set(evidence.truth_pins().values())
 
 
 def test_evidence_renders_as_a_table_with_one_row_per_gate(store, tmp_path):

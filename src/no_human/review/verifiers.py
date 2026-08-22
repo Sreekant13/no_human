@@ -19,7 +19,6 @@ that is a follow-up ticket.
 
 from __future__ import annotations
 
-import functools
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
@@ -29,6 +28,7 @@ from typing import Any
 
 import yaml
 
+from ..core import pathglob
 from .selfcheck import ChecklistItem
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
@@ -249,44 +249,11 @@ def load_verifiers(repo_path: Path, home: Path | None = None) -> LoadReport:
 # --------------------------------------------------------------------------
 
 
-def _translate_segment(segment: str) -> str:
-    out: list[str] = []
-    for ch in segment:
-        if ch == "*":
-            out.append("[^/]*")
-        elif ch == "?":
-            out.append("[^/]")
-        else:
-            out.append(re.escape(ch))
-    return "".join(out)
-
-
-def _glob_to_regex(glob: str) -> str:
-    segments = glob.split("/")
-    parts: list[str] = []
-    n = len(segments)
-    for i, segment in enumerate(segments):
-        is_last = i == n - 1
-        if segment == "**":
-            parts.append(".+" if is_last else "(?:[^/]+/)*")
-        else:
-            parts.append(_translate_segment(segment))
-            if not is_last:
-                parts.append("/")
-    return "".join(parts)
-
-
-@functools.lru_cache(maxsize=256)
-def _compiled_glob(glob: str) -> re.Pattern[str]:
-    return re.compile(_glob_to_regex(glob))
-
-
 def _matches(path: str, globs: Iterable[str]) -> bool:
-    norm = _norm_path(path)
-    for glob in globs:
-        if _compiled_glob(glob).fullmatch(norm):
-            return True
-    return False
+    """Delegates to the one shared glob matcher (`core/pathglob.py`) —
+    this module used to hand-roll its own translator; see that module's
+    docstring for why it moved and which semantics won."""
+    return pathglob.matches(path, list(globs))
 
 
 def select(

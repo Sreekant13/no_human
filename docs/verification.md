@@ -110,6 +110,46 @@ the new tree**. A bugfix whose test also passes on the unfixed code has proved
 nothing. Default mode is `advisory`, which still enforces for a Python bugfix
 (`repro_gate.mode` in [`DEFAULT_CONFIG`](../src/no_human/config.py)).
 
+## Merge-ready policy
+
+[`src/no_human/core/merge_policy.py`](../src/no_human/core/merge_policy.py)
+evaluates a fixed set of rules — review passed, tests ran and passed, the
+tamper guard is clear, the reproduction gate passed or was not required,
+every selected verifier is satisfied, CI is a success or unknown — against
+the gates that already ran for a commit, and returns a single `ready: bool`
+plus a per-rule breakdown. A repo can override the rule set with
+`.no_human/merge_policy.yaml`; a policy file that fails to load (missing,
+malformed, or too large) is a recorded `problem`, not a silent pass, and
+evaluation falls back to the default rule set. A diff that edits
+`.no_human/merge_policy.yaml` itself is flagged as `policy_changed_in_diff`
+— a coder cannot author its own merge gate, so this always forces
+`ready: false` (recorded as a `problems` entry, not a second flag to keep in
+sync) and renders as a `⚠️` row rather than `✅`/`❌`, even when every rule the
+diff's own policy demands happens to pass.
+
+`Orchestrator._finalize` computes this verdict once per commit, from the
+same gate outputs the PR body's Evidence table already gathered, and
+persists it on the task (`task.context.merge_policy.<head sha>`) before
+opening or updating the PR — so a later render and the API read the same
+recorded verdict rather than each re-deriving their own. The PR body prints
+it as the Evidence table's last row plus a per-rule `<details>` fold; the
+API exposes it as `merge_ready` on a task summary (`GET /api/tasks?
+merge_ready=1` filters to it) and the full verdict on task detail.
+
+**This is advisory to the human; nothing merges on it.** The verdict is a
+recorded opinion a human reads before deciding — no code path in this repo
+merges, blocks a push, or gates PR delivery on it (a failed or missing
+compute is caught and logged, never a reason a PR does not ship — see the
+`try`/`except` around the block in `_finalize`). `nh approve` is the only
+merge path, and it does not read this verdict at all — running it IS the
+human decision. What it *does* check before landing is the independent
+reviewer's own PASS on the branch head (`_review_pass_evidence`, in both the
+CLI and the API path, which refuse the merge otherwise); the merge-ready
+verdict is not among those preconditions. The verdict is keyed by head sha
+precisely because nothing re-evaluates it: a verdict stamped for an older commit is shown as absent
+(`merge_ready: null`) for the commit sitting in the PR now, rather than
+carried forward as if it still applied.
+
 ## When it cannot finish
 
 The loop is bounded and it is allowed to give up. `bounds.max_attempts` is 3 per

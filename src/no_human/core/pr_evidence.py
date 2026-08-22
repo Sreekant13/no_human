@@ -45,6 +45,12 @@ class PrEvidence:
       never an empty list standing in for "not run".
     * ``ci_state`` — CI/annotation state for this attempt, or ``None`` before
       CI has reported anything.
+    * ``merge_policy`` — the merge-ready policy verdict for this head
+      (`core.merge_policy.PolicyVerdict.as_dict()`), or ``None`` when it was
+      never computed (evidence-gathering is best-effort; a failed compute is
+      advisory, never blocking — see `orchestrator._finalize`). Advisory to
+      the human ONLY: nothing in this repo merges, waits, or gates a push on
+      this field.
     """
 
     repro: dict[str, Any] | None = None
@@ -53,6 +59,7 @@ class PrEvidence:
     review_verdict: dict[str, Any] | None = None
     verifiers: list[dict[str, Any]] | None = None
     ci_state: Any = None
+    merge_policy: dict[str, Any] | None = None
 
     def has(self, field: str) -> bool:
         return getattr(self, field, None) is not None
@@ -107,6 +114,16 @@ class PrEvidence:
             return f"{total} of {total} satisfied"
         return f"{len(failed)} of {total} failed — {', '.join(failed)}"
 
+    def merge_policy_pin(self) -> str | None:
+        """The merge-ready policy's own summary sentence — re-derived nowhere
+        else; this returns exactly `PolicyVerdict.summary` as it was computed
+        and persisted, never a second opinion of it."""
+        mp = self.merge_policy
+        if not mp:
+            return None
+        summary = mp.get("summary")
+        return str(summary) if summary else None
+
     def truth_pins(self) -> dict[str, str]:
         """``{backing field name: exact fact sentence}`` for every truth pin
         this object can justify. A PR body must never render a measured-fact
@@ -121,6 +138,7 @@ class PrEvidence:
             ("repro", self.repro_count_pin()),
             ("tests", self.tests_summary_pin()),
             ("ci_state", self.ci_state_pin()),
+            ("merge_policy", self.merge_policy_pin()),
         ):
             if pin:
                 pins[field] = pin

@@ -10,6 +10,7 @@ import pytest
 
 from no_human.core.merge_policy import (
     DEFAULT_POLICY,
+    POLICY_RELPATH,
     RULE_NAMES,
     GateFacts,
     PolicyLoad,
@@ -18,8 +19,23 @@ from no_human.core.merge_policy import (
     RuleVerdict,
     evaluate,
     evaluate_repo,
+    facts_from_evidence,
     load_policy,
 )
+
+
+class _Evidence:
+    """Minimal duck-typed stand-in for `core.pr_evidence.PrEvidence` —
+    `facts_from_evidence` only reads attributes off it, never isinstance-
+    checks it (module-boundary discipline), so a plain object with the
+    right attribute names is a faithful test double."""
+
+    def __init__(self, **kw):
+        self.review_verdict = kw.get("review_verdict")
+        self.tests = kw.get("tests")
+        self.tamper = kw.get("tamper")
+        self.verifiers = kw.get("verifiers")
+        self.ci_state = kw.get("ci_state")
 
 
 def _facts(**kw) -> GateFacts:
@@ -542,7 +558,10 @@ def test_as_dict_round_trips_through_json_dumps():
     verdict = evaluate([Rule("review_passed")], facts)
     d = verdict.as_dict()
     assert json.loads(json.dumps(d)) == d
-    assert set(d.keys()) == {"ready", "summary", "source", "problems", "rules"}
+    assert set(d.keys()) == {
+        "ready", "summary", "source", "problems", "rules",
+        "policy_changed_in_diff",
+    }
     for rule_dict in d["rules"]:
         assert set(rule_dict.keys()) == {"name", "passed", "detail"}
 
@@ -630,3 +649,324 @@ def test_policy_load_and_gate_facts_dataclasses_smoke():
     facts = GateFacts(review_passed=None)
     assert facts.tests_ran is False
     assert isinstance(evaluate([], facts), PolicyVerdict)
+
+
+# --------------------------------------------------------------------- #
+# facts_from_evidence — tamper mapping (defect 1)
+# --------------------------------------------------------------------- #
+#
+# `tests/test_merge_policy.py`'s existing tamper_guard_clear tests (above)
+# build `GateFacts` directly via `_facts()` — they never call
+# `facts_from_evidence`, so they cannot catch a bug in ITS tamper mapping.
+# These tests target `facts_from_evidence` specifically.
+
+
+def _one_rule(name, facts):
+    return evaluate([Rule(name)], facts).rules[0]
+
+
+def test_facts_from_evidence_tamper_not_fired_when_no_adjudications():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.tamper_fired is False
+    assert facts.tamper_waived is False
+    assert _one_rule("tamper_guard_clear", facts).passed
+
+
+def test_facts_from_evidence_tamper_not_fired_when_adjudications_none():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(ev, tamper_adjudications=None, )
+    # No raw list AND no evidence.tamper field either -> not fired.
+    assert facts.tamper_fired is False
+    assert facts.tamper_waived is False
+
+
+def test_facts_from_evidence_tamper_fired_and_waived_when_all_legitimate():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(
+        ev, tamper_adjudications=[{"verdict": "LEGITIMATE"}, {"verdict": "LEGITIMATE"}]
+    )
+    assert facts.tamper_fired is True
+    assert facts.tamper_waived is True
+    assert _one_rule("tamper_guard_clear", facts).passed
+
+
+@pytest.mark.parametrize("bad_verdict", ["TAMPERING", "CANNOT_DECIDE"])
+def test_facts_from_evidence_tamper_fired_and_unwaived_fails_the_rule(bad_verdict):
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(ev, tamper_adjudications=[{"verdict": bad_verdict}])
+    assert facts.tamper_fired is True
+    assert facts.tamper_waived is False
+    rv = _one_rule("tamper_guard_clear", facts)
+    assert not rv.passed
+
+
+def test_facts_from_evidence_mixed_verdicts_are_not_waived():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(
+        ev,
+        tamper_adjudications=[{"verdict": "LEGITIMATE"}, {"verdict": "TAMPERING"}],
+    )
+    assert facts.tamper_fired is True
+    assert facts.tamper_waived is False
+    assert not _one_rule("tamper_guard_clear", facts).passed
+
+
+def test_facts_from_evidence_falls_back_to_evidence_tamper_field_when_no_raw_list():
+    # `evidence.tamper` only ever carries LEGITIMATE-verdict entries
+    # (Orchestrator._tamper_data pre-filters), so the fallback path can only
+    # ever say "not fired" or "fired and waived" -- never "fired and
+    # unwaived". That's exactly why callers that HAVE the raw list should
+    # always pass it.
+    ev = _Evidence(
+        review_verdict={"rounds": 1, "verdict": "PASSED"},
+        tamper=[{"verdict": "LEGITIMATE"}],
+    )
+    facts = facts_from_evidence(ev)  # no tamper_adjudications kwarg at all
+    assert facts.tamper_fired is True
+    assert facts.tamper_waived is True
+
+
+def test_facts_from_evidence_other_fields_map_correctly():
+    ev = _Evidence(
+        review_verdict={"rounds": 2, "verdict": "FAIL", "advisory_count": 3},
+        tests={"ran": True, "passed": 4, "failed": 1},
+        verifiers=[
+            {"verifier_id": "b", "passed": False},
+            {"verifier_id": "a", "passed": True},
+        ],
+        ci_state="failure",
+    )
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is False
+    assert facts.review_advisory_count == 3
+    assert facts.tests_ran is True
+    assert facts.tests_passed == 4
+    assert facts.tests_failed == 1
+    assert facts.verifiers_ran == 2
+    assert facts.verifiers_failed == ("b",)
+    assert facts.ci_state == "failure"
+
+
+# --------------------------------------------------------------------- #
+# facts_from_evidence — one test per branch (review/tests/verifiers/ci)
+# --------------------------------------------------------------------- #
+
+
+def test_facts_from_evidence_review_passed_true_on_passed_verdict():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is True
+
+
+def test_facts_from_evidence_review_passed_false_on_fail_verdict():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "FAIL"})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is False
+
+
+def test_facts_from_evidence_review_passed_none_when_unmatched():
+    ev = _Evidence(
+        review_verdict={"rounds": 1, "verdict": "PASSED", "unmatched": True}
+    )
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is None
+
+
+def test_facts_from_evidence_review_passed_none_when_no_rounds():
+    ev = _Evidence(review_verdict={"rounds": 0})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is None
+
+
+def test_facts_from_evidence_review_passed_none_when_no_review_verdict_at_all():
+    ev = _Evidence()
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_passed is None
+
+
+def test_facts_from_evidence_tests_ran_and_passed():
+    ev = _Evidence(tests={"ran": True, "passed": 3, "failed": 0})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.tests_ran is True
+    assert facts.tests_passed == 3
+    assert facts.tests_failed == 0
+
+
+def test_facts_from_evidence_tests_ran_and_failed():
+    ev = _Evidence(tests={"ran": True, "passed": 2, "failed": 1})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.tests_ran is True
+    assert facts.tests_passed == 2
+    assert facts.tests_failed == 1
+
+
+def test_facts_from_evidence_tests_not_run():
+    ev = _Evidence(tests={"ran": False})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.tests_ran is False
+
+
+def test_facts_from_evidence_tests_non_dict_never_raises():
+    ev = _Evidence(tests="not a dict")
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.tests_ran is False
+    assert facts.tests_passed == 0
+    assert facts.tests_failed == 0
+
+
+def test_facts_from_evidence_verifiers_present_all_pass():
+    ev = _Evidence(
+        verifiers=[
+            {"verifier_id": "a", "passed": True},
+            {"verifier_id": "b", "passed": True},
+        ]
+    )
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.verifiers_ran == 2
+    assert facts.verifiers_failed == ()
+
+
+def test_facts_from_evidence_verifiers_present_with_failures_sorted():
+    ev = _Evidence(
+        verifiers=[
+            {"verifier_id": "z", "passed": False},
+            {"verifier_id": "a", "passed": False},
+            {"verifier_id": "m", "passed": True},
+        ]
+    )
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.verifiers_ran == 3
+    assert facts.verifiers_failed == ("a", "z")
+
+
+def test_facts_from_evidence_verifiers_absent_is_zero_ran():
+    ev = _Evidence(verifiers=None)
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.verifiers_ran == 0
+    assert facts.verifiers_failed == ()
+
+
+def test_facts_from_evidence_ci_success():
+    ev = _Evidence(ci_state="success")
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.ci_state == "success"
+
+
+def test_facts_from_evidence_ci_failure():
+    ev = _Evidence(ci_state="failure")
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.ci_state == "failure"
+
+
+def test_facts_from_evidence_ci_unknown():
+    ev = _Evidence(ci_state="unknown")
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.ci_state == "unknown"
+
+
+def test_facts_from_evidence_ci_none():
+    ev = _Evidence(ci_state=None)
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.ci_state is None
+
+
+def test_facts_from_evidence_advisory_count_read_from_review_verdict():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED", "advisory_count": 4})
+    facts = facts_from_evidence(ev, tamper_adjudications=[])
+    assert facts.review_advisory_count == 4
+
+
+# --------------------------------------------------------------------- #
+# evaluate() / evaluate_repo() source labelling
+# --------------------------------------------------------------------- #
+
+
+def test_evaluate_labels_source_as_memory_for_an_in_memory_rule_list():
+    facts = _facts(review_passed=True)
+    verdict = evaluate([Rule("review_passed")], facts)
+    assert verdict.source == "memory"
+
+
+def test_evaluate_repo_default_source_is_default_when_no_file(tmp_path):
+    verdict = evaluate_repo(tmp_path, _facts(review_passed=True))
+    assert verdict.source == "default"
+
+
+def test_evaluate_repo_source_is_file_when_policy_file_present(tmp_path):
+    _policy(tmp_path, "rules:\n  - review_passed\n")
+    verdict = evaluate_repo(tmp_path, _facts(review_passed=True))
+    assert verdict.source == "file"
+
+
+# --------------------------------------------------------------------- #
+# policy_changed_in_diff (defect 4) — a coder cannot author its own gate
+# --------------------------------------------------------------------- #
+
+
+def test_policy_changed_in_diff_is_false_by_default():
+    facts = _facts(review_passed=True)
+    assert facts.policy_changed_in_diff is False
+
+
+def test_facts_from_evidence_detects_policy_file_in_changed_paths():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(
+        ev, tamper_adjudications=[], changed_paths=[POLICY_RELPATH, "src/foo.py"]
+    )
+    assert facts.policy_changed_in_diff is True
+
+
+def test_facts_from_evidence_policy_file_absent_from_changed_paths():
+    ev = _Evidence(review_verdict={"rounds": 1, "verdict": "PASSED"})
+    facts = facts_from_evidence(
+        ev, tamper_adjudications=[], changed_paths=["src/foo.py"]
+    )
+    assert facts.policy_changed_in_diff is False
+
+
+def _ready_facts(**kw):
+    base = dict(
+        review_passed=True,
+        tests_ran=True,
+        tests_failed=0,
+        tests_passed=1,
+        repro_verdict="pass",
+        ci_state="success",
+    )
+    base.update(kw)
+    return GateFacts(**base)
+
+
+def test_policy_changed_in_diff_forces_ready_false_even_if_every_rule_passes():
+    facts = _ready_facts(policy_changed_in_diff=True)
+    verdict = evaluate(list(DEFAULT_POLICY), facts)
+    assert all(v.passed for v in verdict.rules)
+    assert verdict.ready is False
+    assert verdict.summary == (
+        "ready — 6 of 6 rules — POLICY FILE CHANGED IN THIS PR"
+    )
+
+
+def test_policy_changed_in_diff_false_renders_the_ordinary_summary():
+    facts = _ready_facts(policy_changed_in_diff=False)
+    verdict = evaluate(list(DEFAULT_POLICY), facts)
+    assert verdict.ready is True
+    assert verdict.summary == "ready — 6 of 6 rules satisfied"
+
+
+def test_policy_changed_in_diff_with_a_failed_rule_appends_the_suffix():
+    facts = _ready_facts(policy_changed_in_diff=True, tests_ran=False)
+    verdict = evaluate(list(DEFAULT_POLICY), facts)
+    assert verdict.ready is False
+    assert verdict.summary == (
+        "not ready — 1 of 6 rules failed: tests_ran_and_passed"
+        " — POLICY FILE CHANGED IN THIS PR"
+    )
+
+
+def test_policy_changed_in_diff_surfaces_in_as_dict():
+    facts = _ready_facts(policy_changed_in_diff=True)
+    verdict = evaluate(list(DEFAULT_POLICY), facts)
+    assert verdict.as_dict()["policy_changed_in_diff"] is True
+    assert verdict.problems  # a problem string was injected

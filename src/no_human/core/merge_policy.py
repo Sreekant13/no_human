@@ -13,10 +13,17 @@ way a PR merges, and it is always a human invocation — nothing here changes
 that. ``approval.auto_merge_on_approval`` (``config.py``) is not read by this
 module and stays exactly as it is.
 
-This module is deliberately un-wired: nothing imports it, there is no
-``PrEvidence`` -> :class:`GateFacts` adapter (that is a later ticket), no
-PR-body rendering, no board field, no API route, no DB column. It is the
-schema, loader, and evaluator only.
+This module IS wired in: `core.orchestrator._finalize` calls
+:func:`facts_from_evidence` to adapt the gathered `PrEvidence` (plus the raw
+tamper adjudications, changed paths, and repro verdict it doesn't carry)
+into :class:`GateFacts`, evaluates it, persists the verdict on
+`task.context["merge_policy"][<head sha>]`, and the PR body's "Merge policy"
+row/fold render it (`core.pr_evidence.PrEvidence.merge_policy`,
+`orchestrator._merge_policy_evidence_section`). The task API also surfaces it
+read-only (`TaskSummaryOut.merge_ready`, `GET /api/tasks?merge_ready=1`).
+None of that makes the verdict binding: it stays advisory-only, computed
+inside a best-effort `try`/`except` in `_finalize`, and no code path merges,
+blocks, or gates a push on it — see the WHY paragraph above.
 
 A malformed or partially-invalid policy file never raises: it degrades to a
 :class:`PolicyLoad` carrying diagnostic ``problems`` strings, and a verdict
@@ -25,13 +32,14 @@ built from a load with any problem is never "ready" (fail closed).
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import yaml
+
+from . import pathglob
 
 # --- vocabulary ------------------------------------------------------------ #
 
@@ -117,6 +125,11 @@ class GateFacts:
     ci_state: str | None = None  # success/failure/pending/unknown/None
     changed_paths: tuple[str, ...] = ()
     changed_lines: int = 0
+    # True when the diff being evaluated itself edits the policy file
+    # (`POLICY_RELPATH`) — a coder authoring its own gate. Computed by
+    # `facts_from_evidence` from `changed_paths`, never set by hand in
+    # production; tests may still set it directly to exercise `_evaluate`.
+    policy_changed_in_diff: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,14 +145,30 @@ class PolicyVerdict:
     rules: tuple[RuleVerdict, ...]
     source: str
     problems: tuple[str, ...] = ()
+    # Mirrors `GateFacts.policy_changed_in_diff` — surfaced here too so
+    # renderers (and the "self-authored gate" ⚠️ glyph) don't need the facts
+    # object, only the verdict. See `_evaluate`: when true this is ALSO why
+    # `ready` is forced False (a problem string is injected), but `summary`
+    # below computes rule satisfaction from `self.rules`, not from `ready` —
+    # so "3 of 3 rules" reads correctly even though the overall verdict is
+    # not ready.
+    policy_changed_in_diff: bool = False
 
     @property
     def summary(self) -> str:
-        if self.ready:
-            return f"ready — {len(self.rules)} of {len(self.rules)} rules satisfied"
+        n = len(self.rules)
         failed = [v.name for v in self.rules if not v.passed]
+        if self.policy_changed_in_diff:
+            if not failed:
+                return f"ready — {n} of {n} rules — POLICY FILE CHANGED IN THIS PR"
+            return (
+                f"not ready — {len(failed)} of {n} rules failed: "
+                f"{', '.join(failed)} — POLICY FILE CHANGED IN THIS PR"
+            )
+        if not failed:
+            return f"ready — {n} of {n} rules satisfied"
         return (
-            f"not ready — {len(failed)} of {len(self.rules)} rules failed: "
+            f"not ready — {len(failed)} of {n} rules failed: "
             f"{', '.join(failed)}"
         )
 
@@ -149,6 +178,7 @@ class PolicyVerdict:
             "summary": self.summary,
             "source": self.source,
             "problems": list(self.problems),
+            "policy_changed_in_diff": self.policy_changed_in_diff,
             "rules": [
                 {"name": v.name, "passed": v.passed, "detail": v.detail}
                 for v in self.rules
@@ -271,91 +301,10 @@ def _parse_rule_item(item: Any) -> tuple[Rule | None, str | None]:
 
 # --- glob matcher --------------------------------------------------------- #
 #
-# Bare fnmatch is wrong for `paths_within` in the exact direction the spec
-# calls out: fnmatch's `*` crosses `/`, so `docs/*` would wrongly match
-# `docs/a/b.md`. PurePath.match has no `**` support before Python 3.13. So we
-# hand-translate the glob segment-by-segment into one anchored regex, mirroring
-# the reasoning (not the code — duplication here is intended) already used by
-# project_config._is_scoped_glob.
-
-
-def _normalize_path(p: str) -> str:
-    p = p.replace("\\", "/")
-    p = p.removeprefix("./")
-    p = p.lstrip("/")
-    return PurePosixPath(p).as_posix()
-
-
-def _translate_segment(seg: str) -> str:
-    if seg == "**":
-        return ""  # handled specially by the caller
-    out = []
-    i, n = 0, len(seg)
-    while i < n:
-        c = seg[i]
-        if c == "*":
-            out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "[":
-            j = seg.find("]", i + 2)
-            if j == -1:
-                # unterminated class: fall back to a literal escape of the
-                # whole segment rather than raising.
-                return re.escape(seg)
-            cls = seg[i:j + 1]
-            if cls.startswith("[!"):
-                cls = "[^" + cls[2:]
-            out.append(cls)
-            i = j
-        else:
-            out.append(re.escape(c))
-        i += 1
-    return "".join(out)
-
-
-def _glob_to_regex(pattern: str) -> str:
-    segments = pattern.split("/")
-    n = len(segments)
-    pieces: list[str] = []
-    for idx, seg in enumerate(segments):
-        is_last = idx == n - 1
-        if seg == "**":
-            if is_last:
-                # A trailing `**` gets an alternative consuming the
-                # remainder: one or more path segments joined by "/", so
-                # `docs/**` matches both `docs/x.md` and `docs/a/b.md`.
-                pieces.append(r"[^/]+(?:/[^/]+)*")
-            else:
-                # A non-trailing `**` matches zero or more whole directory
-                # segments, each already including its trailing "/".
-                pieces.append(r"(?:[^/]+/)*")
-        else:
-            pieces.append(_translate_segment(seg))
-            if not is_last:
-                pieces.append("/")
-    return "".join(pieces)
-
-
-_COMPILE_CACHE: dict[str, re.Pattern[str] | None] = {}
-
-
-def _compiled(pattern: str) -> re.Pattern[str] | None:
-    if pattern not in _COMPILE_CACHE:
-        try:
-            _COMPILE_CACHE[pattern] = re.compile(_glob_to_regex(pattern))
-        except re.error:
-            _COMPILE_CACHE[pattern] = None
-    return _COMPILE_CACHE[pattern]
-
-
-def _matches_any(path: str, patterns: list[str]) -> bool:
-    norm = _normalize_path(path)
-    for pattern in patterns:
-        rx = _compiled(pattern)
-        if rx is not None and rx.fullmatch(norm):
-            return True
-    return False
+# Moved to `core/pathglob.py` (the single shared implementation — this
+# module's translator was the stricter/more-complete of the two that used to
+# exist, so it is the one that moved verbatim). `_check_paths_within` below
+# now delegates to `pathglob.matches`.
 
 
 # --- evaluator ------------------------------------------------------------ #
@@ -442,7 +391,7 @@ def _check_paths_within(facts: GateFacts, arg: Any) -> tuple[bool, str]:
     paths = facts.changed_paths
     if not paths:
         return True, "no changed paths"
-    offenders = [p for p in paths if not _matches_any(p, patterns)]
+    offenders = [p for p in paths if not pathglob.matches(p, patterns)]
     if not offenders:
         return True, f"all {len(paths)} changed paths within the allowed set"
     shown = offenders[:5]
@@ -477,21 +426,151 @@ def _evaluate(rules: list[Rule], facts: GateFacts, problems: tuple[str, ...], so
         check = _CHECKS[rule.name]
         passed, detail = check(facts, rule.arg)
         verdicts.append(RuleVerdict(name=rule.name, passed=passed, detail=detail))
-    ready = bool(rules) and not problems and all(v.passed for v in verdicts)
-    return PolicyVerdict(ready=ready, rules=tuple(verdicts), source=source, problems=problems)
+    all_problems = list(problems)
+    if facts.policy_changed_in_diff:
+        # One mechanism, not two: a self-authored gate is recorded as a
+        # `problems` entry so the existing `ready = ... and not problems ...`
+        # line below is the ONLY place that forces `ready=False` for it —
+        # there is no separate `and not facts.policy_changed_in_diff` clause
+        # to keep in sync.
+        all_problems.append(
+            f"{POLICY_RELPATH} was itself changed in this diff — a coder "
+            "cannot author its own merge gate"
+        )
+    ready = bool(rules) and not all_problems and all(v.passed for v in verdicts)
+    return PolicyVerdict(
+        ready=ready,
+        rules=tuple(verdicts),
+        source=source,
+        problems=tuple(all_problems),
+        policy_changed_in_diff=facts.policy_changed_in_diff,
+    )
 
 
-def evaluate(rules: list[Rule], facts: GateFacts) -> PolicyVerdict:
+def evaluate(rules: list[Rule], facts: GateFacts, *, source: str = "memory") -> PolicyVerdict:
     """Evaluate an explicit rule list against gate facts. Pure function; no
-    file I/O. ``source`` is always "file" here — callers that loaded rules
-    from disk should prefer :func:`evaluate_repo`, which carries the real
-    load source through."""
-    return _evaluate(rules, facts, (), source="file")
+    file I/O. ``source`` defaults to "memory" — this rule list did not come
+    from `load_policy`, so it should not be labelled "file". Callers that
+    loaded rules from disk should prefer :func:`evaluate_repo`, which carries
+    the real load source through; a caller with its own loaded rules can
+    still pass an explicit ``source="file"``."""
+    return _evaluate(rules, facts, (), source=source)
 
 
-def evaluate_repo(repo_path: Path, facts: GateFacts) -> PolicyVerdict:
+def evaluate_repo(repo_path: Path, facts: GateFacts, *,
+                  extra_problems: tuple[str, ...] = ()) -> PolicyVerdict:
     """``load_policy`` + :func:`evaluate`, carrying ``source``/``problems``
     from the load into the verdict. A verdict built from a load with any
-    problem is never "ready" — fail closed."""
+    problem is never "ready" — fail closed.
+
+    ``extra_problems`` is for the CALLER's own evidence failures — a diff it
+    could not read, a fact it could not establish. They join the load's
+    problems in the one ``ready = ... and not all_problems ...`` line, so a
+    caller never has to invent a second way to force "not ready", and the
+    reason is rendered to the human like any other problem."""
     load = load_policy(repo_path)
-    return _evaluate(load.rules, facts, tuple(load.problems), source=load.source)
+    return _evaluate(load.rules, facts,
+                     tuple(load.problems) + tuple(extra_problems),
+                     source=load.source)
+
+
+# --- PrEvidence adapter ---------------------------------------------------- #
+
+
+def facts_from_evidence(
+    evidence: Any,
+    *,
+    changed_paths: list[str] | tuple[str, ...] = (),
+    changed_lines: int = 0,
+    repro_verdict: str | None = None,
+    repro_required: bool = False,
+    tamper_adjudications: list[dict] | tuple[dict, ...] | None = None,
+) -> GateFacts:
+    """Adapt a `core.pr_evidence.PrEvidence` (plus the facts it deliberately
+    does not carry — changed paths/lines, and the repro gate's verdict,
+    which lives in the orchestrator's attempt-scoped state, not on the
+    evidence object) into a flat :class:`GateFacts`.
+
+    Deliberately duck-typed on *evidence* (reads attributes, not an isinstance
+    check): `pr_evidence.py`'s own boundary is "never import the review
+    package", and this module mirrors that discipline by not importing
+    `core.pr_evidence` either — the two modules only agree on shape.
+
+    ``tamper_adjudications`` should be the RAW, unfiltered adjudication list
+    (``task.context["tamper_adjudications"]``) — every entry the tamper
+    guard ever produced for this run, not just the ones some other reader
+    already decided were legitimate. ``evidence.tamper`` (`core/pr_evidence.
+    py`) is NOT that: per its own docstring it is pre-filtered by
+    `Orchestrator._tamper_data` to `verdict == "LEGITIMATE"` entries only, so
+    a caller that falls back to it (``tamper_adjudications=None``) can only
+    ever observe "did not fire" or "fired and waived" — an unwaived fire is
+    structurally invisible through that field, because the filter has
+    already removed it before this function ever sees it. Passing the raw
+    list is what makes an unwaived fire (TAMPERING / CANNOT_DECIDE) visible
+    at all, so callers that HAVE it should always pass it; the fallback
+    exists only for callers that genuinely don't (e.g. tests exercising the
+    evidence-only path on purpose).
+    """
+    review_verdict = getattr(evidence, "review_verdict", None) or {}
+    review_passed: bool | None = None
+    # "unmatched" (rounds exist, but none is stamped for THIS head) and a
+    # never-run review both mean "no round has judged this head" — `_check_
+    # review_passed` already reads that as `review_passed=None` -> not ready.
+    if review_verdict.get("rounds") and not review_verdict.get("unmatched"):
+        verdict = review_verdict.get("verdict")
+        if verdict:
+            review_passed = str(verdict).upper() == "PASSED"
+    review_advisory_count = int(review_verdict.get("advisory_count", 0) or 0)
+
+    tests = getattr(evidence, "tests", None) or {}
+    tests_ran = bool(tests.get("ran")) if isinstance(tests, dict) else False
+    tests_failed = int(tests.get("failed", 0) or 0) if isinstance(tests, dict) else 0
+    tests_passed = int(tests.get("passed", 0) or 0) if isinstance(tests, dict) else 0
+
+    if tamper_adjudications is not None:
+        raw = tamper_adjudications
+    else:
+        raw = getattr(evidence, "tamper", None) or []
+    # Duck-typed dict check only — see the module-boundary note above; this
+    # module never imports `review.tamper_adjudication` to compare against
+    # its verdict enum, it compares the literal string the adjudicator
+    # writes (`review/tamper_adjudication.py`'s `Verdict.LEGITIMATE.value`).
+    tamper_entries = [e for e in raw if isinstance(e, dict)]
+    tamper_fired = len(tamper_entries) > 0
+    tamper_waived = tamper_fired and all(
+        e.get("verdict") == "LEGITIMATE" for e in tamper_entries
+    )
+
+    verifiers = getattr(evidence, "verifiers", None) or []
+    verifiers_ran = len(verifiers)
+    verifiers_failed = tuple(
+        sorted(
+            str(v.get("verifier_id", "")) for v in verifiers
+            if isinstance(v, dict) and not v.get("passed")
+        )
+    )
+
+    ci_state = getattr(evidence, "ci_state", None)
+    ci_state = str(ci_state) if ci_state else None
+
+    policy_changed_in_diff = any(
+        pathglob.normalize_path(p) == POLICY_RELPATH for p in changed_paths
+    )
+
+    return GateFacts(
+        review_passed=review_passed,
+        review_advisory_count=review_advisory_count,
+        tests_ran=tests_ran,
+        tests_failed=tests_failed,
+        tests_passed=tests_passed,
+        tamper_fired=tamper_fired,
+        tamper_waived=tamper_waived,
+        repro_verdict=repro_verdict,
+        repro_required=repro_required,
+        verifiers_ran=verifiers_ran,
+        verifiers_failed=verifiers_failed,
+        ci_state=ci_state,
+        changed_paths=tuple(changed_paths),
+        changed_lines=changed_lines,
+        policy_changed_in_diff=policy_changed_in_diff,
+    )

@@ -213,7 +213,12 @@ def test_verdict_and_rounds_match_review_verdict_data_for_the_same_head():
         {"round": 2, "sha": head_sha, "passed": True, "blocking": [], "advisory": []},
     ]}
     rv = Orchestrator._review_verdict_data(task, head_sha=head_sha, repo=None)
-    assert rv == {"rounds": 2, "verdict": "PASSED", "addressed": []}
+    # `advisory_count` joined this contract with the merge-ready work: the PR
+    # body needs the UNCAPPED advisory count, which the 5-item review_history
+    # trail cannot give. Pinned by exact equality like the three fields before
+    # it, so a fifth key cannot appear unnoticed either.
+    assert rv == {"rounds": 2, "verdict": "PASSED", "addressed": [],
+                  "advisory_count": 0}
 
     body = Orchestrator._review_checklist_comment(
         task, _decision(passed=True, items=[]), head_sha=head_sha,

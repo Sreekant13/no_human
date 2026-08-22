@@ -22,6 +22,7 @@ attempt's gate outputs:
 | Test-change guard | present only when the tamper guard fired and an independent adjudicator waived it as required by the ticket; its reasoning is printed under the table. |
 | Tests | the orchestrator's own run of the project's tests on the final tree — counts, or `NOT RUN` with the reason. Failing test names are folded under the table. |
 | CI | the forge's CI state for the branch, when one is known. |
+| Merge policy | the repo's merge-ready policy verdict for *this* commit — ✅ or ❌ plus the policy's own summary sentence, computed once by `core/merge_policy.py` and rendered nowhere else. `⚠️` replaces `✅`/`❌` when this diff itself edited `.no_human/merge_policy.yaml` (a coder cannot author its own merge gate — this also forces the verdict to `ready: false`) or when the policy file failed to load (broken/oversized, falling back to the default); either case prints a visible warning line *above* the fold, never only inside it. Every rule's name, pass/fail, and detail is folded under the table. **This row is advisory to the human; nothing in this repo merges on it** — see [verification.md](verification.md#merge-ready-policy). |
 
 Nothing in this table is written by the coder. A sentence can appear here
 only if the evidence object that backs it exists — a test pins that.

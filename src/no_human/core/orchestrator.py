@@ -129,6 +129,7 @@ from ..vcs import (
 from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
 from ..vcs.task_pr import resolve_task_pr
+from . import merge_policy
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector, error_signature
 from ..blockers.taxonomy import carried_checkpoint, resume_checkpoint
@@ -6114,10 +6115,13 @@ class Orchestrator:
                     # H8: which attempt delivered this — the same row already
                     # carries it, and no PR body has ever said.
                     attempt_n = a.get("attempt_number")
-                    # no-human-67: the checklist the PR-comment reader needs —
-                    # THIS attempt's own stored review, not the compact
-                    # per-round trail in task.context (that one is labels-only
-                    # and is what `_review_verdict_data` already renders).
+                    # THIS attempt's own stored review, raw and uncapped —
+                    # not the compact per-round trail in task.context (that one
+                    # is labels-only and is what `_review_verdict_data` already
+                    # renders). Two consumers read this single local: the PR
+                    # comment (`_post_review_checklist_comment`) and the PR
+                    # body's advisory count, which runs it through
+                    # `findings_from_checklist` (the 5-item trail undercounts).
                     review_checklist_raw = a.get("review_checklist")
                     break
         except Exception as exc:  # noqa: BLE001 — evidence never blocks the PR
@@ -6132,10 +6136,97 @@ class Orchestrator:
             receipts = await self.store.list_verification_receipts(attempt_id)
         except Exception as exc:  # noqa: BLE001
             self._advisory(f"verification receipts missing from PR body: {exc}")
+        # Merge-ready policy verdict (core/merge_policy.py) — computed ONCE
+        # here from a single `_gather_evidence` call, folded into that SAME
+        # `PrEvidence` object, and threaded into `_pr_body` via its
+        # `evidence=` param so the render never re-gathers (and could never
+        # re-derive a different answer for tamper/review/CI state than the
+        # one the persisted verdict below was computed from).
+        #
+        # ADVISORY ONLY. This block computes and PERSISTS a verdict for a
+        # human to read (`task.context["merge_policy"]`, read by the API's
+        # `merge_ready` field/filter and rendered as the PR body's "Merge
+        # policy" row); it never merges, blocks delivery, or gates the push
+        # below. Wrapped like the two evidence blocks above it — a failure
+        # here is an advisory note, never a reason this PR doesn't ship.
+        merge_policy_dict: dict | None = None
+        policy_evidence: PrEvidence | None = None
+        head_sha = (getattr(commit, "sha", "") or "").strip()
+        try:
+            review_base = self._review_base(repo, base)
+            # An empty diff read is NOT a safe default here: `paths_within`
+            # passes on "no changed paths", `max_changed_lines` passes on 0,
+            # and `policy_changed_in_diff` — the one check that stops a coder
+            # authoring its own gate — is derived from `changed_paths` alone.
+            # So a swallowed failure is recorded as a policy `problem`, which
+            # is the single mechanism that forces `ready=False`, instead of
+            # three rules quietly reading as satisfied.
+            evidence_problems: list[str] = []
+            try:
+                changed_paths = list(repo.changed_files(review_base))
+            except Exception as exc:  # noqa: BLE001
+                changed_paths = []
+                evidence_problems.append(
+                    f"the changed-file list could not be read ({exc}) — "
+                    "paths_within and the self-authored-gate check could not "
+                    "be evaluated")
+            changed_lines = 0
+            try:
+                for line in repo.diff(review_base).splitlines():
+                    if line.startswith(("+++", "---")):
+                        continue
+                    if line.startswith(("+", "-")):
+                        changed_lines += 1
+            except Exception as exc:  # noqa: BLE001
+                changed_lines = 0
+                evidence_problems.append(
+                    f"the diff could not be read ({exc}) — max_changed_lines "
+                    "could not be evaluated")
+            repro_state = getattr(self, "_last_repro", None) or {}
+            policy_evidence = self._gather_evidence(
+                task, test_evidence=test_evidence, receipts=receipts,
+                head_sha=head_sha, repo=repo, review_checklist=review_checklist_raw,
+                observable=self._backend_is_observable(),
+            )
+            verdict = merge_policy.evaluate_repo(
+                repo.path,
+                extra_problems=tuple(evidence_problems),
+                facts=merge_policy.facts_from_evidence(
+                    policy_evidence,
+                    changed_paths=changed_paths,
+                    changed_lines=changed_lines,
+                    repro_verdict=repro_state.get("verdict"),
+                    repro_required=bool(repro_state.get("required")),
+                    # The RAW, unfiltered adjudication list — NOT
+                    # `evidence.tamper`, which `_tamper_data` has already
+                    # pre-filtered down to LEGITIMATE-only waivers. A
+                    # TAMPERING/CANNOT_DECIDE fire must still be visible to
+                    # `tamper_guard_clear` even though it never reaches the
+                    # PR body.
+                    tamper_adjudications=(task.context or {}).get(
+                        "tamper_adjudications"),
+                ),
+            )
+            merge_policy_dict = verdict.as_dict()
+            # Fold the verdict INTO the evidence object it was computed from,
+            # rather than gathering a second time for `_pr_body` — see the
+            # comment above this block.
+            policy_evidence = replace(policy_evidence, merge_policy=merge_policy_dict)
+            if head_sha:
+                # RFC 7396 merge patch: only this sha's key is touched, so a
+                # concurrent writer's entry for a DIFFERENT sha (or a prior
+                # attempt's entry for this same task) survives.
+                task.context = await self.store.merge_context(
+                    task.id, {"merge_policy": {head_sha: merge_policy_dict}})
+            self.emit("merge_policy", verdict.summary, ready=verdict.ready)
+        except Exception as exc:  # noqa: BLE001 — advisory only; never blocks the PR
+            self._advisory(f"merge policy verdict missing from PR body: {exc}")
+            policy_evidence = None
         body = self._pr_body(task, commit, result, test_evidence=test_evidence,
                              receipts=receipts,
                              repo=repo, base=base, branch=branch,
-                             attempt_n=attempt_n)
+                             attempt_n=attempt_n, merge_policy=merge_policy_dict,
+                             evidence=policy_evidence)
         # Refresh the body only if THIS TASK opened the draft that is sitting on THIS
         # branch. Durable (task.context), so it survives a park/resume and a process
         # restart; branch-scoped, so a revision onto a different branch cannot inherit it.
@@ -7505,6 +7596,13 @@ class Orchestrator:
         or the `TaskOutcome` that ends the attempt.
         """
         repro_mode = self.config.get("repro_gate", {}).get("mode", "advisory")
+        # Merge-policy's `repro_gate` rule reads this off the attempt-scoped
+        # instance, not `task.context` — the verdict never persists there
+        # (only the `repro_gate` EVENT does). Reset every call so an "off"
+        # mode (early return below) or a crashed gate never leaves a STALE
+        # verdict from a previous call on this same instance for `_finalize`
+        # to pick up.
+        self._last_repro = None
         if repro_mode == "off":
             return None
         # Historically the gate only ran pytest, so it could only REQUIRE a
@@ -7531,6 +7629,7 @@ class Orchestrator:
                     resume_shape=resume_shape)
             except Exception as exc:  # noqa: BLE001 — a crashed gate is not a verdict
                 self._advisory(f"repro gate crashed: {exc}")
+                self._last_repro = {"verdict": None, "required": enforced}
                 return None
             self.emit(
                 "repro_gate",
@@ -7542,6 +7641,11 @@ class Orchestrator:
                 verdict=repro.verdict,
                 resume_shape=resume_shape,
             )
+            # Latest verdict wins: `_run_gate` is called a second time after a
+            # corrective round, and `_finalize` must see what actually
+            # happened LAST, matching how the `_fail` path already reports
+            # "that second run's own detail (not the first run's)".
+            self._last_repro = {"verdict": repro.verdict, "required": enforced}
             return repro
 
         async def _fail(bad_repro) -> TaskOutcome:
@@ -17542,6 +17646,8 @@ SIX of them read a checkpoint and TWO do not — but do
         receipts: list[dict] | None = None,
         repo: "GitRepo | None" = None, base: str | None = None,
         branch: str | None = None, attempt_n: int | None = None,
+        merge_policy: dict | None = None,
+        evidence: PrEvidence | None = None,
     ) -> str:
         # Short and to the point: no boilerplate, no product name, no verbose
         # dump. The title is the PR title; the body is criteria + a brief summary
@@ -17582,10 +17688,21 @@ SIX of them read a checkpoint and TWO do not — but do
         # `receipts` or `test_evidence` independently — so two sections can
         # never print two different answers to "how many rounds passed" or
         # "how many commands ran". See `core/pr_evidence.py`.
-        evidence = self._gather_evidence(
-            task, test_evidence=test_evidence, receipts=receipts,
-            head_sha=head_sha, repo=repo, observable=observable,
-        )
+        #
+        # `evidence` may already be gathered by the caller (`_finalize` builds
+        # it once to compute the merge-policy verdict, then folds that verdict
+        # into the SAME object and passes it here) — a second gather in that
+        # case could read a different tamper/review/CI state than the one the
+        # persisted verdict was computed from, which is exactly the bug this
+        # parameter exists to close. Callers with nothing pre-gathered (the
+        # pre-review draft body, this file's own unit tests) leave it at the
+        # default `None` and get the old gather-it-here behaviour.
+        if evidence is None:
+            evidence = self._gather_evidence(
+                task, test_evidence=test_evidence, receipts=receipts,
+                head_sha=head_sha, repo=repo, observable=observable,
+                merge_policy=merge_policy,
+            )
         # ONE evidence area, decisive-first (the independent reviewer's verdict,
         # then the orchestrator's own test run) — see `_evidence_section`. The
         # raw command receipts stay their own `## How I verified this` appendix
@@ -17623,7 +17740,8 @@ SIX of them read a checkpoint and TWO do not — but do
     def _gather_evidence(
         self, task: Task, *, test_evidence: dict | None = None,
         receipts: list[dict] | None = None, head_sha: str = "",
-        repo=None, observable: bool = True,
+        repo=None, observable: bool = True, merge_policy: dict | None = None,
+        review_checklist: "str | dict | None" = None,
     ) -> PrEvidence:
         """Gather this attempt's gate outputs ONCE into a single `PrEvidence`.
 
@@ -17633,14 +17751,30 @@ SIX of them read a checkpoint and TWO do not — but do
         takes `evidence` instead of re-deriving its own answer from
         `task.context`/`receipts`/`test_evidence`, so there is exactly one
         place per gate where its output is read out of the attempt.
+
+        ``merge_policy`` is the ONE field this method does not derive itself
+        (unlike every other field, it needs facts — changed paths/lines, the
+        repro gate's verdict — this method has no access to): `_finalize`
+        computes+persists it once via `core.merge_policy.evaluate_repo` and
+        passes the resulting `PolicyVerdict.as_dict()` straight through here,
+        so the persisted verdict and the rendered row can never disagree.
+
+        ``review_checklist`` is the attempt row's raw (uncapped)
+        `attempts.review_checklist` column, threaded through to
+        `_review_verdict_data` so its `advisory_count` can read the real
+        count instead of the 5-item-capped trail (`_append_review_history`).
         """
         return PrEvidence(
             repro={"receipts": list(receipts or []), "observable": observable},
             tamper=self._tamper_data(task),
             tests=test_evidence,
-            review_verdict=self._review_verdict_data(task, head_sha=head_sha, repo=repo),
+            review_verdict=self._review_verdict_data(
+                task, head_sha=head_sha, repo=repo,
+                review_checklist=review_checklist,
+            ),
             verifiers=((task.context or {}).get("verifier_results") or {}).get(head_sha),
             ci_state=(task.context or {}).get("ci_status"),
+            merge_policy=merge_policy,
         )
 
     def _evidence_section(
@@ -17674,7 +17808,12 @@ SIX of them read a checkpoint and TWO do not — but do
         ci = ""
         if evidence.ci_state:
             ci = f"| CI | {self._inline_cell(str(evidence.ci_state), None)} |\n"
-        rows, after = self._split_rows(review + verifiers + tamper + tests + ci)
+        # Merge policy LAST: it is a verdict ABOUT the rows above it, so it
+        # reads best once a reviewer already has review/verifiers/tamper/
+        # tests/CI in view.
+        merge_policy = self._merge_policy_evidence_section(evidence)
+        rows, after = self._split_rows(
+            review + verifiers + tamper + tests + ci + merge_policy)
         if not rows:
             return ""
         return ("## Evidence\n| Check | Result |\n|---|---|\n" + rows
@@ -17879,6 +18018,7 @@ SIX of them read a checkpoint and TWO do not — but do
     @staticmethod
     def _review_verdict_data(
         task: Task, *, head_sha: str = "", repo=None,
+        review_checklist: "str | dict | None" = None,
     ) -> dict | None:
         """W1.6: the reviewer's verdict trail, as RAW structured facts — the
         ONE place `task.context["review_history"]` is read for the PR body.
@@ -17891,8 +18031,20 @@ SIX of them read a checkpoint and TWO do not — but do
         section must still SAY out loud rather than silently vanish, since
         "no review evidence" and "no section" look identical to a reader.
         Otherwise returns `{"rounds": int, "verdict": "PASSED"|"not passed",
-        "addressed": [str, ...]}` — `addressed` already `_inline_cell`-safe
-        and capped at 8, matching what the section has always shown.
+        "addressed": [str, ...], "advisory_count": int}` — `addressed`
+        already `_inline_cell`-safe and capped at 8, matching what the
+        section has always shown. `advisory_count` counts the REAL,
+        uncapped advisory findings via `review.reviewer.findings_from_checklist`
+        against the attempt row's own `review_checklist` column (passed in as
+        ``review_checklist``, since this method has no store access) — the
+        same predicate the gate itself used, never a second copy of the
+        severity rule. `_append_review_history` caps the stored label TRAIL
+        at 5 for the PR body's addressed-list, which is fine for that list's
+        purpose (a readable sample) but was silently reused as the merge-
+        policy `no_advisory_findings` rule's input count too, which needs the
+        true number. Falls back to that capped trail count only when no
+        usable checklist is available (older attempts, or a caller that never
+        threaded one through) so this never regresses for those.
 
         Data flows review -> evidence -> body here, and only here. Nothing in
         this method may ever flow the other way: the body carries
@@ -17933,7 +18085,19 @@ SIX of them read a checkpoint and TWO do not — but do
                 # rendered INSIDE the section headed `## Review evidence`, which
                 # is the exact fabrication this branch exists to stop.
                 addressed.append(Orchestrator._inline_cell(b))
-        return {"rounds": rounds, "verdict": verdict, "addressed": addressed[:8]}
+        # Prefer the REAL count from the raw checklist over the capped trail
+        # — see the docstring above. `review_checklist` truthy (a non-empty
+        # dict or a non-empty JSON string) is "usable"; anything falsy (None,
+        # "", {}) means no checklist was threaded through, so keep the old
+        # capped-trail number rather than claim a false zero.
+        advisory_count = len(last.get("advisory") or [])
+        if review_checklist:
+            _blocking, advisory_items = findings_from_checklist(review_checklist)
+            advisory_count = len(advisory_items)
+        return {
+            "rounds": rounds, "verdict": verdict, "addressed": addressed[:8],
+            "advisory_count": advisory_count,
+        }
 
     @staticmethod
     def _review_evidence_section(
@@ -18010,6 +18174,62 @@ SIX of them read a checkpoint and TWO do not — but do
         fold = (f"<details><summary>Verifiers ({k})</summary>\n\n"
                 + "\n".join(items) + "\n\n</details>\n")
         return row + fold
+
+    @staticmethod
+    def _merge_policy_evidence_section(evidence: PrEvidence) -> str:
+        """The merge-ready policy verdict (`core/merge_policy.py`), as the
+        LAST row of the Evidence table — a verdict ABOUT the rows above it.
+        Renders EXCLUSIVELY from ``evidence.merge_policy`` /
+        ``evidence.merge_policy_pin()`` — the row's text IS the pin, same
+        discipline as `_verifiers_evidence_section`. "" when no verdict was
+        computed for this head (a failed/skipped compute in `_finalize` is
+        advisory and prints nothing, never a stale or fabricated row).
+
+        ADVISORY TO THE HUMAN ONLY: this row and its fold report a verdict;
+        nothing in this repo reads it to merge, block, or gate a push — see
+        `_finalize`'s comment at the call site that computes it. `nh approve`,
+        the only merge path, never reads this verdict: running it is itself
+        the human decision. Any recorded ``problems`` (a
+        broken/oversized policy file falling back to the default, or an
+        evidence read the caller could not complete) render as
+        a VISIBLE warning line ABOVE the fold — never buried inside the
+        `<details>`, since a human deciding whether to trust "ready" must
+        see this without expanding anything.
+        """
+        mp = evidence.merge_policy
+        if not mp:
+            return ""
+        pin = evidence.merge_policy_pin() or ""
+        # ⚠️ outranks ✅/❌: a diff that edits the policy file is authoring its
+        # own gate (`core/merge_policy.py`'s `policy_changed_in_diff`), and
+        # that is worth a human's attention even when every rule the coder's
+        # own policy demands happens to pass.
+        glyph = ("⚠️" if mp.get("policy_changed_in_diff")
+                 else ("✅" if mp.get("ready") else "❌"))
+        row = f"| Merge policy | {glyph} {Orchestrator._inline_cell(pin, None)} |\n"
+        warn = ""
+        problems = mp.get("problems") or []
+        if problems:
+            joined = "; ".join(
+                Orchestrator._inline_cell(str(p), None) for p in problems)
+            warn = f"⚠️ merge policy: {joined}\n\n"
+        rules = mp.get("rules") or []
+        items = []
+        for r in rules:
+            rglyph = "✅" if r.get("passed") else "❌"
+            name = Orchestrator._inline_cell(str(r.get("name") or ""), None)
+            detail = Orchestrator._inline_cell(str(r.get("detail") or ""), None)
+            items.append(f"- {rglyph} {name} — {detail}")
+        fold = ""
+        if items:
+            k = len(items)
+            src = Orchestrator._inline_cell(str(mp.get("source") or ""), None)
+            fold = (
+                f"<details><summary>Merge-ready policy "
+                f"({k} rule{'s' if k != 1 else ''}, source: {src})</summary>\n\n"
+                + "\n".join(items) + "\n\n</details>\n"
+            )
+        return row + warn + fold
 
     #: How many recorded commands are shown WITH their captured output, and how
     #: many are listed at all. Both are needed: 200 receipts x a 1,200-character
