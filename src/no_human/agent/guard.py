@@ -431,7 +431,7 @@ def _protected_venvs(cwd: "str | None") -> list:
 
 #: Verbs that mutate a pip-family environment.
 _PIP_VERBS = ("install", "uninstall", "sync")
-_PY_EXE_RE = re.compile(r"^python[0-9.]*$")
+_PY_EXE_RE = re.compile(r"^(?:python|pypy)[0-9.]*$")
 
 #: argv[0] names this guard treats as package-manager invocations — passed to
 #: `_strip_wrappers` so `env -i pip install …` / `sudo -H <primary>/.venv/`
@@ -445,6 +445,21 @@ def _is_pkg_manager_name(name: str) -> bool:
     return name in _PKG_MANAGER_NAMES or bool(_PY_EXE_RE.match(name))
 
 
+#: Cap on how many `<interpreter> -m <interpreter> -m …` prefixes
+#: `_pkg_install_match` will peel before giving up. Each peel strictly
+#: shortens argv, so unbounded recursion always terminates — but "always
+#: terminates" is not "never blows the call stack": a crafted
+#: `"python " + "-m python " * N + "-m pip install x"` recurses N deep
+#: with no cap, and Python's C-stack limit turns that into a RecursionError
+#: raised OUT OF `guard.evaluate`, i.e. a guard that crashes instead of
+#: denying. The loop below is iterative (no call-stack growth at all) and
+#: bounded anyway: no real invocation nests interpreters this deep, and a
+#: pathological one that exceeds the cap simply falls through to `None`
+#: here — an ordinary v1 miss, not a crash — leaving v2's resolution-based
+#: check as the backstop, same as any other command v1 does not recognise.
+_MAX_INTERPRETER_PEEL = 8
+
+
 def _pkg_install_match(argv: list):
     """The install-command's trailing args, or ``None`` if ``argv`` (argv[0]
     possibly a path) is not a package-install invocation. Deliberately NOT
@@ -453,15 +468,29 @@ def _pkg_install_match(argv: list):
     unrelated to the developer venv's package set."""
     if not argv:
         return None
+    for _ in range(_MAX_INTERPRETER_PEEL):
+        name = PurePosixPath(argv[0]).name
+        if not _PY_EXE_RE.match(name):
+            break
+        rest = argv[1:]
+        # `-m <installer> …` IS an invocation of that installer: peel the
+        # interpreter off and re-examine the remainder with the same
+        # matcher, so every grammar it already knows (`pip install`, `uv pip
+        # install`, `uv add|sync|remove`, …) is recognised behind `-m` too,
+        # with no second verb table to drift. Purely lexical — v1 never
+        # consults PATH, which is the point: v2 answers the *resolution*
+        # question and fails OPEN when PATH cannot answer it
+        # (`_resolve_installer`'s "could not be resolved via PATH; allowing"
+        # branch), so this layer must not depend on it either.
+        if len(rest) >= 2 and rest[0] == "-m" and _is_pkg_manager_name(rest[1]):
+            argv = rest[1:]  # strictly shorter — the `for` cap bounds it too
+            continue
+        return None
     name = PurePosixPath(argv[0]).name
     rest = argv[1:]
     if name in ("pip", "pip3"):
         if rest and rest[0] in _PIP_VERBS:
             return rest[1:]
-        return None
-    if _PY_EXE_RE.match(name):
-        if len(rest) >= 3 and rest[0] == "-m" and rest[1] == "pip" and rest[2] in _PIP_VERBS:
-            return rest[3:]
         return None
     if name == "uv":
         if rest and rest[0] == "pip":

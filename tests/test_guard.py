@@ -2221,6 +2221,170 @@ def test_protected_venvs_excludes_anything_under_the_session_cwd(tmp_path, monke
 
 
 # --------------------------------------------------------------------------- #
+# `<interpreter> -m <pkg-manager> …` closes the resolution-failure hole: v2
+# (`venv_install_guard`) fails OPEN when `shutil.which` cannot resolve the
+# interpreter — the live server's "names an installer but could not be
+# resolved via PATH; allowing" case, logged dozens of times an hour from real
+# coder worktrees, i.e. the NORMAL state, not a corner case. v1's lexical
+# matcher must therefore deny `python -m uv pip install`/`-m uv add`/`-m uv
+# sync`/`-m pip install` on its own, purely from argv text, whether or not
+# PATH can resolve anything. `cwd=<worktree>` is deliberately NOT one of the
+# two `cwd` shapes exercised below — every bare install spelling is already
+# ALLOW there by design (`test_installs_into_the_worktree_own_venv_are_
+# allowed` above), so a `-m uv` row would be incoherent to deny there too;
+# `test_worktree_targeted_installs_are_unchanged_by_the_dash_m_widening`
+# below asserts that shape is untouched instead.
+# --------------------------------------------------------------------------- #
+
+_REAL_PATH = os.environ.get("PATH", "/usr/bin:/bin")
+
+#: `{primary}` is filled in with the fake primary checkout's path per-test.
+_UV_M_DENY = [
+    "python -m uv pip install evilpkg",
+    "python3.12 -m uv pip install evilpkg",
+    "pypy3 -m uv pip install evilpkg",
+    "{primary}/.venv/bin/python -m uv pip install evilpkg",
+    "uv run python -m uv pip install evilpkg",
+    "python -m uv add evilpkg",
+    "python -m uv sync",
+    "python -m pip install evilpkg",  # regression anchor: pre-existing DENY
+]
+
+_MUST_ALLOW = [
+    "python -m pytest -q",
+    'python -c "print(1)"',
+    "python -m json.tool",
+    "uv run pytest",
+    "python -m uv --version",
+    "python -m uv lock",
+    "python -m uv run pytest",
+    "python -m pip list",
+    "python -m uv pip list",  # near-miss control: not an install verb
+]
+
+
+def test_interpreter_dash_m_uv_installs_are_denied_in_every_mode_and_path_state(tmp_path, monkeypatch):
+    """RED on pre-fix main for every `-m uv` row in the PATH=/nonexistent
+    column: v2 fails open there, and the pre-fix v1 matcher only recognised
+    `-m pip install`, never `-m uv …`."""
+    primary = _fake_primary_checkout(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    for readonly in (False, True):
+        for path_state, path_value in (("resolvable", _REAL_PATH), ("broken", "/nonexistent")):
+            for cwd in (None, str(primary)):
+                for template in _UV_M_DENY:
+                    cmd = template.format(primary=primary)
+                    d = guard.evaluate(
+                        "Bash", {"command": cmd},
+                        forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                        readonly=readonly, cwd=cwd, env={"PATH": path_value},
+                    )
+                    assert d.allow is False, (
+                        f"must be DENY: {cmd!r} readonly={readonly} "
+                        f"PATH={path_state} cwd={cwd!r} — got ALLOW"
+                    )
+
+
+def test_non_install_python_module_commands_stay_allowed(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    for readonly in (False, True):
+        for path_state, path_value in (("resolvable", _REAL_PATH), ("broken", "/nonexistent")):
+            for cwd in (None, str(worktree)):
+                for cmd in _MUST_ALLOW:
+                    d = guard.evaluate(
+                        "Bash", {"command": cmd},
+                        forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                        readonly=readonly, cwd=cwd, env={"PATH": path_value},
+                    )
+                    assert d.allow is True, (
+                        f"must stay ALLOW: {cmd!r} readonly={readonly} "
+                        f"PATH={path_state} cwd={cwd!r} — reason={d.reason!r}"
+                    )
+
+
+def test_worktree_targeted_installs_are_unchanged_by_the_dash_m_widening(tmp_path, monkeypatch):
+    """Scope guard for the `cwd`-known invariant: installs that resolve to
+    the SESSION's own worktree venv stay allowed there, `-m uv` included —
+    only installs landing in the shared PRIMARY venv are newly denied."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    still_allowed = [
+        "uv pip install -e .",
+        "pip install -r requirements.txt",
+        "uv sync",
+        "python -m uv pip install foo",
+        "python -m uv sync",
+        f"{worktree}/.venv/bin/pip install foo",
+    ]
+    for path_state, path_value in (("resolvable", _REAL_PATH), ("broken", "/nonexistent")):
+        for cmd in still_allowed:
+            d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, cwd=str(worktree),
+                               env={"PATH": path_value})
+            assert d.allow is True, f"must stay allowed ({path_state}): {cmd} — {d.reason}"
+
+        still_denied = f"{primary}/.venv/bin/python -m uv pip install foo"
+        d = guard.evaluate("Bash", {"command": still_denied}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree),
+                           env={"PATH": path_value})
+        assert d.allow is False, f"must stay denied ({path_state}): {still_denied}"
+
+
+def test_v1_lexical_layer_matches_dash_m_uv_without_any_path_resolution(tmp_path, monkeypatch):
+    """Names the defect directly: the v1 matcher must recognise `-m uv …` as
+    an install invocation from argv text alone — no `shutil.which` call, no
+    dependence on what PATH resolves."""
+    primary = _fake_primary_checkout(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    for cwd in (None, str(primary)):
+        for template in _UV_M_DENY:
+            cmd = template.format(primary=primary)
+            assert guard._venv_install_denial(cmd, cwd) is not None, (
+                f"v1 must deny without PATH: {cmd!r} cwd={cwd!r}"
+            )
+        for cmd in _MUST_ALLOW:
+            assert guard._venv_install_denial(cmd, cwd) is None, (
+                f"v1 must stay silent (allow) on: {cmd!r} cwd={cwd!r}"
+            )
+
+    # Direct matcher pins.
+    assert guard._pkg_install_match(["python", "-m", "uv", "pip", "install", "x"]) == ["x"]
+    assert guard._pkg_install_match(["python", "-m", "uv", "sync"]) == []
+    assert guard._pkg_install_match(["python", "-m", "uv", "--version"]) is None
+
+
+def test_a_deeply_nested_interpreter_chain_does_not_crash_the_guard(tmp_path, monkeypatch):
+    """`-m <interpreter>` prefixes must be bounded, not merely "always
+    terminates": a pathological `"python " + "-m python " * N + "-m pip
+    install x"` recurses N deep with no cap and raises RecursionError OUT OF
+    `guard.evaluate` — a guard that crashes is not a guard that denies.
+    `_pkg_install_match` must return a plain non-match instead, from every
+    `cwd` shape, so `evaluate()` always returns a `GuardDecision`."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    chain_argv = ["python"] + ["-m", "python"] * 6000 + ["-m", "pip", "install", "evilpkg"]
+    assert guard._pkg_install_match(chain_argv) is None
+
+    cmd = "python " + "-m python " * 6000 + "-m pip install evilpkg"
+    for cwd in (None, str(primary), str(worktree)):
+        d = guard.evaluate(
+            "Bash", {"command": cmd},
+            forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+            readonly=False, cwd=cwd, env={"PATH": _REAL_PATH},
+        )
+        assert isinstance(d, guard.GuardDecision), f"must not raise: cwd={cwd!r}"
+
+
+# --------------------------------------------------------------------------- #
 # Punctuation-run separators. `shlex` in `punctuation_chars` mode emits a
 # maximal RUN of punctuation as a SINGLE token ('\n\n', ';\n', '&\n', '||\n'),
 # not the individual operators `_INSTALL_SEP_TOKENS` used to check for by

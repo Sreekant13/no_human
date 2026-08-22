@@ -408,6 +408,50 @@ def test_non_install_commands_are_untouched(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# `<interpreter> -m uv …` — agreement check. Once the leading `python` token
+# resolves as an installer (it's in `_EXACT_INSTALLERS` / `_VERSIONED_
+# PREFIXES` here in v2), `_mutating_subcommand` already walks past `-m`
+# (a flag) and past `uv`/`pip` (both installer NAMES it skips) to land on
+# the real subcommand (`install`/`add`/`sync`) — the same walk that already
+# handles `uv pip install foo`. No new lexical rule needed here; these tests
+# pin that the existing walk in fact reaches the right verdict for the `-m`
+# spelling, on a resolvable PATH. (None of the cases below use `pypy`: v2's
+# `_EXACT_INSTALLERS`/`_VERSIONED_PREFIXES` in `venv_install_guard.py` do
+# NOT list it — `pypy`/`pypy3*` are recognised only by v1's `_PY_EXE_RE` in
+# `guard.py`, a separate lexical layer covered by `test_guard.py` instead.)
+# ---------------------------------------------------------------------------
+
+def test_interpreter_dash_m_uv_install_resolves_and_is_denied(tmp_path):
+    primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
+    cases = [
+        "python -m uv pip install evilpkg",
+        "python3 -m uv pip install evilpkg",
+        "python -m uv add evilpkg",
+        "python -m uv sync",
+        f"{primary_venv}/bin/python -m uv pip install evilpkg",
+    ]
+    for cmd in cases:
+        r = venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env)
+        assert r is not None, f"must be denied: {cmd}"
+        assert primary_venv in r, f"reason must name {primary_venv}: {r}"
+    d = _ev("Bash", {"command": "python -m uv pip install evilpkg"}, cwd=wt, env=prod_env)
+    assert not d.allow, "must be blocked via evaluate() too"
+
+
+def test_dash_m_uv_non_install_subcommands_are_not_install_intent(tmp_path):
+    primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
+    cases = [
+        "python -m uv --version",
+        "python -m pip list",
+        "uv run pytest -q",
+        "python -m pytest -q",
+    ]
+    for cmd in cases:
+        r = venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env)
+        assert r is None, f"must stay allowed: {cmd} — {r}"
+
+
+# ---------------------------------------------------------------------------
 # Wiring.
 # ---------------------------------------------------------------------------
 
