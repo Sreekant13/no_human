@@ -13,8 +13,11 @@ Two coordination rules:
     before its coroutine is scheduled, so the next tick won't re-claim it (even
     though its DB status becomes IMPLEMENTING mid-run).
   - **Shared-quota gate (7.4).** All workers share one subscription. When any
-    task parks PAUSED_QUOTA, the pool stops dispatching until the reset time —
-    one worker hitting the limit pauses the whole pool, not just itself.
+    task parks PAUSED_QUOTA on a billing wall, the pool stops dispatching
+    until the reset time — one worker hitting the limit pauses the whole
+    pool, not just itself. An INFRA park (`blocker.infra`, a dead SDK
+    session) parks only its own task; the 3-strike breaker is the pool's
+    response to those.
 """
 
 from __future__ import annotations
@@ -1702,7 +1705,7 @@ class Scheduler:
             orch._sink = _sink
             self._running[task.id] = orch
             outcome = await orch.run_task(task)
-            # 7.4: a quota park pauses the whole pool until the reset time.
+            # 7.4: a billing-wall park pauses the whole pool until the reset.
             # An INFRA park (dead SDK session, `blocker.infra`) is the
             # task's to sleep off, not the pool's: the 3-strike breaker in
             # `_tick` is the fleet response to dead sessions. Arming the

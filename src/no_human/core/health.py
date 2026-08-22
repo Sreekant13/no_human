@@ -98,17 +98,25 @@ async def _quota_profile(store: Any) -> str | None:
     ``None`` rather than guessing. Quota-only: an infra-breaker cooldown
     must never call this — a stale unrelated park would be misattributed
     as the cause of an SDK/auth failure."""
-    row = await store.query_one(
+    # Newest NON-infra park: an infra park (`blocker.infra`, a dead SDK
+    # session) never armed the pool clock, so it must not be the row that
+    # names whose wall the pool is waiting on. Same skip as
+    # `Scheduler.recover_quota_cooldown`.
+    rows = await store.query(
         "SELECT blocker FROM tasks WHERE status = 'paused_quota' "
-        "AND blocker IS NOT NULL ORDER BY updated_at DESC LIMIT 1", ())
-    if not row or not row[0]:
-        return None
-    try:
-        blocker = json.loads(row[0])
-    except (TypeError, ValueError):
-        return None
-    profile = blocker.get("auth_profile") if isinstance(blocker, dict) else None
-    return profile if isinstance(profile, str) else None
+        "AND blocker IS NOT NULL ORDER BY updated_at DESC LIMIT 20", ())
+    for row in rows or ():
+        if not row or not row[0]:
+            continue
+        try:
+            blocker = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(blocker, dict) or blocker.get("infra"):
+            continue
+        profile = blocker.get("auth_profile")
+        return profile if isinstance(profile, str) else None
+    return None
 
 
 async def queue_health(

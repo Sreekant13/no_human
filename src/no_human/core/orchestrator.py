@@ -8709,7 +8709,7 @@ class Orchestrator:
 
     async def _park_quota(self, task: Task, exc: QuotaExhausted, *,
                           repo: GitRepo | None = None) -> TaskOutcome:
-        # Name the exhausted subscription: parking stops the whole pool, and with
+        # Name the exhausted subscription: a wall park stops the whole pool, and with
         # more than one profile configured "quota exhausted" alone does not tell
         # the operator which token to top up or switch away from.
         profile = active_auth_profile()

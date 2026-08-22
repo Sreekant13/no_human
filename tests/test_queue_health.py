@@ -327,3 +327,27 @@ async def test_queue_depth_excludes_done_and_blocked(store):
 
     h = await queue_health(store, max_workers=2)
     assert h.queue_depth == 1
+
+
+async def test_paused_profile_names_the_wall_not_a_newer_infra_park(store):
+    """An infra park (`blocker.infra`, a dead SDK session) never armed the
+    pool clock, so it must not be the row that labels whose wall the pool is
+    waiting on — even when it is the NEWEST paused_quota row. RED before the
+    fix: `_quota_profile` took the newest row unconditionally."""
+    await _task(store, TaskStatus.PENDING)   # something owed, or health returns early
+    wall = await _task(store, TaskStatus.PAUSED_QUOTA)
+    wall.blocker = {"auth_profile": "personal2"}
+    await store.update_task(wall)
+    dead = await _task(store, TaskStatus.PAUSED_QUOTA)
+    dead.blocker = {"auth_profile": "personal3", "infra": True}
+    await store.update_task(dead)
+    await store.db.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?",
+        ((datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), dead.id))
+    await store.db.commit()
+
+    reset_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    h = await queue_health(store, max_workers=4, quota_cooldown_until=reset_at)
+
+    assert h.paused_profile == "personal2", (
+        f"the infra park's profile was reported: {h.paused_profile!r}")
