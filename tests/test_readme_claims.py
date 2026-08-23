@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -448,6 +449,10 @@ def test_load_bearing_claim_still_cites_its_symbol(documented, symbol, basename)
 
 # Claims proven false by review and fixed. A regression here is not a typo — it
 # is the README describing a feature the code does not have.
+# Reviewer-session claims (docs/security.md, PRODUCT.md) do NOT belong here:
+# this list is scoped to DOCUMENTED_SURFACES via the `documented` fixture, and
+# neither file is in that union — RETIRED_REVIEWER_CLAIMS below is a
+# separately-scoped table for exactly that pair of files.
 RETIRED_CLAIMS = [
     ("monaco", "the diff view is native — recheck with: grep -ri monaco web/src/"),
     ("desktop notification", "recheck with: ls src/no_human/notify/"),
@@ -470,6 +475,428 @@ def test_retired_false_claim_has_not_returned(documented, claim, why):
     assert claim.lower() not in documented.lower(), (
         f"docs reintroduce a claim review already disproved: {claim!r} — {why}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Reviewer-session claims, scoped to docs/security.md §3 and PRODUCT.md's
+# Positioning section — the two files `documented`/DOCUMENTED_SURFACES does
+# not read (see the pointer comment on RETIRED_CLAIMS above).
+#
+# Why this exists: `6ef8921ae` corrected docs/security.md §3 to say what
+# `agent/guard.py` actually does during a review session. `da3599ae4`, built
+# on an older base and landed later, silently carried the pre-fix wording
+# back in (`git diff 6ef8921ae da3599ae4 -- docs/security.md` shows the
+# reverted lines). Nothing caught it, because RETIRED_CLAIMS above only ever
+# reads README.md + docs/configuration.md + docs/verification.md.
+# `bd0733456` corrected the wording a second time; this block is the guard
+# that stops a third, stale-base revert from landing clean.
+# ---------------------------------------------------------------------------
+
+SECURITY_MD = REPO / "docs" / "security.md"
+PRODUCT_MD = REPO / "PRODUCT.md"
+REVIEWER_CLAIM_SURFACES = {"security": SECURITY_MD, "product": PRODUCT_MD}
+
+# Section boundaries: (line the section starts with, line the NEXT section
+# starts with). Sliced rather than whole-file so a legitimate `read-only` use
+# elsewhere in either file (there is none today, but nothing prevents one)
+# cannot be swept in by accident.
+_SECTION_BOUNDS = {
+    "security": ("## 3. ", "## 4. "),
+    "product": ("## Positioning", "## "),
+}
+
+
+def _section(text: str, start_prefix: str, next_prefix: str) -> str:
+    """Slice one markdown section: the line starting with `start_prefix` up
+    to (not including) the next line starting with `next_prefix`.
+
+    Asserts the slice is non-empty so a renamed heading fails loudly — a
+    guard scoped to a section that no longer exists would silently check
+    nothing, which is the same failure mode this whole block exists to close.
+    """
+    lines = text.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(start_prefix)), None
+    )
+    assert start is not None, (
+        f"heading {start_prefix!r} not found — did the section get renamed "
+        f"or moved?"
+    )
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if lines[i].startswith(next_prefix)
+        ),
+        len(lines),
+    )
+    section = "\n".join(lines[start:end])
+    assert section.strip(), f"section under {start_prefix!r} sliced to nothing"
+    return section
+
+
+def _normalize_claim_text(text: str) -> str:
+    """Collapse whitespace to single spaces, strip markdown bold markers,
+    lowercase, then blank straight-double-quoted spans.
+
+    Three defects this fixes, all of which already happened:
+
+    1. The reverted sentence was line-wrapped on disk (`git diff 6ef8921ae
+       da3599ae4 -- docs/security.md`: "...backend runs **read-only**: all
+       write tools are\\nblocked unconditionally."). A matcher that does not
+       collapse whitespace first would miss a verbatim replay of the actual
+       historical regression this ticket is about.
+    2. The corrected prose *quotes* the false claim verbatim
+       (`docs/security.md`: `said "read-only: all write tools are blocked
+       unconditionally" until 2026-08-22.`). A bare substring match fires on
+       the correction itself. Blanking quoted spans before matching means a
+       stale-base revert — which reintroduces the claim as unquoted prose —
+       still trips the guard, while the sentence documenting the fix does not.
+    3. That same reverted sentence wrapped "read-only" in markdown bold
+       (`**read-only**`, verbatim on disk — see `_DA3599AE4_HUNK` below). A
+       matcher over the raw text would miss "the backend runs read-only" as a
+       substring because the two `**` markers sit between "runs" and
+       "read-only". Stripping `**` before matching means a replay that
+       re-adds the historical emphasis still trips the guard.
+    """
+    collapsed = re.sub(r"\s+", " ", text)
+    unbolded = collapsed.replace("**", "")
+    lowered = unbolded.lower()
+    return re.sub(r'"[^"]{0,400}"', " ", lowered)
+
+
+def _claim_text(path: Path, surface: str) -> str:
+    """Read `path` (a real reviewer-claim surface, or a tmp_path copy of
+    one), slice the section scoped to `surface`, and normalize it."""
+    start_prefix, next_prefix = _SECTION_BOUNDS[surface]
+    raw = path.read_text(encoding="utf-8")
+    return _normalize_claim_text(_section(raw, start_prefix, next_prefix))
+
+
+def _wrap_mid_phrase(phrase: str) -> str:
+    """Insert a newline at the middle space of `phrase`.
+
+    Mirrors how da3599ae4's revert actually read on disk (line-wrapped
+    mid-sentence). Used only to prove `_claim_text`'s whitespace collapse is
+    what makes an injected phrase detectable, not a coincidence of how the
+    injection happens to be typed in this test file.
+    """
+    spaces = [i for i, c in enumerate(phrase) if c == " "]
+    assert spaces, f"phrase has no space to wrap: {phrase!r}"
+    mid = spaces[len(spaces) // 2]
+    return phrase[:mid] + "\n" + phrase[mid + 1 :]
+
+
+def _reviewer_surface_missing(surface: str, path: Path) -> bool:
+    """True if `path` is absent; False if it exists.
+
+    docs/security.md is SHIP-classified (EXPORT_CLASSIFICATION.txt:197) and
+    ships in every tree — a caller must hard-fail if it is ever missing.
+    PRODUCT.md is DROP-classified (EXPORT_CLASSIFICATION.txt:687) and is
+    correctly absent from the exported/public tree (confirmed: 404s on the
+    public repo) while `tests/test_readme_claims.py` itself is SHIP and runs
+    there — a caller skips a PRODUCT.md-dependent case in that tree instead
+    of hard-failing on a file that was intentionally dropped. Whenever
+    PRODUCT.md IS present (this private tree, or any build that keeps it)
+    every downstream assertion still runs at full strength: this only makes
+    absence non-fatal, it never softens a check that can actually run.
+    """
+    if path.exists():
+        return False
+    assert surface == "product", f"surface {surface!r} ({path}) does not exist"
+    return True
+
+
+ReviewerClaim = namedtuple(
+    "ReviewerClaim", ["claim_id", "surfaces", "phrase", "injection", "why"]
+)
+
+RETIRED_REVIEWER_CLAIMS = [
+    # False claim: "the backend runs **read-only**: all write tools are
+    # blocked unconditionally" (docs/security.md, until 2026-08-22).
+    # Ground truth: guard.py:58 WRITE_TOOLS = {"Write", "Edit",
+    # "NotebookEdit", "MultiEdit"}; the readonly denial set is WRITE_TOOLS +
+    # BACKGROUND_TOOLS + SPAWN_TOOLS (guard.py:2404-2408) — Bash is in none
+    # of those sets, so a shell redirection writes. `6ef8921ae` corrected
+    # this; `da3599ae4`, built on an older base, silently reverted it;
+    # `bd0733456` corrected it again — this entry is the guard against a
+    # fourth landing of the same stale hunk.
+    ReviewerClaim(
+        "write-tools-unconditional",
+        ("security", "product"),
+        "all write tools are blocked unconditionally",
+        "During review the backend runs read-only: all write tools are "
+        "blocked unconditionally.",
+        "guard.py:58 WRITE_TOOLS has 4 names; Bash is in no readonly denial "
+        "set (guard.py:2404-2408) — reintroduced by da3599ae4 over "
+        "6ef8921ae",
+    ),
+    # False claim: the other half of the same da3599ae4 sentence — "the
+    # backend runs **read-only**" — so a partial replay of the revert (e.g.
+    # dropping only the "unconditionally" clause) still trips the guard.
+    # Same ground truth as write-tools-unconditional above.
+    ReviewerClaim(
+        "backend-runs-read-only",
+        ("security", "product"),
+        "the backend runs read-only",
+        "During review, the backend runs read-only, so nothing changes on "
+        "disk.",
+        "guard.py:58/2404-2408 — Bash is not in any readonly denial set, so "
+        "the backend is not read-only; reintroduced by da3599ae4 over "
+        "6ef8921ae",
+    ),
+    # False claim: PRODUCT.md's pre-bd0733456 spelling — "adversarial review
+    # by a different model in fresh context with read-only tools". Matched
+    # as the long phrase deliberately: bare "read-only" is legitimate
+    # elsewhere (nh investigate, Codex --sandbox read-only, "read-only
+    # gatherers", the verifier's "read-only file access") and must not fire.
+    ReviewerClaim(
+        "review-with-read-only-tools",
+        ("security", "product"),
+        "with read-only tools",
+        "an adversarial review by a different model in fresh context with "
+        "read-only tools, told to refute \"done\".",
+        "guard.py:58/2404-2408 — Bash is not denied, so the session is not "
+        "read-only; corrected by bd0733456 (PRODUCT.md's Positioning "
+        "section)",
+    ),
+    # False claim, retired pre-emptively: "cannot modify it" as a
+    # description of the reviewer's tree access. `git log -S"cannot modify
+    # it" -- '*.md'` returns nothing in this repo's history (verified
+    # 2026-08-22) — this entry cites the 6ef8921ae -> da3599ae4 revert as
+    # PRECEDENT for the failure mode, not as this exact phrase's source.
+    ReviewerClaim(
+        "reviewer-cannot-modify",
+        ("security", "product"),
+        "cannot modify it",
+        "the reviewer session cannot modify it, so any change on disk is "
+        "impossible.",
+        "guard.py:58/2404-2408 — Bash can still write via shell "
+        "redirection; precedent for the failure mode: da3599ae4 over "
+        "6ef8921ae",
+    ),
+]
+
+_REVIEWER_CLAIM_SURFACE_CASES = [
+    (entry, surface) for entry in RETIRED_REVIEWER_CLAIMS for surface in entry.surfaces
+]
+
+_LEGITIMATE_READ_ONLY_SENTENCES = [
+    # `nh investigate` (cli/commands.py) is a genuinely read-only command.
+    "`nh investigate` runs a read-only investigation of the repo and writes "
+    "nothing to disk.",
+    # docs/BACKENDS.md:144, verbatim.
+    "The mitigation that *is* real prevention is the sandbox: coder "
+    "sessions run `--sandbox workspace-write`, read-only sessions "
+    "`--sandbox read-only`.",
+    # docs/adapters.md:223, verbatim.
+    "Read-only gatherers run in parallel with a per-source timeout; one "
+    "slow/bad source can't abort the rest.",
+    # docs/verification.md:76, verbatim.
+    "puts each one, independently, to a fresh bounded judge call (max one "
+    "turn) with the diff and read-only file access.",
+    # PRODUCT.md:60, verbatim — the CORRECTED wording itself, which must not
+    # trip its own guard.
+    "file-edit tools, git and forge writes and subagents refused (Bash "
+    "stays, so the session is not read-only), told to refute \"done\".",
+]
+
+
+def _retired_reviewer_hits(texts_by_surface: dict[str, str]) -> list[str]:
+    """Run every RETIRED_REVIEWER_CLAIMS entry against the surfaces it
+    covers. `texts_by_surface` maps surface key ("security"/"product") to
+    ALREADY-NORMALIZED text (see `_claim_text`/`_normalize_claim_text`).
+    Returns one `"<claim_id>@<surface>"` string per hit; empty means clean.
+
+    Shared by the absence test (fed the real files) and the injection test
+    (fed a mutated tmp_path copy re-read from disk), so a mutant is proven to
+    be the thing actually loaded, not a re-implementation of the match.
+    """
+    hits: list[str] = []
+    for entry in RETIRED_REVIEWER_CLAIMS:
+        for surface in entry.surfaces:
+            text = texts_by_surface.get(surface)
+            if text is None:
+                continue
+            if entry.phrase in text:
+                hits.append(f"{entry.claim_id}@{surface}")
+    return hits
+
+
+@pytest.mark.parametrize("entry", RETIRED_REVIEWER_CLAIMS, ids=lambda e: e.claim_id)
+def test_retired_reviewer_claim_has_not_returned(entry):
+    """Mirrors test_retired_false_claim_has_not_returned above, scoped to the
+    two surfaces DOCUMENTED_SURFACES/`documented` does not cover. A
+    regression here means a stale-base landing carried a false
+    reviewer-session claim back into docs/security.md or PRODUCT.md, exactly
+    the way da3599ae4 did."""
+    texts: dict[str, str] = {}
+    for surface, path in REVIEWER_CLAIM_SURFACES.items():
+        if _reviewer_surface_missing(surface, path):
+            continue  # PRODUCT.md: DROP-classified, absent from this tree
+        start_prefix, next_prefix = _SECTION_BOUNDS[surface]
+        raw_section = _section(path.read_text(encoding="utf-8"), start_prefix, next_prefix)
+        assert raw_section.strip(), f"scoped section for {surface!r} is empty"
+        texts[surface] = _claim_text(path, surface)
+    assert texts, "no reviewer-claim surface exists in this tree at all"
+    hits = [h for h in _retired_reviewer_hits(texts) if h.startswith(f"{entry.claim_id}@")]
+    assert not hits, (
+        f"docs reintroduce a claim review already disproved: "
+        f"{entry.phrase!r} — {entry.why} (hits: {hits})"
+    )
+
+
+@pytest.mark.parametrize(
+    "case", _REVIEWER_CLAIM_SURFACE_CASES, ids=lambda c: f"{c[0].claim_id}-{c[1]}"
+)
+def test_retired_reviewer_claim_entry_can_fail(tmp_path, case):
+    """Proves the entry can fail — a RETIRED_REVIEWER_CLAIMS entry that
+    matches nothing is the same vacuous green that let da3599ae4 through.
+
+    Splices the entry's injection sentence into a COPY of the scoped
+    section, with the retired phrase itself wrapped across a newline
+    mid-phrase (exactly how da3599ae4's revert read on disk), re-reads the
+    copy from disk, and asserts the checker flags it.
+    """
+    entry, surface = case
+    source = REVIEWER_CLAIM_SURFACES[surface]
+    if _reviewer_surface_missing(surface, source):
+        pytest.skip(f"{source.name} is DROP-classified and absent from this tree")
+    start_prefix, _next_prefix = _SECTION_BOUNDS[surface]
+    original = source.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    heading_index = next(i for i, line in enumerate(lines) if line.startswith(start_prefix))
+
+    assert entry.phrase in entry.injection, (
+        f"fixture bug: {entry.phrase!r} is not a substring of its own "
+        f"injection {entry.injection!r}"
+    )
+    wrapped_phrase = _wrap_mid_phrase(entry.phrase)
+    injected_sentence = entry.injection.replace(entry.phrase, wrapped_phrase, 1)
+    # Splice one line after the heading: inside the scoped section. Some
+    # injections quote unrelated text elsewhere in the sentence (e.g.
+    # review-with-read-only-tools ends in `told to refute "done"`) — that
+    # quoted span gets blanked by _normalize_claim_text's quote-strip, but
+    # the retired phrase itself is never inside quote marks in any of these
+    # injections, so the strip cannot erase what this test is proving
+    # detectable.
+    lines.insert(heading_index + 1, injected_sentence)
+
+    copy_path = tmp_path / source.name
+    copy_path.write_text("\n".join(lines), encoding="utf-8")
+
+    text = _claim_text(copy_path, surface)
+    hits = _retired_reviewer_hits({surface: text})
+    assert f"{entry.claim_id}@{surface}" in hits, (
+        f"injecting {entry.phrase!r} (wrapped mid-phrase) into a copy of "
+        f"{surface} did not trip the guard — hits: {hits}"
+    )
+
+
+# The literal two lines da3599ae4 introduced over docs/security.md, verbatim
+# from `git diff 6ef8921ae da3599ae4 -- docs/security.md`.
+_DA3599AE4_HUNK = (
+    "the git layer. During review the backend runs **read-only**: all write "
+    "tools are\nblocked unconditionally."
+)
+
+
+def test_the_actual_reverted_hunk_is_caught():
+    """The literal historical regression, not a phrase invented for this
+    ticket. Proves the guard catches the actual event da3599ae4 produced."""
+    normalized = _normalize_claim_text(_DA3599AE4_HUNK)
+    hits = _retired_reviewer_hits({"security": normalized, "product": normalized})
+    assert hits, f"the actual da3599ae4 hunk produced no hits: {_DA3599AE4_HUNK!r}"
+
+
+@pytest.mark.parametrize("surface", sorted(REVIEWER_CLAIM_SURFACES), ids=str)
+@pytest.mark.parametrize(
+    "sentence", _LEGITIMATE_READ_ONLY_SENTENCES, ids=lambda s: s[:32]
+)
+def test_legitimate_read_only_uses_stay_green(tmp_path, surface, sentence):
+    """Legitimate uses of "read-only" — describing `nh investigate`, a Codex
+    sandbox flag, the context gatherers, the verifier's file access, or
+    PRODUCT.md's own corrected negation — must never trip these entries.
+    Every RETIRED_REVIEWER_CLAIMS phrase is a long, specific false claim for
+    exactly this reason (fact 4 in the plan: no entry matches bare
+    "read-only")."""
+    source = REVIEWER_CLAIM_SURFACES[surface]
+    if _reviewer_surface_missing(surface, source):
+        pytest.skip(f"{source.name} is DROP-classified and absent from this tree")
+    start_prefix, _next_prefix = _SECTION_BOUNDS[surface]
+    original = source.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    heading_index = next(i for i, line in enumerate(lines) if line.startswith(start_prefix))
+    lines.insert(heading_index + 1, sentence)
+
+    copy_path = tmp_path / f"{surface}-{source.name}"
+    copy_path.write_text("\n".join(lines), encoding="utf-8")
+
+    text = _claim_text(copy_path, surface)
+    hits = _retired_reviewer_hits({surface: text})
+    assert not hits, f"legitimate sentence tripped the guard: {sentence!r} — {hits}"
+
+
+def test_scoped_surfaces_still_carry_the_corrected_prose():
+    """Anti-vacuity bound on the quote-strip in `_normalize_claim_text`, and
+    a pin on bd0733456's wording: if that prose is reworded, or the
+    retraction sentence is deleted instead of the guard being fixed, this
+    test turns red instead of the RETIRED_REVIEWER_CLAIMS tests passing
+    vacuously (green because there is nothing left to check).
+
+    docs/security.md is SHIP-classified and its half runs unconditionally —
+    every tree must have it. PRODUCT.md is DROP-classified
+    (EXPORT_CLASSIFICATION.txt:687) and absent from the exported/public
+    tree; its half skips there instead of hard-failing on a file that was
+    intentionally dropped, but runs at full strength whenever the file IS
+    present (see `_reviewer_surface_missing`).
+    """
+    assert not _reviewer_surface_missing("security", SECURITY_MD)
+    security_raw = _section(
+        SECURITY_MD.read_text(encoding="utf-8"), *_SECTION_BOUNDS["security"]
+    )
+    security_collapsed = re.sub(r"\s+", " ", security_raw).lower()
+    security_stripped = _normalize_claim_text(security_raw)
+
+    removed_fraction = 1 - (len(security_stripped) / len(security_collapsed))
+    assert removed_fraction < 0.15, (
+        f"security: quote-strip removed {removed_fraction:.0%} of the "
+        f"section — it is supposed to blank one quoted retraction, not "
+        f"rewrite the prose"
+    )
+    assert "bash stays" in security_stripped
+    assert "file-edit tools" in security_stripped
+
+    retracted_claim = "read-only: all write tools are blocked unconditionally"
+    assert "until 2026-08-22" in security_collapsed, (
+        "the retraction sentence marking when the false claim was corrected "
+        "is gone from docs/security.md §3"
+    )
+    assert retracted_claim in security_collapsed, (
+        "the retraction sentence's quoted false claim is gone from "
+        "docs/security.md — was bd0733456's retraction deleted?"
+    )
+    assert retracted_claim not in security_stripped, (
+        "the quote-strip in _normalize_claim_text no longer blanks the "
+        "quoted false claim — RETIRED_REVIEWER_CLAIMS would trip on the "
+        "retraction sentence that documents the fix"
+    )
+
+    if _reviewer_surface_missing("product", PRODUCT_MD):
+        pytest.skip(f"{PRODUCT_MD.name} is DROP-classified and absent from this tree")
+    product_raw = _section(
+        PRODUCT_MD.read_text(encoding="utf-8"), *_SECTION_BOUNDS["product"]
+    )
+    product_collapsed = re.sub(r"\s+", " ", product_raw).lower()
+    product_stripped = _normalize_claim_text(product_raw)
+
+    removed_fraction = 1 - (len(product_stripped) / len(product_collapsed))
+    assert removed_fraction < 0.15, (
+        f"product: quote-strip removed {removed_fraction:.0%} of the "
+        f"section — it is supposed to blank one quoted retraction, not "
+        f"rewrite the prose"
+    )
+    assert "the session is not read-only" in product_stripped
 
 
 def test_every_documented_cli_command_exists(documented):
