@@ -3764,7 +3764,9 @@ async def api_set_config_models(request: Request) -> dict[str, Any]:
     """Change up to all five ``llm.*_model`` keys in one write.
 
     The body is parsed BY HAND (not a pydantic model) so a malformed request
-    never echoes an arbitrary submitted value back in a 422 body. Validation
+    gets one short operator-facing sentence, not pydantic's auto-generated
+    error tree; that sentence may quote the offending key or value back to
+    the caller (the endpoint is origin-gated). Validation
     and the write itself run through ``model_settings.apply_model_changes`` —
     the exact function ``nh config models set`` calls too, so the API and the
     CLI can never enforce different rules or drift in what they write.

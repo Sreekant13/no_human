@@ -52,7 +52,8 @@ ROLE_BY_KEY = {config_key: role for role, config_key in ROLES.items()}
 
 class ModelSettingsError(ValueError):
     """A model-settings write was refused. The message is always safe to
-    show verbatim to an operator (never a stack trace, never a credential)."""
+    show verbatim to an operator: never a stack trace, and any value it
+    quotes is exactly what the operator just typed into a model-id field."""
 
 
 #: ``task_events`` has no task row for a config change — there is no task.
