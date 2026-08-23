@@ -131,6 +131,49 @@ def test_options_are_sorted_by_price_then_id():
 
 
 # --------------------------------------------------------------------------
+# _price_class boundaries
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "input_rate,expected",
+    [
+        (5.0, "high"),
+        (4.99, "medium"),
+        (2.0, "medium"),
+        (1.99, "low"),
+    ],
+)
+def test_price_class_boundaries(input_rate, expected):
+    assert mc._price_class(input_rate) == expected
+
+
+# --------------------------------------------------------------------------
+# requires_backend
+# --------------------------------------------------------------------------
+
+
+def test_requires_backend_true_only_for_non_claude_coder_options(monkeypatch):
+    monkeypatch.setitem(MODEL_PRICES_USD_PER_MTOK, "gpt-5-codex", (2.5, 10.0))
+    for role in mc.PINNED_ROLES:
+        for opt in mc.options_for(role):
+            assert opt.requires_backend is False
+
+    coder_options = {opt.id: opt for opt in mc.options_for("coder")}
+    for model_id, opt in coder_options.items():
+        assert opt.requires_backend == (not model_id.startswith("claude-"))
+    assert coder_options["gpt-5-codex"].requires_backend is True
+    assert coder_options["claude-sonnet-5"].requires_backend is False
+
+
+def test_is_claude_id_predicate_directly():
+    assert mc._is_claude_id("claude-sonnet-5") is True
+    assert mc._is_claude_id("gpt-5-codex") is False
+    assert mc._is_claude_id(None) is False
+    assert mc._is_claude_id("") is False
+
+
+# --------------------------------------------------------------------------
 # vendor pin note
 # --------------------------------------------------------------------------
 

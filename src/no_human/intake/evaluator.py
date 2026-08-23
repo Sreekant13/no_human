@@ -311,14 +311,27 @@ _EVAL_PROMPT = (
 
 
 def _default_utility_model() -> str:
-    """The configured default, read from the schema rather than a literal.
+    """The CONFIGURED utility model, read via ``load_config`` — not a literal
+    and not the shipped default. ``DEFAULT_CONFIG`` is only the fallback when
+    no config file is reachable or reading it fails for any reason (advisory
+    call sites must never raise for this).
 
-    Both entry points below used to hardcode ``claude-opus-4-8``, so a config
-    change could never reach them. Callers that hold a resolved config should
-    pass ``model=`` explicitly; this is the floor, not the policy.
+    Both entry points below used to hardcode ``claude-opus-4-8``, then later
+    a schema-read of ``DEFAULT_CONFIG`` — either way an operator's own
+    ``llm.utility_model`` (e.g. changed via ``nh config models set utility``
+    or the Settings picker) could never reach them. Callers that hold a
+    resolved config should still pass ``model=`` explicitly; this is the
+    floor, not the policy.
     """
-    from ..config import DEFAULT_CONFIG
-    return DEFAULT_CONFIG["llm"]["utility_model"]
+    from ..config import CONFIG_PATH, DEFAULT_CONFIG, load_config
+    try:
+        # Pass CONFIG_PATH explicitly — load_config()'s no-arg default binds
+        # at module-def time, so a test (or a future caller) that repoints
+        # config.CONFIG_PATH would otherwise be silently ignored here.
+        return (load_config(CONFIG_PATH).data.get("llm") or {}).get(
+            "utility_model") or DEFAULT_CONFIG["llm"]["utility_model"]
+    except Exception:
+        return DEFAULT_CONFIG["llm"]["utility_model"]
 
 
 async def evaluate_spec(

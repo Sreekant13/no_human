@@ -2146,16 +2146,19 @@ def task_retry(task_id):
 # --------------------------------------------------------------------------- #
 
 @cli.command("config")
-@click.argument("action", type=click.Choice(["show", "edit", "path"]))
+@click.argument("action", type=click.Choice(["show", "edit", "path", "models"]))
 @click.option("--key", default=None, help="Show a specific config key (dot-separated).")
-def config_cmd(action, key):
-    """Show, edit, or locate the config file.
+@click.argument("extra", nargs=-1)
+def config_cmd(action, key, extra):
+    """Show, edit, or locate the config file; view or change the model picker.
 
     \b
-      nh config show                # pretty-print full config
-      nh config show --key git      # show just the git section
-      nh config edit                # open in $EDITOR
-      nh config path                # print the config file path
+      nh config show                       # pretty-print full config
+      nh config show --key git             # show just the git section
+      nh config edit                       # open in $EDITOR
+      nh config path                       # print the config file path
+      nh config models                     # show the model picker (5 roles)
+      nh config models set coder <id>      # change one role's model
     """
     import yaml as _yaml
     from ..config import CONFIG_PATH as _cfg_path
@@ -2168,6 +2171,10 @@ def config_cmd(action, key):
         editor = os.environ.get("EDITOR", "vi")
         import subprocess as _sp
         _sp.run([editor, str(_cfg_path)])
+        return
+
+    if action == "models":
+        _config_models_cmd(extra)
         return
 
     # action == "show"
@@ -2187,6 +2194,69 @@ def config_cmd(action, key):
                 return
         data = {key: node}
     console.print_json(data=data)
+
+
+def _config_models_cmd(extra: tuple[str, ...]) -> None:
+    """`nh config models` / `nh config models set <role> <id>` — the exact
+    same validate-then-write path `PUT /api/config/models` uses
+    (`core.model_settings`), so the CLI and the Settings UI can never
+    disagree about what is allowed or how a write is persisted.
+    """
+    from ..config import CONFIG_PATH, load_config
+    from ..core import model_catalog as mc
+    from ..core import model_settings
+
+    on_disk = load_config(CONFIG_PATH)
+
+    if not extra:
+        payload = model_settings.models_payload(on_disk.data, CONFIG_PATH)
+        for row in payload["roles"]:
+            marker = " [yellow](restart required to take effect)[/]" if (
+                payload["restart_required"]) else ""
+            console.print(f"[bold]{row['role']}[/] ({row['key']}): "
+                          f"{row['current']}{marker if row['current'] != row['default'] else ''}")
+            for opt in row["options"]:
+                tag = " [default]" if opt["is_default"] else ""
+                backend_tag = " [needs worker.backend]" if opt["requires_backend"] else ""
+                console.print(f"    {opt['id']}  ({opt['price_class']['label']})"
+                              f"{tag}{backend_tag}")
+        return
+
+    if len(extra) != 3 or extra[0] != "set":
+        raise click.ClickException(
+            "usage: nh config models set <role> <model-id> — role is one of "
+            f"{sorted(mc.ROLES)}")
+    _, role, model_id = extra
+    if role not in mc.ROLES:
+        raise click.ClickException(f"unknown role {role!r}; must be one of {sorted(mc.ROLES)}")
+    config_key = mc.ROLES[role]
+
+    try:
+        payload, changes = model_settings.apply_model_changes(
+            {config_key: model_id},
+            running_cfg_data=on_disk.data,
+            config_path=CONFIG_PATH,
+        )
+    except (model_settings.ModelSettingsError, AuthError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not changes:
+        console.print(f"[yellow]no change[/] — {role} is already {model_id}")
+        return
+
+    async def _persist_event() -> None:
+        cfg = load_config(CONFIG_PATH)
+        async with Store(cfg.db_path) as store:
+            await store.save_events(
+                model_settings.CONFIG_AUDIT_TASK_ID,
+                [model_settings.model_change_event(changes)],
+            )
+
+    asyncio.run(_persist_event())
+
+    change = changes[config_key]
+    console.print(f"[green]{role}[/] ({config_key}): {change['old']} -> {change['new']}")
+    console.print("[yellow]restart required[/] for the running server to pick this up.")
 
 
 # --------------------------------------------------------------------------- #

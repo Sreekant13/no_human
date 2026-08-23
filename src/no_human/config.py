@@ -2205,6 +2205,40 @@ def load_config(
     return Config(data=merged, path=config_path)
 
 
+def _splice_llm_scalar(lines: list[str], key: str, value: str) -> None:
+    """Splice ``key: value`` into the top-level ``llm:`` block of *lines*, in
+    place, preserving every other line (including comments) verbatim.
+
+    Extracted from ``set_auth_profile``, which used to inline exactly this
+    walk for ``auth_profile`` alone: find the top-level ``llm:`` line; if
+    absent, append a fresh ``llm:`` block. If present, replace an existing
+    ``key:`` scalar line within the block (preserving its indent), or insert
+    a new ``  key: value`` line right after ``llm:`` if the key is not yet
+    present. ``set_model_ids`` reuses this once per changed key, on the same
+    mutable ``lines`` list, so multiple keys land in one atomic write.
+    """
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "llm:")
+    except StopIteration:
+        lines.extend(["llm:", f"  {key}: {value}"])
+        return
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            end = i
+            break
+    for i in range(start + 1, end):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(f"{key}:"):
+            indent = lines[i][: len(lines[i]) - len(stripped)]
+            lines[i] = f"{indent}{key}: {value}"
+            break
+    else:
+        lines.insert(start + 1, f"  {key}: {value}")
+
+
 def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
     """Pin ``llm.auth_profile`` in config.yaml. Returns the normalized name.
 
@@ -2222,27 +2256,7 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
     load_config(config_path)  # materialize a default file if there is none
     original = config_path.read_text()
     lines = original.splitlines()
-
-    try:
-        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "llm:")
-    except StopIteration:
-        lines.extend(["llm:", f"  auth_profile: {profile}"])
-    else:
-        end = len(lines)
-        for i in range(start + 1, len(lines)):
-            line = lines[i]
-            if line.strip() and not line[:1].isspace():
-                end = i
-                break
-        for i in range(start + 1, end):
-            stripped = lines[i].lstrip()
-            if stripped.startswith("auth_profile:"):
-                indent = lines[i][: len(lines[i]) - len(stripped)]
-                lines[i] = f"{indent}auth_profile: {profile}"
-                break
-        else:
-            lines.insert(start + 1, f"  auth_profile: {profile}")
-
+    _splice_llm_scalar(lines, "auth_profile", profile)
     _atomic_write_text(config_path, "\n".join(lines) + "\n")
 
     resolved = load_config(config_path).data["llm"].get("auth_profile")
@@ -2253,6 +2267,84 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
             f"after the edit, not {profile!r}. The file has been restored."
         )
     return profile
+
+
+#: A bare model id, as YAML would parse it back unquoted: letters, digits,
+#: '.', '_', '-' only. No quotes, no colons, no newlines — nothing that could
+#: inject YAML structure via a spliced scalar. Checked BEFORE the file is
+#: ever touched, same discipline as ``validate_profile_name``.
+_MODEL_ID_SHAPE_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def set_model_ids(
+    updates: dict[str, str], config_path: Path = CONFIG_PATH
+) -> dict[str, str]:
+    """Splice ``updates`` (``llm.*`` config key -> model id) into config.yaml,
+    one atomic write, preserving comments. Returns the resolved values after
+    the write.
+
+    Mirrors ``set_auth_profile``: every value is shape-validated before the
+    file is ever touched, the write is verified by re-loading the config
+    afterward, and the original file is restored on ANY failure — including
+    ``load_config`` itself raising (e.g. ``_reject_api_key_in_config`` firing
+    on a written value shaped like a credential) and a written value that
+    resolved to something other than what was requested.
+
+    This function does no role resolution and no catalog validation
+    (vendor pin / price / review-gate) of its own — callers
+    (``core.model_settings.apply_model_changes``, and its CLI twin) are
+    responsible for calling ``model_catalog.validate`` on every value first.
+    Its own job is purely the text splice and the write-time safety net; it
+    still refuses an unrecognised key as a last-line guard, so a caller bug
+    cannot write outside the five allowed ``llm.*_model`` keys.
+    """
+    from .core.model_catalog import ROLES  # local: config.py stays free of a
+
+    # module-level import from core/ so the arrow (core -> config, via
+    # model_catalog.defaults()'s own local import) stays one-directional.
+
+    allowed = set(ROLES.values())
+    unknown = set(updates) - allowed
+    if unknown:
+        raise ValueError(
+            f"unrecognised config key(s) {sorted(unknown)!r}; must be a "
+            f"subset of {sorted(allowed)!r}"
+        )
+    for key, value in updates.items():
+        if not isinstance(value, str) or not _MODEL_ID_SHAPE_RE.fullmatch(value):
+            raise ValueError(
+                f"{key} value {value!r} is not a bare model id "
+                "(letters, digits, '.', '_', '-' only) — refusing to splice "
+                "it into config.yaml."
+            )
+
+    load_config(config_path)  # materialize a default file if there is none
+    original = config_path.read_text()
+    lines = original.splitlines()
+    for key, value in updates.items():
+        _splice_llm_scalar(lines, key, value)
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+
+    try:
+        resolved_cfg = load_config(config_path)
+    except Exception as exc:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set model id(s) {sorted(updates)!r}: {config_path} "
+            f"failed to reload after the edit ({exc}). The file has been "
+            "restored."
+        ) from exc
+
+    resolved = {key: resolved_cfg.data.get("llm", {}).get(key) for key in updates}
+    mismatched = {k: v for k, v in resolved.items() if v != updates[k]}
+    if mismatched:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set model id(s): {config_path} resolved to "
+            f"{mismatched!r} after the edit, not the requested values. The "
+            "file has been restored."
+        )
+    return resolved
 
 
 #: Query-param names, matched case-insensitively as a substring, that mark a

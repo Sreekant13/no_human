@@ -3,7 +3,7 @@
 | Doc | What it covers |
 |-----|----------------|
 | [**quickstart.md**](quickstart.md) | **Start here** — from zero to first task in 5 minutes |
-| [configuration.md](configuration.md) | `~/.no_human/config.yaml`, every section + default |
+| [configuration.md](configuration.md) | `~/.no_human/config.yaml`, every section + default, plus the model picker (`GET /api/models`, `PUT /api/config/models`, `nh config models`) |
 | [verification.md](verification.md) | The gates that stop a broken change, the bounded loop, the limits |
 | [security.md](security.md) | Subscription-auth boundary, the never-merge rule, guards |
 | [adapters.md](adapters.md) | Intake (TRACKER/GitHub/GitLab), context, VCS, CI backends |

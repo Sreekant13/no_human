@@ -3738,6 +3738,77 @@ async def save_telemetry_consent(
     return {"telemetry": _scrub_secrets(tel), "reload_required": True}
 
 
+@app.get("/api/models")
+async def api_get_models(request: Request) -> dict[str, Any]:
+    """The model picker's catalog + current values, for Settings.
+
+    Options and defaults come ONLY from ``model_catalog``; ``current`` comes
+    from the RUNNING process's bound config (``app.state.config.data``) — the
+    same "what does this server actually believe right now" source every
+    other GET in this file reads. ``restart_required`` is a true file-vs-
+    process comparison performed inside ``model_settings.models_payload``,
+    the same shape of check ``/api/auth/status`` already does for the auth
+    profile.
+    """
+    from ..config import CONFIG_PATH
+    from ..core import model_settings
+
+    _require_local_origin(request)
+    cfg = getattr(request.app.state, "config", None)
+    data = getattr(cfg, "data", None) or {}
+    return await asyncio.to_thread(model_settings.models_payload, data, CONFIG_PATH)
+
+
+@app.put("/api/config/models")
+async def api_set_config_models(request: Request) -> dict[str, Any]:
+    """Change up to all five ``llm.*_model`` keys in one write.
+
+    The body is parsed BY HAND (not a pydantic model) so a malformed request
+    never echoes an arbitrary submitted value back in a 422 body. Validation
+    and the write itself run through ``model_settings.apply_model_changes`` —
+    the exact function ``nh config models set`` calls too, so the API and the
+    CLI can never enforce different rules or drift in what they write.
+
+    Deliberately does NOT reload ``request.app.state.config`` — unlike the
+    integrations/telemetry PUTs above, a model change only takes effect on
+    the NEXT task (the orchestrator reads ``self.config`` per task, not per
+    request), so reloading here would make ``restart_required`` lie the
+    moment this handler returns even though nothing running has actually
+    picked the new value up yet.
+    """
+    from ..config import CONFIG_PATH, AuthError
+    from ..core import model_settings
+
+    _require_local_origin(request, writing=True)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — never surface the raw body
+        raise HTTPException(422, "expected a JSON object") from None
+
+    cfg = getattr(request.app.state, "config", None)
+    running_data = getattr(cfg, "data", None) or {}
+    try:
+        payload, changes = await asyncio.to_thread(
+            model_settings.apply_model_changes,
+            body,
+            running_cfg_data=running_data,
+            config_path=CONFIG_PATH,
+        )
+    except (model_settings.ModelSettingsError, AuthError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    if changes:
+        store = _store(request)
+        event = model_settings.model_change_event(changes)
+        await store.save_events(model_settings.CONFIG_AUDIT_TASK_ID, [event])
+        await _mgr.broadcast({
+            "type": "task_event",
+            "task_id": model_settings.CONFIG_AUDIT_TASK_ID,
+            "event": event,
+        })
+    return payload
+
+
 async def _attach_imported(
     request: Request, source: str, briefs: list[dict[str, Any]]
 ) -> list[TrackerIssueOut]:

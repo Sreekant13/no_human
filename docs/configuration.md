@@ -387,6 +387,60 @@ config, the key never does. If the local server enforces a key, it goes in
 `llm.local_base_url` / `llm.local_model` are unset, or when the URL is not a
 loopback/RFC1918 address (`config.assert_local_backend_mode`).
 
+### Model picker — `GET /api/models`, `PUT /api/config/models`, `nh config models`
+
+The five model-tier config keys — `llm.primary_model` (coder),
+`llm.review_model` (reviewer), `llm.planner_model` (planner),
+`llm.supervisor_model` (supervisor) and `llm.utility_model` (utility, also
+what intake's `evaluate_spec` / `resolve_assumptions` run on) — can be read
+and changed without hand-editing `config.yaml`, through either front door
+below. Both call the exact same functions in `core/model_settings.py`
+(`models_payload` / `apply_model_changes`), so they can never disagree about
+what is allowed or how a write is persisted.
+
+**`GET /api/models`** returns, for each of the five roles: its config key,
+its current value, the shipped default, and the full list of allowed
+options (id, coarse price class — `low` / `medium` / `high`, on the input
+rate — and whether picking it would also require a `worker.backend` change).
+It also returns a top-level `restart_required` flag — a true file-vs-process
+comparison between what is on disk and what the running server actually
+loaded, the same shape `/api/auth/status` already uses for the auth
+profile.
+
+**`PUT /api/config/models`** takes a JSON body of `{"<config-key>":
+"<model-id>", ...}` — only the five keys above are ever accepted. Every
+write goes through the same two rules `model_catalog.validate` enforces
+everywhere else in the picker: a vendor-pinned role (every role except
+coder) may only be set to a Claude model id, and `review_model` may never
+equal `primary_model` in either direction (a fresh-context reviewer is the
+product's headline gate). A third rule is layered on top for the coder role
+only: `llm.primary_model` may only hold a Claude id, even though the id is
+otherwise priced and valid — the coder's actual backend (Claude/Codex/local)
+is `worker.backend`'s job, with its own `llm.codex_model` /
+`llm.local_model` keys, so a non-Claude id here is refused with a message
+naming where it does belong. An unpriced/unknown id is refused outright
+(no free-text "custom model" escape hatch) rather than silently pricing at a
+fallback later. Any refusal is a `422` and writes nothing. A write that
+changes nothing (the submitted id already matches what's on disk) is a
+no-op: `200`, empty `changes`, nothing written, nothing logged. A write that
+does change something is a comment-preserving splice of `config.yaml` (the
+rest of the file — comments, key order, unrelated sections — is untouched)
+and persists exactly one `source: human` `task_events` row (`task_id
+"__config__"`, `kind: "human_config_models_set"`) naming the old and new
+value per changed key. **It does not reload the running server's config** —
+that is exactly what `restart_required` on the next `GET` is for; a change
+here takes effect on restart.
+
+**`nh config models`** (no args) prints the same five roles/current
+values/options `GET /api/models` returns, from a freshly loaded config file
+rather than a running server's state (there may be no server running).
+**`nh config models set <role> <model-id>`** (role is one of `coder`,
+`reviewer`, `planner`, `supervisor`, `utility` — not the config key) applies
+one change through the identical `apply_model_changes` the PUT endpoint
+calls, and prints a `restart required` reminder on success. A refusal exits
+non-zero with the same message text the API would have returned in its 422
+body.
+
 ## `learning:` — memory lifecycle
 
 Memory lifecycle C (`docs/design/memory-lifecycle-triage.md`) — retirement and

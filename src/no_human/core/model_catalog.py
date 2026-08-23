@@ -54,6 +54,7 @@ __all__ = [
     "ROLES",
     "PINNED_ROLES",
     "VENDOR_PIN_NOTE",
+    "CODER_BACKEND_REASON",
     "PriceInfo",
     "ModelOption",
     "options_for",
@@ -86,6 +87,21 @@ VENDOR_PIN_NOTE = (
     "This role always runs on the Claude backend, so only Claude models are "
     "offered. That is a vendor pin, not a limit on the model tier — any "
     "Claude model listed here is available."
+)
+
+# The coder role is not vendor-pinned (see Rule 1 above), but a non-Claude id
+# still cannot be written to llm.primary_model: no backend reads that key for
+# any vendor other than Claude — the coder's actual backend (Claude/Codex/
+# local) is chosen separately, by worker.backend, with its own model keys
+# (llm.codex_model / llm.local_model). This message names that path so a
+# refusal tells the operator where the id DOES belong, not just that it was
+# rejected. Layered strictly after model_catalog.validate() in part 2's
+# model_settings module — never folded into validate() itself, which stays a
+# pure catalog/pricing/review-gate answer.
+CODER_BACKEND_REASON = (
+    "{model_id!r} cannot be set as llm.primary_model: only the Claude backend "
+    "reads that key (agent/backend.py make_backend). Choose the backend with "
+    "worker.backend, and set llm.codex_model / llm.local_model for those."
 )
 
 # Coarse price-class thresholds, on the INPUT rate ($/MTok). Named constants
@@ -123,6 +139,12 @@ class ModelOption:
     price_class: PriceInfo
     is_default: bool
     note: str
+    # True for a non-Claude id offered to the (unpinned) coder role: picking
+    # it needs a backend switch (worker.backend) plus a matching
+    # llm.codex_model / llm.local_model, since no backend reads a non-Claude
+    # id from llm.primary_model. Always False for a pinned role's options —
+    # those are all Claude ids by construction. See CODER_BACKEND_REASON.
+    requires_backend: bool
 
 
 def _known_roles_message() -> str:
@@ -159,6 +181,7 @@ def options_for(role: str) -> list[ModelOption]:
             ),
             is_default=(model_id == default_id),
             note=note,
+            requires_backend=not _is_claude_id(model_id),
         )
         for model_id, rates in MODEL_PRICES_USD_PER_MTOK.items()
         if not _violates_vendor_pin(role, model_id)
@@ -167,11 +190,19 @@ def options_for(role: str) -> list[ModelOption]:
     return options
 
 
+def _is_claude_id(model_id: str) -> bool:
+    """True when ``model_id`` names a Claude model. The one place this string
+    test is spelled — both the vendor-pin rule and ``ModelOption.
+    requires_backend`` reuse it, rather than re-deriving "starts with
+    claude-" a second time."""
+    return str(model_id or "").startswith("claude-")
+
+
 def _violates_vendor_pin(role: str, model_id: str) -> bool:
     """True when ``role`` is vendor-pinned to Claude and ``model_id`` is not
     a Claude id. Checked FIRST in :func:`validate`: for a pinned role this is
     the actionable reason ("wrong vendor"), not a distraction about price."""
-    return role in PINNED_ROLES and not str(model_id or "").startswith("claude-")
+    return role in PINNED_ROLES and not _is_claude_id(model_id)
 
 
 def _has_no_published_price(model_id: str) -> bool:

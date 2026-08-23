@@ -123,3 +123,40 @@ def test_quickstart_does_not_promise_freeform_ingestion_of_a_tracker_key():
         "quickstart claims a bare tracker key is ingested as freeform text; "
         "ingest_from_url raises and the CLI exits 1"
     )
+
+
+# --------------------------------------------------------------------------- #
+# _default_utility_model honors an operator's configured llm.utility_model    #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("isolated_env_file")
+def test_default_utility_model_reads_the_configured_value(tmp_path, monkeypatch):
+    """Model picker part 2 gap fix: this used to read DEFAULT_CONFIG (the
+    shipped default) directly, so `nh config models set utility <id>` (or the
+    Settings picker) could change llm.utility_model on disk and every intake
+    advisory call (evaluate_spec/resolve_assumptions/grill_spec) would still
+    silently run on the OLD default — never the operator's chosen model."""
+    import no_human.config as nh_config
+    from no_human.intake.evaluator import _default_utility_model
+
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(nh_config, "CONFIG_PATH", cfg_path)
+    nh_config.set_model_ids({"utility_model": "claude-opus-5"}, cfg_path)
+
+    assert _default_utility_model() == "claude-opus-5"
+
+
+@pytest.mark.usefixtures("isolated_env_file")
+def test_default_utility_model_falls_back_to_the_shipped_default_when_config_is_unreadable(
+        tmp_path, monkeypatch):
+    """The fallback must never raise — every call site here is advisory."""
+    import no_human.config as nh_config
+    from no_human.config import DEFAULT_CONFIG
+    from no_human.intake.evaluator import _default_utility_model
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("not: valid: yaml: [[[")
+    monkeypatch.setattr(nh_config, "CONFIG_PATH", cfg_path)
+
+    assert _default_utility_model() == DEFAULT_CONFIG["llm"]["utility_model"]
