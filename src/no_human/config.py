@@ -2314,6 +2314,15 @@ def load_config(
     return Config(data=merged, path=config_path)
 
 
+#: The top-level `llm:` header line, with an OPTIONAL trailing inline comment
+#: (`llm:  # which subscription pays`). Matched conservatively: no value may
+#: follow the colon except whitespace and a `#` comment, so `llm: {}` or a
+#: flow mapping is deliberately NOT treated as a spliceable block header.
+#: Anchored at column 0 — no leading whitespace — so a nested `llm:` under
+#: another section stays out of scope.
+_LLM_HEADER_RE = re.compile(r"^llm:[ \t]*(#.*)?$")
+
+
 def _splice_llm_scalar(lines: list[str], key: str, value: str) -> None:
     """Splice ``key: value`` into the top-level ``llm:`` block of *lines*, in
     place, preserving every other line (including comments) verbatim.
@@ -2325,9 +2334,16 @@ def _splice_llm_scalar(lines: list[str], key: str, value: str) -> None:
     a new ``  key: value`` line right after ``llm:`` if the key is not yet
     present. ``set_model_ids`` reuses this once per changed key, on the same
     mutable ``lines`` list, so multiple keys land in one atomic write.
+
+    The header line itself is never rewritten — an inline comment on it
+    (``llm:  # which subscription pays``) is matched by ``_LLM_HEADER_RE``
+    and preserved byte-for-byte; only ``==  "llm:"`` used to match, so a
+    commented header was treated as absent and a second ``llm:`` block got
+    appended, which PyYAML resolves last-wins — silently dropping the
+    operator's entire original section.
     """
     try:
-        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "llm:")
+        start = next(i for i, ln in enumerate(lines) if _LLM_HEADER_RE.match(ln.rstrip()))
     except StopIteration:
         lines.extend(["llm:", f"  {key}: {value}"])
         return
@@ -2346,6 +2362,58 @@ def _splice_llm_scalar(lines: list[str], key: str, value: str) -> None:
             break
     else:
         lines.insert(start + 1, f"  {key}: {value}")
+
+
+def _duplicate_top_level_keys(text: str) -> list[str]:
+    """Top-level keys that appear more than once in *text*.
+
+    PyYAML's *constructor* (``safe_load``) resolves duplicate mapping keys
+    last-wins and silently drops the earlier block; its *composer*
+    (``yaml.compose``) does not — it keeps every key node in the parse tree,
+    so it is the one instrument that can see the outcome the constructor
+    hides. A malformed document returns ``[]`` and is left to ``load_config``
+    to reject.
+    """
+    try:
+        node = yaml.compose(text)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    keys: list[str] = []
+    for key_node, _value_node in node.value:
+        if isinstance(key_node, yaml.ScalarNode):
+            keys.append(key_node.value)
+    seen_once: set[str] = set()
+    dupes: set[str] = set()
+    for k in keys:
+        if k in seen_once:
+            dupes.add(k)
+        else:
+            seen_once.add(k)
+    return sorted(dupes)
+
+
+def _reject_duplicate_keys_after_write(config_path: Path, original: str, what: str) -> None:
+    """Refuse a write that left two top-level blocks for the same key.
+
+    Called right after ``_atomic_write_text`` and BEFORE the resolve check,
+    because the resolve check is exactly the instrument that a duplicate-key
+    bug can satisfy while the file is wrong: PyYAML resolves only the last
+    block, so re-loading and checking the new value back looks fine even
+    though the operator's *entire original section* (e.g. which subscription
+    pays) was just silently dropped. A verify that the bug itself can pass is
+    not a verify.
+    """
+    dupes = _duplicate_top_level_keys(config_path.read_text())
+    if dupes:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to {what}: the edit left duplicate top-level key(s) "
+            f"{dupes!r} in {config_path}; PyYAML would silently resolve only "
+            "the last one and drop the operator's original section. The file "
+            "has been restored."
+        )
 
 
 def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
@@ -2367,6 +2435,7 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
     lines = original.splitlines()
     _splice_llm_scalar(lines, "auth_profile", profile)
     _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(config_path, original, "set auth profile")
 
     resolved = load_config(config_path).data["llm"].get("auth_profile")
     if resolved != profile:
@@ -2433,6 +2502,9 @@ def set_model_ids(
     for key, value in updates.items():
         _splice_llm_scalar(lines, key, value)
     _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(
+        config_path, original, f"set model id(s) {sorted(updates)!r}"
+    )
 
     try:
         resolved_cfg = load_config(config_path)

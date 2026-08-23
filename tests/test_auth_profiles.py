@@ -8,6 +8,7 @@ never leak a token value into a name-only surface.
 import os
 
 import pytest
+import yaml
 
 from no_human import config
 from no_human.config import (
@@ -217,6 +218,133 @@ def test_set_auth_profile_edits_only_the_llm_block(tmp_path):
     data = load_config(cfg_path).data
     assert data["ci_gate"]["auth_profile"] == "untouched"
     assert data["llm"]["auth_profile"] == "personal"
+
+
+def test_set_auth_profile_splices_into_a_header_with_an_inline_comment(tmp_path):
+    """The header-locator used to require `ln.rstrip() == "llm:"` exactly, so
+    a header carrying an inline comment (a real hand-edit, e.g. "which
+    subscription pays") was treated as absent: a SECOND `llm:` block got
+    appended, and PyYAML's last-wins constructor silently resolved only that
+    new block — dropping the operator's entire original section, including
+    which subscription pays."""
+    cfg_path = tmp_path / "config.yaml"
+    seed = (
+        "server:\n"
+        "  port: 8420\n"
+        "llm:  # which subscription pays\n"
+        "  auth_profile: personal\n"
+        "  auth_mode: subscription\n"
+    )
+    cfg_path.write_text(seed)
+
+    assert set_auth_profile("enterprise", cfg_path) == "enterprise"
+
+    text = cfg_path.read_text()
+    assert text.count("llm:") == 1
+    assert "llm:  # which subscription pays" in text
+    assert text.count("auth_profile:") == 1
+    cfg = load_config(cfg_path)
+    assert cfg.data["llm"]["auth_mode"] == "subscription"
+    assert cfg.data["llm"]["auth_profile"] == "enterprise"
+
+    before_lines = seed.splitlines()
+    after_lines = text.splitlines()
+    assert len(before_lines) == len(after_lines)
+    assert sum(a != b for a, b in zip(before_lines, after_lines)) == 1
+
+
+def test_set_auth_profile_does_not_hijack_an_llm_header_with_a_value(tmp_path):
+    """`llm: {}` carries a value on the header line, so `_LLM_HEADER_RE`
+    deliberately does not match it (pins the conservative half of the
+    regex): `_splice_llm_scalar` still appends a fresh `llm:` block exactly
+    as before this fix. That now leaves two top-level `llm` keys in the
+    file, which is precisely the shape the new duplicate-key guard exists to
+    catch — so the write is refused and the original is restored byte-for-
+    byte, which is a strictly SAFER outcome than the pre-guard behaviour
+    (silent last-wins) for the exact same input."""
+    cfg_path = tmp_path / "config.yaml"
+    seed = "llm: {}\n"
+    cfg_path.write_text(seed)
+
+    with pytest.raises(AuthError, match="duplicate top-level key"):
+        set_auth_profile("personal", cfg_path)
+
+    assert cfg_path.read_text() == seed
+    assert "llm: {}" in cfg_path.read_text().splitlines()
+
+    # Unit-level pin, independent of the duplicate-key guard: the splicer's
+    # own append-when-not-a-block behaviour is unchanged by this fix.
+    lines = ["llm: {}"]
+    config._splice_llm_scalar(lines, "auth_profile", "personal")
+    assert lines == ["llm: {}", "llm:", "  auth_profile: personal"]
+
+
+def test_the_llm_header_pattern_matches_a_comment_but_not_a_value():
+    for header in ("llm:", "llm: ", "llm:  # which plan pays", "llm:\t# x"):
+        assert config._LLM_HEADER_RE.match(header), header
+    for not_header in ("  llm:", "llm: {}", "llmx:", "llm: personal"):
+        assert config._LLM_HEADER_RE.match(not_header) is None, not_header
+
+
+def test_a_splicer_bug_that_duplicates_the_llm_block_is_refused_and_the_file_restored(
+    tmp_path, monkeypatch
+):
+    """Simulates the exact defect this ticket fixes: a splicer that decides
+    (wrongly) that no `llm:` block exists and appends a second one. The
+    post-write verify must catch the resulting duplicate top-level key and
+    restore the file — a resolve-and-compare check alone is not enough,
+    because PyYAML resolves the SECOND block and the comparison would pass
+    while the operator's subscription pin was just silently dropped."""
+
+    def _buggy_splice(lines, key, value):
+        lines.extend(["llm:", f"  {key}: {value}"])
+
+    monkeypatch.setattr(config, "_splice_llm_scalar", _buggy_splice)
+
+    cfg_path = tmp_path / "config.yaml"
+    seed = "llm:\n  auth_profile: personal\n  auth_mode: subscription\n"
+    cfg_path.write_text(seed)
+
+    with pytest.raises(AuthError, match=r"duplicate top-level key.*'llm'"):
+        set_auth_profile("enterprise", cfg_path)
+
+    assert cfg_path.read_text() == seed
+    assert load_config(cfg_path).data["llm"]["auth_profile"] == "personal"
+
+
+def test_set_model_ids_refuses_a_write_that_duplicates_a_top_level_key(
+    tmp_path, monkeypatch
+):
+    def _buggy_splice(lines, key, value):
+        lines.extend(["llm:", f"  {key}: {value}"])
+
+    monkeypatch.setattr(config, "_splice_llm_scalar", _buggy_splice)
+
+    cfg_path = tmp_path / "config.yaml"
+    seed = "llm:\n  auth_profile: personal\n  auth_mode: subscription\n"
+    cfg_path.write_text(seed)
+
+    with pytest.raises(AuthError, match=r"duplicate top-level key.*'llm'"):
+        config.set_model_ids({"primary_model": "claude-sonnet-5"}, cfg_path)
+
+    assert cfg_path.read_text() == seed
+    assert load_config(cfg_path).data["llm"]["auth_profile"] == "personal"
+
+
+def test_duplicate_top_level_keys_sees_what_safe_load_hides():
+    """`safe_load` cannot answer this question — last-wins IS its contract —
+    so the check has to run on the parse tree (`yaml.compose`), not on the
+    dict `safe_load` hands back. Asserted here so the check is not vacuous:
+    the ordinary instrument really does hide what we are looking for."""
+    dup_text = "llm:\n  a: 1\nserver:\n  port: 1\nllm:\n  b: 2\n"
+    assert config._duplicate_top_level_keys(dup_text) == ["llm"]
+    assert config._duplicate_top_level_keys("llm:\n  a: 1\nserver:\n  port: 1\n") == []
+    # A key repeated at a NESTED level, under two distinct top-level parents,
+    # is not a top-level duplicate.
+    assert config._duplicate_top_level_keys("a:\n  x: 1\nb:\n  x: 2\n") == []
+
+    # Non-vacuity: prove `safe_load` really does hide the second block.
+    assert yaml.safe_load(dup_text) == {"llm": {"b": 2}, "server": {"port": 1}}
 
 
 def test_the_profile_name_pattern_rejects_a_trailing_newline():

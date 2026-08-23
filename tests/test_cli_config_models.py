@@ -256,6 +256,46 @@ def test_models_set_preserves_hand_written_comments_and_unrelated_sections(
     assert "  branch_prefix: no-human/" in after_lines
 
 
+def test_models_set_splices_into_a_header_with_an_inline_comment(
+        runner, tmp_path, monkeypatch):
+    """The header-locator used to require an exact `"llm:"` line, so a header
+    carrying an inline comment (a real hand-edit naming which subscription
+    pays) was treated as absent and a second `llm:` block got appended —
+    PyYAML's last-wins constructor then silently dropped the operator's
+    entire original section on the next load."""
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(nh_config, "CONFIG_PATH", path)
+    monkeypatch.setattr(nh_config, "ENV_PATH", tmp_path / ".env")
+    seed = _COMMENTED_CONFIG.format(db_path=str(tmp_path / "test.db")).replace(
+        "llm:\n", "llm:  # which subscription pays\n", 1
+    )
+    path.write_text(seed)
+    assert nh_config.load_config(path).db_path == tmp_path / "test.db"
+
+    before_lines = seed.splitlines()
+    result = runner.invoke(
+        cli, ["config", "models", "set", "utility", "claude-opus-5"],
+        catch_exceptions=False)
+    assert result.exit_code == 0
+
+    after = path.read_text()
+    after_lines = after.splitlines()
+    assert after.count("llm:") == 1
+    assert "llm:  # which subscription pays" in after_lines
+    assert len(after_lines) == len(before_lines)
+    changed = [(b, a) for b, a in zip(before_lines, after_lines) if b != a]
+    assert len(changed) == 1
+    assert changed[0] == (
+        "  utility_model: claude-haiku-4-5",
+        "  utility_model: claude-opus-5",
+    )
+    assert (
+        "  review_model: claude-opus-4-8  # reviewer tier — do not change lightly"
+        in after_lines
+    )
+    assert nh_config.load_config(path).data["llm"]["auth_mode"] == "subscription"
+
+
 # --------------------------------------------------------------------------- #
 # CLI and API share one code path                                             #
 # --------------------------------------------------------------------------- #
