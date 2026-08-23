@@ -9,9 +9,39 @@ state, no caching, so the numbers cannot drift from the record. Served by
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .db import USAGE_ROLES, Store, usage_columns_for
+
+
+def cache_read_share(read: int | None, creation: int | None) -> float | None:
+    """Share of an attempt's cache tokens that were READ (reuse) rather than
+    re-CREATED. None when the attempt recorded no cache tokens at all — an
+    unmeasured attempt is not a 0.0 one. Rounded to 4dp, matching
+    cache_economics['creation_share']; note this is its COMPLEMENT over the
+    same universe (read+creation), so the two can never be read as different
+    denominators. The ONLY definition of this arithmetic — api/models.py and
+    eval/northstar_card.py both import it rather than re-deriving it, and no
+    JS twin exists (the frontend only ever displays a value this function, or
+    the API row it populated, already computed)."""
+    try:
+        r = int(read) if read is not None else 0
+        c = int(creation) if creation is not None else 0
+    except (TypeError, ValueError):
+        return None
+    total = r + c
+    if total <= 0:
+        return None
+    return round(r / total, 4)
+
+
+def _percentile(vals: list[float], q: float) -> float:
+    """Nearest-rank percentile. Not statistics.quantiles, which raises for
+    n < 2 — a single-attempt session must still produce a p50/p90 (both equal
+    to that one observation), not a crash."""
+    idx = min(len(vals) - 1, math.ceil(q * len(vals)) - 1)
+    return vals[idx]
 
 
 async def compute_metrics(store: Store) -> dict[str, Any]:
@@ -100,6 +130,27 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "read_per_attempt": sum_read // n_attempts if n_attempts else 0,
         "creation_share": round(sum_creation / (sum_creation + sum_read), 4)
         if (sum_creation + sum_read) else None,
+    }
+
+    # Per-attempt cache-read-share distribution — a SIBLING of cache_economics
+    # above, not a member of it: cache_economics pools every attempt's tokens
+    # into one FLEET ratio, while this is a distribution OVER per-attempt
+    # ratios (the earliest signal a single attempt is heading for budget
+    # exhaustion, not a total). Keeping the two dicts structurally separate
+    # means a reader can never mistake a pooled total for a per-attempt
+    # spread. Same population/filter as cache_economics (no time window) so
+    # the two stay comparable.
+    rows = await store.query(
+        """SELECT COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0)
+           FROM attempts
+           WHERE COALESCE(cache_read_tokens, 0) > 0
+              OR COALESCE(cache_creation_tokens, 0) > 0""")
+    _shares = sorted(
+        s for s in (cache_read_share(r, c) for r, c in rows) if s is not None)
+    cache_read_share_dist = {
+        "attempts_measured": len(_shares),
+        "p50": _percentile(_shares, 0.5) if _shares else None,
+        "p90": _percentile(_shares, 0.9) if _shares else None,
     }
 
     # CI_GATE integration gate (M6): runs started / passed / failed.
@@ -300,6 +351,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "repro_gate_verdicts": repro,
         "ci_gate": ci_gate,
         "cache_economics": cache_economics,
+        "cache_read_share_dist": cache_read_share_dist,
         "error_breakdown": error_breakdown,
         "grill_answering_outcomes": grill_answering,
         "grill_answering_answers": grill_answers,

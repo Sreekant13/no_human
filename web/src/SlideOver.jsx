@@ -2713,6 +2713,15 @@ function AttemptsTab({ task }) {
         <div key={a.id} className="attempt-row">
           <div className="attempt-number">Attempt #{a.attempt_number}</div>
           {a.branch_name && <div className="attempt-branch">{a.branch_name}</div>}
+          {a.cache_read_share != null && (
+            <div
+              className="attempt-cache"
+              data-testid="attempt-cache"
+              title={`${(a.cache_read_tokens ?? 0).toLocaleString()} read · ${(a.cache_creation_tokens ?? 0).toLocaleString()} rebuilt`}
+            >
+              cache read {(a.cache_read_share * 100).toFixed(0)}%
+            </div>
+          )}
           {a.pr_url && (
             <div className="attempt-pr">
               <a href={a.pr_url} target="_blank" rel="noreferrer">{a.pr_url}</a>

@@ -21,6 +21,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from ..core.metrics import cache_read_share
 from .northstar import BASIS_MIXED, BenchScore
 
 RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "northstar"
@@ -1400,10 +1401,10 @@ def render_northstar_md(card: NorthStarCard,
         "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio (basis) | "
         "orig follow-ups (proxy) | attempts | tokens @ escalation | "
         + ("pass^k | " if card.trials > 1 else "")
-        + "notes |",
+        + "cache | notes |",
         "|---|---|---|---|---|---|---|---|---|"
         + ("---|" if card.trials > 1 else "")
-        + "---|",
+        + "---|---|",
     ]
     # PRIVACY: only hand-curated (PR-reviewed) core specs get per-task rows
     # in this git-tracked report; generated specs are verbatim operator
@@ -1411,6 +1412,10 @@ def render_northstar_md(card: NorthStarCard,
     core_scores = [s for s in card.scores if s.subset == "core"]
     hidden = len(card.scores) - len(core_scores)
     per_spec = card.per_spec_passes if card.trials > 1 else {}
+    # Mean over rows that recorded cache tokens — a run with none excluded,
+    # not counted as a 0.0, for the same reason cache_read_share itself
+    # returns None rather than 0 for an unmeasured attempt.
+    _cache_shares: list[float] = []
     for s in core_scores:
         # The basis rides in the SAME cell as the number — a separate column
         # would let a reader eyeball the ratio column alone and re-introduce
@@ -1439,13 +1444,26 @@ def render_northstar_md(card: NorthStarCard,
         if card.trials > 1:
             passes, ran_n = per_spec.get(s.task_id, (0, 0))
             pass_k_cell = (f"{passes}/{ran_n} | " if ran_n else "— (not measured) | ")
+        # The earliest signal an attempt is heading for budget exhaustion —
+        # per-task, not the fleet total metrics.py's cache_economics reports.
+        sh = cache_read_share(s.nh_cache_tokens, s.nh_cache_creation_tokens)
+        cache_cell = f"{sh:.0%}" if sh is not None else "—"
+        if sh is not None:
+            _cache_shares.append(sh)
         lines.append(
             f"| {task_cell} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
             f"{s.orig_tokens:,} | {ratio_s} | {s.orig_corrections} | "
             f"{attempts_cell} | {tokens_cell} | {pass_k_cell}"
+            f"{cache_cell} | "
             f"{redact_for_publish(s.notes or '')[:80].replace('|', '/')} |")
     if hidden:
         lines.append(f"\n_{hidden} non-core task(s) included in the aggregates only (privacy: raw corpus rows never enter git)._")
+    if _cache_shares:
+        _mean_cache = sum(_cache_shares) / len(_cache_shares)
+        lines.append(
+            f"\n_Mean cache-read share over {len(_cache_shares)} core "
+            f"run(s) that recorded cache tokens: {_mean_cache:.0%} — runs "
+            f"with no cache tokens are excluded, not counted as 0._")
 
     # Per-spec pass counts — the reliability view the pass^k headline is a
     # summary OF. Core specs only, same privacy rule as the table above.

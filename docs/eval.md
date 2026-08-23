@@ -155,10 +155,10 @@ identity (`:6828-6846`) so a resumed multi-trial run cannot double-count a spec.
 Each trial is its own `BenchScore` (`BenchScore.trial`,
 `src/no_human/eval/northstar.py`). The reliability figure this produces is
 `NorthStarCard.pass_k_rate` — the fraction of specs that passed **every**
-trial, not the mean success rate (`src/no_human/eval/northstar_card.py:442`) —
+trial, not the mean success rate (`src/no_human/eval/northstar_card.py:443`) —
 surfaced in the headline as `· pass^{trials} {rate}`
-(`northstar_card.py:828-829`), in a dedicated "Per-spec reliability" table
-(`northstar_card.py:1452-1456`), and now also as a `pass^k` cell (`n/k`, read
+(`northstar_card.py:829-830`), in a dedicated "Per-spec reliability" table
+(`northstar_card.py:1474-1478`), and now also as a `pass^k` cell (`n/k`, read
 from the same `per_spec_passes` — no new arithmetic) on each core spec's row
 in the "Per-task" table, present only when `trials > 1` (`pass^1` is
 arithmetically the mean; printing it would read as a second, corroborating
@@ -188,7 +188,7 @@ it as a failed run, not a strong result.
 uneven trial count (a resumed run that died partway) silently over-weights
 whichever specs happened to run more often. The headline is
 `spec_mean_success_rate` — the mean of PER-SPEC means
-(`northstar_card.py:359`) — and it should be read together with cost ratio and
+(`northstar_card.py:360`) — and it should be read together with cost ratio and
 the honest-escalation rate, never alone. **Bench is an instrument, not a target: never tune the product to pass the specific specs in this corpus** —
 that measures memorization of the benchmark, not capability.
 

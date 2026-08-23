@@ -107,3 +107,31 @@ test("no tokens_used_total (an un-restarted server) → BOTH surfaces say '—',
   assert.equal(fmtCost(lifetimeCost(metrics)), "—");
   assert.equal(northStarTiles(metrics).find((t) => t.label === "Cost / merged PR").value, "—");
 });
+
+// The per-attempt distribution is a SIBLING tile of the fleet "Cache reuse" tile, not
+// a replacement — the earliest signal a single attempt (not the whole fleet) is heading
+// for budget exhaustion. Neither label may say "reuse"; that word belongs to the fleet tile.
+test("cache-read-share distribution is its own tile, distinct from the fleet 'Cache reuse' tile", () => {
+  const tiles = northStarTiles({
+    cache_economics: { creation_share: 0.03 },
+    cache_read_share_dist: { p50: 0.9, p90: 0.99, attempts_measured: 3 },
+  });
+  const fleet = tiles.find((t) => t.label === "Cache reuse");
+  const perAttempt = tiles.find((t) => t.label !== "Cache reuse" && /cache/i.test(t.label));
+  assert.ok(fleet, "fleet tile must still be present");
+  assert.ok(perAttempt, "a distinct per-attempt tile must be present");
+  assert.notEqual(fleet.label, perAttempt.label);
+  assert.doesNotMatch(perAttempt.label.toLowerCase(), /reuse/);
+  assert.equal(fleet.value, "97%");            // 1 - 0.03, unaffected by the new tile
+  assert.equal(perAttempt.value, "90%");       // p50
+  assert.match(perAttempt.sub, /99%/);         // p90 surfaced too
+  assert.match(perAttempt.sub, /3/);           // attempts_measured surfaced too
+});
+
+test("cache-read-share distribution absent → the tile reads '—', no crash", () => {
+  const tiles = northStarTiles({ prs_merged: 1 });
+  const perAttempt = tiles.find((t) => t.label !== "Cache reuse" && /cache/i.test(t.label));
+  assert.ok(perAttempt);
+  assert.equal(perAttempt.value, "—");
+  assert.equal(perAttempt.sub, "no data");
+});

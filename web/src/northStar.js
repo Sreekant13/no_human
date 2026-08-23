@@ -18,6 +18,7 @@ export function northStarTiles(metrics) {
   const rPass = metrics.review_pass ?? 0;
   const rFail = metrics.review_fail ?? 0;
   const share = metrics.cache_economics?.creation_share;
+  const dist = metrics.cache_read_share_dist;
 
   // Cost is the headline concern, so it is a VALUE, not a subtitle under a token count.
   //
@@ -65,6 +66,20 @@ export function northStarTiles(metrics) {
       value: share != null ? `${((1 - share) * 100).toFixed(0)}%` : "—",
       sub: share != null ? `${(share * 100).toFixed(1)}% rebuilt (full price)` : "no data",
       tone: share == null ? "neutral" : share > 0.5 ? "bad" : "good",
+    },
+    // The fleet tile above pools every attempt's tokens into one ratio, so a single
+    // attempt heading for budget exhaustion can hide inside a healthy pooled average.
+    // This is a DISTRIBUTION over per-attempt shares (metrics.py cache_read_share_dist,
+    // itself computed by core.metrics.cache_read_share — no local arithmetic here) —
+    // the earliest signal that one specific attempt, not the fleet, is in trouble.
+    {
+      label: "Cache read / attempt (p50)",
+      value: dist?.p50 != null ? `${(dist.p50 * 100).toFixed(0)}%` : "—",
+      sub:
+        dist?.p90 != null
+          ? `p90 ${(dist.p90 * 100).toFixed(0)}% · ${dist.attempts_measured} attempt(s) measured`
+          : "no data",
+      tone: "neutral",
     },
   ];
 }

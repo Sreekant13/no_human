@@ -1245,3 +1245,53 @@ def test_the_published_report_carries_the_generators_judge_calibration_pointer()
         "docs/NORTH_STAR_BENCH.md does not carry the pointer the generator "
         f"emits. Expected this line verbatim:\n  {rendered[0]}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Per-task `cache` column — the earliest signal an attempt is heading for
+# budget exhaustion, surfaced per row (not just the fleet-wide
+# metrics.py cache_economics total).
+# --------------------------------------------------------------------------- #
+
+def test_per_task_table_has_a_cache_column_and_mean_footer():
+    """A two-run fixture: one row with cache tokens recorded (share 0.9), one
+    row with none at all (must print '—' and be excluded from the mean, not
+    counted as a 0.0 — the same contract cache_read_share() itself has)."""
+    a = _score(task_id="ns-cache-a", nh_cache_tokens=900, nh_cache_creation_tokens=100)
+    b = _score(task_id="ns-cache-b", nh_cache_tokens=0, nh_cache_creation_tokens=0)
+    for s in (a, b):
+        s.subset = "core"
+    card = NorthStarCard(scores=[a, b], created_at="2026-08-23", label="t")
+    md = render_northstar_md(card)
+
+    header_line = next(ln for ln in md.splitlines() if ln.startswith("| task |"))
+    assert "cache" in header_line, header_line
+
+    row_a = next(ln for ln in md.splitlines() if ln.startswith("| ns-cache-a "))
+    assert "90%" in row_a, row_a
+
+    row_b = next(ln for ln in md.splitlines() if ln.startswith("| ns-cache-b "))
+    cells_b = [c.strip() for c in row_b.strip("|").split("|")]
+    assert cells_b[-2] == "—", row_b  # cache cell, right before notes
+
+    footer = next(ln for ln in md.splitlines() if "Mean cache-read share" in ln)
+    assert "1 core run" in footer, footer
+    assert "90%" in footer, footer
+
+
+def test_cache_column_does_not_shift_the_escalation_cells():
+    """The cache column was appended at the very END of the row, after
+    `attempts`/`tokens @ escalation` — those two cells must stay at the same
+    index regardless of the new column, matching the invariant
+    test_bench_escalation_latency.py already pins."""
+    s = _score(task_id="ns-cache-c", nh_cache_tokens=0, nh_cache_creation_tokens=0)
+    s.subset = "core"
+    card = NorthStarCard(scores=[s], created_at="2026-08-23", label="t")
+    md = render_northstar_md(card)
+
+    row = next(ln for ln in md.splitlines() if ln.startswith("| ns-cache-c "))
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    # task | outcome | satisfied | nh tokens | orig tokens | cost ratio |
+    # orig follow-ups (proxy) | attempts | tokens @ escalation | cache | notes
+    assert cells[7] == "—", row  # attempts (not escalated)
+    assert cells[8] == "—", row  # tokens @ escalation (not escalated)

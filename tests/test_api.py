@@ -1515,6 +1515,32 @@ def test_task_out_reports_cache_creation_burn():
     assert bare.total_cache_creation is None
 
 
+def test_attempt_rows_carry_the_cache_read_share():
+    """The earliest signal an attempt is heading for budget exhaustion —
+    per-attempt, computed by the one function that owns this arithmetic
+    (core.metrics.cache_read_share), not re-derived here."""
+    from no_human.api.models import AttemptOut
+    from no_human.core.metrics import cache_read_share
+
+    row = {"id": "a1", "attempt_number": 1,
+           "cache_read_tokens": 900_000, "cache_creation_tokens": 100_000}
+    out = AttemptOut.from_row(row)
+    assert out.cache_read_tokens == 900_000
+    assert out.cache_creation_tokens == 100_000
+    assert out.cache_read_share == cache_read_share(900_000, 100_000) == 0.9
+
+
+def test_attempt_cache_read_share_is_null_when_unmeasured():
+    """An attempt that recorded no cache tokens at all reports None, not a
+    misleading 0.0 — matching cache_read_share()'s own contract."""
+    from no_human.api.models import AttemptOut
+
+    out = AttemptOut.from_row({"id": "a1", "attempt_number": 1})
+    assert out.cache_read_tokens is None
+    assert out.cache_creation_tokens is None
+    assert out.cache_read_share is None
+
+
 def test_task_out_surfaces_the_failure_reason_the_drawer_asks_for():
     """The drawer's "Why it failed" banner could never render.
 

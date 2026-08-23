@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, model_validator
 
 from ..core.db import USAGE_ROLES, usage_columns_for
+from ..core.metrics import cache_read_share
 from ..core.task import Task
 
 
@@ -45,6 +46,12 @@ class AttemptOut(BaseModel):
     tokens_used: int | None = None
     cache_read_tokens: int | None = None
     cache_creation_tokens: int | None = None
+    # The earliest signal an attempt is heading for budget exhaustion — a
+    # per-ATTEMPT ratio, distinct from metrics.py's fleet-wide
+    # cache_economics['creation_share']. Computed by the one function that
+    # owns this arithmetic (core.metrics.cache_read_share); this field never
+    # derives it locally.
+    cache_read_share: float | None = None
     status: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
@@ -79,6 +86,8 @@ class AttemptOut(BaseModel):
             tokens_used=row.get("tokens_used"),
             cache_read_tokens=row.get("cache_read_tokens"),
             cache_creation_tokens=row.get("cache_creation_tokens"),
+            cache_read_share=cache_read_share(
+                row.get("cache_read_tokens"), row.get("cache_creation_tokens")),
             status=row.get("status"),
             started_at=row.get("started_at"),
             completed_at=row.get("completed_at"),

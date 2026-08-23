@@ -3096,6 +3096,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
   color: var(--cyan);
 }
 
+.attempt-cache {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .attempt-pr a {
   font-size: 12px;
   color: var(--blue);
