@@ -200,6 +200,20 @@ named here.
   all before the fact — `codex exec` offers no PreToolUse veto, so the same
   rules are evaluated on an already-executed call.
 
+  **Two more spellings, considered in the 2026-08-23 round and named here
+  rather than left silent.** `ssh host "gh ... pr merge 7"` executes the
+  mention on a REMOTE host under credentials this process cannot account
+  for, so recursing into it would assert a policy about a machine this guard
+  has no authority over. `find . -exec gh ... pr merge 7 \;` has its own
+  `\;`-vs-`+` argument-batching grammar across matched files, which earns
+  its own parser rather than inheriting this one's false-negative surface.
+  Neither is a narrowing of an existing rule — both were already unreached
+  before this round — so both are disclosed gaps, not regressions. A third
+  spelling in the same family, `case x in x) gh pr merge 7;; esac`, is also
+  unreached and is disclosed here for the first time for THIS rule — the
+  `case...esac` gap already on record in `CHANGELOG.md` names `nh approve`,
+  a different check, and disclosing it there does not cover this one.
+
   **The control that does close the door is not this.** It is a check at the
   act: `nh approve` refusing inside an agent session, and the four gate-ending
   routes requiring something an agent session does not have. That work is

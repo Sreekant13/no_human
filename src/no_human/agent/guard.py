@@ -895,7 +895,13 @@ def _venv_install_denial(cmd: str, cwd: "str | None") -> "str | None":
 # is NOT this: a PR is merged through the forge, and that is what must be denied.
 _FORGE_MERGE = re.compile(
     r"\b(?:gh\s+pr\s+merge"           # gh pr merge 7004 --squash
-    r"|glab\s+mr\s+merge"             # glab mr merge 12
+    r"|glab\s+mr\s+(?:merge|accept)"  # glab mr merge 12 / glab mr accept 12
+    # `accept` is a documented alias of `merge`, not a distinct verb: run
+    # `glab mr accept --help` (glab 1.113.0) and its USAGE line reads
+    # "glab mr merge [<id | branch>] [--flags]", with EXAMPLES pairing
+    # `glab mr merge 235` and `glab mr accept 235`. `gh pr accept --help`
+    # and `gh alias list` (gh 2.97.0) show no such alias on the gh side —
+    # confirmed by execution, not assumed. Found 2026-08-23, additive.
     r"|gh\s+api\b[^|;&]*?/(?:pulls|merge_requests)/\d+/merge"  # the REST call
     r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge"
     # GraphQL merges a PR in one mutation and never touches the REST path
@@ -1342,6 +1348,32 @@ _GROUPING = re.compile(r"(?:^|(?<=\s))[({]|[)}](?=\s|$)|<\(|\)")
 #: `_GROUPING` itself: other rules depend on its current behavior.
 _SUBST_HEAD = re.compile(r"(?:^|(?<=\s))[$`]?[({]|`")
 
+#: `_SUBST_HEAD` above only fires at start-of-segment or after whitespace, so
+#: an assignment glued directly onto a substitution head — `x=$(gh pr merge
+#: 7)`, `` x=`gh pr merge 7` `` — is never neutralized: shlex does not know
+#: shell substitution, so it yields one opaque token `x=$(gh`, which
+#: `_strip_wrappers` then reads as a plain `VAR=value` assignment (it
+#: fullmatches `[A-Za-z_][A-Za-z0-9_]*=.*`) and drops whole — taking the real
+#: command name down with it, which is why this spelling read as ALLOW while
+#: the already-neutralized backtick-only form `` `gh pr merge 7` `` (no `x=`
+#: prefix) read as DENY. A sibling, not an edit to `_SUBST_HEAD` itself:
+#: inserting one space right after the `=` and before the substitution head
+#: gives `_SUBST_HEAD` the leading whitespace it already requires, so applying
+#: this FIRST (see `_forge_invocations` below) lets `_SUBST_HEAD` do the rest
+#: unmodified. Found 2026-08-23 as the parity gap against the backtick form.
+_ASSIGN_SUBST_HEAD = re.compile(r"(?<==)(?=[$`])")
+
+#: Shell keywords that introduce a `VAR=value` assignment without being one
+#: themselves — `export FOO=$(gh pr merge 7)`, `local X=$(...)`, `readonly
+#: X=...`, `declare X=...`, `typeset X=...`. Each is its own token (shlex
+#: splits on the space before it), so it is mistaken for argv[0] itself
+#: unless dropped the same way `_strip_shell_keywords` already drops a
+#: leading `if`/`then`/etc. Consulted only by `_forge_invocations`, which
+#: drops these from the head after `_strip_shell_keywords` runs — a sibling
+#: list, not a widening of `_WRAPPERS`: `_strip_wrappers` is shared by the
+#: git-push and package-install guards and stays byte-identical.
+_ASSIGN_DECLARATORS = frozenset({"export", "local", "readonly", "declare", "typeset"})
+
 #: A `gh`/`glab` mention inside a shell-runner argument — precompiled once so
 #: the depth-bounded recursion in `_forge_invocations` stays linear even on
 #: the 50k-char / 1000-wrapper adversarial case.
@@ -1761,12 +1793,19 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
 })
 
 #: (noun, verb) pairs on gh/glab that write, and the subset that MERGES.
+#: `("mr", "accept")` is here alongside `("mr", "merge")` because it is the
+#: SAME verb under glab's own alias, not a new one: `glab mr accept --help`
+#: (glab 1.113.0) prints the `glab mr merge` USAGE line verbatim and pairs
+#: `glab mr merge 235` with `glab mr accept 235` in its EXAMPLES. An alias
+#: of a write verb is a write in read-only mode too. Found 2026-08-23,
+#: additive — `("mr", "merge")` is untouched.
 _FORGE_WRITE_PAIRS = {
     ("pr", "create"), ("pr", "merge"), ("pr", "close"), ("pr", "edit"),
     ("pr", "ready"), ("pr", "review"),
     ("mr", "create"), ("mr", "merge"), ("mr", "close"), ("mr", "update"),
+    ("mr", "accept"),
 }
-_FORGE_MERGE_PAIRS = {("pr", "merge"), ("mr", "merge")}
+_FORGE_MERGE_PAIRS = {("pr", "merge"), ("mr", "merge"), ("mr", "accept")}
 
 #: The nouns every `_FORGE_WRITE_PAIRS`/`_FORGE_MERGE_PAIRS` entry keys off.
 #: `_forge_subcommand` scans FOR this noun rather than taking the first two
@@ -1826,7 +1865,7 @@ _GIT_WRITE = re.compile(
 )
 _FORGE_WRITE = re.compile(
     r"\b(?:gh\s+pr\s+(?:create|merge|close|edit|ready|review)"
-    r"|glab\s+mr\s+(?:create|merge|close|update))\b"
+    r"|glab\s+mr\s+(?:create|merge|accept|close|update))\b"
 )
 
 
@@ -2152,6 +2191,19 @@ def _git_subcommand(argv: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+#: Runner names `_forge_invocations` recurses into. A union of the shell
+#: runners `_git_invocations` also uses and the trailing-argv runners the
+#: package-install guard already recognises (`setsid`, `unbuffer`, `nice`,
+#: `ionice`, `chrt`, ... — see `_TRAILING_ARGV_RUNNERS`): `setsid gh -R o/r pr
+#: merge 7` read as ALLOW because `setsid` was consulted by `_approve_denial`
+#: elsewhere but never by this recursion. New name so the widening is scoped
+#: to `_forge_invocations` alone — `_git_invocations`, `_git_push_invocations`
+#: and the install guard keep matching on `_SHELL_RUNNERS`/
+#: `_TRAILING_ARGV_RUNNERS` exactly as before, byte-identical. Found
+#: 2026-08-23.
+_FORGE_RUNNER_NAMES = _SHELL_RUNNERS | _TRAILING_ARGV_RUNNERS
+
+
 def _forge_invocations(cmd: str, _depth: int = 0) -> list[list[str]]:
     """Every `gh`/`glab` argv in ``cmd``, found the way `_git_invocations`
     finds git: split on shell separators, strip `VAR=value` and wrappers, and
@@ -2161,15 +2213,20 @@ def _forge_invocations(cmd: str, _depth: int = 0) -> list[list[str]]:
 
     Recurses up to two levels into nested shell runners — `bash -c "gh -R o/r
     pr merge 7"`, `sh -c "glab -R o/r mr merge 12"`, `timeout 30 gh …`,
-    `xargs gh …` — the same bound `_git_invocations` uses, mirrored rather
-    than shared (no helper refactor across the two paths). `$(...)`, `` `...`
-    `` and `{ ...; }` are stripped per segment with `_SUBST_HEAD` (a
-    `_GROUPING` sibling — `_GROUPING` itself is untouched) before
-    tokenising, and `_strip_shell_keywords` drops a leading `if`/`then`/etc.
-    so `if true; then gh -R o/r pr merge 7; fi` is seen after `_CMD_SEP`
-    splits on `;`. Bounded depth — a guard must not become a parser with
-    unbounded work; `_FORGE_MENTION` is precompiled so the bound holds on a
-    50k-char / 1000-wrapper adversarial command.
+    `xargs gh …`, `setsid gh …`, `chrt -f 1 gh …` (`_FORGE_RUNNER_NAMES`) —
+    the same bound `_git_invocations` uses over its own (narrower)
+    `_SHELL_RUNNERS`, mirrored rather than shared (no helper refactor across
+    the two paths). `$(...)`, `` `...` `` and `{ ...; }` are stripped per
+    segment with `_SUBST_HEAD` (a `_GROUPING` sibling — `_GROUPING` itself is
+    untouched); `_ASSIGN_SUBST_HEAD` runs first so the same substitution
+    heads are also stripped when glued onto an assignment (`x=$(gh …)`); and
+    `_strip_shell_keywords` drops a leading `if`/`then`/etc., followed by a
+    drop of any leading `_ASSIGN_DECLARATORS` word (`export`/`local`/...) so
+    `export FOO=$(gh -R o/r pr merge 7)` and `if true; then gh -R o/r pr
+    merge 7; fi` are both seen after their respective splits. Bounded depth —
+    a guard must not become a parser with unbounded work; `_FORGE_MENTION` is
+    precompiled so the bound holds on a 50k-char / 1000-wrapper adversarial
+    command.
 
     Deliberate polarity: a quoted MENTION of `gh`/`glab` inside a runner
     argument (`bash -c "echo gh pr merge 7"`) is recursed into and analysed
@@ -2179,19 +2236,33 @@ def _forge_invocations(cmd: str, _depth: int = 0) -> list[list[str]]:
 
     Structural limit, not covered by this recursion: a command assembled at
     RUNTIME (`$VAR`, a heredoc, `base64 -d | sh`) is not visible to any
-    static rule — see docs/verification.md.
+    static rule — see docs/verification.md. `ssh host "gh ... pr merge 7"`
+    and `find . -exec gh ... pr merge 7 \\;` are ALSO out of scope, but not
+    for that reason — both are statically visible. `ssh` is left unrecursed
+    because the mention is executed on a REMOTE host under credentials this
+    process cannot account for, and a guard that recurses into it would be
+    asserting a policy about a machine it has no authority over. `find
+    -exec` is left unrecursed because `-exec ... \\;` vs. `-exec ... +`
+    changes how `find` batches arguments across multiple matched files, and a
+    parser for that grammar earns its own false-negative surface rather than
+    inheriting this function's. Neither is a lexical rule being narrowed —
+    both were already un-recursed before this change — so recorded here as a
+    disclosed gap, not a regression.
     """
     found: list[list[str]] = []
     for seg in _CMD_SEP.split(cmd):
         seg = seg.strip()
         if not seg:
             continue
-        seg_body = _SUBST_HEAD.sub(" ", _GROUPING.sub(" ", seg))
+        seg_body = _SUBST_HEAD.sub(
+            " ", _GROUPING.sub(" ", _ASSIGN_SUBST_HEAD.sub(" ", seg)))
         try:
             tokens = shlex.split(seg_body)
         except ValueError:
             tokens = seg_body.split()
         tokens = _strip_shell_keywords(tokens)
+        while tokens and tokens[0] in _ASSIGN_DECLARATORS:
+            tokens = tokens[1:]
         argv = _strip_wrappers(
             tokens, is_extra_target=lambda n: n in {"gh", "glab"})
         if not argv:
@@ -2199,7 +2270,7 @@ def _forge_invocations(cmd: str, _depth: int = 0) -> list[list[str]]:
         name = PurePosixPath(argv[0]).name
         if name in {"gh", "glab"}:
             found.append(argv)
-        elif name in _SHELL_RUNNERS and _depth < 2:
+        elif name in _FORGE_RUNNER_NAMES and _depth < 2:
             for j, tok in enumerate(argv[1:], start=1):
                 # `bash -c "gh -R o/r pr merge 7"` — quoted payload, one token.
                 if _FORGE_MENTION.search(tok):

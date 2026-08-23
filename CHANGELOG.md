@@ -124,6 +124,36 @@ All notable changes to no_human. The format follows
   there is still read as the verb on purpose, so it cannot swallow the next
   token and over-deny an unrelated command.
 
+  **2026-08-23 round: `glab mr accept` is a Cobra alias for `glab mr merge`**
+  (confirmed by running `glab mr accept --help`, which prints the same USAGE
+  line and pairs `glab mr merge 235`/`glab mr accept 235` under EXAMPLES) and
+  was reaching both session modes undenied; `gh` has no equivalent alias
+  (`gh pr accept --help` falls back to generic help, and `gh alias list` lists
+  only `co: pr checkout`), so only the `glab` side changed. A second gap in
+  the same round: `x=$(gh pr merge 7)` — an assignment-prefixed command
+  substitution — was allowed while the equivalent backtick form,
+  `` out=`gh pr merge 7` ``, was already denied, because `_SUBST_HEAD`'s
+  lookbehind requires start-of-string or whitespace before `$(`/backtick and
+  an immediately-preceding `=` defeats it; `export`/`local`/`readonly`/
+  `declare`/`typeset` prefixes on the same substitution had their own gap,
+  since those declarator words are not shell keywords `_strip_shell_keywords`
+  models and are not wrappers `_strip_wrappers` models, so they were read as
+  argv[0] and rejected outright rather than peeled. `setsid gh pr merge 7`
+  was a third gap: `setsid` was already a modelled trailing-argv runner
+  elsewhere in the guard, but `_forge_invocations`'s own recursion only
+  consulted the narrower shell-runner set. All three are fixed additively —
+  new sibling regexes/constants, no existing rule narrowed — and a 1,000-deep
+  nested-assignment input (~50k characters) still evaluates in well under a
+  second in both modes.
+  **Known gaps, named rather than left silent, same as above:** `ssh host
+  "gh pr merge 7"` executes the mention on a remote host under credentials
+  this process cannot account for; `find . -exec gh pr merge 7 \;` has its
+  own `\;`-vs-`+` batching grammar that earns its own parser; and
+  `case x in x) gh pr merge 7;; esac` reaches the same shell-grammar blind
+  spot the `nh approve` check's own `case...esac` gap (above) already
+  illustrates, but for this different check. None of the three is a
+  narrowing — all were already unreached before this round.
+
 ## [0.1.4] — 2026-08-21
 
 Fixes `nh mcp-serve` on every install that resolves dependencies from PyPI —

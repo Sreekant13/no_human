@@ -1414,6 +1414,186 @@ def test_forge_merge_family_denied_in_both_modes():
             assert not d.allow, f"readonly={readonly} must deny: {cmd}"
 
 
+def test_glab_mr_accept_is_a_merge_alias_and_is_denied():
+    """`glab mr accept` is a documented ALIAS of `glab mr merge`, not a
+    distinct verb — found by running `--help` on the installed CLI rather
+    than assumed, and it was ALLOW in every session mode before this fix.
+
+    `glab --version` (executed): `glab 1.113.0 (d62881304)`.
+    `glab mr accept --help` (executed, rc=0) prints:
+
+        USAGE
+          glab mr merge [<id | branch>] [--flags]
+        EXAMPLES
+          # Merge a merge request
+          glab mr merge 235
+          glab mr accept 235
+
+    — the USAGE line names `merge`, not `accept`, and the EXAMPLES pair the
+    two spellings against the same numeric MR id. `gh`'s side was checked
+    the same way and found to have NO such alias: `gh pr accept --help`
+    (executed, rc=0) falls back to the generic `gh pr <command>` list with
+    no `accept` entry, and `gh alias list` (executed, rc=0) shows only the
+    pre-existing `co: pr checkout` — nothing merge-shaped. That is why only
+    the `glab` side gains a spelling here."""
+    for readonly in (False, True):
+        for cmd in (
+            "glab mr accept 12",
+            "glab mr -R o/r accept 12",
+            "glab -R o/r mr accept 12",
+            "glab mr --repo=o/r accept 12",
+            'bash -c "glab mr accept 12"',
+            "timeout 5 glab mr accept 12",
+            "setsid glab mr accept 12",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_an_assignment_prefixed_command_substitution_is_denied_like_the_backtick_form():
+    """`x=$(gh -R o/r pr merge 7)` was ALLOW while the already-denied
+    backtick form `` `gh -R o/r pr merge 7` `` (no `x=` prefix) was DENY —
+    an assignment glued directly onto a substitution head defeated
+    `_SUBST_HEAD`'s whitespace-or-start-of-string requirement, so shlex
+    produced one opaque token `x=$(gh` that `_strip_wrappers` read as a
+    plain `VAR=value` assignment and discarded whole, taking `gh` down
+    with it. `export`/`local`/`readonly`/`declare` prefixes hit the same
+    hole one token further out. The backtick control below is pinned so
+    this parity cannot regress a second time."""
+    for readonly in (False, True):
+        for cmd in (
+            "x=$(gh -R o/r pr merge 7)",
+            "out=`gh -R o/r pr merge 7`",  # already-denied control
+            "export x=$(gh -R o/r pr merge 7)",
+            "local x=$(glab mr -R o/r accept 12)",
+            "readonly x=$(gh -R o/r pr merge 7)",
+            "declare x=$(gh -R o/r pr merge 7)",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_setsid_and_the_trailing_argv_runners_carry_a_forge_merge():
+    """`setsid` was in `_TRAILING_ARGV_RUNNERS` (consulted by
+    `_approve_denial`) but never in `_SHELL_RUNNERS`, the only set
+    `_forge_invocations`'s recursion checked — so `setsid gh -R o/r pr merge
+    7` was ALLOW. `_FORGE_RUNNER_NAMES` (a union of both sets, scoped to
+    this one function) closes it, along with the rest of the trailing-argv
+    family (`ionice`, `chrt`, `unbuffer`, ...).
+
+    `ssh host "gh ... pr merge 7"` and `find . -exec gh ... pr merge 7 \\;`
+    are declared OUT OF SCOPE, not handled here: `ssh` executes the mention
+    on a REMOTE host under credentials this process cannot account for, and
+    `find -exec` has its own `\\;`-vs-`+` argument-batching grammar that
+    deserves its own parser rather than inheriting this one's — see
+    docs/security.md and CHANGELOG.md for the same disclosure. This test
+    does not assert either is denied."""
+    for readonly in (False, True):
+        for cmd in (
+            "setsid gh -R o/r pr merge 7",
+            "ionice gh -R o/r pr merge 7",
+            "chrt -f 1 gh -R o/r pr merge 7",
+            "unbuffer glab mr -R o/r accept 12",
+            'setsid bash -c "gh -R o/r pr merge 7"',
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_the_merge_alias_rules_do_not_over_deny():
+    """The three widenings above (`accept` alias, assignment substitution,
+    trailing-argv runners) can only ADD argvs — ordinary read-only forge
+    use, unrelated assignments, and unrelated runner-wrapped commands must
+    all stay allowed in both modes."""
+    for readonly in (False, True):
+        for cmd in (
+            "gh pr view 7",
+            "gh pr list",
+            "gh -R o/r pr view 7",
+            'gh pr view --json title',
+            "glab mr list",
+            "glab mr view 12",
+            'gh issue create --title "pr" --body "merge"',
+            "grep -n 'pr merge' docs/security.md",
+            "v=$(git rev-parse HEAD)",
+            "x=$(gh pr view 7)",
+            "setsid pytest -k approve",
+            "pytest -k approve",
+            "git -C . log",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert d.allow, f"readonly={readonly} must stay allowed: {cmd!r} -> {d.reason}"
+    # NOT included above: `echo 'glab mr accept 12'` — the existing quoted-
+    # mention polarity denies it by design (same as `echo 'gh pr merge 7'`
+    # already does), so adding it here would assert the opposite of current,
+    # intentional behavior.
+
+
+def test_the_alias_and_assignment_rules_stay_linear_on_a_50k_input():
+    """Mirrors `test_the_forge_recursion_is_depth_bounded`'s adversarial
+    shape for the new code paths specifically: 1000 nested
+    `x=$(bash -c "...")` wrappers around a `glab mr accept 12` payload,
+    which exercises `_ASSIGN_SUBST_HEAD` and the runner recursion together
+    on every nesting level. `_depth < 2` still bounds the recursion, so cost
+    stays O(command length) regardless of nesting count."""
+    payload = 'echo "glab mr accept 12"'
+    for _ in range(1000):
+        payload = f'x=$(bash -c "{payload}") # {"y" * 40}'
+    assert len(payload) > 50_000
+    for readonly in (False, True):
+        start = time.perf_counter()
+        d = guard.evaluate("Bash", {"command": payload}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, readonly=readonly)
+        elapsed = time.perf_counter() - start
+        print(f"readonly={readonly} elapsed={elapsed:.4f}s len={len(payload)}")
+        assert elapsed < 1.0, (
+            f"readonly={readonly} alias/assignment recursion took "
+            f"{elapsed:.3f}s on a 1000-wrapper command")
+        assert not d.allow, "the innermost alias, however deeply wrapped, must still deny"
+
+
+def test_no_previously_denied_forge_spelling_became_allowed():
+    """Table of every spelling the existing tests already pin as DENY —
+    pinned again here so a future rewrite that deletes or narrows a lexical
+    rule (the failure mode that has hit this file before) fails on THIS
+    test, independent of the alias/assignment/runner tests above."""
+    for readonly in (False, True):
+        for cmd in (
+            "gh -R o/r pr merge 7",
+            "gh pr -R o/r merge 7",
+            "gh -H pr merge 7",
+            "glab -R o/r mr merge 12",
+            "`gh pr merge 7`",
+            'bash -c "gh pr merge 7"',
+            "if true; then gh -R o/r pr merge 7; fi",
+            "$(gh -R o/r pr merge 7)",
+            "{ gh -R o/r pr merge 7; }",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
+def test_the_out_of_scope_gaps_are_disclosed():
+    """`ssh` and `find -exec` are declared out of scope rather than silently
+    unhandled — docs/security.md and CHANGELOG.md must name both, alongside
+    the pre-existing `case...esac` disclosure."""
+    security_md = (_REPO_ROOT / "docs" / "security.md").read_text()
+    changelog_md = (_REPO_ROOT / "CHANGELOG.md").read_text()
+    for text, name in ((security_md, "docs/security.md"), (changelog_md, "CHANGELOG.md")):
+        assert "ssh" in text, f"{name} must disclose the ssh gap"
+        assert "find" in text and "-exec" in text, f"{name} must disclose the find -exec gap"
+
+
 def test_merge_stack_denial_does_not_overcorrect():
     """The other direction: ordinary agent git/gh workflow — including the
     WORD "merge" in a PR title or comment (a guard once denied an agent
