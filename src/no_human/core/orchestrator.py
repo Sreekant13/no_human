@@ -5120,7 +5120,7 @@ class Orchestrator:
                     else:
                         return await self._gate_already_satisfied(
                             task, repo, attempt_id, claim, branch=branch,
-                            attempt_n=attempt_n,
+                            attempt_n=attempt_n, result=result, base=base,
                         )
             if resumed_commit is None:
                 detail = _NO_CHANGES_DETAIL
@@ -8274,6 +8274,7 @@ class Orchestrator:
     async def _gate_already_satisfied(
         self, task: Task, repo: GitRepo, attempt_id: str, claim: str, *,
         branch: str | None, attempt_n: int | None = None,
+        result: Any = None, base: str | None = None,
     ) -> TaskOutcome:
         """A zero-diff attempt claimed every criterion is ALREADY met, with the
         per-criterion evidence table. Never take the coder's word for it: the
@@ -8416,6 +8417,43 @@ class Orchestrator:
             criteria=len(task.acceptance_criteria or []),
             advisory=advisory_pass, pr_url=pr_url,
         )
+
+        # Rebuild the PR body through the SAME _gather_evidence/_pr_body chain
+        # _finalize uses, and post the SAME review-checklist comment — so a
+        # PR delivered via the already-satisfied gate is not left with the
+        # pre-gate draft body (no Evidence table, no checklist comment).
+        # Best-effort: evidence never blocks a gate that already passed.
+        _dctx = task.context or {}
+        may_refresh_body = bool(_dctx.get("pr_draft_created")) and \
+            _dctx.get("pr_draft_branch") == branch
+        if pr_url and may_refresh_body and \
+                pr_url == str(_dctx.get("pr_draft_created") or "").strip():
+            try:
+                from types import SimpleNamespace
+                receipts = await self.store.list_verification_receipts(attempt_id)
+                evidence = self._gather_evidence(
+                    task, test_evidence=None, receipts=receipts,
+                    head_sha=reviewed_sha, repo=repo,
+                    review_checklist=decision.as_dict(),
+                    observable=self._backend_is_observable())
+                body = self._pr_body(
+                    task, SimpleNamespace(sha=reviewed_sha), result,
+                    test_evidence=None, receipts=receipts, repo=repo, base=base,
+                    branch=branch, attempt_n=attempt_n, evidence=evidence)
+                await asyncio.to_thread(
+                    open_pr, repo, branch, self._commit_message(task), body,
+                    base=base or "main",
+                    github_hosts=self.config.get("git", {}).get("github_hosts"),
+                    update_existing_body=True)
+            except Exception as exc:  # noqa: BLE001 — evidence never blocks the gate
+                self._advisory(f"already-satisfied PR body not refreshed: {exc}")
+        if pr_url:
+            try:
+                await self._post_review_checklist_comment(
+                    task, pr_url, decision.as_dict(),
+                    head_sha=reviewed_sha, rounds=review_round)
+            except Exception as exc:  # noqa: BLE001 — a comment never blocks the gate
+                self._advisory(f"review checklist comment not posted: {exc}")
 
         # Promote a resolved draft to ready — only when there IS a PR that
         # could be a draft. Best-effort: the review passed and the PR exists

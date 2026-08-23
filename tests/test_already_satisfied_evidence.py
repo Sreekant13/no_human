@@ -45,7 +45,7 @@ from no_human.doctor import diagnose
 from no_human.notify.slack import SlackNotifier
 from no_human.review.reviewer import ReviewDecision
 from no_human.review.selfcheck import ChecklistItem
-from no_human.vcs import github
+from no_human.vcs import comment_poster, github
 from no_human.vcs.task_pr import (
     AWAITING_APPROVAL_EVIDENCE_KINDS,
     DONE_EVIDENCE_KINDS,
@@ -106,6 +106,39 @@ def _spy_gh_ready(monkeypatch, *, returncode: int = 0, stdout: str = "", stderr:
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
         return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(github.subprocess, "run", fake_run)
+    return calls
+
+
+def _spy_gh_full(monkeypatch, *, pr_url: str | None = None, ready_returncode: int = 0):
+    """Like `_spy_gh_ready`, but also answers `gh pr create` ("already
+    exists"), `gh pr list` (resolves the existing PR) and `gh pr edit`
+    (captures the rebuilt body) — the extra calls the body-refresh path
+    (`vcs/__init__.py:open_pr` -> `github.open_pr`) makes, on top of the
+    checklist-comment `gh api` calls and `gh pr ready` promotion
+    `_spy_gh_ready` already answers. Every OTHER subprocess call (git
+    plumbing) runs for real."""
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if argv[:1] != ["gh"]:
+            return real_run(argv, **kwargs)
+        calls.append(list(argv))
+        if argv[1:3] == ["pr", "create"]:
+            return subprocess.CompletedProcess(
+                argv, 1, "",
+                'a pull request for branch "x" into branch "main" already exists')
+        if argv[1:3] == ["pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, (pr_url or "") + "\n", "")
+        if argv[1:3] == ["pr", "edit"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[1:3] == ["pr", "ready"]:
+            return subprocess.CompletedProcess(argv, ready_returncode, "", "")
+        # gh api ... — the checklist comment's read (GET, no -X) and post
+        # (POST, -X). No marker in the (empty) existing-comments read.
+        return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(github.subprocess, "run", fake_run)
     return calls
@@ -204,10 +237,22 @@ async def test_already_satisfied_terminal_leaves_typed_evidence_and_a_ready_pr(
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
     assert outcome.pr_url == "https://github.com/acme/widgets/pull/9", outcome.pr_url
-    # The real `gh pr ready <url>` argv, produced by github.mark_pr_ready via
-    # promote_draft_pr's remote-routing — not a stubbed orchestrator call.
-    assert gh_calls == [["gh", "pr", "ready",
-                         "https://github.com/acme/widgets/pull/9"]], gh_calls
+    # The already-satisfied gate now also posts the review checklist comment
+    # (via the SAME `_post_review_checklist_comment` helper `_finalize` uses)
+    # before promoting the draft: a read of existing comments (no marker
+    # found), then the post itself, then the real `gh pr ready <url>` argv
+    # produced by github.mark_pr_ready via promote_draft_pr's remote-routing.
+    assert len(gh_calls) == 3, gh_calls
+    assert gh_calls[0] == ["gh", "api", "--hostname", "github.com", "--paginate",
+                           "repos/acme/widgets/issues/9/comments?per_page=100"], gh_calls
+    assert gh_calls[1][:6] == ["gh", "api", "--hostname", "github.com", "-X", "POST"], \
+        gh_calls
+    assert gh_calls[1][6] == "repos/acme/widgets/issues/9/comments", gh_calls
+    assert gh_calls[2] == ["gh", "pr", "ready",
+                           "https://github.com/acme/widgets/pull/9"], gh_calls
+
+    review_comments = [e for e in events if e.get("kind") == "review_comment"]
+    assert review_comments and review_comments[-1].get("status") == "posted", events
 
     already = [e for e in events if e.get("kind") == "already_satisfied"]
     assert already, events
@@ -327,9 +372,15 @@ async def test_already_satisfied_terminal_records_advisory_when_promotion_fails(
 
     # And the real `gh pr ready <url>` subprocess call actually happened —
     # promote_draft_pr's remote-routing dispatched to github.mark_pr_ready
-    # rather than a stub answering for it.
-    assert gh_calls == [["gh", "pr", "ready",
-                         "https://github.com/acme/widgets/pull/9"]], gh_calls
+    # rather than a stub answering for it. The checklist-comment attempt also
+    # ran first: this spy returns returncode=1 for EVERY gh call, so reading
+    # existing comments fails too ("unverifiable") and no POST is attempted —
+    # `post_to_pr_once` never risks a duplicate post on an unreadable PR.
+    assert gh_calls == [
+        ["gh", "api", "--hostname", "github.com", "--paginate",
+         "repos/acme/widgets/issues/9/comments?per_page=100"],
+        ["gh", "pr", "ready", "https://github.com/acme/widgets/pull/9"],
+    ], gh_calls
 
 
 # --------------------------------------------------------------------------- #
@@ -493,3 +544,215 @@ def test_restore_approval_accepts_pr_draft_only_evidence(tmp_path):
     assert len(repaired) == 1, events
     assert (t.context or {}).get("pr_closed_repaired_url") == \
         "https://example.invalid/pr/9"
+
+
+# --------------------------------------------------------------------------- #
+# already-satisfied PR delivery must reuse _finalize's own two helpers:      #
+# _pr_body (via _gather_evidence) and _post_review_checklist_comment.        #
+# --------------------------------------------------------------------------- #
+
+def _head_sha(work):
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=work, capture_output=True,
+        text=True, check=True,
+    ).stdout.strip()
+
+
+async def test_already_satisfied_rebuilds_the_pr_body_through_pr_body(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """AC1: a PR delivered through the already-satisfied gate must not keep
+    its pre-gate draft body (opened before review ran — no `## Evidence`
+    table, no review verdict, no Verifiers row). The gate now rebuilds it
+    through the SAME `_gather_evidence` -> `_pr_body` ->
+    `open_pr(..., update_existing_body=True)` chain `_finalize` uses,
+    exercised end to end: `gh pr create` -> "already exists" -> `gh pr list`
+    -> `gh pr edit --body <body>`, whose captured body is asserted here.
+    """
+    branch = "no-human/add-mul"
+    # `_run_attempt`'s `pr_branch` shortcut does `repo.checkout(branch)` (no
+    # implicit create) — the branch must already exist locally.
+    _git(bare_repo, "branch", branch)
+    head_sha = _head_sha(bare_repo)
+
+    reviewer = FakeReviewer(_PASSING)
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    events = []
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer,
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    t.context = {
+        "eval_result": {"verdict": "accept"},
+        "pr_branch": branch,
+        "pr_draft_created": pr_url,
+        "pr_draft_branch": branch,
+        # Seeds the Verifiers row: production writes this same key under
+        # the reviewed sha; `_gather_evidence` reads it back by that key.
+        "verifier_results": {
+            head_sha: [{
+                "verifier_id": "type_check", "passed": True,
+                "evidence": "mypy clean", "file": "calc.py", "line": 1,
+                "comment": "", "severity": "info", "files_checked": ["calc.py"],
+                "tokens_used": 0, "raw_output": "", "no_verdict": False,
+                "unavailable": False,
+            }],
+        },
+    }
+    await store.create_task(t)
+
+    gh_calls = _spy_gh_full(monkeypatch, pr_url=pr_url)
+
+    outcome = await orch.run_task(t)
+    await store.save_events(t.id, events)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url == pr_url, outcome.pr_url
+
+    edit_calls = [c for c in gh_calls if c[1:3] == ["pr", "edit"]]
+    assert len(edit_calls) == 1, gh_calls
+    assert edit_calls[0][4] == "--body", edit_calls[0][:5]
+    body = edit_calls[0][5]
+
+    assert body.startswith("## Evidence"), body[:200]
+    assert "| Independent review | ✅ **PASSED**" in body, body
+    assert "| Verifiers |" in body, body
+    # test_evidence=None by design (this path runs no test command) — the
+    # Tests row must never claim a pass; _test_evidence_section renders no
+    # row at all for a non-dict test_evidence.
+    assert "| Tests |" not in body, body
+
+
+async def test_already_satisfied_posts_the_review_checklist_comment_once(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """AC2: the reviewer checklist comment is posted exactly once, through
+    the SAME `_post_review_checklist_comment` helper `_finalize` uses. A
+    second post attempt on the same PR is a no-op (`skipped_duplicate`)."""
+    reviewer = FakeReviewer(_PASSING)
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    events = []
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer,
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    t.context = {
+        "eval_result": {"verdict": "accept"},
+        "pr_draft_created": pr_url,
+        # Deliberately NOT the run's real (UUID-derived) branch — proves the
+        # comment posts regardless of the body-refresh ownership match
+        # (that predicate is AC1's concern, not the checklist's).
+        "pr_draft_branch": "no-human/add-mul",
+    }
+    await store.create_task(t)
+    _spy_gh_ready(monkeypatch)
+
+    forge: list[str] = []
+    monkeypatch.setattr(
+        comment_poster, "marker_present_on_pr",
+        lambda url, marker: (True, any(marker in b for b in forge)))
+    monkeypatch.setattr(
+        comment_poster, "post_to_pr",
+        lambda url, body: forge.append(body) or
+            {"ok": True, "mode": "issue_comment", "error": ""})
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert len(forge) == 1, forge
+    assert Orchestrator.REVIEW_CHECKLIST_MARKER in forge[0]
+
+    # A second PASS on the same PR (e.g. a repeat already-satisfied claim)
+    # posts nothing further — the same idempotent, marker-based helper.
+    result = await orch._post_review_checklist_comment(
+        t, pr_url, _PASSING.as_dict(), head_sha="deadbeef", rounds=1)
+    assert result is True
+    assert len(forge) == 1, forge
+
+
+async def test_already_satisfied_with_no_pr_posts_nothing_and_opens_none(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """AC3a: a task with no PR at all (no draft, no watch, no attempt url)
+    opens none and posts nothing — no `gh pr create`/`gh pr edit`/`gh pr
+    ready` call, and the checklist comment poster is never invoked."""
+    reviewer = FakeReviewer(_PASSING)
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    events = []
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer,
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    gh_calls = _spy_gh_full(monkeypatch)
+    forge: list[str] = []
+    monkeypatch.setattr(comment_poster, "marker_present_on_pr",
+                        lambda url, marker: (True, False))
+    monkeypatch.setattr(
+        comment_poster, "post_to_pr",
+        lambda url, body: forge.append(body) or
+            {"ok": True, "mode": "issue_comment", "error": ""})
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert not outcome.pr_url, outcome.pr_url
+    assert gh_calls == [], gh_calls
+    assert forge == [], forge
+
+
+async def test_already_satisfied_does_not_rewrite_a_draft_it_does_not_own(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """AC3b: a PR this run did not open — surfaced via `pr_watch` (a
+    human-linked PR the task is merely tracking, with no `pr_draft_created`
+    this run set) — must never have its body rewritten (only the run that
+    opened the draft may rewrite it, `vcs/github.py:66`), while the
+    checklist comment still posts (additive, safe regardless of ownership).
+    """
+    branch = "no-human/human-opened"
+    _git(bare_repo, "branch", branch)
+
+    reviewer = FakeReviewer(_PASSING)
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    events = []
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer,
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    t.context = {
+        "eval_result": {"verdict": "accept"},
+        "pr_watch": pr_url,
+        "pr_branch": branch,
+    }
+    await store.create_task(t)
+
+    gh_calls = _spy_gh_full(monkeypatch, pr_url=pr_url)
+    forge: list[str] = []
+    monkeypatch.setattr(comment_poster, "marker_present_on_pr",
+                        lambda url, marker: (True, False))
+    monkeypatch.setattr(
+        comment_poster, "post_to_pr",
+        lambda url, body: forge.append(body) or
+            {"ok": True, "mode": "issue_comment", "error": ""})
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url == pr_url, outcome.pr_url
+    assert not any(c[1:3] == ["pr", "edit"] for c in gh_calls), gh_calls
+    assert not any(c[1:3] == ["pr", "create"] for c in gh_calls), gh_calls
+    assert len(forge) == 1, forge
