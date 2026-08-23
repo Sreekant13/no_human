@@ -135,7 +135,7 @@ named here.
   `git fetch origin` (`vcs/git.py:767`, `:797`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:2778`). This is *your* command, not the agent's — an agent
+  (`cli/commands.py:2785`). This is *your* command, not the agent's — an agent
   session's Bash is denied it for the spellings the rule models
   (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
   in both session modes; see §2 for the bound.
@@ -221,7 +221,7 @@ named here.
   **The control that does close the door is not this.** It is a check at the
   act: `nh approve` refusing inside an agent session, and the four gate-ending
   routes requiring something an agent session does not have. That check is
-  **not implemented today** — neither `nh approve` (`cli/commands.py:4597`)
+  **not implemented today** — neither `nh approve` (`cli/commands.py:4604`)
   nor the API's `approve_task` route (`api/app.py:1022`) tests for an agent
   session — so nothing here should be read as telling you to rely on it.
 

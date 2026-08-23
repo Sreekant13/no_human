@@ -367,6 +367,38 @@ exception, for friends/commercial installs that pay Anthropic directly with
 4. No OAuth token is exported into the process env in this mode.
 5. The run is attributed to the `api_key` profile for cost/audit tracking.
 
+### `llm.codex_auth_mode` — two modes for the `codex` coder backend
+
+Only consulted when `worker.backend` (or a task's `--backend`) is `codex`.
+Reviewer, planner, supervisor and utility stay on Claude in **both** modes —
+`CLAUDE_PINNED_ROLES` is untouched by this setting. See
+[BACKENDS.md](BACKENDS.md) for the full comparison table.
+
+**`codex_auth_mode: api_key` (default, unchanged).** `OPENAI_API_KEY`, loaded
+from `~/.no_human/.env` only — never from config.yaml, never from an ambient
+process env fallback. The CLI is invoked with
+`preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
+login that happens to be present on the machine. Default model:
+`gpt-5.3-codex` (`llm.codex_model`, overridable).
+
+**`codex_auth_mode: subscription` (opt-in, added 2026-08-22).** Drives the
+coder from a Codex CLI session signed in via `codex login` — the operator's
+own ChatGPT plan. no_human is never the authenticating party: it never calls,
+wraps, or shells out to `codex login` itself, and never reads, parses, or
+`stat()`s `~/.codex/auth.json`. The operator runs `codex login` themselves
+before selecting this mode; no_human only checks the resulting session
+read-only, via `codex login status` (`codex_login_status()` in
+`agent/codex_backend.py`, and `nh doctor`'s Codex row). `preferred_auth_method`
+is omitted entirely from the CLI invocation in this mode — there is no key to
+force, and forcing `"apikey"` would make the CLI refuse the very session this
+mode exists to use. Default model: `gpt-5.6-terra` (`llm.codex_model`,
+overridable) — codex-branded ids (`gpt-5.3-codex`, `gpt-5.1-codex*`) are
+refused by a live ChatGPT session with "not supported when using Codex with a
+ChatGPT account," so the api_key default is not reused here.
+
+Each mode scrubs the other's metered routes (`assert_codex_mode` in
+`config.py`) so a run bills exactly one path.
+
 ### `llm.local_model` / `llm.local_base_url` / `llm.local_cli_path`
 
 Reserved for `worker.backend: local`. `local_base_url` is **required** in

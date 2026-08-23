@@ -1,4 +1,5 @@
-"""The second coding backend: OpenAI Codex, BYO-API-key only.
+"""The second coding backend: OpenAI Codex, on a BYO-API-key OR a ChatGPT
+subscription — see TWO SANCTIONED AUTH PATHS below.
 
 WHY A SUBPROCESS AND NOT THE OpenAI PYTHON SDK. Constraint §6's "no
 re-implemented tools" survived the 2026-08-01 amendment untouched: a second
@@ -11,10 +12,11 @@ thing. The Codex CLI already ships all of that. So this backend drives
 CLI: a subprocess, a JSONL event stream, and a normalizer. It adds ZERO Python
 dependencies for the same reason the Claude path needs no ``anthropic`` package.
 
-WHY BYO-API-KEY ONLY, AND NOTHING ELSE. An earlier version of this docstring
-asserted, as settled fact, that OpenAI's terms forbid a ChatGPT sign-in from
-driving a third-party service. That sentence was never sourced — no such
-clause was found in OpenAI's terms — and is withdrawn.
+TWO SANCTIONED AUTH PATHS, selected by ``llm.codex_auth_mode`` (default
+``"api_key"``, so no existing install's behaviour changes — operator
+amendment, 2026-08-22). The same sourcing is duplicated above
+``CODEX_API_KEY_VAR`` in ``config.py`` so the assert functions there carry it
+too; this copy is the primary one.
 
 WHAT OPENAI'S OWN DOCUMENTATION SAYS, quoted from
 ``developers.openai.com/codex/auth`` (308-redirects to
@@ -30,31 +32,38 @@ WHAT OPENAI'S OWN DOCUMENTATION SAYS, quoted from
     public environments."
 
 So a ChatGPT sign-in IS an officially documented Codex CLI method for local
-work — the first two quotes above contradict the withdrawn sentence for
-exactly the case we would use. The THIRD quote is the unfavourable half and
-must not be dropped just because it is unfavourable: OpenAI steers
-PROGRAMMATIC workflows — CI/CD jobs, nearer what no_human does, since it
-drives the CLI unattended with nobody at the keyboard — to the API key, not
-to a ChatGPT sign-in.
+work — which is why subscription mode is now sanctioned below. The THIRD
+quote is the unfavourable half and is not dropped just because it is
+unfavourable: OpenAI steers PROGRAMMATIC workflows — CI/CD jobs, nearer what
+no_human does, since it drives the CLI unattended with nobody at the
+keyboard — to the API key, not to a ChatGPT sign-in. That is exactly why
+``"api_key"`` stays the DEFAULT even though ``"subscription"`` is now offered.
 
-STILL OPEN, named here as open rather than resolved: whether a THIRD-PARTY
+STILL OPEN, named here as open rather than resolved: whether a third-party
 tool may drive that ChatGPT sign-in on a user's behalf. ``openai/codex``
 discussion #8338 asked exactly this question; an OpenAI maintainer answered
 only the licensing half and left the policy half unresolved — unanswered,
-not settled either way.
+not settled either way. This is the operator's call taken under stated
+uncertainty, not a finding of law — a lawyer should still settle it.
 
-So BYO-API-key is the deliberately CONSERVATIVE choice under genuine
-uncertainty, not a finding of law: the one path whose terms are unambiguous,
-taken pending legal advice. A lawyer should settle this, and the answer may
-well be that a subscription path is fine. Until then there is NO
-subscription path here: no browser login flow, no ``codex login``, no reuse
-of a ChatGPT session. The run demands ``OPENAI_API_KEY`` from
-``~/.no_human/.env`` (the mode lives in config, the key never does — the
-same rule as constraint §1) and passes ``preferred_auth_method=apikey`` so
-the CLI cannot silently fall back to a ChatGPT credential that happens to be
-on the machine. If the key is absent the backend refuses to start rather
-than degrading to whatever auth it finds.
-See ``config.assert_codex_api_key_mode``.
+* **"api_key"** (default, unchanged behaviour). The run demands
+  ``OPENAI_API_KEY`` from ``~/.no_human/.env`` (the mode lives in config, the
+  key never does — the same rule as constraint §1) and passes
+  ``preferred_auth_method=apikey`` so the CLI cannot silently fall back to a
+  ChatGPT credential that happens to be on the machine. If the key is absent
+  the backend refuses to start rather than degrading to whatever auth it
+  finds. See ``config.assert_codex_api_key_mode``.
+* **"subscription"** (opt-in). no_human holds NO OpenAI credential of its own:
+  it never calls, wraps or shells out to ``codex login`` — the operator runs
+  that themselves — and it never reads, parses, copies or even stats the
+  local ChatGPT credential file. Presence is an existence check only, via
+  ``codex login status`` (see :func:`codex_login_status`). Because there is no
+  key to point at, ``preferred_auth_method`` is simply OMITTED from argv in
+  this mode rather than pointed at a value we don't have. See
+  ``config.assert_codex_subscription_mode``.
+
+Both modes scrub the OTHER mode's credentials from the child env, so a run
+always bills exactly one path (constraint §6).
 
 WHAT THIS BACKEND CANNOT DO, stated here and declared in
 :data:`CODEX_CAPABILITIES` so it is a fact at the seam rather than a surprise:
@@ -88,6 +97,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
+from ..config import CODEX_SUBSCRIPTION_SCRUB_VARS
 from . import guard
 from .backend import (
     AgentEvent,
@@ -133,7 +143,29 @@ _ITEM_TOOL_NAMES = {
 
 
 class CodexAuthError(RuntimeError):
-    """Codex was selected without a usable BYO ``OPENAI_API_KEY``."""
+    """Codex was selected without a usable credential for the selected mode."""
+
+
+class CodexModelUnsupportedError(RuntimeError):
+    """The vendor refused ``llm.codex_model`` under the selected auth mode.
+
+    Observed verbatim (2026-08-22, real ``codex exec`` call, ChatGPT session):
+    ``"The 'gpt-5-codex' model is not supported when using Codex with a
+    ChatGPT account."`` — a codex-branded model id refused under a
+    subscription session. The reverse (a ChatGPT-only id refused under an
+    api_key session) is not ruled out and is matched by the same check.
+    """
+
+    def __init__(self, *, mode: str, model: str, detail: str):
+        self.mode = mode
+        self.model = model
+        self.detail = detail
+        super().__init__(
+            f"the vendor refused model {model!r} under "
+            f"llm.codex_auth_mode: {mode!r}: {detail} "
+            f"Set llm.codex_model to an id that works under this mode, or "
+            f"switch llm.codex_auth_mode."
+        )
 
 
 def find_codex_cli(explicit: str | None = None) -> str | None:
@@ -165,14 +197,6 @@ def find_codex_cli(explicit: str | None = None) -> str | None:
     return None
 
 
-#: Per-process cache for the two read-only CLI probes below, keyed by
-#: resolved CLI path. `_command` runs once per attempt but a single process
-#: can launch many attempts, so this keeps each unique CLI path to one
-#: `--help`/`--version` subprocess spawn for the life of the process rather
-#: than one per attempt. `_HELP_CACHE` is keyed by `(cli, resume)` because
-#: `codex exec resume --help` documents a DIFFERENT, narrower flag surface
-#: than `codex exec --help` (verified live: no `--cd`, no `--sandbox`) — the
-#: two must never share a cache slot.
 _HELP_CACHE: dict[tuple[str, bool], str | None] = {}
 _VERSION_CACHE: dict[str, str] = {}
 
@@ -186,18 +210,12 @@ def reset_probe_caches() -> None:
 def codex_exec_help(cli: str, *, resume: bool = False, timeout: float = 10.0) -> str | None:
     """Return ``codex exec [resume] --help``'s combined stdout+stderr, or None.
 
-    Read-only, cached per ``(cli, resume)``. This is how :func:`approval_args`
-    learns which non-interactive flag the INSTALLED binary actually accepts
-    instead of assuming one — codex-cli moved ``--ask-for-approval`` off
-    ``exec`` and onto only the root ``codex`` command at some point before
-    0.149.0 (confirmed live: ``codex exec --help`` lacks it, ``codex --help``
-    has it at ``-a, --ask-for-approval <APPROVAL_POLICY>``), and a hardcoded
-    flag silently started failing every Codex-backed attempt at launch.
-
-    ``resume=True`` probes ``codex exec resume --help`` instead: that
-    subcommand accepts neither ``--cd`` nor ``--sandbox`` (a resumed thread
-    inherits both from the session it is resuming), so the resume argv must be
-    validated against its OWN help text, not the non-resume one.
+    codex-cli moved ``--ask-for-approval`` off ``exec`` and onto only the root
+    ``codex`` command at some point before 0.149.0 — the exact version this
+    happened in is not pinned here, so the installed CLI's own ``--help`` text
+    is asked rather than assumed. Cached per ``(cli, resume)`` so a session
+    that launches many turns does not re-spawn a probe subprocess per turn;
+    :func:`reset_probe_caches` clears it between test cases.
     """
     key = (cli, resume)
     if key in _HELP_CACHE:
@@ -219,10 +237,10 @@ def codex_exec_help(cli: str, *, resume: bool = False, timeout: float = 10.0) ->
 def codex_version(cli: str, *, timeout: float = 10.0) -> str:
     """Return ``codex --version``'s first output line, or a placeholder.
 
-    Read-only, cached per CLI path. Used only for human-facing messages
-    (``nh doctor``, the :class:`BackendUnavailable` raised by
-    :func:`approval_args`) — never parsed for a version comparison, since the
-    flag probe in :func:`codex_exec_help` is the actual source of truth.
+    Used only to name the installed CLI in :func:`approval_args`'s error
+    message when neither known approval-suppression flag is available —
+    never parsed or compared against for behaviour, so an unrecognised
+    version format degrades to the placeholder rather than raising.
     """
     if cli in _VERSION_CACHE:
         return _VERSION_CACHE[cli]
@@ -349,6 +367,106 @@ def model_error_from_failure(msg: dict, model: str) -> CodexModelUnavailable | N
     )
 
 
+#: Substring match, deliberately loose: the vendor's message is observed to
+#: nest a JSON-encoded string inside `error.message` (see the module's own
+#: measurement notes), so matching on exact JSON shape would break on the
+#: next minor vendor release. The phrase itself is what OpenAI's CLI prints
+#: today; if it changes, this stops firing and the run surfaces the vendor's
+#: raw text instead — a missed classification, not a wrong one.
+_MODEL_UNSUPPORTED_MARKER = "not supported when using codex with a"
+
+
+def _classify_vendor_error(text: str, *, mode: str, model: str) -> "CodexModelUnsupportedError | None":
+    """``text`` → a typed error if it is the vendor's "wrong account type for
+    this model" refusal, else None (unrecognised text is not this backend's
+    to classify further — the caller falls back to the raw message).
+    """
+    if _MODEL_UNSUPPORTED_MARKER in (text or "").lower():
+        return CodexModelUnsupportedError(mode=mode, model=model, detail=text.strip())
+    return None
+
+
+@dataclass(frozen=True)
+class CodexSessionStatus:
+    """The verdict of one ``codex login status`` probe. Existence check ONLY —
+    nothing here is, or is derived from, the credential itself.
+
+    ``via`` is the CLI's own account-type wording, matched loosely
+    (``"chatgpt"`` / ``"api_key"`` / ``"unknown"`` / ``"none"``) — see
+    :func:`codex_login_status`'s docstring for the full state table.
+    ``detail`` is raw CLI stdout/stderr for LOGS ONLY: never printed by
+    ``nh doctor`` or surfaced in any error message, because it can echo
+    account identifiers the CLI chooses to print.
+    """
+
+    present: bool
+    via: str  # "chatgpt" | "api_key" | "unknown" | "none"
+    detail: str = ""
+
+
+def codex_login_status(cli_path: str | None = None, timeout_s: float = 10.0) -> CodexSessionStatus:
+    """Ask the ``codex`` CLI itself whether a session is live. Existence
+    check ONLY.
+
+    Never calls, wraps or shells out to ``codex login`` — only
+    ``codex login status`` — and never reads, parses, copies or even stats
+    the local ChatGPT credential file. This is the one function subscription
+    mode uses to learn anything about credential state; everything else in
+    this module is downstream of its verdict.
+
+    State table (mirrors PLAN.md verbatim):
+
+    =====================================  =========================
+    Observation                            Verdict
+    =====================================  =========================
+    :func:`find_codex_cli` → None          present=False, via="none"
+    rc 0, stdout matches /chatgpt/i        present=True, via="chatgpt" (accept)
+    rc 0, stdout matches /api key/i        present=True, via="api_key" (refuse
+                                            in subscription mode — that is a
+                                            key-backed session, not the plan)
+    rc 0, unrecognised wording             present=True, via="unknown" (accept
+                                            — the CLI's own verdict wins)
+    rc != 0                                present=False
+    timeout / not found / permission /     present=False, detail captured,
+    other OSError                          never raised
+    =====================================  =========================
+
+    Runs with every var in :data:`no_human.config.CODEX_SUBSCRIPTION_SCRUB_VARS`
+    removed from ITS OWN env, so a stray ``OPENAI_API_KEY`` on the machine
+    cannot make the CLI answer "logged in with an API key" and slip an
+    api_key-backed session past the subscription-mode gate.
+    """
+    cli = find_codex_cli(cli_path)
+    if cli is None:
+        return CodexSessionStatus(present=False, via="none", detail="codex CLI not found")
+
+    env = dict(os.environ)
+    for var in CODEX_SUBSCRIPTION_SCRUB_VARS:
+        env.pop(var, None)
+
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [cli, "login", "status"], capture_output=True, text=True,
+            timeout=timeout_s, env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return CodexSessionStatus(present=False, via="none", detail=f"timed out: {exc}")
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        return CodexSessionStatus(present=False, via="none", detail=str(exc))
+
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode != 0:
+        return CodexSessionStatus(present=False, via="none", detail=output.strip()[-500:])
+
+    low = output.lower()
+    if "chatgpt" in low:
+        return CodexSessionStatus(present=True, via="chatgpt", detail=output.strip()[-500:])
+    if "api key" in low:
+        return CodexSessionStatus(present=True, via="api_key", detail=output.strip()[-500:])
+    return CodexSessionStatus(present=True, via="unknown", detail=output.strip()[-500:])
+
+
 @dataclass
 class _Usage:
     """One turn's token report, already translated into THIS ledger's classes.
@@ -413,6 +531,7 @@ class CodexBackend:
         model: str = DEFAULT_CODEX_MODEL,
         reasoning_effort: str | None = None,
         cli_path: str | None = None,
+        auth_mode: str = "api_key",
         forbidden_paths: list[str] | None = None,
         never_push_to: list[str] | None = None,
         readonly: bool = False,
@@ -421,6 +540,12 @@ class CodexBackend:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.cli_path = cli_path
+        # "api_key" (default) or "subscription" — see the module docstring's
+        # "TWO SANCTIONED AUTH PATHS". Read by `_child_env` and `_command`;
+        # never used to pick which credential to bill (the assert_codex_*
+        # functions in config.py already ran that gate before this backend
+        # was constructed — this is the point-of-use re-check).
+        self.auth_mode = auth_mode
         # Same defaults as ClaudeBackend, and mutable for the same reason: the
         # orchestrator rewrites both per task on a reused instance.
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
@@ -437,38 +562,75 @@ class CodexBackend:
     def _child_env(self) -> dict[str, str]:
         """The subprocess environment: exactly one billing path, ours.
 
+        Dispatches on ``self.auth_mode`` — see the module docstring's "TWO
+        SANCTIONED AUTH PATHS". Both branches strip the Anthropic credential
+        from the CHILD's env only — the parent process still needs it,
+        because the reviewer, planner, supervisor and utility tiers remain
+        Claude even when the coder is Codex.
+        """
+        if self.auth_mode == "subscription":
+            env = self._child_env_subscription()
+        else:
+            env = self._child_env_api_key()
+        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN"):
+            env.pop(var, None)
+        return env
+
+    def _child_env_api_key(self) -> dict[str, str]:
+        """``llm.codex_auth_mode: "api_key"`` (default). Unchanged behaviour.
+
         ``config.assert_codex_api_key_mode`` has already put ``OPENAI_API_KEY``
         in the process env and scrubbed the alternate OpenAI routings. This
         re-asserts the requirement at the point of use (a long-lived server may
-        have been started before the backend was switched) and strips the
-        Anthropic credential from the CHILD's env only — the parent process
-        still needs it, because the reviewer, planner, supervisor and utility
-        tiers remain Claude even when the coder is Codex.
+        have been started before the backend was switched).
         """
         env = dict(self._env_override if self._env_override is not None else os.environ)
         key = env.get("OPENAI_API_KEY")
         if not key:
             raise CodexAuthError(
                 "the coder backend is 'codex' (worker.backend, or this task's "
-                "--backend) but no OPENAI_API_KEY was found. "
-                "Codex runs on YOUR OWN OpenAI API key — there is no "
-                "subscription path here. Not because one is known to be "
-                "forbidden: OpenAI documents 'Sign in with ChatGPT' for local "
-                "Codex CLI use, but steers programmatic/CI workflows to an "
-                "API key, and whether a third-party tool may drive that "
-                "sign-in for you is unresolved. no_human takes the "
-                "conservative path until a lawyer settles it. See the module "
-                "docstring for the quoted source. Add the key to "
+                "--backend) but no OPENAI_API_KEY was found, and "
+                "llm.codex_auth_mode is 'api_key' (the default). Codex runs "
+                "on YOUR OWN OpenAI API key in this mode. Add the key to "
                 "~/.no_human/.env (chmod 600):\n"
                 "  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env\n"
-                "The key never belongs in config.yaml."
+                "The key never belongs in config.yaml. Or, to run on your "
+                "ChatGPT plan instead, set llm.codex_auth_mode: subscription "
+                "in config.yaml and sign in yourself with `codex login`. "
+                "Whether a third-party tool may drive that ChatGPT sign-in "
+                "is unresolved — a lawyer should still settle it."
             )
-        # A Claude credential in the child's environment cannot bill anything
-        # through `codex`, but it can be READ by any command the agent runs.
-        # Not exporting it is free and removes the whole question.
-        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
-                    "ANTHROPIC_AUTH_TOKEN"):
+        return env
+
+    def _child_env_subscription(self) -> dict[str, str]:
+        """``llm.codex_auth_mode: "subscription"``. Holds NO OpenAI credential.
+
+        Re-scrubs every var in ``config.CODEX_SUBSCRIPTION_SCRUB_VARS`` from
+        the CHILD's env only (both spellings of the OpenAI API key, plus
+        every alternate-routing var), then re-checks the ChatGPT session via
+        :func:`codex_login_status` — an existence check only; this function
+        never reads, parses, copies or stats the local ChatGPT credential
+        file. Mirrors ``config.assert_codex_subscription_mode``'s
+        scrub-then-check at the point of use, for the same "long-lived
+        server may have switched modes since startup" reason the api_key
+        branch re-asserts.
+        """
+        env = dict(self._env_override if self._env_override is not None else os.environ)
+        for var in CODEX_SUBSCRIPTION_SCRUB_VARS:
             env.pop(var, None)
+        status = codex_login_status(self.cli_path)
+        if not status.present or status.via == "api_key":
+            raise CodexAuthError(
+                "the coder backend is 'codex' and llm.codex_auth_mode is "
+                "'subscription', but no ChatGPT session was found (`codex "
+                "login status`). no_human holds no OpenAI credential in this "
+                "mode and never reads your local ChatGPT credential file — "
+                "sign in yourself:\n"
+                "  codex login\n"
+                "Or, to run on your own OpenAI API key instead, set "
+                "llm.codex_auth_mode: api_key in config.yaml."
+            )
         return env
 
     # ------------------------------------------------------------ command --
@@ -504,13 +666,13 @@ class CodexBackend:
             # `danger-full-access` is never used: an unsandboxed agent with no
             # PreToolUse veto has no safety boundary left at all.
             cmd += ["--sandbox", "read-only" if self.readonly else "workspace-write"]
-        cmd += [
-            # THE CONSERVATIVE-PATH GATE, in code: never fall back to a
-            # ChatGPT login that happens to exist on this machine. Not a
-            # known legal boundary — see the module docstring — but the
-            # deliberate choice while that question is unresolved.
-            "--config", 'preferred_auth_method="apikey"',
-        ]
+        if self.auth_mode == "api_key":
+            # THE LEGALITY GATE, in code: never fall back to a ChatGPT login
+            # that happens to exist on this machine. In "subscription" mode
+            # this is OMITTED, not pointed at a substitute value — there is
+            # no key to force, and forcing "apikey" here would make the
+            # subscription mode's own CLI calls refuse themselves.
+            cmd += ["--config", 'preferred_auth_method="apikey"']
         # Nobody is at the keyboard. An approval prompt in a headless run is
         # an indefinite hang, not a safety feature — but the flag that
         # suppresses it moved between CLI versions (codex-cli 0.149.0 dropped
@@ -859,6 +1021,18 @@ class CodexBackend:
             if with_code not in (0, -9) and not failure:
                 failure = (stderr.decode(errors="replace").strip()[-2000:]
                            or f"codex exited {with_code}")
+
+        # Classify AFTER both failure sources above (the JSON turn.failed/
+        # error branch and the non-zero-exit stderr branch) have had their
+        # chance to populate `failure` — one check covers both, since the
+        # vendor's "wrong account type for this model" refusal can arrive
+        # either way depending on CLI version.
+        if failure:
+            classified = _classify_vendor_error(
+                failure, mode=self.auth_mode, model=self.model)
+            if classified is not None:
+                failure = str(classified)
+                stop_reason = "model_unsupported"
 
         yield AgentEvent(
             "result",

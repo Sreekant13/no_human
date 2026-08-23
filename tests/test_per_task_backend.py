@@ -118,6 +118,46 @@ async def test_a_per_task_codex_run_without_the_cli_is_refused_at_construction(t
         await store.close()
 
 
+async def test_a_per_task_codex_subscription_run_is_preflighted_too(
+        tmp_path, monkeypatch):
+    """The dispatcher-aware twin of the two tests above: a task opts into
+    codex while the install's `llm.codex_auth_mode` is `subscription`, and
+    the per-task preflight must route through `assert_codex_mode` (not a
+    hardcoded api_key check) — refusing when no live ChatGPT session is
+    found, and never calling `codex login` or reading `~/.codex/auth.json`
+    itself to find out."""
+    from no_human.config import AuthError, load_config
+    from no_human.core.db import Store
+    import no_human.agent.codex_backend as cx
+
+    (tmp_path / "config.yaml").write_text(
+        "llm:\n  codex_auth_mode: subscription\n")
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.data["llm"]["codex_auth_mode"] == "subscription"
+
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(False, "none"))
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        with pytest.raises(AuthError, match="codex login"):
+            build_orchestrator(cfg, store, task=_Task({"backend": "codex"}))
+    finally:
+        await store.close()
+
+    # And the positive path: a live ChatGPT session lets construction proceed
+    # to the (separately-tested) CLI-presence check, not the credential one.
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "chatgpt"))
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/stub/codex")
+    store2 = await Store(tmp_path / "t2.db").connect()
+    try:
+        orch = build_orchestrator(cfg, store2, task=_Task({"backend": "codex"}))
+        assert isinstance(orch.backend, CodexBackend)
+        assert orch.backend.auth_mode == "subscription"
+    finally:
+        await store2.close()
+
+
 def test_the_factory_ignores_an_override_for_every_non_coder_role():
     """Review finding N4: the Claude pin must be the factory's, not the one
     call site's — `make_backend(role="reviewer", backend="codex")` used to

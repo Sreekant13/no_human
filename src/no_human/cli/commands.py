@@ -27,9 +27,10 @@ from ..agent.claude_backend import ClaudeBackend
 from ..agent.backend import make_backend, resolve_backend_name, SUPPORTED_BACKENDS
 from ..config import (
     AuthError,
-    assert_codex_api_key_mode,
+    assert_codex_mode,
     assert_local_backend_mode,
     assert_subscription_mode,
+    codex_auth_mode,
     load_config,
 )
 from ..context import ContextGatherer, build_default_sources
@@ -277,7 +278,10 @@ def _bootstrap(*, require_auth: bool = True):
             # discover it one task later. Codex adds a SECOND per-vendor
             # assertion; it never replaces the first.
             if resolve_backend_name(config.data) == "codex":
-                assert_codex_api_key_mode()
+                assert_codex_mode(
+                    codex_auth_mode(config.data),
+                    cli_path=_llm.get("codex_cli_path"),
+                )
             # Same rule as codex: the Anthropic assertion above still runs,
             # because the reviewer/planner/supervisor/utility tiers stay on
             # Claude regardless of what the coder runs on.
@@ -285,11 +289,14 @@ def _bootstrap(*, require_auth: bool = True):
                 assert_local_backend_mode((_llm or {}).get("local_base_url"))
         except AuthError as exc:
             console.print(f"[bold red]auth error:[/] {exc}")
-            # The Codex failure carries its own complete remedy (add
-            # OPENAI_API_KEY, or switch back to claude). Appending the Claude
-            # recipe under it would send the operator to `claude setup-token`
-            # for a problem that has nothing to do with their Claude token.
-            if "OPENAI_API_KEY" in str(exc):
+            # The Codex failure carries its own complete remedy — either "add
+            # OPENAI_API_KEY" (api_key mode) or "run `codex login`"
+            # (subscription mode) — and both raisers name
+            # `llm.codex_auth_mode` in their message. Appending the Claude
+            # recipe under either would send the operator to `claude
+            # setup-token` for a problem that has nothing to do with their
+            # Claude token.
+            if "llm.codex_auth_mode" in str(exc):
                 sys.exit(2)
             console.print(
                 "\n[bold]Fix:[/] run [bold]nh init[/] to set up authentication, or:\n"
@@ -5935,10 +5942,23 @@ def doctor(verbose, verify_auth):
         console.print(f"[bold]coding backend[/] — claude CLI: "
                       f"[{colour}]{cli}[/]")
 
-        # The codex row only appears when the codex backend is actually in
-        # play (worker.backend == "codex", or a live task asked for
-        # --backend codex) — `d.codex` is `{"selected": False}` otherwise and
-        # `codex_readiness` spawned nothing to produce it.
+        # Codex row: printed unconditionally (codex need not be the selected
+        # backend) — pure and read-only, see doctor.codex_row's docstring.
+        from ..doctor import codex_row
+
+        crow = codex_row(config.data)
+        codex_colour = "green" if crow["present"] else "yellow"
+        console.print(
+            f"[bold]codex backend[/] — mode: [cyan]{crow['mode']}[/]  "
+            f"credential: [{codex_colour}]{'present' if crow['present'] else 'not found'}[/]  "
+            f"model: [cyan]{crow['model']}[/]  "
+            f"cli: [dim]{crow['cli_path']}[/]"
+        )
+
+        # The detailed readiness row only appears when the codex backend is
+        # actually in play (worker.backend == "codex", or a live task asked
+        # for --backend codex) — `d.codex` is `{"selected": False}` otherwise
+        # and `codex_readiness` spawned nothing to produce it.
         if d.codex and d.codex.get("selected"):
             cx_colour = "green" if d.codex.get("flags_ok") else "red"
             cx_cli = d.codex.get("cli_path") or "not found"
@@ -5952,6 +5972,7 @@ def doctor(verbose, verify_auth):
             console.print(f"                OPENAI_API_KEY: "
                           f"[{key_colour}]{key_state}[/]  [dim](presence only)[/]")
             console.print(f"                [dim]{d.codex.get('entitlement_note')}[/]")
+
 
         if verbose:
             console.print("[bold]mechanism liveness[/] (lifetime firings)")

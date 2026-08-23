@@ -339,6 +339,60 @@ def editable_install_problem(
         return None
 
 
+def codex_row(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Presence-only summary of the Codex coder backend's auth state.
+
+    Pure and read-only: makes NO network/subprocess call and never touches
+    the local ChatGPT credential file — it reports the same ``mode``/``model``/
+    ``cli_path`` facts :func:`agent.backend.make_backend` would use, plus a
+    ``present`` boolean, without spending anything to get them. ``nh doctor``
+    renders this row unconditionally (codex may not even be the selected
+    backend); it costs nothing to compute either way.
+
+    ``present`` is a best-effort existence check, deliberately weaker than
+    the live preflight (:func:`config.assert_codex_mode`): in ``api_key``
+    mode it is "was an OPENAI_API_KEY found" (env or ``~/.no_human/.env``,
+    never echoed); in ``subscription`` mode it is "did `codex login status`
+    report a live session" via the same read-only probe
+    :func:`agent.codex_backend.codex_login_status` uses elsewhere. Any
+    probe failure reads as ``present=False`` rather than raising — a
+    diagnostic must never crash the command that prints it. The raw
+    ``detail`` string a session probe returns is intentionally never
+    surfaced here (only the boolean and the mode), so this row cannot leak
+    anything credential-shaped.
+    """
+    from .agent.backend import default_codex_model
+    from .config import CODEX_API_KEY_VAR, ENV_PATH, _read_env_file, codex_auth_mode
+
+    llm = (config or {}).get("llm") or {}
+    mode = codex_auth_mode(config or {})
+    cli_path = llm.get("codex_cli_path")
+    model = str(llm.get("codex_model") or default_codex_model(mode))
+
+    present = False
+    try:
+        if mode == "subscription":
+            from .agent.codex_backend import codex_login_status
+
+            status = codex_login_status(cli_path)
+            present = bool(status.present and status.via != "api_key")
+        else:
+            import os
+
+            key = _read_env_file(ENV_PATH).get(CODEX_API_KEY_VAR) or os.environ.get(
+                CODEX_API_KEY_VAR)
+            present = bool(key)
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        present = False
+
+    return {
+        "mode": mode,
+        "present": present,
+        "model": model,
+        "cli_path": cli_path or "codex (PATH)",
+    }
+
+
 @dataclass
 class Diagnosis:
     mechanisms: list[dict[str, Any]] = field(default_factory=list)

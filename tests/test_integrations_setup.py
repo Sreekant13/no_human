@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
+import yaml
 from httpx import ASGITransport, AsyncClient
 
 import no_human.config as nh_config
@@ -529,10 +530,21 @@ async def test_put_setup_rejects_a_credential_with_422(client):
                          json={"values": {"api_key": "lin_api_LEAKME"}})
     assert r.status_code == 422, r.text
     assert "LEAKME" not in r.text
-    # load_config materialises a default config.yaml, so the assertion is that
-    # nothing from the refused call reached it — not that the file is absent.
-    assert "LEAKME" not in nh_config.CONFIG_PATH.read_text()
-    assert "api_key" not in nh_config.CONFIG_PATH.read_text()
+    # load_config materialises a FULL default config.yaml (yaml.safe_dump of
+    # DEFAULT_CONFIG), unlike reg.apply_setup which splices only touched keys.
+    # A whole-file `"api_key" not in text` was true only by accident: it broke
+    # the moment an unrelated default key (llm.codex_auth_mode: "api_key")
+    # started existing, in a section this endpoint never writes. What this
+    # test actually guards is that a refused credential-shaped field never
+    # reaches the integrations.linear section — so assert on the parsed
+    # structure, not the raw text of an unrelated part of the file.
+    text = nh_config.CONFIG_PATH.read_text()
+    assert "LEAKME" not in text
+    assert "lin_api" not in text
+    cfg = nh_config.load_config(nh_config.CONFIG_PATH).data
+    linear = (cfg.get("integrations") or {}).get("linear") or {}
+    assert "api_key" not in linear, linear
+    assert not [k for k in linear if k in CREDENTIAL_ATTEMPTS], linear
 
 
 @pytest.mark.asyncio

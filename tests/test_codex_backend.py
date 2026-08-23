@@ -232,11 +232,13 @@ def test_the_codex_model_is_its_own_config_key_not_a_claude_tier(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
-    """BYO-API-key is the only path no_human offers — the conservative choice
-    under unresolved legal uncertainty, not a sourced prohibition (see the
-    module docstring). `preferred_auth_method="apikey"` is what stops the CLI
-    falling back to a ChatGPT login that happens to be on the machine, so it
-    is pinned here rather than left to the CLI's default.
+    """`llm.codex_auth_mode: "api_key"` is the DEFAULT (unchanged since before
+    the 2026-08-22 amendment that added the sibling "subscription" mode).
+    `preferred_auth_method="apikey"` is what stops the CLI falling back to a
+    ChatGPT login that happens to be on the machine when THIS mode is
+    selected, so it is pinned here rather than left to the CLI's default.
+    (Subscription mode's own command construction, which omits this flag
+    entirely, is covered separately below.)
 
     Approval flag: stubbed with the MODERN help text (the actually installed
     codex-cli 0.149.0, verified live), which has no `--ask-for-approval` on
@@ -298,11 +300,17 @@ def test_resume_continues_a_thread(monkeypatch):
 
 
 def test_a_missing_openai_key_refuses_rather_than_finding_other_auth():
+    """api_key mode (the default) demands ITS OWN credential rather than
+    silently trying the other mode. Reworded 2026-08-22: the message used to
+    assert "no subscription path" existed at all; now it names the sibling
+    "subscription" mode as the alternative, since that mode is sanctioned
+    too — it just is not what api_key mode itself will fall back to."""
     with pytest.raises(cx.CodexAuthError) as exc:
         cx.CodexBackend(env={"PATH": "/bin"})._child_env()
     msg = str(exc.value)
     assert "OPENAI_API_KEY" in msg
-    assert "no subscription path" in msg
+    assert "llm.codex_auth_mode" in msg
+    assert "subscription" in msg
     assert "config.yaml" in msg  # the key never lives there
     assert "prohibit" not in msg.lower()  # the unsourced claim is withdrawn
     assert "lawyer" in msg.lower()  # names the uncertainty honestly
@@ -327,6 +335,10 @@ def test_a_missing_codex_cli_is_an_absence_with_a_name(monkeypatch):
         cx.CodexBackend()._command(Path("/repo"), effort=None, resume=None)
     assert "npm install -g @openai/codex" in str(exc.value)
 
+
+# --------------------------------------------------------------------------- #
+# 2b. CLI compatibility ladder is probed, never assumed                        #
+# --------------------------------------------------------------------------- #
 
 @pytest.mark.skipif(shutil.which("codex") is None,
                      reason="codex CLI is not installed on PATH")
@@ -438,7 +450,7 @@ def test_codex_version_falls_back_to_a_placeholder_when_unspawnable():
 
 
 # --------------------------------------------------------------------------- #
-# 2b. The legal wording is sourced, honest, and behaviour-free                 #
+# 2c. The legal wording is sourced, honest, and behaviour-free                 #
 # --------------------------------------------------------------------------- #
 
 def test_no_shipped_file_asserts_an_unsourced_openai_prohibition():
@@ -497,18 +509,64 @@ def test_the_module_docstring_cites_its_primary_source_and_both_halves():
     assert "unresolved" in doc or "unanswered" in doc
 
 
-def test_the_wording_change_added_no_subscription_machinery():
-    """AC5: this ticket changes what we CLAIM, not what we DO — no
-    subscription auth path, no login flow, no reading of Codex's own
-    credential file, and the api-key argv flag is still emitted."""
-    src_root = Path(cx.__file__).resolve().parents[1]  # .../src/no_human
-    codex_src = (src_root / "agent" / "codex_backend.py").read_text()
-    config_src = (src_root / "config.py").read_text()
-    for text in (codex_src, config_src):
-        assert "login_chatgpt" not in text
-        assert "auth.json" not in text
-        assert "codex_auth_mode" not in text
-    assert 'preferred_auth_method="apikey"' in codex_src
+def test_the_only_codex_login_argv_built_anywhere_is_login_status():
+    """The one invariant the deleted `test_the_wording_change_added_no_
+    subscription_machinery` covered that nothing else does: this codebase
+    never builds a bare `codex login` (which would pop a browser) or a
+    `login_chatgpt` subcommand — every quoted `"login"` token that appears in
+    the Codex feature's own files is immediately followed by `"status"`, the
+    one read-only existence probe `codex_login_status` runs (see
+    `[cli, "login", "status"]` above). Scoped to the files this feature
+    actually touches (`codex_backend.py`, `config.py`, `agent/backend.py`,
+    `doctor.py`) rather than all of `src/no_human`, because unrelated code
+    (GitHub API `login` fields, the unrelated `brain login` CLI command) also
+    spells the bare word `"login"` and would otherwise false-positive.
+
+    POSITIVE CONTROL: `preferred_auth_method` (known present in
+    codex_backend.py) proves the scan reaches real content, and the scan
+    must actually find at least one quoted `"login"` token (the real
+    `[cli, "login", "status"]` call) — so an empty offenders list means
+    'checked and clean', not 'the regex never matched anything'."""
+    codex_files = [
+        Path(cx.__file__),
+        Path(cx.__file__).resolve().parents[1] / "config.py",
+        Path(cx.__file__).resolve().parent / "backend.py",
+        Path(cx.__file__).resolve().parents[1] / "doctor.py",
+    ]
+    for p in codex_files:
+        assert p.is_file(), f"expected file missing: {p}"
+
+    login_token_re = re.compile(r'''["']login["']''')
+    login_status_re = re.compile(r'''["']login["']\s*,\s*["']status["']''')
+
+    positive_control_hit = False
+    login_tokens_found = 0
+    offenders: list[str] = []
+    for path in codex_files:
+        text = path.read_text(encoding="utf-8")
+        if "preferred_auth_method" in text:
+            positive_control_hit = True
+        if "login_chatgpt" in text:
+            offenders.append(f"{path}: login_chatgpt")
+        for m in login_token_re.finditer(text):
+            login_tokens_found += 1
+            window = text[m.start():m.start() + 40]
+            if not login_status_re.match(window):
+                line_no = text.count("\n", 0, m.start()) + 1
+                offenders.append(f"{path}:{line_no}: 'login' not followed by \"status\"")
+
+    assert positive_control_hit, (
+        "positive control failed — 'preferred_auth_method' was not found in "
+        "any of the scanned files, so the scan cannot be trusted"
+    )
+    assert login_tokens_found > 0, (
+        "the scan found no quoted 'login' token at all — it is scanning the "
+        "wrong files, not confirming a real absence"
+    )
+    assert not offenders, (
+        "a bare `codex login` (or `login_chatgpt`) argv was built where only "
+        "`codex login status` is sanctioned:\n" + "\n".join(offenders)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -948,8 +1006,14 @@ def test_the_openai_key_is_refused_in_config_yaml_like_the_anthropic_one(
     cfgmod._reject_api_key_in_config({"worker": {"backend": "codex"}})
 
 
-def test_codex_mode_requires_the_key_and_says_there_is_no_subscription_path(
+def test_codex_api_key_mode_refuses_without_the_key_and_names_the_subscription_alternative(
         tmp_path, monkeypatch):
+    """Reworded 2026-08-22: this used to assert the message says there is NO
+    subscription path at all. Since the amendment sanctioning
+    `llm.codex_auth_mode: subscription`, api_key mode's refusal instead NAMES
+    that sibling mode as the alternative — kept byte-identical in signature
+    and control flow (`assert_codex_api_key_mode`, see its docstring); only
+    this message text changed."""
     from no_human import config as cfgmod
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -959,7 +1023,8 @@ def test_codex_mode_requires_the_key_and_says_there_is_no_subscription_path(
         cfgmod.assert_codex_api_key_mode(empty)
     msg = str(exc.value)
     assert "OPENAI_API_KEY" in msg
-    assert "no subscription path" in msg
+    assert "llm.codex_auth_mode" in msg
+    assert "subscription" in msg
     assert "ChatGPT" in msg           # names the reason, not just the rule
     assert "config.yaml" in msg
     assert "prohibit" not in msg.lower()  # the unsourced claim is withdrawn
@@ -1048,9 +1113,294 @@ def test_every_boolean_capability_is_true_for_claude():
 
 
 # --------------------------------------------------------------------------- #
-# 8. Docs — the verified CLI version and the entitlement rule must be STATED,  #
-#    not just true in code, so an operator reading the docs sees the same     #
-#    ground truth this file's stub help text was built from.                  #
+# 8. Codex: the "subscription" auth mode                                      #
+# --------------------------------------------------------------------------- #
+#
+# No real credential appears below, and no test in this section shells out to
+# a real `codex` binary or reads `~/.codex/auth.json` — `subprocess.run` and
+# `codex_login_status` are both monkeypatched.
+
+def test_default_codex_model_is_split_per_mode():
+    """The api_key and subscription defaults are DIFFERENT ids, per the
+    operator's own same-day measurement recorded above `DEFAULT_CODEX_MODEL`
+    in `agent/backend.py`: a live ChatGPT session refuses the codex-branded
+    ids the api_key default uses."""
+    assert seam.default_codex_model("api_key") == seam.DEFAULT_CODEX_MODEL
+    assert seam.default_codex_model("subscription") == seam.DEFAULT_CODEX_MODEL_SUBSCRIPTION
+    assert seam.DEFAULT_CODEX_MODEL != seam.DEFAULT_CODEX_MODEL_SUBSCRIPTION
+    # Anything else falls to the api_key default rather than raising — the
+    # fail-loud check on an unrecognised mode string lives in
+    # `config.codex_auth_mode`, not duplicated here.
+    assert seam.default_codex_model("nonsense") == seam.DEFAULT_CODEX_MODEL
+
+
+def test_make_backend_resolves_the_model_from_the_configured_auth_mode():
+    """The seam acceptance criterion for AC's model-default requirement: a
+    config that selects subscription mode and sets no explicit
+    `llm.codex_model` gets the SUBSCRIPTION default, not the api_key one."""
+    be = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_auth_mode": "subscription"},
+    })
+    assert isinstance(be, cx.CodexBackend)
+    assert be.model == seam.DEFAULT_CODEX_MODEL_SUBSCRIPTION
+    assert be.auth_mode == "subscription"
+
+    be2 = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+    })
+    assert be2.model == seam.DEFAULT_CODEX_MODEL
+    assert be2.auth_mode == "api_key"
+
+    # An explicit llm.codex_model still wins over EITHER per-mode default.
+    be3 = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_auth_mode": "subscription", "codex_model": "gpt-5.5"},
+    })
+    assert be3.model == "gpt-5.5"
+
+
+def test_subscription_mode_omits_the_api_key_forcing_flag(monkeypatch):
+    """The mirror image of `test_the_command_forces_api_key_auth_and_never_
+    offers_a_login` above: in subscription mode there is no key to force, and
+    forcing `preferred_auth_method="apikey"` here would make the CLI refuse
+    the very ChatGPT session this mode exists to use."""
+    _stub_cli(monkeypatch)
+    cmd = cx.CodexBackend(auth_mode="subscription")._command(
+        Path("/repo"), effort=None, resume=None)
+    joined = " ".join(cmd)
+    assert "preferred_auth_method" not in joined
+    # Still never an unsandboxed run, and still never offers to log in itself.
+    assert "--sandbox" in cmd and "workspace-write" in cmd
+    assert "login" not in joined
+
+
+def test_subscription_child_env_holds_no_openai_credential(monkeypatch):
+    """`_child_env_subscription` scrubs every var in
+    `CODEX_SUBSCRIPTION_SCRUB_VARS` from the CHILD env — both spellings of the
+    key plus every alternate routing — after a session check reports a live
+    ChatGPT session."""
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "chatgpt"))
+    env_in = {"PATH": "/bin", "OPENAI_API_KEY": "not-a-real-key",
+              "CODEX_API_KEY": "also-not-real", "OPENAI_BASE_URL": "https://evil"}
+    env = cx.CodexBackend(auth_mode="subscription", env=env_in)._child_env()
+    from no_human import config as cfgmod
+    for var in cfgmod.CODEX_SUBSCRIPTION_SCRUB_VARS:
+        assert var not in env
+    assert env["PATH"] == "/bin"
+
+
+def test_subscription_mode_refuses_when_no_chatgpt_session_is_found(monkeypatch):
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(False, "none"))
+    with pytest.raises(cx.CodexAuthError) as exc:
+        cx.CodexBackend(auth_mode="subscription", env={"PATH": "/bin"})._child_env()
+    msg = str(exc.value)
+    assert "codex login" in msg
+    assert "llm.codex_auth_mode" in msg and "api_key" in msg
+
+
+def test_subscription_mode_refuses_an_api_key_backed_session(monkeypatch):
+    """A session `codex login status` reports as api_key-backed is not the
+    plan this mode exists to spend — refused the same as no session."""
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "api_key"))
+    with pytest.raises(cx.CodexAuthError, match="codex login"):
+        cx.CodexBackend(auth_mode="subscription", env={"PATH": "/bin"})._child_env()
+
+
+def test_subscription_mode_accepts_an_unrecognised_but_present_session(monkeypatch):
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "unknown"))
+    env = cx.CodexBackend(auth_mode="subscription",
+                          env={"PATH": "/bin"})._child_env()
+    assert env == {"PATH": "/bin"}
+
+
+# --------------------------------------------------------------------------- #
+# 9. Codex: codex_login_status — the read-only session probe                  #
+# --------------------------------------------------------------------------- #
+
+def _fake_run(returncode=0, stdout="", stderr=""):
+    class _CP:
+        pass
+    cp = _CP()
+    cp.returncode = returncode
+    cp.stdout = stdout
+    cp.stderr = stderr
+    def _run(*_args, **_kwargs):
+        return cp
+    return _run
+
+
+def test_login_status_absent_cli_reports_not_present(monkeypatch):
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: None)
+    status = cx.codex_login_status()
+    assert status.present is False and status.via == "none"
+
+
+def test_login_status_recognises_a_chatgpt_session(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(subprocess, "run", _fake_run(
+        returncode=0, stdout="Logged in using ChatGPT"))
+    status = cx.codex_login_status()
+    assert status.present is True and status.via == "chatgpt"
+
+
+def test_login_status_recognises_an_api_key_session(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(subprocess, "run", _fake_run(
+        returncode=0, stdout="Logged in using an API key"))
+    status = cx.codex_login_status()
+    assert status.present is True and status.via == "api_key"
+
+
+def test_login_status_unrecognised_wording_still_counts_as_present(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(subprocess, "run", _fake_run(
+        returncode=0, stdout="Session: ok, account: acct_123"))
+    status = cx.codex_login_status()
+    assert status.present is True and status.via == "unknown"
+
+
+def test_login_status_nonzero_exit_reports_not_present(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(subprocess, "run", _fake_run(
+        returncode=1, stderr="Not logged in"))
+    status = cx.codex_login_status()
+    assert status.present is False
+
+
+def test_login_status_timeout_or_oserror_never_raises(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd="codex", timeout=10.0)
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    status = cx.codex_login_status()
+    assert status.present is False and "timed out" in status.detail
+
+    def _oserror(*_a, **_kw):
+        raise FileNotFoundError("no such file")
+    monkeypatch.setattr(subprocess, "run", _oserror)
+    status = cx.codex_login_status()
+    assert status.present is False
+
+
+def test_login_status_scrubs_its_own_subprocess_env(monkeypatch):
+    """A stray `OPENAI_API_KEY` on the machine running the probe must not
+    make the CLI answer 'logged in with an API key' and slip a key-backed
+    session past the subscription-mode gate — the probe scrubs its own
+    child env before asking."""
+    import subprocess
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setenv("OPENAI_API_KEY", "should-not-reach-the-child")
+    seen_env = {}
+
+    def _run(*_args, **kwargs):
+        seen_env.update(kwargs.get("env") or {})
+        class _CP:
+            returncode = 0
+            stdout = "Logged in using ChatGPT"
+            stderr = ""
+        return _CP()
+    monkeypatch.setattr(subprocess, "run", _run)
+    cx.codex_login_status()
+    from no_human import config as cfgmod
+    for var in cfgmod.CODEX_SUBSCRIPTION_SCRUB_VARS:
+        assert var not in seen_env
+
+
+# --------------------------------------------------------------------------- #
+# 10. Codex: the vendor "wrong account type for this model" refusal           #
+# --------------------------------------------------------------------------- #
+
+def test_a_model_account_mismatch_is_classified_not_left_as_a_raw_failure(
+        monkeypatch):
+    """The vendor phrase observed 2026-08-22 under a live ChatGPT session,
+    refusing a codex-branded model id — surfaced as a typed
+    CodexModelUnsupportedError via `stop_reason == "model_unsupported"`,
+    not just another opaque failed-attempt string. Uses api_key mode here so
+    the fixture exercises only the classification wiring, not the separate
+    session-check gate covered by the subscription-mode tests above."""
+    result, _ = _run(
+        cx.CodexBackend(env=FAKE_ENV, model="gpt-5.3-codex"),
+        monkeypatch,
+        [{"type": "turn.failed", "error": {
+            "message": "The 'gpt-5.3-codex' model is not supported when "
+                       "using Codex with a ChatGPT account."}}],
+    )
+    assert result.is_error is True
+    assert result.stop_reason == "model_unsupported"
+    assert "gpt-5.3-codex" in result.final_text
+    assert "llm.codex_auth_mode" in result.final_text or "llm.codex_model" in result.final_text
+
+
+def test_an_unrelated_vendor_failure_is_not_misclassified(monkeypatch):
+    """`_classify_vendor_error` is a substring match on one specific vendor
+    phrase — anything else must fall through as a plain failure rather than
+    being mislabelled as a model/account mismatch."""
+    result, _ = _run(cx.CodexBackend(env=FAKE_ENV), monkeypatch, [
+        {"type": "turn.failed", "error": {"message": "insufficient_quota"}},
+    ])
+    assert result.is_error is True
+    assert result.stop_reason != "model_unsupported"
+
+
+# --------------------------------------------------------------------------- #
+# 11. AC2's repo-wide guarantee: nothing SHIPPED ever names the credential    #
+#     file, in code OR in the comments/docstrings/messages explaining why    #
+#     not — a docstring that itself spells out the path is one `.format()`   #
+#     typo away from becoming a read.                                       #
+# --------------------------------------------------------------------------- #
+
+def test_no_source_file_touches_the_chatgpt_credential_file():
+    """`rglob("*.py")` over `src/no_human`, textually — not just AST/code —
+    because the property under test is "the string never appears", and a
+    docstring explaining what we don't do is exactly the kind of place a
+    stray literal path creeps in. A POSITIVE CONTROL
+    (`preferred_auth_method`, which src/no_human/agent/codex_backend.py and
+    src/no_human/config.py both use for real, live code) proves the scanner
+    can find text that IS there — without it, an empty result would be
+    equally consistent with "safe" and "the scanner never ran"."""
+    src_root = Path(cx.__file__).resolve().parents[1]
+    assert src_root.name == "no_human"
+    py_files = sorted(src_root.rglob("*.py"))
+    assert py_files, "the scanner found no files at all — path is wrong"
+
+    forbidden = ("auth.json", "~/.codex")
+    offenders: list[str] = []
+    positive_control_hit = False
+    for path in py_files:
+        text = path.read_text(encoding="utf-8")
+        if "preferred_auth_method" in text:
+            positive_control_hit = True
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{path}: {needle!r}")
+
+    assert positive_control_hit, (
+        "positive control failed — 'preferred_auth_method' was not found "
+        "anywhere under src/no_human, so the scanner cannot be trusted to "
+        "find text that IS there"
+    )
+    assert not offenders, (
+        "a shipped source file names the ChatGPT credential file directly "
+        "— reword to describe it without the literal path:\n"
+        + "\n".join(offenders)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 12. Docs — the verified CLI version and the entitlement rule must be STATED, #
+#     not just true in code, so an operator reading the docs sees the same    #
+#     ground truth this file's stub help text was built from.                 #
 # --------------------------------------------------------------------------- #
 
 def test_the_docs_state_the_verified_cli_version_and_the_entitlement_rule():

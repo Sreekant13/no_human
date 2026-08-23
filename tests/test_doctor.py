@@ -14,10 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from no_human import config as cfgmod
 from no_human.agent import codex_backend as _cx
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
-from no_human.doctor import MECHANISMS, diagnose
+from no_human.doctor import MECHANISMS, codex_row, diagnose
 
 from tests.test_codex_backend import _MODERN_HELP_TEXT, _MODERN_RESUME_HELP_TEXT
 
@@ -959,12 +960,14 @@ async def test_verify_credential_live_never_calls_out_with_no_credential(
     assert seen["constructed"] == 0
 
 
-def _doctor(monkeypatch, tmp_path, *args, live=None):
+def _doctor(monkeypatch, tmp_path, *args, live=None, config=None):
     """Run the `doctor` COMMAND (not the group) against a tmp DB.
 
     The command object directly, so the group callback's update notice never
     runs; `load_config` and `check_backend` are replaced so nothing here reads
-    the operator's real ~/.no_human.
+    the operator's real ~/.no_human. `config`, if given, becomes `_Cfg.data`
+    (default `{}`, matching every pre-existing call site byte-for-byte) —
+    additive, so callers that don't pass it see identical behaviour to before.
     """
     from click.testing import CliRunner
 
@@ -972,7 +975,7 @@ def _doctor(monkeypatch, tmp_path, *args, live=None):
     from no_human.cli import commands as cmd_mod
 
     class _Cfg:
-        data: dict = {}
+        data: dict = config if config is not None else {}
         db_path = tmp_path / "doctor.db"
         utility_model = "claude-haiku-4-5"
 
@@ -1048,3 +1051,204 @@ def test_a_credential_the_live_call_rejects_fails_the_doctor_gate(
     assert "live call REJECTED" in result.output, result.output
     assert result.exit_code == 1, (
         f"a dead credential must fail the gate:\n{result.output}")
+
+
+# --------------------------------------------------------------------------- #
+# codex_row — presence-only summary, no network/subprocess call in api_key    #
+# mode, and never surfacing the session probe's raw `detail` in either mode.  #
+# --------------------------------------------------------------------------- #
+
+def test_codex_row_api_key_mode_present_when_the_env_file_has_a_key(
+        tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=not-a-real-key\n")
+    monkeypatch.setattr(cfgmod, "ENV_PATH", env_file)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    row = codex_row({})
+    assert row == {
+        "mode": "api_key",
+        "present": True,
+        "model": "gpt-5.3-codex",
+        "cli_path": "codex (PATH)",
+    }
+
+
+def test_codex_row_api_key_mode_absent_without_a_key_anywhere(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    row = codex_row({"llm": {"codex_auth_mode": "api_key"}})
+    assert row["present"] is False
+    assert row["mode"] == "api_key"
+
+
+def test_codex_row_never_calls_out_in_api_key_mode(tmp_path, monkeypatch):
+    """`present` for api_key mode is a pure env/file read — no subprocess, no
+    network. A call to `codex_login_status` here would mean this row quietly
+    started spending on every `nh doctor` invocation.
+
+    `codex_row` wraps its probe in a bare `except Exception`, so a stub that
+    only *raises* proves nothing: the raise would be swallowed into
+    `present=False` whether or not the stub ever ran, and the test would
+    pass either way. Track calls explicitly instead — that observation
+    survives the swallow.
+    """
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    calls = []
+
+    def _tracking(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("codex_login_status must not run in api_key mode")
+
+    monkeypatch.setattr(_cx, "codex_login_status", _tracking)
+    codex_row({"llm": {"codex_auth_mode": "api_key"}})
+    assert calls == []
+
+
+def test_codex_row_subscription_mode_present_on_a_live_chatgpt_session(
+        monkeypatch):
+    import no_human.agent.codex_backend as cx
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(
+                            True, "chatgpt", detail="account: acct_super_secret"))
+
+    row = codex_row({"llm": {"codex_auth_mode": "subscription"}})
+    assert row["present"] is True
+    assert row["mode"] == "subscription"
+    assert row["model"] == "gpt-5.6-terra"
+    # The probe's raw detail (which can echo account identifiers) must never
+    # reach the row this command prints.
+    assert "acct_super_secret" not in str(row)
+
+
+def test_codex_row_subscription_mode_absent_when_no_session_is_found(
+        monkeypatch):
+    import no_human.agent.codex_backend as cx
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(False, "none"))
+
+    row = codex_row({"llm": {"codex_auth_mode": "subscription"}})
+    assert row["present"] is False
+
+
+def test_codex_row_subscription_mode_absent_for_an_api_key_backed_session(
+        monkeypatch):
+    """A session `codex login status` reports as api_key-backed does not
+    count as a live ChatGPT session for this row, mirroring the same
+    refusal `assert_codex_subscription_mode` applies before a run."""
+    import no_human.agent.codex_backend as cx
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "api_key"))
+
+    row = codex_row({"llm": {"codex_auth_mode": "subscription"}})
+    assert row["present"] is False
+
+
+def test_codex_row_never_raises_when_the_session_probe_blows_up(monkeypatch):
+    """A diagnostic must never crash the command that prints it."""
+    import no_human.agent.codex_backend as cx
+
+    def _boom(cli_path=None):
+        raise OSError("codex binary vanished mid-probe")
+
+    monkeypatch.setattr(cx, "codex_login_status", _boom)
+    row = codex_row({"llm": {"codex_auth_mode": "subscription"}})
+    assert row["present"] is False
+
+
+def test_codex_row_honours_an_explicit_model_override_in_either_mode(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    row = codex_row({"llm": {"codex_model": "gpt-5.5"}})
+    assert row["model"] == "gpt-5.5"
+
+
+def test_codex_row_reports_a_cli_path_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    row = codex_row({"llm": {"codex_cli_path": "/opt/codex/bin/codex"}})
+    assert row["cli_path"] == "/opt/codex/bin/codex"
+
+
+# --------------------------------------------------------------------------- #
+# codex_row through the actual `nh doctor` COMMAND — not just the pure        #
+# function above. The CLI wiring (cli/commands.py) is what an operator        #
+# actually sees; a unit test on codex_row() alone cannot prove the string     #
+# never made it into the rendered line, or that a probe's raw detail didn't   #
+# leak through the f-string that assembles it.                               #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("mode", ["api_key", "subscription"])
+def test_doctor_shows_the_codex_row_in_both_modes(monkeypatch, tmp_path, mode):
+    """Reuses the existing `_doctor` CliRunner harness. The probe/env are
+    monkeypatched so this never shells out or touches a real credential; the
+    injected `detail` string is deliberately something that would be alarming
+    to see printed (an account identifier shape) so its absence from the
+    output is a meaningful assertion, not a vacuous one."""
+    import no_human.agent.codex_backend as cx
+
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    SECRET_DETAIL = "acct_should-never-be-printed_9f3e"
+    if mode == "subscription":
+        monkeypatch.setattr(
+            cx, "codex_login_status",
+            lambda *a, **kw: cx.CodexSessionStatus(
+                present=True, via="chatgpt", detail=SECRET_DETAIL))
+    else:
+        (tmp_path / ".env").write_text("OPENAI_API_KEY=not-a-real-key\n")
+
+    result, calls = _doctor(
+        monkeypatch, tmp_path, config={"llm": {"codex_auth_mode": mode}})
+    assert result.exit_code == 0, result.output
+    assert calls == [], "doctor spent quota without being asked"
+
+    lines = [ln for ln in result.output.splitlines() if "codex backend" in ln]
+    assert lines, f"no codex backend row at all:\n{result.output}"
+    row_line = lines[0]
+
+    assert f"mode: {mode}" in row_line, row_line
+    assert "present" in row_line, row_line
+    from no_human.agent.backend import default_codex_model
+    assert default_codex_model(mode) in row_line, row_line
+
+    # Never the raw probe detail, never a credential value, anywhere in the
+    # whole rendered output — not just the one row.
+    assert SECRET_DETAIL not in result.output, result.output
+    assert "not-a-real-key" not in result.output, result.output
+
+
+def test_the_codex_row_makes_no_live_call(monkeypatch, tmp_path):
+    """The default `nh doctor` invocation (no --verify-auth) must compute the
+    codex row without any subprocess or live-credential call: `verify_credential_live`
+    (Claude probe) must be entirely unreached (`calls == []`, patched to
+    record rather than run), and `codex_login_status` — the only thing in
+    api_key mode's own code path that COULD shell out — must never be called
+    either, proven by making it explode rather than merely asserting a mock
+    wasn't invoked afterward. (Blocking `socket.socket` outright was tried
+    first and rejected: asyncio's own event loop opens a local self-pipe via
+    `socket.socketpair()` as plumbing, unrelated to any credential call, so
+    that blocks command startup itself rather than testing anything real.)
+    """
+    import no_human.agent.codex_backend as cx
+
+    def _no_probe(*_a, **_kw):
+        raise AssertionError("codex_login_status must not be called in the "
+                              "default (api_key) doctor invocation")
+
+    monkeypatch.setattr(cfgmod, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(cx, "codex_login_status", _no_probe)
+
+    result, calls = _doctor(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    assert calls == [], "the Claude live-verify probe ran without --verify-auth"
+    assert "codex backend" in result.output, result.output

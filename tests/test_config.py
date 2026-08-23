@@ -887,3 +887,111 @@ def test_the_claude_pinned_roles_and_backend_resolution_are_untouched():
     assert resolve_backend_name(DEFAULT_CONFIG) == "claude"
     assert resolve_backend_name({"worker": {"backend": "local"}}) == "local"
     assert resolve_backend_name({"worker": {"backend": "local"}}, role="reviewer") == "claude"
+
+
+# --------------------------------------------------------------------------- #
+# 8. `llm.codex_auth_mode` — the api_key/subscription dispatcher               #
+# --------------------------------------------------------------------------- #
+#
+# No real credential appears below. `session_check` is the seam
+# `assert_codex_subscription_mode` exposes precisely so these tests never
+# have to shell out to a real `codex` binary or touch `~/.codex/auth.json`.
+
+class _FakeStatus:
+    def __init__(self, present, via, detail=""):
+        self.present = present
+        self.via = via
+        self.detail = detail
+
+
+def test_codex_auth_mode_defaults_to_api_key():
+    assert config.codex_auth_mode({}) == "api_key"
+    assert config.codex_auth_mode({"llm": {}}) == "api_key"
+    assert config.codex_auth_mode(None) == "api_key"
+
+
+def test_codex_auth_mode_accepts_subscription():
+    assert config.codex_auth_mode(
+        {"llm": {"codex_auth_mode": "subscription"}}) == "subscription"
+    # Case/whitespace are not a second way to spell the value wrong.
+    assert config.codex_auth_mode(
+        {"llm": {"codex_auth_mode": " Subscription "}}) == "subscription"
+
+
+def test_codex_auth_mode_rejects_an_unrecognised_value_rather_than_defaulting():
+    """A typo here would otherwise silently bill the metered API instead of
+    the plan the operator thought they had selected — fail loud, never
+    fall back to api_key."""
+    with pytest.raises(AuthError) as exc:
+        config.codex_auth_mode({"llm": {"codex_auth_mode": "chatgpt-plus"}})
+    msg = str(exc.value)
+    assert "codex_auth_mode" in msg
+    assert "chatgpt-plus" in msg
+    assert "api_key" in msg and "subscription" in msg
+
+
+def test_assert_codex_subscription_mode_scrubs_the_openai_routes(monkeypatch):
+    for var in config.CODEX_SUBSCRIPTION_SCRUB_VARS:
+        monkeypatch.setenv(var, "placeholder")
+    report = config.assert_codex_subscription_mode(
+        session_check=lambda: _FakeStatus(True, "chatgpt"))
+    assert set(report.removed) == set(config.CODEX_SUBSCRIPTION_SCRUB_VARS)
+    for var in config.CODEX_SUBSCRIPTION_SCRUB_VARS:
+        assert var not in os.environ
+
+
+def test_assert_codex_subscription_mode_refuses_when_no_session_is_found():
+    with pytest.raises(AuthError) as exc:
+        config.assert_codex_subscription_mode(
+            session_check=lambda: _FakeStatus(False, "none"))
+    msg = str(exc.value)
+    assert "llm.codex_auth_mode" in msg and "subscription" in msg
+    assert "codex login" in msg
+    assert "api_key" in msg  # names the alternative, not just the rule
+    # Names the file it explicitly does NOT read, but never reads it to get
+    # here — there is no credential value in this message to echo.
+    assert "sk-" not in msg
+
+
+def test_assert_codex_subscription_mode_refuses_an_api_key_backed_session():
+    """A `codex login status` that reports an API-key-backed session is not
+    the ChatGPT plan this mode exists to use — refused the same as no
+    session at all, not silently accepted as 'close enough'."""
+    with pytest.raises(AuthError, match="codex login"):
+        config.assert_codex_subscription_mode(
+            session_check=lambda: _FakeStatus(True, "api_key"))
+
+
+def test_assert_codex_subscription_mode_accepts_unrecognised_wording():
+    """The CLI's own verdict wins on wording it hasn't seen before — a
+    stricter parse here would refuse a legitimate session over a vendor
+    wording change no_human doesn't recognise."""
+    report = config.assert_codex_subscription_mode(
+        session_check=lambda: _FakeStatus(True, "unknown"))
+    assert isinstance(report, config.ScrubReport)
+
+
+def test_assert_codex_mode_dispatches_subscription_to_the_session_check():
+    calls = []
+
+    def _check():
+        calls.append(1)
+        return _FakeStatus(True, "chatgpt")
+
+    report = config.assert_codex_mode("subscription", session_check=_check)
+    assert isinstance(report, config.ScrubReport)
+    assert calls == [1]
+
+
+def test_assert_codex_mode_dispatches_api_key_by_default(tmp_path, monkeypatch):
+    """Any mode other than the literal string "subscription" — including the
+    default — takes the api_key path. `codex_auth_mode` is what turns an
+    unrecognised string into a fail-loud error; the dispatcher itself just
+    routes the two legal values."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=placeholder-not-a-real-key\n")
+    report = config.assert_codex_mode("api_key", env_path=env_file)
+    assert isinstance(report, config.ScrubReport)
+    assert os.environ["OPENAI_API_KEY"] == "placeholder-not-a-real-key"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)

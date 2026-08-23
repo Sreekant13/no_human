@@ -52,8 +52,9 @@ def assert_task_backend_usable(name: str | None, config: dict[str, Any] | None) 
     if name == "codex":
         from ..agent.backend import BackendUnavailable
         from ..agent.codex_backend import find_codex_cli
-        from ..config import assert_codex_api_key_mode
-        assert_codex_api_key_mode()
+        from ..config import assert_codex_mode, codex_auth_mode
+        llm_cfg = (config or {}).get("llm") or {}
+        assert_codex_mode(codex_auth_mode(config or {}), cli_path=llm_cfg.get("codex_cli_path"))
         if find_codex_cli(((config or {}).get("llm") or {}).get("codex_cli_path")) is None:
             raise BackendUnavailable(
                 "this task asked for `--backend codex` but the `codex` CLI was "

@@ -6,8 +6,8 @@ The default is unchanged and always will be the default unless you change it.
 | | `claude` (default) | `codex` | `local` |
 |---|---|---|---|
 | Harness | Claude Agent SDK → `claude` CLI | `codex exec --json` → `codex` CLI | Claude Agent SDK → `claude` CLI, pointed at your own server |
-| Credential | `CLAUDE_CODE_OAUTH_TOKEN` (subscription) or `ANTHROPIC_API_KEY` (BYO) | `OPENAI_API_KEY` (BYO **only**) | `ANTHROPIC_API_KEY`, per-subprocess only (see below) |
-| Model | `llm.primary_model` | `llm.codex_model` | `llm.local_model` |
+| Credential | `CLAUDE_CODE_OAUTH_TOKEN` (subscription) or `ANTHROPIC_API_KEY` (BYO) | `OPENAI_API_KEY` (`llm.codex_auth_mode: api_key`, default) **or** a `codex login` ChatGPT session (`llm.codex_auth_mode: subscription`) | `ANTHROPIC_API_KEY`, per-subprocess only (see below) |
+| Model | `llm.primary_model` | `llm.codex_model` (per-mode default — see below) | `llm.local_model` |
 | Install | `npm install -g @anthropic-ai/claude-code` | `npm install -g @openai/codex` | none — reuses the Claude CLI |
 
 Everything except the coder — reviewer, planner, supervisor, utility, intake —
@@ -28,7 +28,8 @@ task's coder only and gets the same credential/CLI preflight as the global key.
 worker:
   backend: codex          # default: claude
 llm:
-  codex_model: gpt-5-codex          # default
+  codex_auth_mode: api_key          # default; the other value is "subscription"
+  codex_model: null                 # null ⇒ per-mode default, see below
   codex_reasoning_effort: null      # null ⇒ the CLI's own default
   codex_cli_path: null              # null ⇒ resolve `codex` on PATH
 ```
@@ -40,7 +41,8 @@ OPENAI_API_KEY=sk-...
 
 The **mode** lives in config; the **key never does**. `nh` refuses to load a
 config file containing either vendor's API key, and refuses to start with
-`worker.backend: codex` and no `OPENAI_API_KEY` on file.
+`worker.backend: codex`, `llm.codex_auth_mode: api_key` and no `OPENAI_API_KEY`
+on file.
 
 ## CLI compatibility is probed, never assumed
 
@@ -68,8 +70,8 @@ answer — it never falls back to `--dangerously-bypass-approvals-and-sandbox`
 or any other flag that removes the sandbox boundary. `nh doctor` runs the same
 probe (whenever `worker.backend: codex`, or a live task asks for it) and prints
 a `codex backend` row naming the CLI path, the verified version, which
-approval mode was chosen (or `UNSUPPORTED`), and `OPENAI_API_KEY` presence
-(never its value).
+approval mode was chosen (or `UNSUPPORTED`), the selected `llm.codex_auth_mode`,
+and credential presence for that mode (never its value).
 
 **Resuming a thread is probed separately, because its flag surface is
 narrower.** `codex exec resume <thread-id>` accepts neither `--cd` nor
@@ -80,51 +82,72 @@ omits both on the resume launch and validates that argv against
 fresh-attempt argv can still reject the resume one, so `nh doctor` checks and
 reports both independently rather than assuming compatibility transfers.
 
+Both probes (`codex exec --help` and `codex --version`) are cached per
+resolved CLI path for the life of the process, so a long-running daemon
+spawning many attempts against the same CLI does not re-spawn the probe on
+every attempt.
+
 **Model entitlement is a separate, unchecked question.** `nh doctor`'s codex
 row always carries a note that `llm.codex_model`'s entitlement cannot be
 verified without a **billed** call to `/v1/responses` — a model id appearing
 in `GET /v1/models` is not the same as being entitled to call it on
 `/v1/responses`, and no diagnostic here spends OpenAI quota to find out. If
-the configured model 404s at run time, that surfaces as an ordinary attempt
-failure, not a doctor contradiction.
+the configured model 404s at run time, or is refused as unsupported under the
+active `llm.codex_auth_mode` (see below), that surfaces as an ordinary attempt
+failure naming `llm.codex_model`, not a doctor contradiction.
 
-## Codex is BYO-API-key only — a conservative choice, not a known prohibition
+## Two sanctioned Codex auth paths
 
-An earlier version of this section asserted that OpenAI's terms forbid using
-a ChatGPT sign-in to drive a third-party service. That claim was never
-sourced and is withdrawn.
+`llm.codex_auth_mode` selects how the Codex coder backend authenticates.
+**`"api_key"` is the default and is unchanged** from the original Codex
+integration: a `OPENAI_API_KEY` the operator pays OpenAI for
+directly, loaded from `~/.no_human/.env` only. The CLI is invoked with
+`preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
+credential that happens to be on the machine.
 
-What OpenAI's own documentation says, quoted from
-[`developers.openai.com/codex/auth`](https://developers.openai.com/codex/auth)
-(308-redirects to
-[`learn.chatgpt.com/docs/auth`](https://learn.chatgpt.com/docs/auth)),
-fetched 2026-08-22: "Codex supports two ways for a person to sign in ...
-Sign in with ChatGPT for subscription access [and] Sign in with an API key
-for usage-based access," and "The ChatGPT desktop app, Codex CLI, and IDE
-extension support both sign-in methods for local work." A ChatGPT sign-in is
-therefore an officially documented Codex CLI method. But the same page also
-says: "Use API key authentication for programmatic Codex CLI workflows, such
-as CI/CD jobs" — closer to what no_human does, since it drives the CLI
-unattended.
+**`"subscription"` is an opt-in** added 2026-08-22, letting a Codex CLI signed
+in via `codex login` (a ChatGPT plan) drive the coder. no_human is never the
+authenticating party: it never calls, wraps, or shells out to `codex login`
+itself, and never reads, parses, or copies `~/.codex/auth.json`. The operator
+runs `codex login` themselves, on their own machine, before selecting this
+mode; no_human only *checks* the resulting session via the read-only, no-op
+`codex login status` (`codex_login_status()` in `agent/codex_backend.py`), the
+same way `nh doctor`'s Codex row does. Selecting this mode omits
+`preferred_auth_method` entirely from the CLI invocation — there is no key to
+force, and forcing `"apikey"` here would make the CLI refuse the very session
+this mode exists to use.
 
-Whether a third-party tool may drive that ChatGPT sign-in on a user's behalf
-is still open: [`openai/codex` discussion
-#8338](https://github.com/openai/codex/discussions/8338) asked exactly this,
-and an OpenAI maintainer answered only the licensing half, leaving the
-policy half unresolved.
+Each mode scrubs the other's metered routes so a run bills exactly one path,
+and picks its own default model (below) — a live ChatGPT session and an
+`OPENAI_API_KEY` do not accept the same model ids.
 
-So no_human takes the conservative path pending legal advice, not as a
-finding of law — a lawyer should settle this, and the answer may well be
-that a subscription path is fine. Until then, no_human has **no**
-Codex-on-a-ChatGPT-subscription mode: no browser login, no reuse of an
-existing `codex login`, no routing of anyone's consumer plan. The CLI is
-invoked with `preferred_auth_method="apikey"` precisely so it cannot fall
-back to a ChatGPT credential that happens to be on the machine. If you want
-that mode today, you want a different tool.
+(The Claude default staying OAuth-only, and Codex defaulting to `api_key`
+rather than subscription, both trace to the same asymmetry: a Claude
+*subscription* used locally is the operator's own credential on the operator's
+own machine with no no_human server in the path, which is one of two arguments
+that survived legal review for Anthropic specifically. That reasoning is
+Anthropic-specific and was never assumed to transfer to OpenAI by default —
+which is exactly why the Codex subscription path is opt-in, not the default,
+and why no_human still refuses to be the one that signs in. See the project's
+non-negotiable constraints for the full, hedged reasoning and its counter-
+evidence on the Anthropic side; the OpenAI-side sourcing this amendment rests
+on is `learn.chatgpt.com/docs/auth`, cross-referenced against an internal
+per-vendor terms review that is not part of this export.)
 
-(The Claude path is different because a Claude *subscription* is the operator's
-own credential on the operator's own machine — see the auth constraint. That
-reasoning does not transfer to OpenAI, and nothing here assumes it does.)
+### Model defaults
+
+| `llm.codex_auth_mode` | Default `llm.codex_model` |
+|---|---|
+| `api_key` (default) | `gpt-5.3-codex` |
+| `subscription` | `gpt-5.6-terra` |
+
+The two model families are not interchangeable: a live ChatGPT session refuses
+codex-branded ids (`gpt-5.3-codex`, `gpt-5.1-codex*`) with "not supported when
+using Codex with a ChatGPT account", while those same ids are the entitled
+ones on an API key. `agent/backend.py`'s `default_codex_model(mode)` picks the
+right default per mode; a vendor refusal that names the mismatch is surfaced
+as a typed `CodexModelUnsupportedError` rather than degrading silently. Set
+`llm.codex_model` explicitly to override either default.
 
 ## What you give up by switching
 

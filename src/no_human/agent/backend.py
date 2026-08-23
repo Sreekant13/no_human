@@ -427,19 +427,24 @@ def make_backend(
         )
 
     if name == "codex":
+        from ..config import codex_auth_mode
         from .codex_backend import CodexBackend
 
         cfg = codex_config if codex_config is not None else (
             (config or {}).get("llm") or {})
+        mode = codex_auth_mode(config or {})
         return CodexBackend(
             # The Claude tier IDs in `config.llm` are fixed by the programme's
             # model-tier constraint and
             # are meaningless to Codex, so the Codex model is its OWN key. The
             # `model=` argument is the CLAUDE tier the caller asked for; it is
-            # deliberately NOT forwarded.
-            model=str(cfg.get("codex_model") or DEFAULT_CODEX_MODEL),
+            # deliberately NOT forwarded. The default itself is PER-MODE (see
+            # `default_codex_model`): a ChatGPT-subscription session refuses
+            # the codex-branded ids api_key mode defaults to.
+            model=str(cfg.get("codex_model") or default_codex_model(mode)),
             reasoning_effort=cfg.get("codex_reasoning_effort"),
             cli_path=cfg.get("codex_cli_path"),
+            auth_mode=mode,
             forbidden_paths=forbidden_paths,
             never_push_to=never_push_to,
             readonly=readonly,
@@ -499,30 +504,61 @@ def make_backend(
     )
 
 
-#: Default Codex model id. Chosen EXPLICITLY (BUILD item 4) rather than
-#: inherited from a Claude tier, and overridable via ``llm.codex_model``. This
-#: is the SOLE source of truth — ``config.py`` and ``doctor.py`` import it
-#: rather than each carrying their own literal (that duplication was itself
-#: part of this ticket's test gap).
+#: Default Codex model id for ``llm.codex_auth_mode: "api_key"``. Chosen
+#: EXPLICITLY (BUILD item 4) rather than inherited from a Claude tier, and
+#: overridable via ``llm.codex_model``.
 #:
-#: The 2026-08-22 review send-back on this ticket reported that
-#: ``gpt-5-codex`` 400s at the first turn on a real installed CLI with "The
-#: 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
-#: account", and proposed replacing the default with ``gpt-5.6-terra``. That
-#: replacement id could NOT be independently confirmed in this change — it is
-#: not a documented OpenAI model id, a non-billed ``GET /v1/models`` listing
-#: is not entitlement even when a name appears in it, and this project's own
-#: rule against spending OpenAI quota on a diagnostic rules out a billed
-#: ``/v1/responses`` call to settle it either way. Shipping an unverified
-#: string as the default would swap one guess for another, so the default
-#: stays ``gpt-5-codex`` here; what this ticket actually fixes for the bad-
-#: model-id case is that the failure is no longer a silent hang or a raw
-#: traceback — see ``model_error_from_failure``'s new "not supported when
-#: using codex" pattern, which turns exactly this 400 into a named
-#: ``CodexModelUnavailable``. Anyone who confirms a working replacement id
-#: (their own account, their own entitlement) sets it via ``llm.codex_model``;
-#: this constant is not the place to encode an unverified guess.
-DEFAULT_CODEX_MODEL = "gpt-5-codex"
+#: This ticket supersedes `dc529db3` (the retired-default fix): the OLD
+#: default, `gpt-5-codex`, is dead on the api_key path — the operator's own
+#: same-day measurement on their machine returned `Model not found` for it.
+#: Of the codex-branded ids the operator measured as ENTITLED under api_key
+#: that same day (`insufficient_quota` — a valid, billable id merely short of
+#: credit, as opposed to `Model not found`/`model_not_found` for a dead one),
+#: `gpt-5.3-codex` is picked here as the closest continuation of "coding-tuned
+#: default" intent; `gpt-5.4`/`gpt-5.5`/`gpt-5.6-*` were entitled too and are
+#: reachable via `llm.codex_model` for anyone who wants a different one.
+#:
+#: WHAT THIS SANDBOX COULD NOT RE-VERIFY: this build ran in a separate
+#: environment (no live ChatGPT session; `codex login status` here reports
+#: "Not logged in"), and could not call `codex login` to create one — that is
+#: the hard, explicit constraint this task imposes on no_human itself: it
+#: never calls, wraps, or shells out to that command. This sandbox's own
+#: ambient `OPENAI_API_KEY` also returned a plain `401 Unauthorized` rather
+#: than either of the vendor codes above, meaning it belongs to neither of
+#: the operator's measured accounts and could not reproduce their entitlement
+#: check either. The value below is therefore taken from the operator's own
+#: same-machine, same-day measurement as instructed ("measured today on this
+#: machine — do not re-derive it"), not independently re-measured here; if a
+#: future run finds it retired too, the vendor's own refusal (or the typed
+#: `CodexModelUnsupportedError` below) names the absence loudly rather than
+#: silently degrading.
+DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
+
+#: Default Codex model id for ``llm.codex_auth_mode: "subscription"``.
+#: Per the operator's own same-day measurement (see above): under a live
+#: ChatGPT session, `gpt-5.6-terra` and `gpt-5.5` both ran; the codex-branded
+#: ids (`gpt-5.3-codex`, `gpt-5.1-codex*`) were refused with "not supported
+#: when using Codex with a ChatGPT account" — the exact vendor phrase
+#: `_MODEL_UNSUPPORTED_MARKER` in `codex_backend.py` matches on — so they are
+#: not candidates for this default. `gpt-5.6-terra` is picked as the more
+#: capable of the two working ids. Same caveat as above: this sandbox has no
+#: live ChatGPT session and is forbidden from creating one via `codex login`,
+#: so this value is carried from the operator's measurement rather than
+#: re-confirmed here.
+DEFAULT_CODEX_MODEL_SUBSCRIPTION = "gpt-5.6-terra"
+
+
+def default_codex_model(mode: str) -> str:
+    """The built-in Codex model id for *mode*, before ``llm.codex_model``.
+
+    Split per-mode because the two auth paths are refused different model
+    ids by the vendor (see the constants above) — there is no single default
+    that works on both.
+    """
+    if mode == "subscription":
+        return DEFAULT_CODEX_MODEL_SUBSCRIPTION
+    return DEFAULT_CODEX_MODEL
+
 
 __all__ = [
     "AgentEvent",
@@ -532,6 +568,8 @@ __all__ = [
     "CodingBackend",
     "CLAUDE_PINNED_ROLES",
     "DEFAULT_CODEX_MODEL",
+    "DEFAULT_CODEX_MODEL_SUBSCRIPTION",
+    "default_codex_model",
     "DEFAULT_CODER_COMPACT_WINDOW_TOKENS",
     "SUPPORTED_BACKENDS",
     "LOCAL_CAPABILITIES",

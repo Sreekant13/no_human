@@ -25,13 +25,6 @@ from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 
-# `agent/backend.py`'s top-level imports are stdlib-only (verified: no import
-# of this module, directly or transitively, at module scope), so importing
-# its one shared constant here is not circular. This makes it the SOLE source
-# of truth for the Codex default model, rather than a literal duplicated here
-# and in doctor.py.
-from .agent.backend import DEFAULT_CODEX_MODEL
-
 # Home for the user's private token + config. Never inside the repo.
 log = logging.getLogger("no_human.config")
 
@@ -81,32 +74,41 @@ METERED_AUTH_VARS = (
 # The SECOND coding backend's credential (OpenAI Codex).                       #
 # --------------------------------------------------------------------------- #
 #
-# BYO-API-KEY IS THE ONLY SANCTIONED PATH — a deliberately CONSERVATIVE choice
-# under genuine uncertainty, not a known legal boundary. An earlier version of
-# this comment asserted, unsourced, that OpenAI's terms forbid a ChatGPT
-# sign-in from driving a third-party service; no such clause was ever found,
-# and that assertion is withdrawn. What OpenAI's own docs actually say
-# (`developers.openai.com/codex/auth`, 308-redirecting to
-# `learn.chatgpt.com/docs/auth`, fetched 2026-08-22): a ChatGPT sign-in is an
-# officially documented Codex CLI method "for local work", but the same page
-# steers "programmatic Codex CLI workflows, such as CI/CD jobs" to an API
-# key — nearer what no_human does, since it drives the CLI unattended.
-# Whether a third-party tool may drive that ChatGPT sign-in on a user's
-# behalf is still open: `openai/codex` discussion #8338 asked exactly this
-# and an OpenAI maintainer answered only the licensing half, leaving the
-# policy half unresolved. So no_human takes the conservative path pending
-# legal advice — a lawyer should settle it, and the answer may well be that
-# a subscription path is fine — and does not route a user's ChatGPT
-# subscription: there is no browser-login flow here, no `codex login`, and
-# the Codex CLI is invoked with `preferred_auth_method="apikey"` so it
-# cannot silently fall back to a ChatGPT credential that happens to exist on
-# the machine. See `agent/codex_backend.py`'s module docstring for the full
-# quoted source and the still-open question.
+# TWO SANCTIONED PATHS, selected by `llm.codex_auth_mode` (default "api_key",
+# so no existing install changes — operator amendment, 2026-08-22, after the
+# operator ran `codex login`, asked "can't we support both options?" and
+# instructed "do it" / "you have it"):
 #
-# The same discipline as the Anthropic key applies verbatim: the MODE
-# (`worker.backend: codex`) may live in config.yaml, the KEY never does — it
-# comes from ~/.no_human/.env, chmod 600 (see `_reject_api_key_in_config`,
-# which names both vendors' keys).
+# * "api_key" — YOUR OWN OpenAI API key, from ~/.no_human/.env. Unchanged
+#   behaviour: no browser-login flow, no `codex login` call from no_human,
+#   and the Codex CLI is invoked with `preferred_auth_method="apikey"` so it
+#   cannot silently fall back to a ChatGPT credential that happens to exist
+#   on the machine.
+# * "subscription" — the operator's own ChatGPT sign-in, done by the
+#   operator running `codex login` themselves (no_human never calls, wraps
+#   or shells out to `codex login` — only `codex login status`). no_human
+#   holds NO OpenAI credential in this mode: presence is an existence check
+#   via `codex login status` only, and the local ChatGPT credential file is
+#   never read, parsed, copied or even stat'd. `preferred_auth_method` is
+#   simply omitted from argv in this mode rather than pointed at a value we
+#   don't have.
+#
+# SOURCING for the split (recorded so a future reader can re-judge, not
+# inherit it): learn.chatgpt.com/docs/auth presents subscription sign-in and
+# API-key sign-in as two supported ways for a PERSON to sign in, and says the
+# CLI supports both for LOCAL work — but steers PROGRAMMATIC workflows
+# (nearer what no_human does) to the API key. Whether a THIRD-PARTY tool may
+# drive that sign-in is unresolved (`openai/codex` discussion #8338 answered
+# only the licensing half). The flat "OpenAI's terms prohibit..." sentence
+# this comment used to assert was never found in OpenAI's terms and has been
+# removed — do not reintroduce it, and do not assert a new prohibition
+# either. This is the operator's call taken under stated uncertainty, not a
+# finding of law — a lawyer should still settle it.
+#
+# The same discipline as the Anthropic key applies verbatim in api_key mode:
+# the MODE (`worker.backend: codex`, `llm.codex_auth_mode`) may live in
+# config.yaml, the KEY never does — it comes from ~/.no_human/.env, chmod 600
+# (see `_reject_api_key_in_config`, which names both vendors' keys).
 CODEX_API_KEY_VAR = "OPENAI_API_KEY"
 
 # Variables that would silently REROUTE an OpenAI call to somebody else's
@@ -128,6 +130,26 @@ CODEX_ALTERNATE_ROUTING_VARS = (
     "AZURE_OPENAI_ENDPOINT",
     "AZURE_OPENAI_AD_TOKEN",
 )
+
+# The two legal values of `llm.codex_auth_mode`. Never fall back silently on
+# an unrecognised value — see `codex_auth_mode()` below.
+CODEX_AUTH_MODES = ("api_key", "subscription")
+
+# The alternate name some Codex CLI builds read for the OpenAI API key.
+# no_human never authenticates with it — it is named here only so
+# subscription mode can scrub it from the child env if an operator's shell
+# happens to export it (the same "no third path" reasoning as
+# CODEX_ALTERNATE_ROUTING_VARS above).
+CODEX_ALT_API_KEY_VAR = "CODEX_API_KEY"
+
+# Every var that must be ABSENT from the child env for a Codex run in
+# "subscription" mode to bill the ChatGPT plan and nothing else: both
+# spellings of the OpenAI API key, plus every alternate-routing var — an
+# OPENAI_BASE_URL redirects the bill just as effectively as a key.
+CODEX_SUBSCRIPTION_SCRUB_VARS = (
+    CODEX_API_KEY_VAR,
+    CODEX_ALT_API_KEY_VAR,
+) + CODEX_ALTERNATE_ROUTING_VARS
 
 
 # If the operator's local server enforces a key, it lives in ~/.no_human/.env
@@ -552,6 +574,10 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
 
     Raises :class:`AuthError` when no ``OPENAI_API_KEY`` resolves. Never echoes
     the key.
+
+    Kept byte-identical in signature and control flow (2026-08-22 amendment):
+    only the message text below changed, to drop the now-unsourced "OpenAI's
+    terms prohibit..." absolute and name the sibling mode instead.
     """
     env_path = ENV_PATH if env_path is None else env_path
     key = _read_env_file(env_path).get(CODEX_API_KEY_VAR) or os.environ.get(
@@ -564,22 +590,97 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
     if not key:
         raise AuthError(
             "the coder backend is 'codex' (worker.backend, or a task's "
-            "--backend) but no OPENAI_API_KEY was found. The "
-            "Codex backend runs on YOUR OWN OpenAI API key — there is no "
-            "subscription path here today. Not because one is a known legal "
-            "boundary: OpenAI documents 'Sign in with ChatGPT' for local "
-            "Codex CLI use, but steers programmatic/CI workflows to an API "
-            "key, and whether a third-party tool may drive that sign-in for "
-            "you is unresolved. no_human takes the conservative path until "
-            "a lawyer settles it; see agent/codex_backend.py's module "
-            "docstring for the quoted source.\n"
+            "--backend) but no OPENAI_API_KEY was found, and "
+            "llm.codex_auth_mode is 'api_key' (the default). The Codex "
+            "backend runs on YOUR OWN OpenAI API key in this mode.\n"
             f"Add the key to {env_path} (chmod 600):\n"
             "  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env\n"
             "It must never go in config.yaml. To go back to Claude, set "
-            "worker.backend: claude."
+            "worker.backend: claude. Or, to run on your ChatGPT plan "
+            "instead, set llm.codex_auth_mode: subscription in config.yaml "
+            "and sign in yourself with `codex login`. Whether a "
+            "third-party tool may drive that ChatGPT sign-in is "
+            "unresolved — a lawyer should still settle it."
         )
     os.environ[CODEX_API_KEY_VAR] = key
     return report
+
+
+def codex_auth_mode(data: dict[str, Any]) -> str:
+    """Read ``llm.codex_auth_mode`` from a config dict; default ``"api_key"``.
+
+    Never a silent fallback on an unrecognised value — a typo here would
+    otherwise quietly bill the metered API instead of the plan the operator
+    thought they had selected, so an unrecognised spelling is a fail-loud
+    :class:`AuthError` naming the key and both legal values, not a default.
+    """
+    raw = (((data or {}).get("llm") or {}).get("codex_auth_mode") or "api_key")
+    value = str(raw).strip().lower()
+    if value not in CODEX_AUTH_MODES:
+        raise AuthError(
+            f"llm.codex_auth_mode is {raw!r}; it must be one of "
+            f"{CODEX_AUTH_MODES!r}."
+        )
+    return value
+
+
+def assert_codex_subscription_mode(*, cli_path: str | None = None,
+                                    session_check: Any = None) -> ScrubReport:
+    """Enforce ChatGPT-subscription billing for the Codex coding backend.
+
+    Holds no OpenAI credential of its own: scrubs every var in
+    :data:`CODEX_SUBSCRIPTION_SCRUB_VARS` from the process env FIRST, so the
+    session probe below sees the exact env the run will, then asks the
+    ``codex`` CLI itself whether a session is live via
+    ``codex login status`` (existence check only — never ``codex login``,
+    never reads/parses/copies/stats the local ChatGPT credential file).
+
+    ``session_check``, if given, replaces the call to
+    :func:`agent.codex_backend.codex_login_status` — the seam tests use to
+    avoid shelling out to a real ``codex`` binary.
+
+    Raises :class:`AuthError` naming ``llm.codex_auth_mode: subscription``
+    and instructing the operator to run ``codex login`` themselves when no
+    accepted session is found. Never echoes a credential — there is none to
+    echo.
+    """
+    report = ScrubReport()
+    for var in CODEX_SUBSCRIPTION_SCRUB_VARS:
+        if os.environ.get(var):
+            report.removed.append(var)
+            del os.environ[var]
+    if session_check is None:
+        from .agent.codex_backend import codex_login_status
+        session_check = lambda: codex_login_status(cli_path)  # noqa: E731
+    status = session_check()
+    if not status.present or status.via == "api_key":
+        raise AuthError(
+            "the coder backend is 'codex' and llm.codex_auth_mode is "
+            "'subscription', but no ChatGPT session was found (`codex "
+            "login status`). no_human holds no OpenAI credential in this "
+            "mode and never reads your local ChatGPT credential file — sign "
+            "in yourself:\n"
+            "  codex login\n"
+            "Or, to run on your own OpenAI API key instead, set "
+            "llm.codex_auth_mode: api_key in config.yaml."
+        )
+    return report
+
+
+def assert_codex_mode(mode: str, *, cli_path: str | None = None,
+                       env_path: Path | None = None,
+                       session_check: Any = None) -> ScrubReport:
+    """Dispatch to the credential assertion for the selected Codex auth mode.
+
+    The single call site both preflights (`cli/commands.py`'s `_bootstrap`
+    and `core/runtime.py`'s `assert_task_backend_usable`) now use, so the two
+    can never drift. ``session_check`` is injectable for tests — see
+    :func:`assert_codex_subscription_mode`.
+    """
+    if mode == "subscription":
+        return assert_codex_subscription_mode(
+            cli_path=cli_path, session_check=session_check)
+    return assert_codex_api_key_mode(env_path)
 
 
 def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
@@ -1225,14 +1326,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # or supervisor — those four tiers are fixed above.
         "utility_model": "claude-haiku-4-5",
         # --- OpenAI Codex backend (only read when worker.backend == "codex") ---
+        # Which of the two sanctioned Codex sign-ins pays for a run — see the
+        # long comment above CODEX_API_KEY_VAR. Default "api_key" so no
+        # existing install's behaviour changes (2026-08-22 amendment). The
+        # sibling "subscription" mode holds no OpenAI credential at all and is
+        # opt-in only, by an operator who has already run `codex login`.
+        "codex_auth_mode": "api_key",
         # Chosen EXPLICITLY rather than derived from a Claude tier: the four
         # Claude IDs above are fixed by constraint and mean nothing to Codex,
         # so the Codex model gets its own key and its own default. Overriding
         # this is the supported way to move the Codex tier; nothing else here
-        # changes when it does. Value lives in `agent.backend.DEFAULT_CODEX_MODEL`
-        # (see that constant's docstring for why it did not move off `gpt-5-codex`) —
-        # this key is not a second place to change it.
-        "codex_model": DEFAULT_CODEX_MODEL,
+        # changes when it does. None ⇒ resolve via `default_codex_model(mode)`
+        # (agent/backend.py) — the default itself depends on codex_auth_mode,
+        # since a ChatGPT-subscription session refuses codex-branded model
+        # ids ("not supported when using Codex with a ChatGPT account") that
+        # the api_key path accepts.
+        "codex_model": None,
         # Codex's `model_reasoning_effort`. None ⇒ let the CLI use its own
         # default. The orchestrator's `effort=` ("low"/"medium"/"high") is
         # mapped onto this per call and takes precedence when it is set.
