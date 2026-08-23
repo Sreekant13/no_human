@@ -4,7 +4,7 @@ This is the detail the front page links to. It was the README's longest section
 until 2026-08-01; nothing here was deleted, only moved off a page whose job is
 to get you to a first task.
 
-Three gates, and one input they run on. All of it is code, not prompt
+Four gates, and one input they run on. All of it is code, not prompt
 instructions, and the two deterministic gates run before the review gate does.
 (The tamper guard's adjudicator runs on the reviewer tier, so a flagged attempt
 does spend reviewer-tier tokens — just not on the gate review.)
@@ -213,15 +213,18 @@ hour to review.
 - **Ambitious tasks are not the target.** It is aimed at well-scoped work:
   bugfixes, test gaps, small features, investigations. A vague ticket produces
   an escalation, which is the intended behaviour, not a workaround.
-- **No published catch-rate for the reviewer.** The reviewer tier moved to
+- **Published catch-rate for the reviewer.** The reviewer tier moved to
   `claude-opus-5` on 2026-07-26 and was reverted to `claude-opus-4-8` on
   2026-08-11, after an A/B scored Opus 5 lower on the seeded-defect corpus at
   roughly 3x the round duration. The corpus and its control set have also grown
-  across those runs, and the committed run records do not state which model
-  they measured, so quoting any of them would attribute a number to a
-  configuration it may not describe. No number is published anywhere here. The
-  method is in [REVIEWER_RECALL_METHOD.md](REVIEWER_RECALL_METHOD.md);
-  regenerate with `nh bench report --reviewer-recall`.
+  across those runs, and older run records do not state which model they
+  measured, so quoting any of them would attribute a number to a configuration
+  it may not describe. The confirmation run at the current corpus size:
+  2026-08-11, `claude-opus-4-8`, 19 seeded + 10 controls — recall **15/19
+  (79%)**, specificity **7/10**. Method, class breakdown and instrument
+  discipline are in
+  [REVIEWER_RECALL_METHOD.md](REVIEWER_RECALL_METHOD.md); regenerate with
+  `nh bench report --reviewer-recall`.
 - **The benchmark is self-run and you cannot reproduce it.** There is a harness
   that replays real past tasks through the real pipeline and scores against what
   the human actually did; the committed run is

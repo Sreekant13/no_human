@@ -19,8 +19,8 @@ are from BEFORE it. Re-measure, then re-enable or close.
 
 ```
 sqlite3.OperationalError: cannot commit transaction - SQL statements in progress
-  src/no_human/core/db.py:518 in update_attempt   (await self.db.commit())
-  <- src/no_human/core/orchestrator.py:2706 in _run_attempt
+  src/no_human/core/db.py:1805 in update_attempt   (await self.db.commit())
+  <- src/no_human/core/orchestrator.py:3993 in _run_attempt
 ```
 
 **This is a product defect, not a test defect.** The traceback is entirely in
@@ -71,7 +71,7 @@ not one the store code is still holding a Python reference to.
 
 **Lead, not a fix.** Opening the connection in autocommit mode
 (`aiosqlite.connect(path, isolation_level=None)`, a one-line change at
-`db.py:47`) took the isolated test from 3/8 failures to **0/12**. That is a
+`db.py:471`) took the isolated test from 3/8 failures to **0/12**. That is a
 strong signal about where the problem lives, but it is not a fix that can be
 adopted on that evidence: it removes multi-statement atomicity from every write
 path in the product (`create_attempt`'s `UPDATE` + `INSERT` pair, `_migrate`,
@@ -172,7 +172,7 @@ and the `--until-empty` exit path gained the missing case.)
 
 Separately, `nh stop --timeout` defaulted to 3s — shorter than one
 Agent SDK turn, so it SIGKILLed the drain SIGTERM had just requested — and now
-defaults to 30s.
+defaults to `concurrency.stop_grace_s` (60s) plus a 15s margin, i.e. 75s.
 
 ---
 

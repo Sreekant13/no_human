@@ -91,7 +91,7 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 **Read this first: no_human is not an offline tool, and this page does not claim
 to be an exhaustive list of its network traffic.** It cannot be one. The coder
 session is a Claude Agent SDK session built with **no tool restrictions** and
-`permission_mode="bypassPermissions"` (`agent/claude_backend.py:309`, `:423`) —
+`permission_mode="bypassPermissions"` (`agent/claude_backend.py:518`, `:543`) —
 no tool allowlist, no tool denylist, no per-call permission callback. It has
 Bash. Anything an agent decides to run — `curl`, `pip install`, `npm i`, a test
 suite that hits a staging API — leaves your machine, and nothing in no_human sits
@@ -120,21 +120,25 @@ named here.
   there is no key that disables it**<!-- /egress:push:no-optout --> — a task's deliverable IS the PR.
   `never_push_to` (default `main`, `master`, `release/*`) chooses **where** a
   push may land, never **whether** one happens; a branch it protects is refused
-  at the git layer (`ProtectedBranch`), and the agent is denied `gh pr merge` /
-  `glab mr merge` regardless.<!-- /egress:push -->
+  at the git layer (`ProtectedBranch`), and an agent session is denied
+  `gh pr merge` / `glab mr merge` for the spellings the guard models — a
+  lexical rule plus an argv-shaped one that peels shell wrappers two levels
+  deep (`_FORGE_MERGE` and `_forge_invocations` in `agent/guard.py`). The
+  modelled set is not closed; see §2 and `verification.md`'s "The merge ban,
+  in code".<!-- /egress:push -->
 - **PR body, and review comments that quote your code**, posted through `gh` /
   `glab` (`vcs/github.py`, `vcs/gitlab.py`, `vcs/comment_poster.py`). The PR
   body carries the commit summary and test evidence; reviewer findings cite file
   and line and quote the lines they are about. Same destination as the push.
 - **PR receipt and status polling** — `gh` / `glab` calls for the PR's head SHA
   and its mergeability (`vcs/pr_watcher.py:507-533`, `vcs/receipts.py`), plus
-  `git fetch origin` (`vcs/git.py:374-381`), while a task waits on CI or review.
+  `git fetch origin` (`vcs/git.py:767`, `:797`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:1793`). This is *your* command, not the agent's — an agent
-  session's Bash is denied it in every mode (`_LEXICAL_MERGE_STACK` in
-  `agent/guard.py`, alongside the `gh pr merge` / `glab mr merge` denial and
-  the argv rule; §2).
+  (`cli/commands.py:2693`). This is *your* command, not the agent's — an agent
+  session's Bash is denied it for the spellings the rule models
+  (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
+  in both session modes; see §2 for the bound.
   Until 2026-08-08 this sentence overstated: the guard denied the direct
   spellings but not this wrapper.
 - **`nh approve` lands the PR** — a local squash commit made as the operator
@@ -216,9 +220,10 @@ named here.
 
   **The control that does close the door is not this.** It is a check at the
   act: `nh approve` refusing inside an agent session, and the four gate-ending
-  routes requiring something an agent session does not have. That work is
-  tracked separately and is the thing to rely on; treat this rule as the layer
-  in front of it.
+  routes requiring something an agent session does not have. That check is
+  **not implemented today** — neither `nh approve` (`cli/commands.py:4512`)
+  nor the API's `approve_task` route (`api/app.py:1022`) tests for an agent
+  session — so nothing here should be read as telling you to rely on it.
 
   The paragraph overstated between 2026-08-12 and 2026-08-22, when `nh approve`
   gained a real `git merge --squash` and push while neither it nor the API
@@ -231,15 +236,15 @@ named here.
   spellings and started EXECUTING them, which is how most of the list was
   found.
 - **One `GET https://pypi.org/pypi/no-human/json` per day**, to notice a newer
-  release (`updates.py:39`). No identifier, no repo name, no telemetry — the
+  release (`updates.py:44`). No identifier, no repo name, no telemetry — the
   same request `pip install` makes. On by default (`updates.enabled: true`,
   `interval_seconds: 86400`); off with `updates.enabled: false` in
   `~/.no_human/config.yaml` or `NH_NO_UPDATE_CHECK=1`
-  (`updates.py:52`, which also covers CI).
+  (`updates.py:57`, which also covers CI).
 - **The desktop app checks GitHub Releases at startup**, once a day
-  (`desktop/main.mjs:733` → `desktop/updater.mjs:104`, feed
-  `provider: github, owner: no-human-ai, repo: no_human` —
-  `desktop/electron-builder.config.cjs:168`). It never downloads on its own
+  (`desktop/main.mjs:213` → `desktop/updater.mjs:104`, called at startup from
+  `desktop/main.mjs:901`, feed `provider: github, owner: no-human-ai, repo:
+  no_human` — `desktop/electron-builder.config.cjs:342`). It never downloads on its own
   (`autoDownload` is off, `desktop/updater.mjs:66`). **This is a separate code
   path from the PyPI check above and neither `NH_NO_UPDATE_CHECK` nor
   `updates.enabled` exists in `desktop/` — those switches do not reach it.**
@@ -267,7 +272,7 @@ config key that turns it on and the default that keeps it off.
     default *state*) POSTs a pipeline via
     `glab api --method POST projects/<project>/pipeline`, sending the **branch
     name** and the **key/value pairs you put in `ci.variables`** (default `{}`)
-    as the request body (`ci/gitlab.py:155-172`). It has no watch-only mode: if
+    as the request body (`ci/gitlab.py:403`). It has no watch-only mode: if
     it is enabled, it triggers.
   - **Jenkins** (`ci.backend: "jenkins"`) reaches `ci.base_url` over `curl`
     (`ci/jenkins.py:301-330`). `ci.mode` defaults to **`watch`**, which only
@@ -311,7 +316,7 @@ config key that turns it on and the default that keeps it off.
 - **Integration health checks.** `nh integrations` / the board's integrations
   page authenticate against whichever of Jira, Linear, CircleCI and the Teams
   webhook you have configured, to show a live status
-  (`integrations/__init__.py:497`, `:533`). Nothing configured → nothing sent.
+  (`integrations/__init__.py:499`, `:533`). Nothing configured → nothing sent.
 - **Team brain control plane.** `team_brain.enabled` defaults to **`false`** and
   `team_brain.control_plane_url` to **`""`**; when set, the client exchanges
   task patterns with that URL over `https` (loopback excepted)

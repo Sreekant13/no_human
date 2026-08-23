@@ -21,10 +21,13 @@ architecture-tree tests assert that something true is actually there.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from no_human.blockers.taxonomy import BlockerCategory
 from no_human.config import DEFAULT_CONFIG
@@ -1086,4 +1089,665 @@ def test_the_onboarding_docs_name_the_command_that_verifies_the_install(doc_name
         f"{doc_name} never mentions `nh doctor`. It is the only command that "
         f"verifies an install is real, and a user following only the public "
         f"onboarding path has no way to find it. See ADOPT-4."
+    )
+
+
+# --- docs-vs-code audit (2026-08-23): stale claims in security/eval/known-issues
+#
+# A supervising session's audit found docs/security.md, docs/eval.md and
+# docs/KNOWN_ISSUES.md each asserting something the code no longer does, or
+# citing a line the code had moved off of: an overclaimed merge-denial
+# guarantee, a merge-time check that was never implemented, a red-team task
+# count and judge model that had grown/changed, and a `nh stop` default that
+# had been widened. Fixed this round. These guards are the mechanism that
+# keeps each fix from rotting the same way it broke the first time.
+
+EVAL_MD = REPO / "docs" / "eval.md"
+KNOWN_ISSUES_MD = REPO / "docs" / "KNOWN_ISSUES.md"
+VERIFICATION_MD = REPO / "docs" / "verification.md"
+
+
+@pytest.fixture(scope="module")
+def eval_doc() -> str:
+    return EVAL_MD.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def known_issues_doc() -> str:
+    return KNOWN_ISSUES_MD.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def verification_doc() -> str:
+    return VERIFICATION_MD.read_text(encoding="utf-8")
+
+
+# --- merge-denial must not overclaim what the guard models -------------------
+#
+# `agent/guard.py` denies `gh pr merge` / `glab mr merge` (and the
+# `merge-stack` wrapper) for the SPELLINGS the lexical rule plus the
+# argv-shaped check model — not "regardless" of spelling, and not "in every
+# mode" as an unqualified universal. Two of three such sentences were
+# corrected; the third (the `nh approve` bullet, which really is denied in
+# both session modes because it is the operator's own command) is deliberately
+# untouched and out of scope for this guard.
+
+_EGRESS_PUSH_SPAN = (PUSH_BULLET_OPEN, PUSH_BULLET_CLOSE)
+
+
+def _merge_stack_bullet(security_doc: str) -> str:
+    """The `nh merge-stack run` bullet's text, or "" if the heading moved."""
+    marker = "**`nh merge-stack run` calls `gh pr merge`**"
+    start = security_doc.find(marker)
+    if start == -1:
+        return ""
+    end = security_doc.find("\n- **", start + len(marker))
+    if end == -1:
+        end = len(security_doc)
+    return security_doc[start:end]
+
+
+def test_security_md_does_not_overclaim_merge_denial(security_doc):
+    """Neither the push-egress bullet nor the merge-stack bullet may claim the
+    guard denies merge "regardless" of spelling or "in every mode" as a bare
+    universal — it denies the spellings the matcher models, in both session
+    modes, which is a narrower and truer claim.
+
+    Scoped deliberately to these two spans. The `nh approve` bullet's "denied
+    it in every mode" is a THIRD, correct instance (approve really is denied
+    in both modes, unconditionally, because it is the operator's own local
+    command) and is out of scope for this guard on purpose — asserting over
+    the whole document would make this guard fail on the sentence it must
+    leave alone.
+    """
+    push_bullet = _slice_between(security_doc, *_EGRESS_PUSH_SPAN)
+    merge_stack_bullet = _merge_stack_bullet(security_doc)
+    assert push_bullet, "the push-egress span is empty; see the anchors above"
+    assert merge_stack_bullet, (
+        "the `nh merge-stack run` bullet was not found by its heading text; "
+        "it may have been reworded or removed"
+    )
+    for label, span in (("push-egress", push_bullet), ("merge-stack", merge_stack_bullet)):
+        lowered = span.lower()
+        assert "regardless" not in lowered, (
+            f"the {label} bullet still says the merge guard fires "
+            f"'regardless' of spelling — it fires for the spellings the "
+            f"matcher models, not every spelling"
+        )
+        assert "denied it in every mode" not in lowered, (
+            f"the {label} bullet still claims denial 'in every mode' as a "
+            f"bare universal — narrow it to the spellings the guard models"
+        )
+    for span in (push_bullet, merge_stack_bullet):
+        assert "gh pr merge" in span, (
+            "a merge-denial bullet dropped the concrete command it denies"
+        )
+
+
+#: Every backticked `gh …` / `glab …` shell literal in docs/security.md, as of
+#: this fix. Not an exhaustive-coverage claim about what the guard denies —
+#: a floor on the table so nobody quietly re-publishes a closed enumeration of
+#: "every spelling the guard covers" under cover of this fix.
+_GH_GLAB_LITERAL_RE = re.compile(r"`((?:gh|glab) [a-z][a-z -]*)`")
+
+
+def test_no_new_exhaustive_coverage_list_is_published(security_doc):
+    """The fix must not trade one overclaim ("regardless") for another (a
+    closed list of every spelling the matcher happens to cover today).
+
+    Pinned to the count measured right after the fix landed. A genuinely new,
+    load-bearing command mention would grow this by one and should be looked
+    at, not silently waved through by a guard with no ceiling at all.
+    """
+    literals = _GH_GLAB_LITERAL_RE.findall(security_doc)
+    assert len(literals) <= 5, (
+        f"docs/security.md now names {len(literals)} `gh`/`glab` command "
+        f"literals ({sorted(set(literals))}); this looks like a new exhaustive "
+        f"coverage list of the merge guard's modelled spellings, which the fix "
+        f"deliberately avoided publishing. If this growth is legitimate "
+        f"(unrelated command documentation), raise the ceiling with a note "
+        f"saying why."
+    )
+
+
+# --- approve-time control: not implemented, must not be promised -------------
+#
+# `is_agent_session` is a real, used symbol — just not inside `approve` /
+# `approve_task`. The doc must say the control is not implemented, not send a
+# reader to rely on a check that does not run at approve time.
+
+ORCHESTRATOR_PY = REPO / "src" / "no_human" / "core" / "orchestrator.py"
+APP_PY = REPO / "src" / "no_human" / "api" / "app.py"
+COMMANDS_PY = REPO / "src" / "no_human" / "cli" / "commands.py"
+
+
+def _function_body_source(source: str, func_name: str) -> str:
+    """Source text of the FIRST `def`/`async def` named *func_name* found
+    anywhere in the module — top-level or a class method — bounded by the
+    node's own `end_lineno`.
+
+    AST-parsed for both the start and the end (so a comment or string
+    mentioning the name cannot be mistaken for the definition, and a nested
+    def below it cannot leak past the real end of the body), which is enough
+    to prove a symbol is present/absent inside exactly that function.
+    """
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    node = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == func_name
+        ),
+        None,
+    )
+    assert node is not None, f"no def {func_name}(...) found anywhere in the module"
+    end = node.end_lineno or len(lines)
+    return "".join(lines[node.lineno - 1:end])
+
+
+def test_is_agent_session_is_real_but_absent_from_approve(security_doc):
+    """Positive control first: `is_agent_session` must be a real, live symbol
+    somewhere in the tree, or this test would be proving a no-op.
+
+    `agent/guard.py` — where the merge-ban's own spelling check lives — has
+    NO occurrence of `is_agent_session` at all; the symbol is defined in
+    `core/orchestrator.py` and consumed by websocket/event code in `api/app.py`
+    and `cli/commands.py`, never by `approve` or `approve_task`. That is the
+    fact the doc must now state plainly instead of pointing a reader at an
+    approve-time check that does not run.
+    """
+    orchestrator_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
+    assert "def is_agent_session" in orchestrator_src, (
+        "is_agent_session is no longer defined in core/orchestrator.py — "
+        "re-check where the real symbol lives before re-reading this test"
+    )
+    app_src = APP_PY.read_text(encoding="utf-8")
+    commands_src = COMMANDS_PY.read_text(encoding="utf-8")
+    assert app_src.count("is_agent_session") >= 1, (
+        "is_agent_session is no longer referenced in api/app.py; the positive "
+        "control this test relies on to prove the symbol is real has gone stale"
+    )
+    assert commands_src.count("is_agent_session") >= 1, (
+        "is_agent_session is no longer referenced in cli/commands.py; the "
+        "positive control this test relies on to prove the symbol is real "
+        "has gone stale"
+    )
+
+    approve_body = _function_body_source(commands_src, "approve")
+    assert "is_agent_session" not in approve_body, (
+        "cli/commands.py's approve() now calls is_agent_session — the "
+        "approve-time control docs/security.md says is unimplemented may "
+        "have been built; if so, update the doc to describe it instead of "
+        "denying it"
+    )
+    approve_task_body = _function_body_source(app_src, "approve_task")
+    assert "is_agent_session" not in approve_task_body, (
+        "api/app.py's approve_task() now calls is_agent_session — the "
+        "approve-time control docs/security.md says is unimplemented may "
+        "have been built; if so, update the doc to describe it instead of "
+        "denying it"
+    )
+
+    assert "is the thing to rely on" not in security_doc, (
+        "docs/security.md still tells the reader an approve-time "
+        "agent-session check is the thing to rely on — it is not "
+        "implemented; the doc must say so instead"
+    )
+
+
+# --- file:line citations must resolve to the code they describe --------------
+#
+# `docs/verification.md` moved its citations to SYMBOLS for exactly the reason
+# stated at `test_documented_source_citations_resolve` above: line numbers rot
+# on every edit above them. security.md, eval.md and KNOWN_ISSUES.md still use
+# `path:line[-line]` citations, and rewriting that convention would be a style
+# change this fix does not make — so instead every citation is pinned here to
+# a literal token on the line(s) it names, and every citation actually written
+# in the three docs is required to appear in the table below.
+
+_LINE_CITATION_RE = re.compile(
+    r"`((?:[\w./-]+\.(?:py|mjs|cjs))?:\d+(?:-\d+)?)`"
+)
+
+#: (doc filename, raw citation text exactly as it appears between backticks,
+#: path to resolve it against — inherited from the preceding citation in the
+#: same doc for a bare `:NNN` continuation, exactly as a reader would read it
+#: in prose — expected literal substring on the cited line(s)).
+CITATION_TABLE = (
+    # docs/security.md
+    ("security.md", "guard.py:58", "guard.py", 'WRITE_TOOLS = {"Write"'),
+    ("security.md", "agent/claude_backend.py:518", "agent/claude_backend.py",
+     'permission_mode: str = "bypassPermissions"'),
+    ("security.md", ":543", "agent/claude_backend.py", "PreToolUse guard"),
+    ("security.md", "vcs/pr_watcher.py:507-533", "vcs/pr_watcher.py",
+     '"gh", "pr", "view"'),
+    ("security.md", "vcs/git.py:767", "vcs/git.py", '"git", "fetch"'),
+    ("security.md", ":797", "vcs/git.py", '["fetch", remote]'),
+    ("security.md", "cli/commands.py:2693", "cli/commands.py",
+     '"gh", "pr", "merge"'),
+    ("security.md", "cli/commands.py:4512", "cli/commands.py", "def approve("),
+    ("security.md", "api/app.py:1022", "api/app.py", "async def approve_task("),
+    ("security.md", "updates.py:44", "updates.py", "PYPI_JSON_URL"),
+    ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
+    ("security.md", "desktop/main.mjs:213", "desktop/main.mjs",
+     "async function checkForUpdates("),
+    ("security.md", "desktop/updater.mjs:104", "desktop/updater.mjs",
+     "autoUpdater.checkForUpdates()"),
+    ("security.md", "desktop/main.mjs:901", "desktop/main.mjs", "checkForUpdates()"),
+    ("security.md", "desktop/electron-builder.config.cjs:342",
+     "desktop/electron-builder.config.cjs", '"github"'),
+    ("security.md", "desktop/updater.mjs:66", "desktop/updater.mjs",
+     "autoDownload = false"),
+    ("security.md", "ci/gitlab.py:403", "ci/gitlab.py", "pipeline"),
+    ("security.md", "ci/jenkins.py:301-330", "ci/jenkins.py", "_HTTP_MARKER"),
+    ("security.md", "ci/jenkins.py:154-169", "ci/jenkins.py", "buildWithParameters"),
+    ("security.md", "ci_gate/enrich.py:70-83", "ci_gate/enrich.py", "_HTTP_MARKER"),
+    ("security.md", "ci/circleci.py:169-180", "ci/circleci.py", "_latest_pipeline_for"),
+    ("security.md", "ci/circleci.py:182-186", "ci/circleci.py", "_create_pipeline"),
+    ("security.md", "context/teams.py:35", "context/teams.py", "GRAPH_SEARCH_URL"),
+    ("security.md", ":55-66", "context/teams.py", '"queryString": query'),
+    ("security.md", "context/teams.py:50-54", "context/teams.py",
+     "M365 Graph token not configured"),
+    ("security.md", "notify/slack.py:53", "notify/slack.py",
+     "httpx.post(self.webhook_url"),
+    ("security.md", "notify/teams.py:205", "notify/teams.py",
+     "httpx.post(self.webhook_url"),
+    ("security.md", "integrations/__init__.py:499", "integrations/__init__.py",
+     "_probe_github_ambient"),
+    ("security.md", ":533", "integrations/__init__.py",
+     "Only WHETHER a non-empty token exists"),
+    ("security.md", "brain/client.py:89-133", "brain/client.py",
+     "cfg.control_plane_url"),
+    ("security.md", "intake/mcp_bridge.py:29", "intake/mcp_bridge.py",
+     "127.0.0.1:8420"),
+    ("security.md", "cli/commands.py:64-70", "cli/commands.py", "no task matching"),
+    ("security.md", "history/extractor.py:65-72", "history/extractor.py",
+     "csrf_token"),
+    # docs/eval.md
+    ("eval.md", "src/no_human/cli/commands.py:6632", "src/no_human/cli/commands.py",
+     '"--trials"'),
+    ("eval.md", ":6959-6964", "src/no_human/cli/commands.py", "asyncio.gather"),
+    ("eval.md", ":6828-6846", "src/no_human/cli/commands.py",
+     "(sc.task_id, sc.trial)"),
+    ("eval.md", "src/no_human/eval/northstar_card.py:436",
+     "src/no_human/eval/northstar_card.py", "def pass_k_rate("),
+    ("eval.md", "northstar_card.py:794-795", "northstar_card.py",
+     "pass^{card.trials}"),
+    ("eval.md", "northstar_card.py:1397-1401", "northstar_card.py",
+     "Per-spec reliability"),
+    ("eval.md", "tests/test_bench_trials.py:272", "tests/test_bench_trials.py",
+     '"pass^1" not in line'),
+    ("eval.md", "northstar_card.py:353", "northstar_card.py",
+     "def spec_mean_success_rate("),
+    # docs/KNOWN_ISSUES.md
+    ("KNOWN_ISSUES.md", "db.py:471", "db.py", "aiosqlite.connect"),
+)
+
+assert len(CITATION_TABLE) >= 20, (
+    "CITATION_TABLE has too few rows to be a meaningful floor on citation "
+    "coverage across security.md/eval.md/KNOWN_ISSUES.md"
+)
+
+#: Rows that cite a path classified `drop` in EXPORT_CLASSIFICATION.txt (here:
+#: `ci_gate/` at line 597) — the file is real in this private tree but absent
+#: from the public export, so `tests/test_readme_claims.py`, which SHIPS,
+#: would otherwise fail on arrival there. These rows are skipped (not passed)
+#: when the file does not resolve, and still fully checked — mandatory-hit
+#: included — wherever it does; see
+#: `test_absent_tolerant_citation_still_checks_content_when_present` for the
+#: non-vacuity control that proves the skip cannot mask a wrong citation.
+_ABSENT_OK = frozenset({("security.md", "ci_gate/enrich.py:70-83")})
+
+_CITATION_DOC_PATHS = {
+    "security.md": SECURITY_DOC,
+    "eval.md": EVAL_MD,
+    "KNOWN_ISSUES.md": KNOWN_ISSUES_MD,
+}
+
+
+def _citation_source_lines(resolve_path: str, spec: str) -> list[str]:
+    """The literal text of the line(s) *spec* names inside *resolve_path*.
+
+    Empty list if the path does not resolve to exactly one file, or the file
+    is shorter than the citation claims — both read as "this citation no
+    longer points anywhere real" rather than raising.
+    """
+    hits = _resolve_source(resolve_path)
+    if len(hits) != 1:
+        return []
+    lines = hits[0].read_text(encoding="utf-8").splitlines()
+    if "-" in spec:
+        start_s, end_s = spec.split("-", 1)
+    else:
+        start_s = end_s = spec
+    start, end = int(start_s), int(end_s)
+    if start < 1 or end > len(lines):
+        return []
+    return lines[start - 1:end]
+
+
+def _check_citation(doc: str, raw: str, resolve_path: str, token: str) -> None:
+    """Shared assertion body for a single citation row — factored out so the
+    non-vacuity control below can drive it directly with a wrong token."""
+    spec = raw.split(":", 1)[1] if raw.startswith(":") else raw.rsplit(":", 1)[1]
+    lines = _citation_source_lines(resolve_path, spec)
+    assert lines, (
+        f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
+        f"does not resolve to a real line range — the code moved or the "
+        f"citation was never re-derived"
+    )
+    haystack = "\n".join(lines)
+    assert token in haystack, (
+        f"{doc} cites `{raw}` for {token!r}, but the line(s) now read:\n"
+        f"  {haystack!r}\n"
+        f"re-derive the citation from the current tree"
+    )
+
+
+@pytest.mark.parametrize(
+    "doc,raw,resolve_path,token",
+    CITATION_TABLE,
+    ids=[f"{doc}:{raw}" for doc, raw, _, _ in CITATION_TABLE],
+)
+def test_doc_citations_resolve_to_the_code_they_describe(doc, raw, resolve_path, token):
+    """Every `path:line[-line]` citation in security.md/eval.md/KNOWN_ISSUES.md
+    must point at code that still says what the doc cites it for.
+
+    This is the guard the docs-vs-code audit found missing: several of these
+    citations had rotted silently because nothing checked them. A citation
+    that no longer resolves, or resolves to a line with none of the expected
+    content, means the code moved and the doc did not follow.
+
+    Exception: a row in `_ABSENT_OK` cites a drop-classified path (see the
+    comment on `_ABSENT_OK`) — if it doesn't resolve at all, that's the
+    export tree behaving as designed, so this skips instead of failing.
+    If it DOES resolve, the check below still runs in full, mandatory hit
+    included — the file must exist in this dev tree, and non-vacuity is
+    covered by `test_absent_tolerant_citation_still_checks_content_when_present`.
+    """
+    if (doc, raw) in _ABSENT_OK and not _resolve_source(resolve_path):
+        pytest.skip(
+            f"{resolve_path} is drop-classified (EXPORT_CLASSIFICATION.txt) "
+            f"and absent from this tree — expected in the public export; "
+            f"the citation is fully checked wherever the file is present"
+        )
+    _check_citation(doc, raw, resolve_path, token)
+
+
+def test_absent_tolerant_citation_still_checks_content_when_present():
+    """Non-vacuity control for `_ABSENT_OK`: the skip above must trigger only
+    on a genuinely absent file, never on a present-but-wrong citation.
+
+    `ci_gate/enrich.py` is drop-classified but real in this (private) dev
+    tree, so feeding its row a token that is not on the cited lines must
+    still raise — if it silently passed or skipped instead, the
+    absent-tolerant row would be able to mask a stale citation forever.
+
+    This module SHIPS, so this test runs in the public export too, where
+    `ci_gate/enrich.py` is absent by design (same as the row it controls
+    for) — it skips there rather than failing, for the same reason.
+    """
+    doc, raw, resolve_path, _token = next(
+        row for row in CITATION_TABLE if (row[0], row[1]) in _ABSENT_OK
+    )
+    if not _resolve_source(resolve_path):
+        pytest.skip(
+            f"{resolve_path} is drop-classified and absent from this tree — "
+            f"this control only exercises the present-file branch, and can "
+            f"only run wherever the file is present"
+        )
+    with pytest.raises(AssertionError):
+        _check_citation(doc, raw, resolve_path, "no-such-token-in-this-file")
+
+
+def test_the_citation_table_covers_every_line_citation_in_the_three_docs():
+    """Every backticked `path:line[-line]` citation actually written in
+    security.md/eval.md/KNOWN_ISSUES.md must have a row in CITATION_TABLE —
+    otherwise this guard only ever checks the citations someone remembered to
+    add, which is exactly the blind spot that let the originals rot.
+    """
+    table_by_doc: dict[str, set[str]] = {}
+    for doc, raw, _, _ in CITATION_TABLE:
+        table_by_doc.setdefault(doc, set()).add(raw)
+
+    missing: list[str] = []
+    extra: list[str] = []
+    for doc, path in _CITATION_DOC_PATHS.items():
+        text = path.read_text(encoding="utf-8")
+        found = set(_LINE_CITATION_RE.findall(text))
+        table = table_by_doc.get(doc, set())
+        missing.extend(f"{doc}: {raw}" for raw in sorted(found - table))
+        extra.extend(f"{doc}: {raw}" for raw in sorted(table - found))
+
+    assert not missing, (
+        "citations written in the docs are not covered by CITATION_TABLE:\n  "
+        + "\n  ".join(missing)
+    )
+    assert not extra, (
+        "CITATION_TABLE has rows for citations no longer present in the "
+        "docs (stale table entries — the doc changed and the table did not):"
+        "\n  " + "\n  ".join(extra)
+    )
+
+
+# --- KNOWN_ISSUES.md's traceback citations (not backtick-wrapped) ------------
+
+
+def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1805` inside
+    `update_attempt` and `orchestrator.py:3993` inside `_run_attempt` — not
+    backtick-wrapped, so the generic citation table above cannot see them.
+    Checked directly against the AST so a refactor that moves either call is
+    caught rather than silently believed.
+    """
+    assert "db.py:1805" in known_issues_doc, (
+        "the traceback no longer cites db.py:1805 — this test is pointed at "
+        "stale text; re-derive from the current traceback"
+    )
+    assert "orchestrator.py:3993" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:3993 — this test is "
+        "pointed at stale text; re-derive from the current traceback"
+    )
+
+    db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
+    db_body = _function_body_source(db_src, "update_attempt")
+    db_lines = db_src.splitlines()
+    assert 1 <= 1805 <= len(db_lines), "db.py is now shorter than line 1805"
+    assert db_lines[1804].strip() == "await self.db.commit()", (
+        f"db.py:1805 is now {db_lines[1804]!r}, not the commit the traceback "
+        f"names"
+    )
+    assert "await self.db.commit()" in db_body, (
+        "line 1805 is no longer inside update_attempt's body"
+    )
+
+    orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
+    orch_body = _function_body_source(orch_src, "_run_attempt")
+    orch_lines = orch_src.splitlines()
+    assert 1 <= 3993 <= len(orch_lines), "orchestrator.py is now shorter than line 3993"
+    assert "self.store.update_attempt(" in orch_lines[3992], (
+        f"orchestrator.py:3993 is now {orch_lines[3992]!r}, not the "
+        f"update_attempt call the traceback names"
+    )
+    assert "self.store.update_attempt(" in orch_body, (
+        "line 3993 is no longer inside _run_attempt's body"
+    )
+
+
+# --- eval.md: judge model, red-team count, and the live CI file --------------
+
+GOLDEN_TASKS_DIR = REPO / "eval" / "golden_tasks"
+
+
+def _red_team_task_ids() -> set[str]:
+    """Every golden task id where `impossible` or `tempts_tamper` is true."""
+    ids: set[str] = set()
+    for path in sorted(GOLDEN_TASKS_DIR.glob("*.yaml")):
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if data.get("impossible") or data.get("tempts_tamper"):
+            ids.add(data["id"])
+    return ids
+
+
+def test_eval_md_red_team_count_matches_the_golden_tasks(eval_doc):
+    """Derived from the golden task corpus, not hand-counted: a red-team task
+    added or retired changes this count automatically, and the doc's number
+    and named ids must track it.
+    """
+    ids = _red_team_task_ids()
+    assert len(ids) >= 5, (
+        f"only {len(ids)} red-team golden tasks found under "
+        f"{GOLDEN_TASKS_DIR.relative_to(REPO)} — this floor exists so the "
+        f"guard cannot pass by finding nothing"
+    )
+    number_words = {
+        1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+        6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+    }
+    word = number_words.get(len(ids))
+    assert word, f"no number-word mapping for {len(ids)} red-team tasks"
+    assert word in eval_doc.lower(), (
+        f"eval.md does not say {word!r} ({len(ids)}) red-team tasks; it must "
+        f"match the golden task corpus exactly"
+    )
+    missing_ids = [i for i in sorted(ids) if i not in eval_doc]
+    assert not missing_ids, (
+        f"eval.md's red-team paragraph omits {missing_ids} — every red-team "
+        f"task id must be named so a reader can find it in the corpus"
+    )
+
+
+def test_eval_md_names_the_judge_model_the_code_defaults_to(eval_doc):
+    """The Intent-match judge's default model must match what `IntentJudge`
+    actually constructs with, via `inspect.signature` — not a hand-copied
+    string that can drift the day the default changes.
+    """
+    from no_human.eval.judge import IntentJudge
+
+    default_model = inspect.signature(IntentJudge.__init__).parameters["model"].default
+    assert default_model in eval_doc, (
+        f"eval.md does not name IntentJudge's actual default model "
+        f"({default_model!r}) as the judge model"
+    )
+    assert "claude-sonnet-4-6" not in eval_doc, (
+        "eval.md still names the retired judge model claude-sonnet-4-6"
+    )
+
+
+def test_eval_md_names_the_live_ci_workflow(eval_doc):
+    """CI runs the offline eval harness from `.github/workflows/ci.yml`, not
+    `.gitlab-ci.yml` — the doc must point a reader at the workflow that
+    actually runs, and that file must exist.
+    """
+    assert (REPO / ".github" / "workflows" / "ci.yml").exists(), (
+        "docs/eval.md is being asked to name .github/workflows/ci.yml, but "
+        "that file does not exist in this tree"
+    )
+    assert ".github/workflows/ci.yml" in eval_doc, (
+        "eval.md does not name .github/workflows/ci.yml as where the offline "
+        "harness runs in CI"
+    )
+    assert ".gitlab-ci.yml" not in eval_doc, (
+        "eval.md still points at .gitlab-ci.yml, which is not the live CI file"
+    )
+
+
+# --- KNOWN_ISSUES.md: the real `nh stop --timeout` default -------------------
+
+
+def test_known_issues_stop_timeout_default_matches_the_cli(known_issues_doc):
+    """`nh stop --timeout` defaults to `stop_grace_s(config)` (60s) plus
+    `STOP_COMMAND_MARGIN_S` (15s) = 75s. Computed from the real constants
+    rather than hand-copied, so a change to either constant moves this
+    assertion instead of silently leaving the doc behind again.
+    """
+    from no_human.core.scheduler import STOP_COMMAND_MARGIN_S, stop_grace_s
+
+    computed = stop_grace_s(DEFAULT_CONFIG) + STOP_COMMAND_MARGIN_S
+    assert computed == 75, (
+        f"stop_grace_s(DEFAULT_CONFIG) + STOP_COMMAND_MARGIN_S is now "
+        f"{computed}, not 75 — re-derive KNOWN_ISSUES.md's stated default "
+        f"from these constants before trusting the assertion below"
+    )
+    assert "75s" in known_issues_doc, (
+        "KNOWN_ISSUES.md does not state the real nh stop --timeout default "
+        "(75s = stop_grace_s + STOP_COMMAND_MARGIN_S)"
+    )
+    assert "defaulted to 3s" in known_issues_doc, (
+        "KNOWN_ISSUES.md dropped the historical note that the old default "
+        "(3s) was the actual bug"
+    )
+    assert "30s" not in known_issues_doc, (
+        "KNOWN_ISSUES.md still states a 30s nh stop --timeout default, which "
+        "is not what the CLI computes"
+    )
+
+
+# --- verification.md: four gates, and the published recall figure -----------
+
+
+def test_verification_md_counts_four_gates(verification_doc):
+    """The pipeline runs FOUR gates (reviewer, verifiers, tamper guard, repro
+    gate) — not three. "Deterministic lint evidence" is explicitly an INPUT to
+    the gates, not a gate itself, and must stay excluded from the count.
+    """
+    assert "Three gates" not in verification_doc, (
+        "verification.md still opens with 'Three gates' — the pipeline runs "
+        "four (reviewer, verifiers, tamper guard, repro gate)"
+    )
+    assert "Four gates" in verification_doc, (
+        "verification.md does not state the pipeline runs four gates"
+    )
+    gate_headings = [
+        "An adversarial reviewer that is not the author",
+        "Verifiers — a recorded verdict per rule",
+        "A tamper guard against a self-gutted test suite",
+        "A reproduction gate that proves the fix fixed the bug",
+    ]
+    missing = [h for h in gate_headings if f"## {h}" not in verification_doc]
+    assert not missing, (
+        f"verification.md is missing gate heading(s) {missing} — the "
+        f"'four gates' count must be backed by four actual sections"
+    )
+    assert "## Deterministic lint evidence — not a gate, an input" in verification_doc, (
+        "verification.md's lint-evidence heading no longer explicitly "
+        "disclaims being a gate — without that disclaimer a reader could "
+        "recount it as a fifth gate against the stated total of four"
+    )
+
+
+REVIEWER_RECALL_METHOD_MD = REPO / "docs" / "REVIEWER_RECALL_METHOD.md"
+
+
+def test_verification_md_publishes_the_recall_figure(verification_doc):
+    """verification.md must cite the actual published reviewer-recall run
+    (2026-08-11, claude-opus-4-8, 15/19 recall, 7/10 specificity) rather than
+    claiming no number is published — and that run must really be the one
+    REVIEWER_RECALL_METHOD.md documents, not a number invented for this doc.
+    """
+    assert REVIEWER_RECALL_METHOD_MD.exists(), (
+        "docs/REVIEWER_RECALL_METHOD.md does not exist; verification.md is "
+        "being asked to cite a method doc that is not in the tree"
+    )
+    method_doc = REVIEWER_RECALL_METHOD_MD.read_text(encoding="utf-8")
+
+    required_tokens = ("15/19", "7/10", "2026-08-11", "claude-opus-4-8")
+    for token in required_tokens:
+        assert token in verification_doc, (
+            f"verification.md does not cite {token!r} from the published "
+            f"reviewer-recall run"
+        )
+        assert token in method_doc, (
+            f"{token!r} is asserted in verification.md but is not actually "
+            f"in REVIEWER_RECALL_METHOD.md — the citation would not be "
+            f"re-derivable from its own source"
+        )
+    assert "REVIEWER_RECALL_METHOD.md" in verification_doc, (
+        "verification.md does not link/name REVIEWER_RECALL_METHOD.md as "
+        "where the recall figure's method lives"
+    )
+    assert "No number is published" not in verification_doc, (
+        "verification.md still claims no recall number is published, but "
+        "one now is"
     )
