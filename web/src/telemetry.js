@@ -5,13 +5,21 @@
 //    token in /api/config, initTelemetry returns before `posthog-js` is even
 //    IMPORTED (dynamic import) — no consent means the module never loads,
 //    no cookies, no recorder, zero bytes to PostHog.
+//  - NO AUTOCAPTURE, NO IMPLICIT PAGE EVENTS: autocapture (and the
+//    `$el_text` it stamps on every click/change/submit — here that would be
+//    task titles, repo names, file paths, PR text) plus `$pageview` /
+//    `$pageleave` are all disabled. The app sends its own `screen_viewed`
+//    event instead, carrying a lane NAME only. See the published event list
+//    in docs/configuration.md.
 //  - MASKED REPLAY: recordings capture the app's OWN interface only. All
-//    inputs are masked, plus `.ph-mask` (text-level) and PostHog's own
-//    `.ph-no-capture` (whole-block) on every element that renders operator
-//    content: task titles, specs/descriptions, diffs, activity logs, the
-//    composer, backlog ticket titles. Never your code.
-//  - NO PERSON PROFILES: person_profiles "never" — events are keyed to an
-//    anonymous instance, not a person.
+//    inputs are masked, and PostHog's own `.ph-no-capture` (whole-block) is
+//    hand-applied to every element that renders operator content: task
+//    titles, specs/descriptions, diffs, activity logs, the composer,
+//    backlog ticket titles. Never your code. (No blanket text-mask selector
+//    is configured — see the removal note on `maskTextSelector` below.)
+//  - ONE IDENTIFIER: events are tagged with the same anonymous `instance_id`
+//    as the server channel (registered below), not PostHog's own generated
+//    device id. NO PERSON PROFILES: person_profiles "never".
 import { fetchVersion } from "./api.js";
 
 let posthog = null; // the initialized client, or null when not consented
@@ -25,7 +33,8 @@ export function telemetryConsent(cfg) {
   // fallbacks — those names ARE scrubbed to a "●●● set" literal by the
   // config echo, so a fallback would init PostHog with the mask string.
   const key = t.posthog_publishable;
-  return key ? { key, host: t.posthog_host } : null;
+  if (!key) return null;
+  return { key, host: t.posthog_host, instanceId: String(t.instance_id || "") };
 }
 
 // `importer` is injectable so tests can prove "no consent => posthog-js never
@@ -44,8 +53,16 @@ export async function initTelemetry(cfg, { importer } = {}) {
     client.init(consent.key, {
       api_host: consent.host,
       defaults: "2026-05-30",
-      session_recording: { maskAllInputs: true, maskTextSelector: ".ph-mask" },
+      // The $el_text channel: autocapture stamps every click/change/submit
+      // with the element's TEXT — here that is task titles, repo names,
+      // paths, PR text. Off. So are the implicit page events; the app sends
+      // its own `screen_viewed` carrying a lane NAME only.
+      autocapture: false,
+      capture_pageview: false,
+      capture_pageleave: false,
+      session_recording: { maskAllInputs: true },
       person_profiles: "never",
+      ...(consent.instanceId ? { bootstrap: { distinctID: consent.instanceId } } : {}),
     });
     // Stamp every event with the running app version (server's /api/version —
     // the same string `nh --version` prints). Best-effort: unknown stays unknown.
@@ -55,7 +72,10 @@ export async function initTelemetry(cfg, { importer } = {}) {
     } catch {
       /* best-effort */
     }
-    client.register({ app_version: version });
+    client.register({
+      app_version: version,
+      ...(consent.instanceId ? { instance_id: consent.instanceId } : {}),
+    });
     posthog = client;
     return posthog;
   } catch {

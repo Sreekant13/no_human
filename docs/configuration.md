@@ -423,6 +423,59 @@ badge, a "Show archived" filter, and **Restore**/**Dismiss** triage actions —
 see `docs/design/memory-lifecycle-triage.md`'s "Rules/Skills UI" section for
 the exact contract.
 
+## Usage insights: the complete event list
+
+`telemetry.enabled` (default `false`) turns on anonymous, opt-in usage
+telemetry (PostHog). This section is the complete, machine-checked list of
+what can ever be sent — two tests keep it that way:
+`tests/test_telemetry.py::test_every_server_event_kind_is_documented` /
+`test_documented_list_has_no_phantom_events` fail if the server's closed
+allowlist (`src/no_human/telemetry.py`'s `_ALLOWED_EVENTS`) and this table
+ever disagree in either direction, and `web/src/telemetry.test.mjs`'s
+disclosure sweep fails if any `posthog.capture(...)` call site in `web/src`
+sends an event name not listed here.
+
+There are exactly seven possible event kinds, six sent by the server and one
+by the browser:
+
+| Event | Channel | Props |
+|---|---|---|
+| `app_started` | server | — |
+| `task_created` | server | `source` |
+| `task_completed` | server | `status`, `duration_bucket`, `attempts` |
+| `task_failed` | server | `category` |
+| `approve_clicked` | server | — |
+| `feature_used` | server | `name` |
+| `screen_viewed` | browser | `screen` (the lane name — `board`/`backlog`/`done`/`failed`/`stats`/`settings`/…, never content) |
+
+Both channels stamp every event with the same two identifiers: `instance_id`
+(a random uuid4 minted server-side on first consent, persisted in config —
+never minted in, or accepted from, the browser) and `app_version`. No person
+profiles are created (`person_profiles: "never"`); events are not linked to
+any human identity.
+
+**Autocapture is off.** `autocapture`, `capture_pageview` and
+`capture_pageleave` are all disabled in the PostHog client init
+(`web/src/telemetry.js`), so no click/change/submit element text and no
+implicit page-view events are ever collected — only the seven event kinds
+above, ever.
+
+**Session replay, honestly stated.** When telemetry is on, PostHog session
+recording captures the app's own interface. All form inputs are masked
+(`session_recording.maskAllInputs: true`), and every element known to render
+operator content — task titles, specs/descriptions, diffs, activity logs, the
+composer, backlog ticket titles — carries a hand-applied `ph-no-capture`
+block-mask, enforced by a source-level test sweep so a new surface can't ship
+unmasked silently. This is a masked-surface guarantee, not a claim that replay
+"cannot capture content" — it can capture pixels of anything not on the masked
+list, which is why the list is enforced by tests rather than left to review.
+
+**Never sent, on either channel:** task titles, repo names, file paths,
+prompts/specs, diffs, or any credential/token.
+
+Telemetry defaults to **off** (`telemetry.enabled: false` in
+`config.DEFAULT_CONFIG`); nothing above is sent until an operator opts in.
+
 ## Tests command
 
 `tests.command` (optional) overrides test detection for the local suite the

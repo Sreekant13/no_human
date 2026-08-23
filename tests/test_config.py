@@ -480,7 +480,7 @@ def test_the_config_floor_never_inverts_the_retry_window():
 #: diff — `-72 / +73` is unmissable where one more line inside a sorted
 #: 72-entry frozenset is not. Real enforcement would derive the number from
 #: history, outside the file the author is editing.
-_BASELINE_SIZE_AT_WRITING = 72
+_BASELINE_SIZE_AT_WRITING = 71
 
 _UNDOCUMENTED_AT_BASELINE = frozenset({
     "blockers.ignore_comment_authors",
@@ -543,7 +543,6 @@ _UNDOCUMENTED_AT_BASELINE = frozenset({
     "team_brain.control_plane_url",
     "team_brain.enabled",
     "team_brain.max_stale_days",
-    "telemetry.enabled",
     "telemetry.endpoint",
     "telemetry.instance_id",
     "telemetry.posthog_host",

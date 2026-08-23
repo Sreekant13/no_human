@@ -12,6 +12,8 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import re
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -19,7 +21,7 @@ from httpx import AsyncClient, ASGITransport
 
 from no_human import telemetry
 from no_human.api.app import app
-from no_human.config import Config
+from no_human.config import DEFAULT_CONFIG, Config
 from no_human.core.db import Store
 
 app_module = importlib.import_module("no_human.api.app")
@@ -455,3 +457,51 @@ def test_all_poisoned_batch_is_deleted_without_posting(temp_home, no_network,
     telemetry.record("app_started", config={"telemetry": _ENABLED})
     assert telemetry.flush(_ENABLED) == 1
     assert len(no_network) == 1
+
+
+# ------------------- published event-list disclosure ---------------------- #
+# The browser channel (`web/src/telemetry.js`) sends one extra event kind,
+# `screen_viewed`, that the server's closed allowlist deliberately never
+# accepts (it would open the ingest path to it — see telemetry.py's module
+# docstring). These two tests pin the DOCUMENTED list in docs/configuration.md
+# against `_ALLOWED_EVENTS` in both directions, so a server event can't ship
+# undocumented and a stale doc entry can't survive a removed event either.
+
+_DOCS_PATH = Path(__file__).resolve().parent.parent / "docs" / "configuration.md"
+
+
+def _configuration_doc_text() -> str:
+    return _DOCS_PATH.read_text(encoding="utf-8")
+
+
+def test_every_server_event_kind_is_documented():
+    doc = _configuration_doc_text()
+    missing_events = [name for name in telemetry._ALLOWED_EVENTS if name not in doc]
+    assert missing_events == [], (
+        f"event kind(s) not listed in docs/configuration.md: {missing_events}"
+    )
+    all_props = {prop for props in telemetry._ALLOWED_EVENTS.values() for prop in props}
+    missing_props = [
+        prop for prop in all_props
+        if not re.search(rf"`{re.escape(prop)}`", doc)
+    ]
+    assert missing_props == [], (
+        f"prop name(s) not listed (as `backticked`) in docs/configuration.md: {missing_props}"
+    )
+
+
+def test_documented_list_has_no_phantom_events():
+    doc = _configuration_doc_text()
+    documented = {
+        m.group(1)
+        for m in re.finditer(r"`([a-z_]+)`\s*\|\s*(?:server|browser)\s*\|", doc)
+    }
+    published = set(telemetry._ALLOWED_EVENTS) | {"screen_viewed"}
+    assert documented == published, (
+        "docs/configuration.md's event table disagrees with the actual "
+        f"published set — documented={documented!r} published={published!r}"
+    )
+
+
+def test_telemetry_stays_off_by_default():
+    assert DEFAULT_CONFIG["telemetry"]["enabled"] is False

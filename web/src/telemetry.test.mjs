@@ -1,15 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { initTelemetry, telemetryConsent, captureScreen, _resetForTests } from "./telemetry.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
+const WEB = join(SRC, "..");
+const REPO_ROOT = join(WEB, "..");
 const read = (p) => readFileSync(join(SRC, p), "utf8");
 
 function fakePosthogModule() {
-  const calls = { init: [], register: [], capture: [] };
+  const calls = { init: [], register: [], capture: [], identify: [] };
   return {
     calls,
     module: {
@@ -17,6 +19,7 @@ function fakePosthogModule() {
         init: (...a) => calls.init.push(a),
         register: (...a) => calls.register.push(a),
         capture: (...a) => calls.capture.push(a),
+        identify: (...a) => calls.identify.push(a),
       },
     },
   };
@@ -46,7 +49,11 @@ test("telemetryConsent needs enabled AND a client token", () => {
   assert.equal(telemetryConsent({ telemetry: { posthog_publishable: "phc_x" } }), null);
   assert.deepEqual(
     telemetryConsent({ telemetry: { enabled: true, posthog_publishable: "phc_x", posthog_host: "https://us.i.posthog.com" } }),
-    { key: "phc_x", host: "https://us.i.posthog.com" },
+    { key: "phc_x", host: "https://us.i.posthog.com", instanceId: "" },
+  );
+  assert.deepEqual(
+    telemetryConsent({ telemetry: { enabled: true, posthog_publishable: "phc_x", posthog_host: "https://us.i.posthog.com", instance_id: "inst-uuid" } }),
+    { key: "phc_x", host: "https://us.i.posthog.com", instanceId: "inst-uuid" },
   );
 });
 
@@ -57,7 +64,12 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   const fake = fakePosthogModule();
   const imported = [];
   const importer = async (m) => { imported.push(m); return fake.module; };
-  const cfg = { telemetry: { enabled: true, posthog_publishable: "phc_x", posthog_host: "https://us.i.posthog.com" } };
+  const cfg = {
+    telemetry: {
+      enabled: true, posthog_publishable: "phc_x",
+      posthog_host: "https://us.i.posthog.com", instance_id: "inst-uuid",
+    },
+  };
   const client = await initTelemetry(cfg, { importer });
   assert.ok(client);
   assert.deepEqual(imported, ["posthog-js"]);
@@ -67,15 +79,29 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   assert.deepEqual(options, {
     api_host: "https://us.i.posthog.com",
     defaults: "2026-05-30",
-    session_recording: { maskAllInputs: true, maskTextSelector: ".ph-mask" },
+    autocapture: false,
+    capture_pageview: false,
+    capture_pageleave: false,
+    session_recording: { maskAllInputs: true },
     person_profiles: "never",
+    bootstrap: { distinctID: "inst-uuid" },
   });
-  // app_version registered on every event (value best-effort: "unknown" when
-  // no server answers /api/version in this test environment).
+  // Explicit single-key asserts so a failure names the offending option.
+  assert.equal(options.autocapture, false, "$el_text channel must be disabled");
+  assert.equal(options.capture_pageview, false, "implicit $pageview must be disabled");
+  assert.equal(options.capture_pageleave, false, "implicit $pageleave must be disabled");
+  assert.equal(options.session_recording.maskTextSelector, undefined,
+    "maskTextSelector matches zero elements in this UI and must not be configured");
+
+  // app_version + the installation id registered on every event.
   assert.equal(fake.calls.register.length, 1);
   const [registered] = fake.calls.register[0];
   assert.equal(typeof registered.app_version, "string");
   assert.ok(registered.app_version.length > 0);
+  assert.equal(registered.instance_id, "inst-uuid");
+
+  // person_profiles: "never" ⇒ identify() must never be called.
+  assert.deepEqual(fake.calls.identify, []);
 
   // screen views carry the lane NAME only
   captureScreen("board");
@@ -83,9 +109,111 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   _resetForTests();
 });
 
+test("no installation id in config → registered without a fabricated one", async () => {
+  _resetForTests();
+  const fake = fakePosthogModule();
+  const importer = async () => fake.module;
+  const cfg = {
+    telemetry: { enabled: true, posthog_publishable: "phc_x", posthog_host: "https://us.i.posthog.com" },
+  };
+  const client = await initTelemetry(cfg, { importer });
+  assert.ok(client);
+  const [key, options] = fake.calls.init[0];
+  assert.equal(key, "phc_x");
+  assert.equal(options.bootstrap, undefined);
+  const [registered] = fake.calls.register[0];
+  assert.ok(!("instance_id" in registered), "no instance_id key when config has none");
+  assert.equal(typeof registered.app_version, "string");
+  assert.deepEqual(fake.calls.identify, []);
+  _resetForTests();
+});
+
 test("captureScreen before init is a silent no-op", () => {
   _resetForTests();
   assert.doesNotThrow(() => captureScreen("stats"));
+});
+
+// ── no masking option may point at a selector that matches nothing ───────────
+// A `*Selector`-named init option (top level or inside session_recording) that
+// matches zero elements reads as protection and provides none — worse than no
+// selector at all, since it implies coverage the config does not deliver.
+
+async function unmatchedSelectors(initOptions) {
+  const haystacks = [
+    ...readdirSync(SRC).filter((f) => f.endsWith(".jsx")).map(read),
+    readFileSync(join(WEB, "index.html"), "utf8"),
+  ].join("\n");
+  const selectorKeys = [];
+  for (const [k, v] of Object.entries(initOptions)) {
+    if (/Selector$/i.test(k) && typeof v === "string") selectorKeys.push(v);
+    if (v && typeof v === "object") {
+      for (const [k2, v2] of Object.entries(v)) {
+        if (/Selector$/i.test(k2) && typeof v2 === "string") selectorKeys.push(v2);
+      }
+    }
+  }
+  const unmatched = [];
+  for (const sel of selectorKeys) {
+    const token = sel.startsWith(".") || sel.startsWith("#") ? sel.slice(1) : sel;
+    if (!haystacks.includes(token)) unmatched.push(sel);
+  }
+  return unmatched;
+}
+
+test("no configured masking selector matches zero elements (positive control on the actual init)", async () => {
+  _resetForTests();
+  const fake = fakePosthogModule();
+  const importer = async () => fake.module;
+  const cfg = {
+    telemetry: { enabled: true, posthog_publishable: "phc_x", posthog_host: "https://us.i.posthog.com" },
+  };
+  await initTelemetry(cfg, { importer });
+  const [, options] = fake.calls.init[0];
+  assert.deepEqual(await unmatchedSelectors(options), []);
+  _resetForTests();
+});
+
+test("non-vacuity control: the helper DOES flag a selector that matches nothing", async () => {
+  const unmatched = await unmatchedSelectors({ session_recording: { maskTextSelector: ".ph-mask" } });
+  assert.deepEqual(unmatched, [".ph-mask"]);
+});
+
+// ── disclosure sweep: every capture() event kind must be published ───────────
+// Prevents a new browser event from shipping undisclosed: whatever this file
+// (or any other web/src file) calls posthog.capture(...) with must appear in
+// the published event list in docs/configuration.md.
+
+function walkSrcFiles(dir = SRC, prefix = "") {
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    const rel = prefix ? `${prefix}/${name}` : name;
+    if (statSync(full).isDirectory()) out.push(...walkSrcFiles(full, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+function discoveredCaptureEvents() {
+  const found = new Set();
+  const CAPTURE_CALL = /\.capture\(\s*["']([\w.$-]+)["']/g;
+  for (const rel of walkSrcFiles()) {
+    if (!/\.(jsx?|mjs)$/.test(rel) || rel.endsWith(".test.mjs")) continue;
+    const src = readFileSync(join(SRC, rel), "utf8");
+    let m;
+    while ((m = CAPTURE_CALL.exec(src))) found.add(m[1]);
+  }
+  return found;
+}
+
+test("every posthog.capture() event kind is documented in docs/configuration.md", () => {
+  const events = discoveredCaptureEvents();
+  assert.ok(events.size > 0, "the capture() sweep found nothing — regex or directory is broken");
+  assert.ok(events.has("screen_viewed"), "sweep must find the browser screen_viewed event");
+  const docs = readFileSync(join(REPO_ROOT, "docs", "configuration.md"), "utf8");
+  const undisclosed = [...events].filter((name) => !docs.includes(name));
+  assert.deepEqual(undisclosed, [],
+    `capture() events not listed in docs/configuration.md: ${undisclosed}`);
 });
 
 // ── masking presence: the enumerated anchors carry ph-no-capture ─────────────
