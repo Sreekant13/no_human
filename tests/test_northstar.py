@@ -438,6 +438,38 @@ def test_goal_judge_parse_fails_closed():
     assert v3.satisfied is False
 
 
+def test_unparseable_judge_reply_is_unscoreable_not_a_plain_failure():
+    """A judge that never emits a parseable verdict is a BROKEN JUDGE, not an
+    agent that missed the goal — those two were indistinguishable before this
+    field existed. satisfied still fails closed to False (unchanged); the new
+    unscoreable flag is what lets downstream tell them apart."""
+    from no_human.eval.judge import parse_goal_verdict
+    for text in ("", "blah no markers",
+                 "JUDGE_JSON_START\nnot json\nJUDGE_JSON_END"):
+        v = parse_goal_verdict(text)
+        assert v.satisfied is False
+        assert v.unscoreable is True, f"expected unscoreable for {text!r}"
+
+
+def test_a_genuine_not_satisfied_verdict_is_not_relabelled_unscoreable():
+    """The over-broad-fix control: a judge that DID answer — with a real
+    satisfied=false verdict — must not be swept into the new bucket. Only a
+    judge that produced no parseable verdict is unscoreable."""
+    from no_human.eval.judge import parse_goal_verdict
+    v = parse_goal_verdict(
+        'JUDGE_JSON_START\n{"satisfied": false, "evidence": "the diff omits '
+        'X"}\nJUDGE_JSON_END')
+    assert v.satisfied is False
+    assert v.unscoreable is False
+    assert "the diff omits X" in v.evidence
+
+    v2 = parse_goal_verdict(
+        'JUDGE_JSON_START\n{"satisfied": true, "evidence": "ok"}\n'
+        'JUDGE_JSON_END')
+    assert v2.satisfied is True
+    assert v2.unscoreable is False
+
+
 def test_ref_signature_ignores_unrelated_branch_activity(tmp_path):
     """A live repo has its own automation (background jobs pushing state to
     their own branches continuously). An unrelated branch moving is NOT a
@@ -577,6 +609,31 @@ async def test_goal_judge_fails_closed_after_the_retry(monkeypatch):
         request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
     assert be.calls == 2            # tried exactly twice, no infinite loop
     assert v.satisfied is False     # still fails closed
+
+
+@pytest.mark.asyncio
+async def test_unscoreable_survives_the_bounded_retry(monkeypatch):
+    """The retry logic itself is unchanged (still exactly one re-ask, still
+    the same transient detection) — this only proves the NEW field is set
+    correctly at the end of that unchanged path: a judge that never produces
+    a parseable verdict, even after the retry, is unscoreable; one that
+    recovers on the retry is not."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+
+    be = _JudgeBackend(["", ""])    # empty both times: retry logic unchanged
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 2
+    assert v.satisfied is False
+    assert v.unscoreable is True
+
+    be2 = _JudgeBackend(["", _GOOD_JUDGE])   # fails, then recovers on retry
+    v2 = await GoalJudge(backend=be2).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be2.calls == 2
+    assert v2.satisfied is True
+    assert v2.unscoreable is False
 
 
 @pytest.mark.asyncio
@@ -1545,3 +1602,14 @@ def test_cost_ratio_basis_travels_with_the_ratio_in_as_dict():
     d2 = no_baseline.as_dict()
     assert d2["cost_ratio"] is None
     assert d2["cost_ratio_basis"] == "cache-weighted"
+
+
+def test_bench_score_carries_unscoreable_into_the_results_json():
+    """The judge-broke/agent-failed distinction only matters if it survives
+    into the persisted per-spec results JSON — this is the wire boundary."""
+    scored = _score(unscoreable=True)
+    assert scored.as_dict()["unscoreable"] is True
+
+    default = _score()
+    assert default.unscoreable is False
+    assert default.as_dict()["unscoreable"] is False

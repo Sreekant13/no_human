@@ -203,6 +203,150 @@ def test_a_creation_only_spec_is_not_dead():
     assert card.success_rate == 0.5
 
 
+# --------------------------- unscoreable judges ------------------------------ #
+# A judge that produced no parseable verdict after the bounded retry is a
+# BROKEN JUDGE, not an agent that missed the goal — those two used to be
+# indistinguishable downstream (both just `goal_satisfied=False`). These tests
+# pin: (1) the new visibility, (2) that the denominator stays conservative by
+# default (an unscoreable row still counts as not-satisfied), and (3) that an
+# old results file predating the field renders honestly as "not recorded"
+# rather than a confident zero.
+
+def test_aggregate_reports_unscoreable_rows_and_specs():
+    """Rows vs distinct specs, mirroring dead_specs/dead_spec_count: one spec
+    unscoreable across both of its 2 trials counts 2 rows, 1 spec."""
+    unscoreable_t0 = _score(task_id="flaky-judge", satisfied=False)
+    unscoreable_t0.unscoreable = True
+    unscoreable_t0.trial = 0
+    unscoreable_t1 = _score(task_id="flaky-judge", satisfied=False)
+    unscoreable_t1.unscoreable = True
+    unscoreable_t1.trial = 1
+    clean_a = _score(task_id="clean-a", satisfied=True)
+    clean_b = _score(task_id="clean-b", satisfied=False)
+    card = NorthStarCard(
+        scores=[unscoreable_t0, unscoreable_t1, clean_a, clean_b], trials=2)
+    assert card.unscoreable_specs == 2
+    assert card.unscoreable_spec_count == 1
+    agg = card.as_dict()["aggregate"]
+    assert agg["unscoreable_specs"] == 2
+    assert agg["unscoreable_spec_count"] == 1
+
+
+def test_report_renders_the_unscoreable_line_at_zero():
+    """Same rationale as the dead-specs line: a missing line and a measured
+    zero must not look the same — the line always renders, 0 included."""
+    card = NorthStarCard(scores=[_score(satisfied=True)], created_at="2026-08-23")
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines() if "unscoreable" in ln.lower())
+    assert "**0**" in line, line
+
+
+def test_report_renders_the_unscoreable_count_when_present():
+    core = _score(task_id="ns-1", satisfied=False)
+    core.unscoreable = True
+    core.subset = "core"
+    other = _score(task_id="ns-2", satisfied=True)
+    card = NorthStarCard(scores=[core, other], created_at="2026-08-23")
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines() if "unscoreable" in ln.lower())
+    assert "**1**" in line, line
+    assert "STILL COUNT AS NOT SATISFIED" in line, line
+    # per-task table marks the row so a reader scanning ❌s can tell them apart
+    row = next(ln for ln in md.splitlines() if ln.startswith("| ns-1 |"))
+    assert "❌ (judge unparseable)" in row, row
+
+
+def test_an_unscoreable_spec_still_counts_as_not_satisfied():
+    """THE denominator guard — the trap this task exists to avoid. An
+    unscoreable row must move every headline figure IDENTICALLY to an
+    ordinary goal_satisfied=False row: marking it unscoreable is visibility,
+    not a denominator change. If this test starts failing because the two
+    diverge, someone dropped unscoreable rows from a rate — do not "fix" the
+    test to match; that IS the trap this task is about."""
+    def _card(unscoreable):
+        passed = _score(task_id="pass", satisfied=True)
+        failed = _score(task_id="fail", satisfied=False)
+        if unscoreable:
+            failed.unscoreable = True
+        return NorthStarCard(scores=[passed, failed])
+
+    plain = _card(unscoreable=False)
+    broken_judge = _card(unscoreable=True)
+    assert broken_judge.satisfied == plain.satisfied
+    assert broken_judge.success_rate == plain.success_rate
+    assert broken_judge.spec_mean_success_rate == plain.spec_mean_success_rate
+    assert (len(broken_judge.measured_scores) == len(plain.measured_scores))
+    agg_plain = plain.as_dict()["aggregate"]
+    agg_broken = broken_judge.as_dict()["aggregate"]
+    assert agg_broken["spec_mean_success_rate"] == agg_plain["spec_mean_success_rate"]
+    assert agg_broken["satisfied"] == agg_plain["satisfied"]
+    # ...and the row is still measured, still counted — unlike a dead spec.
+    assert broken_judge.dead_specs == 0
+    assert len(broken_judge.priced_scores) == len(plain.priced_scores)
+
+
+def test_headline_unmoved_for_a_corpus_with_no_unscoreable_specs():
+    """A corpus with no unscoreable rows must produce the exact same headline
+    as before this field existed — pinned against an independently computed
+    Wilson interval, not against a re-derivation inside the same module."""
+    from no_human.eval.northstar_card import (
+        sample_phrase, success_headline, wilson_interval)
+    scores = [_score(task_id=f"t{i}", satisfied=(i % 2 == 0)) for i in range(4)]
+    card = NorthStarCard(scores=scores, created_at="2026-08-23")
+    assert card.spec_mean_success_rate == 0.5
+    lo, hi = wilson_interval(2, 4)
+    expected = (f"{0.5:.1%} (95% CI {lo * 100:.1f}–{hi * 100:.1f}, "
+               f"{sample_phrase(card)})")
+    assert success_headline(card) == expected, success_headline(card)
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines()
+               if "Success (goal satisfied" in ln)
+    assert "2/4 measured" in line, line
+
+
+def test_card_save_load_round_trips_unscoreable(tmp_path):
+    s = _score(task_id="ns-1", satisfied=False)
+    s.unscoreable = True
+    card = NorthStarCard(scores=[s], created_at="2026-08-23", label="rt")
+    p = tmp_path / "latest.json"
+    card.save(p)
+    loaded = NorthStarCard.load(p)
+    assert loaded is not None
+    assert loaded.scores[0].unscoreable is True
+    assert loaded.unscoreable_recorded is True
+
+
+def test_an_old_card_without_the_field_says_not_recorded(tmp_path):
+    """A results file written before this field existed has no
+    `unscoreable`/`unscoreable_specs` keys anywhere — `load()` must still
+    succeed, and the rendered line must say so honestly rather than print a
+    confident 0 that looks like a measured zero."""
+    old = {
+        "created_at": "2026-01-01", "label": "pre-field",
+        "scores": [{
+            "task_id": "ns-1", "title": "t", "outcome_status": "done",
+            "goal_satisfied": False, "escalated_honestly": False,
+            "mergeable": True, "nh_tokens": 500, "nh_cache_tokens": 100,
+            "nh_turns": 5, "nh_wall_clock_s": 60.0, "orig_tokens": 1000,
+            "orig_wall_clock_s": 600.0, "orig_corrections": 3,
+            "subset": "core",
+            # deliberately no "unscoreable" key
+        }],
+        "aggregate": {
+            # deliberately no "unscoreable_specs"/"unscoreable_spec_count" keys
+        },
+    }
+    p = tmp_path / "old_latest.json"
+    p.write_text(__import__("json").dumps(old))
+    loaded = NorthStarCard.load(p)
+    assert loaded is not None
+    assert loaded.scores[0].unscoreable is False
+    assert loaded.unscoreable_recorded is False
+    md = render_northstar_md(loaded)
+    line = next(ln for ln in md.splitlines() if "unscoreable" in ln.lower())
+    assert "not recorded" in line, line
+
+
 def test_success_rate_cannot_exceed_one_when_a_dead_row_is_satisfied():
     """The runner scores a pre-model death on an expect-escalation spec as
     escalated-honestly, which arrives here as goal_satisfied=True — so the

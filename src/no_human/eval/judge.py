@@ -139,9 +139,16 @@ class GoalVerdict:
     satisfied: bool
     evidence: str = ""
     raw_output: str = ""
+    #: The judge emitted NO parseable JUDGE_JSON verdict (after the bounded
+    #: re-ask retry). satisfied stays False — fail-closed is unchanged and
+    #: deliberately conservative — but this records that the False came from
+    #: a BROKEN JUDGE, not from an agent that missed the goal. Those two were
+    #: the same value until this field existed.
+    unscoreable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"satisfied": self.satisfied, "evidence": self.evidence}
+        return {"satisfied": self.satisfied, "evidence": self.evidence,
+                "unscoreable": self.unscoreable}
 
 
 def build_goal_prompt(request: str, criteria: list[str], agent_diff: str,
@@ -286,10 +293,10 @@ async def _judged_run(backend: Any, prompt: str, parse: Any, *,
 def parse_goal_verdict(text: str) -> GoalVerdict:
     """Fail closed: no parseable JUDGE_JSON block → not satisfied."""
     if not text:
-        return GoalVerdict(False, "judge produced no output", text)
+        return GoalVerdict(False, "judge produced no output", text, unscoreable=True)
     data, reason = _extract_verdict_json(text, "satisfied")
     if data is None:
-        return GoalVerdict(False, reason, text)
+        return GoalVerdict(False, reason, text, unscoreable=True)
     return GoalVerdict(
         satisfied=bool(data.get("satisfied", False)),
         evidence=str(data.get("evidence", "")),

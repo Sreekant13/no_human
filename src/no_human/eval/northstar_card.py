@@ -262,6 +262,12 @@ class NorthStarCard:
     # published number without an interval is the thing V1 exists to stop, and
     # "the file said so" is the only way to tell after a round-trip.
     ci_recorded: bool = True
+    # Did the file this card came from record the unscoreable field at all?
+    # True for any card built in memory. False for a loaded file predating
+    # this field — WITHOUT this flag a pre-change results file would render a
+    # confident "0", indistinguishable from a run that measured zero
+    # unscoreable specs. Presence, not truthiness, mirrors ``ci_recorded``.
+    unscoreable_recorded: bool = True
 
     # ------------------------------ counts --------------------------------- #
 
@@ -519,6 +525,26 @@ class NorthStarCard:
                     if not score_did_priced_work(s)})
 
     @property
+    def unscoreable_specs(self) -> int:
+        """Rows whose GoalJudge produced no parseable verdict after the
+        bounded re-ask retry — the judge broke, not the agent. Same unit as
+        ``dead_specs`` (rows, not distinct specs).
+
+        These rows REMAIN in the success denominator as not-satisfied — this
+        is the conservative default, not an oversight. See
+        ``render_northstar_md``'s unscoreable line for the operator-decision
+        note on why they are not dropped."""
+        return sum(1 for s in self.ran if _score_field(s, "unscoreable"))
+
+    @property
+    def unscoreable_spec_count(self) -> int:
+        """Distinct specs with at least one unscoreable trial. See
+        ``dead_spec_count`` for why rows and distinct specs are both
+        needed."""
+        return len({s.task_id for s in self.ran
+                    if _score_field(s, "unscoreable")})
+
+    @property
     def total_nh_tokens(self) -> int:
         return sum(s.nh_tokens for s in self.ran)
 
@@ -644,6 +670,12 @@ class NorthStarCard:
                 # Spec-wise companion to the row count above — what a "N of the
                 # corpus went unmeasured" sentence has to be counted in.
                 "dead_spec_count": self.dead_spec_count,
+                # Rows whose GoalJudge produced no parseable verdict after the
+                # bounded retry — the judge broke, not the agent. STILL COUNT
+                # AS NOT SATISFIED in every rate above: this is visibility,
+                # not a denominator change.
+                "unscoreable_specs": self.unscoreable_specs,
+                "unscoreable_spec_count": self.unscoreable_spec_count,
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
                 "corpus_available": self.corpus_available,
@@ -705,6 +737,7 @@ class NorthStarCard:
             events=s.get("events") or [],
             nh_role_tokens=s.get("nh_role_tokens") or {},
             nh_role_models=s.get("nh_role_models") or {},
+            unscoreable=bool(s.get("unscoreable", False)),
         ) for s in data.get("scores", [])]
         agg = data.get("aggregate") or {}
         return NorthStarCard(scores=scores,
@@ -720,6 +753,7 @@ class NorthStarCard:
                              # (nothing ran) still means the writer recorded
                              # one, and that card is refused for other reasons.
                              ci_recorded="success_ci_low" in agg,
+                             unscoreable_recorded="unscoreable_specs" in agg,
                              created_at=data.get("created_at", ""),
                              label=data.get("label", ""),
                              override_reasons=list(
@@ -1321,6 +1355,25 @@ def render_northstar_md(card: NorthStarCard,
            "divergence stays visible to a reader; nothing gates on it — a "
            "saturated run is caught by the publish refusals, not by this line."
            if agg['dead_specs'] else ""),
+        # Always rendered, including the 0 case, for the same reason as the
+        # dead-specs line above: a missing line and a zero line must not look
+        # the same. UNLIKE the dead-specs line, these rows are NOT excluded
+        # from the success figures — a judge failure is a measured, priced,
+        # failed row, and dropping it from the denominator would raise the
+        # published number with no agent improving. That is an operator
+        # decision, not a code change, and it has not been taken here.
+        f"- Specs whose judge produced no parseable verdict after the bounded "
+        f"retry (**unscoreable**): **{agg['unscoreable_specs']}** of "
+        f"{agg['total'] - agg['skipped']} ran"
+        + ("  — these rows STILL COUNT AS NOT SATISFIED in every figure above: "
+           "the denominator is unchanged and deliberately conservative. "
+           "Removing them would raise the published number with no agent "
+           "improving, so it is an operator decision, not a code change. The "
+           "line exists so 'the judge broke' is not read as 'the agent "
+           "missed the goal'."
+           if card.unscoreable_recorded else
+           "  ⚠ **not recorded** — this results file predates the field; the "
+           "0 is an absence of measurement, not a measured zero"),
         f"- **Original-session follow-ups avoided on DELIVERED tasks: "
         f"{agg['corrections_avoided_delivered']}** (proxy for corrections)"
         f"  ·  a further "
@@ -1365,6 +1418,8 @@ def render_northstar_md(card: NorthStarCard,
         ratio_s = (f"{s.cost_ratio:.2f} ({s.cost_ratio_basis})"
                    if s.cost_ratio else "—")
         sat = {True: "✅", False: "❌", None: "—"}[s.goal_satisfied]
+        if s.unscoreable:
+            sat += " (judge unparseable)"
         # One row per TRIAL under --trials, so the trial has to be in the cell
         # or the table reads as N duplicate rows of the same spec disagreeing
         # with themselves.

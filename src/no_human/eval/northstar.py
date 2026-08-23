@@ -285,6 +285,11 @@ class BenchScore:
     # role -> the model id it was actually billed at, when known. Consulted
     # by `tier_weight` before it falls back to today's config default.
     nh_role_models: dict[str, str] = dataclasses.field(default_factory=dict)
+    # The GoalJudge produced no parseable verdict after the bounded re-ask
+    # retry — the judge broke, not the agent. False means "the judge
+    # answered" OR "no judge ran"; it never influences goal_satisfied, which
+    # stays fail-closed exactly as before this field existed.
+    unscoreable: bool = False
 
     @property
     def token_ratio(self) -> float | None:
@@ -411,6 +416,7 @@ class BenchScore:
             "events": self.events,
             "nh_role_tokens": self.nh_role_tokens,
             "nh_role_models": self.nh_role_models,
+            "unscoreable": self.unscoreable,
         }
 
 
@@ -1017,6 +1023,7 @@ class NorthStarRunner:
                 repo_path=str(work))
         score.mergeable = await asyncio.to_thread(self._holdout_ok, spec, work)
         if verdict is not None:
+            score.unscoreable = bool(getattr(verdict, "unscoreable", False))
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)
             # 2000, not 400: the drill of every done-but-unsatisfied spec
