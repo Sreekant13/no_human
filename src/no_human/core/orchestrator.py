@@ -5472,6 +5472,12 @@ class Orchestrator:
                 # `_conclude_review_round` — read the same stamp back rather
                 # than re-deriving it, so the two routes cannot drift.
                 review_round=(task.context or {}).get("review_round_seq"))
+            # Persist the coder's real commit as a handoff so the next attempt
+            # branches from it instead of re-branching from base and redoing
+            # this attempt's exploration and edits (the bug this task fixes).
+            await self._persist_handoff(
+                task, result, repo, wip_sha=commit.sha if commit else "",
+                gate="review", gate_detail=detail, own_partial=True)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         await self.store.update_attempt(
             attempt_id,
@@ -5572,6 +5578,11 @@ class Orchestrator:
                 if excerpt_blocks:
                     detail += "\n" + "\n".join(excerpt_blocks)
                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                # Same handoff as the review-FAIL path above: the commit is
+                # real, coder-produced work — hand it to the next attempt.
+                await self._persist_handoff(
+                    task, result, repo, wip_sha=commit.sha if commit else "",
+                    gate="tests", gate_detail=detail, own_partial=True)
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         else:
             # Offload the (blocking) test subprocess to a thread so concurrent tasks'
@@ -5839,6 +5850,12 @@ class Orchestrator:
                                 )
                             else:
                                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                            # Same handoff as the other two gate-failure sites:
+                            # the commit is real, coder-produced work — hand it
+                            # to the next attempt instead of discarding it.
+                            await self._persist_handoff(
+                                task, result, repo, wip_sha=commit.sha if commit else "",
+                                gate="tests", gate_detail=detail, own_partial=True)
                             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
@@ -15934,6 +15951,18 @@ SIX of them read a checkpoint and TWO do not — but do
             return False          # branching from base — nothing is ahead of it
         resume = ctx.get("resume_from") or {}
         if resume.get("sha") != branch_point:
+            # A gate-failed commit (tests / review) is real coder work, but it
+            # carries the ORDINARY task-commit subject, not "[WIP-PARTIAL]" —
+            # `_is_wip_partial` cannot see it and would fail this gate OPEN
+            # (an attempt that edits nothing gets credited with the inherited
+            # diff). `_persist_handoff` stamps `own_partial` explicitly for
+            # exactly this branch point when it wrote it, because the subject
+            # cannot: trust that recorded provenance before falling back to
+            # subject-sniffing. A stale flag from an OLDER handoff must not
+            # credit an unrelated sha, hence the `wip_sha == branch_point` check.
+            handoff = ctx.get("handoff") or {}
+            if handoff.get("own_partial") and handoff.get("wip_sha") == branch_point:
+                return True
             # NOTHING RECORDS WHO PRODUCED THIS BRANCH POINT — the
             # `handoff.wip_sha` path and a reused `pr_branch` both land here —
             # so the commit's SUBJECT is the only signal left. Fails closed:
@@ -16081,6 +16110,16 @@ SIX of them read a checkpoint and TWO do not — but do
         if not wip_sha and not stopped_because:
             return
         handoff = dict((task.context or {}).get("handoff") or {})
+        # RFC 7396: this method is ONLY called from non-gate abort paths
+        # (budget/stuck/timeout/cancelled/server-stop), so whatever it
+        # checkpoints here supersedes any earlier GATE-failure record. Left
+        # unset, an earlier `_persist_handoff(gate=...)` call's
+        # failed_gate/failed_gate_summary/own_partial would survive the merge
+        # and `build_resume_digest` would keep telling the next attempt "the
+        # tests gate REJECTED that commit" about a commit no gate ever saw.
+        handoff["failed_gate"] = None
+        handoff["failed_gate_summary"] = None
+        handoff["own_partial"] = None
         if stopped_because:
             # BEFORE the wip_sha early-out: an abort with a clean tree has no
             # commit to record but still stopped for a reason, and returning here
@@ -16118,15 +16157,44 @@ SIX of them read a checkpoint and TWO do not — but do
 
     async def _persist_handoff(
         self, task: Task, result, repo, *, wip_sha: str = "",
+        gate: str = "", gate_detail: str = "", own_partial: bool = False,
     ) -> None:
-        """C2: persist a compact handoff record on turn-budget exhaustion or
-        error so the next attempt resumes with context of what was accomplished.
+        """C2: persist a compact handoff record on turn-budget exhaustion,
+        error, or a terminal GATE failure (tests / review) so the next attempt
+        resumes with context of what was accomplished — a gate-failed commit
+        is real, coder-produced work, and discarding it makes the next attempt
+        re-pay the exploration and edits this one already paid for (see
+        `_resume_branch_point`'s docstring: task afe1ed12, 4 attempts,
+        12,071,981 tokens, no PR — the same defect, just triggered by a gate
+        return instead of an agent error).
 
         Stored in task.context["handoff"] — a dict with:
           - summary: the agent's last output (capped to 800 chars)
           - changed_files: files modified in the working tree
           - commit: last-good commit SHA if any
-          - wip_sha: WIP-PARTIAL commit SHA (if partial work was checkpointed)
+          - wip_sha: WIP-PARTIAL (or gate-failed) commit SHA, if any
+          - failed_gate / failed_gate_summary: the failed gate's name and a
+            capped one-line summary of the caller's `detail` when `gate` is
+            passed (a terminal "tests" or "review" gate failure) — the next
+            attempt's prompt states both instead of presenting a bare
+            inherited commit. Written as explicit `None` (RFC 7396 delete)
+            when `gate=""`, so a stale record from an earlier gate-failed
+            attempt cannot survive into a later, unrelated checkpoint.
+          - own_partial: EXPLICIT `True` when `own_partial` is passed, else
+            `None` (delete) — see `_is_own_partial`, which trusts this flag as
+            provenance for a branch point the commit subject alone cannot
+            identify (a gate-failed commit carries the ordinary task subject,
+            not "[WIP-PARTIAL] ...").
+
+        `gate=""` (the original caller — agent error / turn-budget
+        exhaustion) keeps `stopped_because`'s prior "ran out of turns" / abort
+        semantics and always clears `failed_gate`/`failed_gate_summary`/
+        `own_partial`. It is NOT byte-identical to the pre-gate-failure
+        behaviour in one respect: the changed-files diff now always names the
+        commit explicitly (`{wip_sha}~1 wip_sha`) instead of the positional
+        `HEAD~1 HEAD`, because this method is now called from gate-failure
+        sites where something else may advance HEAD before this runs — see
+        the comment at the diff call below.
         """
         ctx = task.context or {}
         summary = (result.final_text or "").strip()[:800]
@@ -16135,9 +16203,17 @@ SIX of them read a checkpoint and TWO do not — but do
         try:
             if not commit_sha:
                 commit_sha = repo.head_sha()
-            # List files from the WIP commit (already committed) or working tree.
+            # List files from the WIP (or gate-failed) commit, already
+            # committed, or the working tree. Diff the EXPLICIT sha's parent
+            # (like `_record_wip_checkpoint`), not the positional `HEAD~1..HEAD`
+            # — this method is now called from gate-failure sites too, and
+            # naming the commit explicitly is robust even if something else
+            # advances HEAD between the commit and this call. A root commit
+            # (no parent) falls through to the existing except and just
+            # leaves `changed` empty — never raises.
             if wip_sha:
-                raw = repo._run("diff", "--name-only", "HEAD~1", "HEAD", check=False)
+                raw = repo._run(
+                    "diff", "--name-only", f"{wip_sha}~1", wip_sha, check=False)
             elif repo.has_changes():
                 raw = repo._run("status", "--porcelain", check=False)
             else:
@@ -16166,7 +16242,31 @@ SIX of them read a checkpoint and TWO do not — but do
             # RFC 7396: None DELETES. An earlier abort may have left
             # `stopped_because`; this path DID run its turns out, so leaving that
             # key would make the next prompt describe the wrong stop reason.
-            "stopped_because": None,
+            # A gate failure ran its turns out too (the coder committed and the
+            # GATE stopped it, not the turn budget) — say so explicitly rather
+            # than let `build_resume_digest` assert "ran out of turns (N used)"
+            # about an attempt that finished cleanly and was gated.
+            "stopped_because": f"the {gate} gate failed" if gate else None,
+            # RFC 7396: always WRITE these three keys, never merely omit them
+            # when unset. `gate=""` is the original error/turn-budget caller —
+            # if it just left failed_gate/failed_gate_summary/own_partial out
+            # of the patch, a STALE record from an earlier gate-failed attempt
+            # would survive the merge unchanged, and the next prompt would
+            # keep describing a gate rejection about a commit no gate ever
+            # saw. Explicit `None` deletes the stale key; a truthy `gate`
+            # (re)writes it.
+            #
+            # The gate NAME comes from the call site, which knows it; the
+            # summary is the first line of the caller's `detail`, capped — do
+            # NOT re-split `detail` on ":", it carries appended stuck notes and
+            # a multi-KB traceback block after a newline. The full text stays
+            # on `attempts.failure_reason`.
+            "failed_gate": gate or None,
+            "failed_gate_summary": (
+                (gate_detail or "").splitlines()[0][:800]
+                if gate and gate_detail else None
+            ),
+            "own_partial": True if own_partial else None,
         }
         # merge_context, not update_task — see _record_wip_checkpoint's docstring:
         # update_task rewrites the whole blob and drops `resume_from` written by

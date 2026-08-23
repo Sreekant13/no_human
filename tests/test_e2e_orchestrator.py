@@ -1033,10 +1033,24 @@ async def test_the_finalize_RETRY_still_refreshes_the_body_0a(
 async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
     """Flawed change + failing reviewer → reviewer blocks; after max_attempts → ESCALATED."""
     call_count: list = []
+    # Attempt 2 now branches from attempt 1's OWN rejected commit (the handoff
+    # fix under test elsewhere), instead of re-branching from base. A fixed,
+    # byte-identical rewrite would then be a genuine zero-diff against the
+    # inherited tree — caught (correctly) as "agent produced no file changes"
+    # rather than a second review-worthy attempt, which would make this test
+    # escalate after only 1 reviewer call via the zero-diff path instead of
+    # via the same-pass-rate stagnation path it exists to pin. A real coder
+    # facing repeated review feedback would still touch something each turn,
+    # so model that with a per-call marker — the review outcome stays fixed
+    # (`failing_decision` below, unconditionally), only the diff needs to be
+    # real.
+    calls: list = []
 
     def mutate(cwd):
+        calls.append(1)
         # Introduce a product file change without adequate tests
-        (cwd / "calc.py").write_text("def add(a, b):\n    return 0  # broken impl\n")
+        (cwd / "calc.py").write_text(
+            f"# attempt {len(calls)}\ndef add(a, b):\n    return 0  # broken impl\n")
         # No test changes — tamper guard stays clean, but reviewer catches the fault.
 
     failing_decision = ReviewDecision(
@@ -1092,9 +1106,27 @@ async def test_stagnation_not_triggered_by_different_findings_same_rate(bare_rep
     treated as stagnation when the specific failing findings are entirely
     different each time — that is real incremental progress (previous
     issues fixed, new ones surfaced), not the agent stuck repeating the
-    same mistake. Modeled on a real run that hit exactly this pattern."""
+    same mistake. Modeled on a real run that hit exactly this pattern.
+
+    Each attempt now branches from the PREVIOUS attempt's own gate-failed
+    commit (this task's fix) instead of re-branching from base. A fixed,
+    byte-identical rewrite on attempts 2/3 would be a genuine zero-diff
+    against the inherited tree — caught by the honesty gate as "agent
+    produced no file changes" rather than reaching review again, which
+    would make this test escalate via the zero-diff path after only 1 real
+    reviewer call instead of exercising the same-pass-rate/different-
+    findings D6 logic it exists to pin. The code is already correct on
+    attempt 1; what's still "wrong" is unrelated (the reviewer's scripted
+    Jenkinsfile findings), so a realistic coder would still touch something
+    each turn in response — model that with a per-call counter so every
+    attempt is a real (if still review-failing, until the last) diff.
+    """
+    calls: list = []
+
     def mutate(cwd):
+        calls.append(1)
         (cwd / "calc.py").write_text(
+            f"# attempt {len(calls)}\n"
             "def add(a, b):\n    return a + b\n\n"
             "def mul(a, b):\n    return a * b\n"
         )

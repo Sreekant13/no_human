@@ -336,6 +336,63 @@ async def test_a_legacy_unstamped_resume_from_reads_as_human(tmp_path, store, cf
 
 
 # --------------------------------------------------------------------------- #
+# B2 — salvage clears a stale gate-failure record                              #
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_salvaged_commit_does_not_inherit_an_earlier_gates_rejection(
+        tmp_path, store, cfg):
+    """A dead worktree salvaged into a `[WIP-PARTIAL]` commit must not inherit
+    an EARLIER attempt's gate-failure record. `_salvage_one`'s
+    `store.merge_context(...)` patch used to clear only `turns_used`, leaving
+    `failed_gate`/`failed_gate_summary`/`own_partial` from an earlier
+    `_persist_handoff(gate=...)` call to survive the RFC 7396 merge onto this
+    salvaged commit — so `build_resume_digest` told the next attempt a gate
+    REJECTED a commit no gate ever saw, and dropped the WIP-PARTIAL framing."""
+    from no_human.core.prompt_blocks import build_resume_digest
+    from no_human.core.worktree import salvage_dead_worktrees
+
+    b = await _build(store, cfg, tmp_path, "gate-stale")
+    old_sha = "e" * 40
+    # Seed the prior handoff through the real writer's payload shape, mirroring
+    # what `_persist_handoff(gate="tests", ...)` would have written for an
+    # earlier attempt on this same task.
+    await store.merge_context(b["task"].id, {
+        "handoff": {
+            "failed_gate": "tests",
+            "failed_gate_summary": "tests failed: test_add AssertionError",
+            "own_partial": True,
+            "wip_sha": old_sha,
+            "changed_files": ["calc.py"],
+        },
+    })
+    premise = await store.get_task(b["task"].id)
+    assert (premise.context or {}).get("handoff", {}).get("failed_gate") == "tests", (
+        "fixture premise: the prior gate-failure record must be seeded before salvage")
+
+    result = await salvage_dead_worktrees(store, cfg.data, live=set())
+    assert result == (1, 0)
+
+    new_sha = _head(b["wt"])
+    assert new_sha != old_sha
+
+    refreshed = await store.get_task(b["task"].id)
+    handoff = (refreshed.context or {}).get("handoff") or {}
+    assert handoff.get("wip_sha") == new_sha, handoff
+    assert handoff.get("failed_gate") is None, handoff
+    assert handoff.get("failed_gate_summary") is None, handoff
+    assert handoff.get("own_partial") is None, handoff
+
+    d = build_resume_digest(refreshed)
+    assert d, "the digest must not be empty"
+    assert "REJECTED that commit" not in d
+    assert "gate REJECTED" not in d
+    assert "tests gate" not in d
+    assert "Fix that failure in the inherited commit" not in d
+    assert f"committed as WIP-PARTIAL {new_sha[:8]}" in d
+
+
+# --------------------------------------------------------------------------- #
 # AC3 — the next run picks the salvage up                                      #
 # --------------------------------------------------------------------------- #
 

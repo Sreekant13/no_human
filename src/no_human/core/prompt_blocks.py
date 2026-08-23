@@ -607,16 +607,43 @@ def build_resume_digest(task: Task) -> str:
             why = f"The previous attempt ran out of turns ({turns} used)"
         else:
             why = "The previous attempt stopped early"
-        resume_lines = [
-            f"{why} and left partial work"
-            f"{' (committed as WIP-PARTIAL ' + wip[:8] + ')' if wip else ''}."
-        ]
+        # A gate-failed commit is real, coder-produced work that a GATE
+        # rejected — it is not an in-progress "[WIP-PARTIAL]" checkpoint, and
+        # calling it one would be a false statement in the coder's prompt.
+        failed_gate = handoff.get("failed_gate") or ""
+        commit_label = "committed as " if failed_gate else "committed as WIP-PARTIAL "
+        if wip:
+            resume_lines = [
+                f"{why} and left partial work"
+                f" ({commit_label}{wip[:8]})."
+            ]
+        elif failed_gate:
+            # No commit exists to name — do not say "left partial work" or
+            # "REJECTED that commit" about a commit that was never made.
+            resume_lines = [f"{why}, before any commit was made."]
+        else:
+            resume_lines = [f"{why} and left partial work."]
         if files:
             resume_lines.append(
                 f"  Files already modified: {', '.join(files[:15])}"
             )
         if summary and not summary.startswith("Claude Code returned"):
             resume_lines.append(f"  Last status: {summary[:600]}")
+        if failed_gate:
+            gate_summary = handoff.get("failed_gate_summary") or ""
+            if wip:
+                resume_lines.append(
+                    f"  The {failed_gate} gate REJECTED that commit: {gate_summary}"
+                )
+                resume_lines.append(
+                    "  Fix that failure in the inherited commit — do NOT restart "
+                    "from scratch, and do NOT weaken, skip, or delete any test to "
+                    "make it pass."
+                )
+            else:
+                resume_lines.append(
+                    f"  The {failed_gate} gate failed: {gate_summary}"
+                )
         # Only tell the agent to read a list when there IS one.
         read_step = ("  1. READ the files listed above to understand what is already done.\n"
                      if files else

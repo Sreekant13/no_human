@@ -134,6 +134,27 @@ def test_resume_digest_surfaces_blocker_and_reply():
     assert "A human answered your blocking question" in d and "A: A." in d
 
 
+def test_resume_digest_says_no_commit_was_made_when_a_gate_failed_before_any_commit():
+    """A3: a gate can fail with NO ``wip_sha`` at all — the gate ran against an
+    uncommitted diff and rejected it before anything was committed. The digest
+    must not claim a commit was "left" as partial work, and must not say a
+    gate "REJECTED that commit" — there is no commit to reject."""
+    from no_human.core.task import Task, TaskStatus
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"],
+             context={"handoff": {
+                 "failed_gate": "tests",
+                 "failed_gate_summary": "collection error: ImportError",
+                 "stopped_because": "the tests gate rejected the diff",
+             }})
+    d = build_resume_digest(t)
+    assert "before any commit was made" in d
+    assert "The tests gate failed: collection error: ImportError" in d
+    assert "REJECTED that commit" not in d
+    assert "left partial work" not in d
+    assert "WIP-PARTIAL" not in d
+
+
 def _finding(label, comment, file="a.py", line=1):
     return {"label": label, "file": file, "line": line, "comment": comment}
 

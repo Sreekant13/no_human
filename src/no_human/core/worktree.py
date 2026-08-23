@@ -444,6 +444,13 @@ async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
             "commit": commit.sha,
             "stopped_because": "killed mid-implementation (owner pid gone)",
             "turns_used": None,
+            # RFC 7396: None deletes. An earlier `_persist_handoff(gate=...)`
+            # record would otherwise survive the merge onto this salvaged
+            # commit, and `build_resume_digest` would tell the next attempt a
+            # gate rejected a commit no gate ever saw.
+            "failed_gate": None,
+            "failed_gate_summary": None,
+            "own_partial": None,
         },
     })
     await store.update_attempt(

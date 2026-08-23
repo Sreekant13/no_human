@@ -42,21 +42,53 @@ def _broken_calc_same_way(cwd):
     )
 
 
-def _mutate_correct_add_mul(cwd):
-    (cwd / "calc.py").write_text(
-        "def add(a, b):\n    return a + b\n\n"
-        "def mul(a, b):\n    return a * b\n"
-    )
-    (cwd / "test_calc.py").write_text(
-        "from calc import add, mul\n\n"
-        "def test_add():\n    assert add(1, 2) == 3\n\n"
-        "def test_mul():\n    assert mul(2, 3) == 6\n"
-    )
+def _make_mutate_correct_add_mul():
+    """Factory, not a bare function: each attempt now branches from the
+    PREVIOUS attempt's own gate-failed commit (this task's fix), so a fixed,
+    byte-identical rewrite on the SECOND call is a genuine zero-diff against
+    the inherited tree — caught by the honesty gate as "agent produced no
+    file changes" rather than reaching review again. The code fix here is
+    already correct on attempt 1; what's still wrong is unrelated (the
+    reviewer's scripted Jenkinsfile findings), so a realistic coder would
+    still touch something each turn in response — model that with a
+    per-call counter comment so every attempt is a real (if still
+    insufficient) diff. A bare module-level function shared by two tests
+    would leak call counts across them; each test must get its own closure."""
+    calls = []
+
+    def mutate(cwd):
+        calls.append(1)
+        (cwd / "calc.py").write_text(
+            f"# attempt {len(calls)}\n"
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+    return mutate
 
 
 async def test_d6_escalation_names_the_recurring_finding(bare_repo, tmp_path, store):
+    # Each attempt now branches from the PREVIOUS attempt's own gate-failed
+    # commit (that is this task's fix) instead of re-branching from base. A
+    # coder that writes byte-identical content on top of a tree that already
+    # has it produces a genuine zero-diff — correctly caught by the honesty
+    # gate as "agent produced no file changes", not a second review-worthy
+    # commit. A real coder, told the SAME finding recurs, would still write
+    # SOMETHING each turn (even if it doesn't fix the root cause) — so the
+    # fixture must too: tag each attempt's content with a counter to keep it a
+    # real (if still broken) diff, so attempt 2 reaches review again and D6's
+    # recurring-finding check (the thing this test exists to pin) actually
+    # gets a chance to fire, exactly as it did before commits were inherited.
+    calls = []
+
     def mutate(cwd):
-        (cwd / "calc.py").write_text("def add(a, b):\n    return 0  # broken impl\n")
+        calls.append(1)
+        (cwd / "calc.py").write_text(
+            f"# attempt {len(calls)}\ndef add(a, b):\n    return 0  # broken impl\n")
 
     decisions = [
         ReviewDecision(passed=False, checklist=[
@@ -120,7 +152,7 @@ async def test_d6_still_ignores_wholly_different_findings_at_the_same_rate(
     ]
     cfg = _config(tmp_path)
     reviewer = SequencedFakeReviewer(decisions)
-    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_correct_add_mul),
+    orch = Orchestrator(store, cfg.data, FakeBackend(_make_mutate_correct_add_mul()),
                         SlackNotifier(None), reviewer=reviewer)
     t = Task.new("fix things", repo_path=str(bare_repo))
     t.acceptance_criteria = ["things are fixed"]
@@ -155,7 +187,7 @@ async def test_minor_issues_bucket_alone_does_not_fire_d6(bare_repo, tmp_path, s
     ]
     cfg = _config(tmp_path)
     reviewer = SequencedFakeReviewer(decisions)
-    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_correct_add_mul),
+    orch = Orchestrator(store, cfg.data, FakeBackend(_make_mutate_correct_add_mul()),
                         SlackNotifier(None), reviewer=reviewer)
     t = Task.new("fix things", repo_path=str(bare_repo))
     t.acceptance_criteria = ["things are fixed"]
