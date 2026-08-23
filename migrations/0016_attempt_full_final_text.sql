@@ -1,0 +1,36 @@
+-- 0016: the coder's full final report, one blob per attempt.
+--
+-- `attempts.full_final_text` holds the coder's raw `result.final_text` for
+-- this attempt, written once at the coder-usage chokepoint in
+-- `orchestrator.py` (the same `update_attempt(attempt_id, ...)` call that
+-- already records `turns_used`/`tokens_used` right after the coder session
+-- ends), capped at `orchestrator._FULL_REPORT_MAX_CHARS` characters as a size
+-- guard against a runaway session, not as a redaction.
+--
+-- This closes a real gap: the PR body's `_SUMMARY_TRUNCATED_MARKER` cuts the
+-- rendered summary at `Orchestrator._SUMMARY_MAX_CHARS` (4000) characters,
+-- and until this column existed the full text had no human-reachable
+-- surface to point a reader at. It now does: `GET /api/tasks/{id}` exposes
+-- it as `TaskOut.full_report` (last attempt with a non-empty value), and
+-- `nh task show` prints it — both through `report_surface.render_full_report`,
+-- which applies the SAME drop-marker filter and outbound scrub the PR
+-- summary uses, uncapped. The raw text is stored unfiltered; filtering
+-- happens at render time so a later change to `_SUMMARY_DROP_MARKERS`
+-- applies retroactively to already-stored rows instead of being frozen into
+-- them.
+--
+-- NULLABLE, NO DEFAULT — deliberately. Every row that predates this change
+-- (and every attempt where the coder session never produced text) reads as
+-- NULL ("no report was ever written here"), never as "" ("the coder wrote
+-- an empty report"): those are different facts, and a DEFAULT would erase
+-- the difference. No backfill: persistence applies to new attempts only.
+--
+-- The column is added defensively in Python (`db.py`'s `att_wanted`, checked
+-- against `PRAGMA table_info(attempts)` before each `ALTER TABLE ... ADD
+-- COLUMN`), not here. `_migrate` executescript's every `migrations/*.sql`
+-- file on EVERY connect with no migration-version tracking, so a literal
+-- `ALTER TABLE attempts ADD COLUMN full_final_text TEXT` in this file would
+-- raise "duplicate column name" and brick the DB on the second connect (see
+-- 0003_task_kind.sql and 0015_attempt_verifier_results.sql for the same
+-- reasoning, applied first). This file is documentation of the column, not
+-- the mechanism that creates it.

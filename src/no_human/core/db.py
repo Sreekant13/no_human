@@ -1089,6 +1089,19 @@ class Store:
             # attempts hit cap and killed work that was already reviewed and
             # about to land.
             "mechanical_round": "INTEGER",
+            # The coder's raw final_text for this attempt, in full — the surface the
+            # PR body's 4000-char `_SUMMARY_TRUNCATED_MARKER` points a reader at
+            # (`GET /api/tasks/{id}` -> `TaskOut.full_report`, and `nh task show`). Written
+            # once, at the coder-usage chokepoint (`update_attempt` right after the
+            # coder session ends), capped at `orchestrator._FULL_REPORT_MAX_CHARS` as
+            # a size guard, not a redaction — filtering/scrubbing happens at RENDER
+            # time (`report_surface.render_full_report`) so a later change to
+            # `_SUMMARY_DROP_MARKERS` applies retroactively to already-stored rows.
+            # NULLABLE, NO DEFAULT: most rows predate this column, and NULL — not ""
+            # — is the honest record of "no report was ever written here". See
+            # migrations/0016_attempt_full_final_text.sql for why the ALTER lives
+            # here and not in a .sql file.
+            "full_final_text": "TEXT",
         }
         # A THIRD exclusion lives beside these two, but needs no new column:
         # `status = 'interrupted'` (the base column, written only by

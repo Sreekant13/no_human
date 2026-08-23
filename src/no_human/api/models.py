@@ -202,6 +202,14 @@ class TaskOut(BaseModel):
     #: so the drawer (this model) and the list/board card can never disagree
     #: about whether the same task's FAILED status was an operator cancel.
     cancelled: bool = False
+    #: The LAST attempt's coder report, in full — the surface the PR body's
+    #: 4000-char `Orchestrator._SUMMARY_TRUNCATED_MARKER` points a reader at.
+    #: Filtered/scrubbed by `report_surface.render_full_report` (the same
+    #: drop-marker filter and outbound scrub the PR summary passes through),
+    #: but NOT capped: this is where the cut tail is meant to be read. `None`
+    #: when no attempt on this task has recorded a report yet (predates this
+    #: column, or the coder session produced no text).
+    full_report: str | None = None
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":
@@ -224,6 +232,16 @@ class TaskOut(BaseModel):
             _lat = task.blocker.get("escalation_latency") or {}
             escalation_attempts = _lat.get("attempts_before_escalation")
             escalation_tokens = _lat.get("tokens_before_escalation")
+        # Lazy import: `report_surface` pulls in `orchestrator`, and `api` is
+        # loaded well before any task runs — a top-level import here would
+        # make importing `api.models` drag in the whole orchestrator graph.
+        from ..core.report_surface import render_full_report
+        full_report = None
+        for a in reversed(attempts or []):
+            raw = a.get("full_final_text")
+            if raw and str(raw).strip():
+                full_report = render_full_report(str(raw))
+                break
         return cls(
             id=task.id,
             external_id=task.external_id,
@@ -256,6 +274,7 @@ class TaskOut(BaseModel):
             escalation_attempts=escalation_attempts,
             escalation_tokens=escalation_tokens,
             cancelled=_operator_cancelled(task),
+            full_report=full_report,
         )
 
 

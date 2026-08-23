@@ -1581,6 +1581,21 @@ def task_show(task_id):
                     console.print(
                         f"    code: {a['loaded_code_version']}"
                     )
+            # The surface `_SUMMARY_TRUNCATED_MARKER` (PR body, capped at
+            # `_SUMMARY_MAX_CHARS`) now points a reader at. Walk attempts
+            # newest-first and print the first non-empty report — same
+            # "last attempt that has one" rule as `TaskOut.full_report`.
+            # Lazy import: `report_surface` pulls in `orchestrator`, and this
+            # CLI module is imported well before any task runs.
+            from ..core.report_surface import render_full_report
+            for a in reversed(attempts):
+                rendered = render_full_report(a.get("full_final_text"))
+                if rendered:
+                    console.print(
+                        f"\n[bold]final report (attempt {a['attempt_number']}, full)[/]"
+                    )
+                    console.print(rendered, markup=False)
+                    break
 
     asyncio.run(_go())
 

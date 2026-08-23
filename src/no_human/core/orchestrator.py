@@ -1109,6 +1109,13 @@ def _ci_failure_unrelated(ci_result: "CIResult", changed_files: list[str]) -> st
 
 _FENCE_CLOSE = "\n```"
 
+# Size guard on `attempts.full_final_text` (a TEXT column a runaway session
+# could otherwise fill without bound) — NOT a redaction. Real coder reports
+# run ~2-20k chars; this is 25x the PR body's 4000-char `_SUMMARY_MAX_CHARS`,
+# so the AC-answer tail this column exists to preserve is never the part
+# that gets cut.
+_FULL_REPORT_MAX_CHARS = 100_000
+
 
 def purge_unscreened_skill_files(skills_dir: Path) -> list[str]:
     """Delete materialized SKILL.md files whose name or body carries a term.
@@ -4741,6 +4748,12 @@ class Orchestrator:
             output_tokens=getattr(result, "output_tokens", None),
             cache_read_tokens=result.cache_read_tokens,
             cache_creation_tokens=result.cache_creation_tokens,
+            # The coder's raw report, in full, for `nh task show`/`TaskOut.full_report`
+            # (`report_surface.render_full_report` filters/scrubs at RENDER time,
+            # not here) — capped at `_FULL_REPORT_MAX_CHARS` as a size guard, and
+            # "" -> None so an empty report reads as SQL NULL, not an empty string.
+            full_final_text=(
+                (result.final_text or "").strip()[:_FULL_REPORT_MAX_CHARS] or None),
             **self._pop_aux_usage(),
         )
         # A result that streamed real tokens proves the account/transport
@@ -16348,16 +16361,22 @@ SIX of them read a checkpoint and TWO do not — but do
     # Budget for the WHOLE rendered section, marker included — a review caught the first
     # version calling 4000 a cap while emitting 4080.
     _SUMMARY_MAX_CHARS = 4000
-    # 🔴 NO LOCATION CLAIM, DELIBERATELY. This said "the full text is in the attempt log"
-    # and a review established there is no such log: `attempts` has no column for the
-    # coder's final text, nothing `update_attempt` writes carries it, and `nh logs` never
-    # prints it. My first correction said "the task report" — the text IS assigned there
-    # (`report=(result.final_text or "").strip()`, orchestrator.py:3168) but I could not
-    # find any surface that renders it, so telling a reviewer to go read it would be a
-    # second unverifiable claim replacing the first. The marker now states only what is
-    # certainly true: text was cut here. That the full text has no human-reachable surface
-    # is a real gap, named here rather than papered over by the marker.
-    _SUMMARY_TRUNCATED_MARKER = "\n\n_(summary truncated at {n} characters)_"
+    # 🔴 THE GAP THIS RECORDS IS NOW CLOSED. This used to say "the full text is in
+    # the attempt log" — a review established there was no such log — and the
+    # correction after that said only "text was cut here", because at the time
+    # nothing rendered the full text anywhere a human could read it: `attempts`
+    # had no column for the coder's final text, and `report=(result.final_text or
+    # "").strip()` (orchestrator.py:3168, the ORIGINAL location this comment used
+    # to cite) was assigned but never surfaced. It now is: the full, unfiltered
+    # text is written to `attempts.full_final_text` at the coder-usage chokepoint
+    # (`update_attempt`, right after the coder session ends), and rendered —
+    # through `_filter_summary_paragraphs`, the SAME drop-marker filter this
+    # marker's own summary uses, uncapped — by `GET /api/tasks/{id}`
+    # (`TaskOut.full_report`) and `nh task show`. The marker below may therefore
+    # name that surface, because the surface is real and is verified by
+    # `tests/test_full_report_surface.py`.
+    _SUMMARY_TRUNCATED_MARKER = (
+        "\n\n_(summary truncated at {n} characters — full report: `nh task show <task-id>`)_")
     # A dropped paragraph leaves a VISIBLE hole. The first version dropped silently, which
     # contradicted the same commit's own rule that truncation must be announced, and left a
     # reviewer looking at orphaned command output with no heading and no explanation.
@@ -16976,26 +16995,27 @@ SIX of them read a checkpoint and TWO do not — but do
         return text
 
     @staticmethod
-    def _clean_summary(summary: str) -> str:
+    def _filter_summary_paragraphs(summary: str) -> str:
         """Drop paragraphs that address the harness/system instructions or reference the
         repro-manifest metadata file — coder-to-harness dialogue, not a reviewer-facing
-        summary. Everything else is KEPT, in order, up to `_SUMMARY_MAX_CHARS`; both a
-        dropped paragraph and a truncated tail leave a visible marker.
+        summary. Everything else is KEPT, in order, with NO length cap; a dropped
+        paragraph leaves a visible marker.
 
-        🔴 THIS USED TO RETURN INSIDE THE LOOP, so it kept exactly ONE paragraph. The
-        docstring said "drop paragraphs that address the harness" — which reads as a filter
-        — and the body was a first-paragraph extractor with a 600-char cap. Nothing after
-        paragraph one ever reached a PR body, which made a whole class of acceptance
-        criterion UNSATISFIABLE rather than merely unmet: the reviewer was refusing
-        artifacts the pipeline could not produce. Measurement, the task it was measured on,
-        and the refutation run before believing it are in the archive at
-        research/PR_BODY_EVIDENCE_UNSATISFIABLE_2026-07-30.md — cited rather than restated,
-        because a docstring outlives the evidence and a review rightly called the numbers
-        here unverifiable from inside this repo.
+        Split out of `_clean_summary` so an UNCAPPED render — `report_surface.
+        render_full_report`, which backs `TaskOut.full_report` and `nh task show`, the
+        surface the PR body's `_SUMMARY_TRUNCATED_MARKER` now points a reader at —
+        reuses this SAME drop-marker filter instead of a second implementation
+        that could drift from it. `_clean_summary` is the only other caller and
+        applies the length cap on top.
 
-        Leading whitespace is PRESERVED: an indented block is how captured command output
-        arrives, and stripping it turned the evidence this function exists to carry into
-        ordinary prose.
+        Returns the joined-but-UNCLOSED body (fences/HTML blocks may still be open
+        at the end) — `_close_orphaned_block` is the caller's job, run on the text
+        the caller is actually about to measure/slice, not on a copy already
+        closed here.
+
+        Leading whitespace is PRESERVED: an indented block is how captured command
+        output arrives, and stripping it turned the evidence this function exists
+        to carry into ordinary prose.
         """
         raw = (summary or "").replace("\r\n", "\n").replace("\r", "\n")
         non_empty = [p for p in raw.split("\n\n") if p.strip()]
@@ -17014,7 +17034,26 @@ SIX of them read a checkpoint and TWO do not — but do
             rendered.append(para.rstrip())      # trailing only — see the docstring
         if dropped == len(non_empty):
             return Orchestrator._SUMMARY_FILTERED_PLACEHOLDER
-        body = "\n\n".join(rendered)
+        return "\n\n".join(rendered)
+
+    @staticmethod
+    def _clean_summary(summary: str) -> str:
+        """Filter the coder's report to a reviewer-facing summary (see
+        `_filter_summary_paragraphs`), then cap it at `_SUMMARY_MAX_CHARS`; both a
+        dropped paragraph and a truncated tail leave a visible marker.
+
+        🔴 THIS USED TO RETURN INSIDE THE LOOP, so it kept exactly ONE paragraph. The
+        docstring said "drop paragraphs that address the harness" — which reads as a filter
+        — and the body was a first-paragraph extractor with a 600-char cap. Nothing after
+        paragraph one ever reached a PR body, which made a whole class of acceptance
+        criterion UNSATISFIABLE rather than merely unmet: the reviewer was refusing
+        artifacts the pipeline could not produce. Measurement, the task it was measured on,
+        and the refutation run before believing it are in the archive at
+        research/PR_BODY_EVIDENCE_UNSATISFIABLE_2026-07-30.md — cited rather than restated,
+        because a docstring outlives the evidence and a review rightly called the numbers
+        here unverifiable from inside this repo.
+        """
+        body = Orchestrator._filter_summary_paragraphs(summary)
         # 🔴 THE CAP IS CHECKED ON THE TEXT THAT LEAVES, fence close included. Two prior
         # versions of this block each emitted over the declared 4000 (4080, then 4004
         # twice): the first appended the truncation marker after the slice; the second
