@@ -720,6 +720,20 @@ class Scheduler:
         IMPLEMENTING/PENDING, and a park is neither until the WakeWatcher's
         own timer flips it — which was still four minutes away.
 
+        INCIDENT (2026-08-23): a restart onto a DIFFERENT auth profile
+        (`nh auth use <other>` + restart) stranded three parks (one HIGH)
+        for ~1h while fresh PENDING tasks filled the freed slots. The
+        profile switch left this process's OWN cooldown clock clear
+        (`recover_quota_cooldown` correctly never arms it from another
+        profile's wall), but this loop was unconditionally skipping every
+        row whose ``auth_profile`` didn't match the one now active, with no
+        fallback — so those parks were left to their own hour-long
+        `wake_check_at` timer instead. Once THIS process is not in cooldown
+        (checked below, before the loop even starts), a park's OTHER
+        profile's wall is moot: the task will retry under the CURRENT
+        profile, which is not walled, so it is resumable now rather than
+        stranded behind fresh dispatch.
+
         Returns the ids actually resumed (flipped to IMPLEMENTING). A live
         wall (`_in_quota_cooldown`) or no wake mechanism wired both mean
         "nothing to do" and this returns ``[]`` without touching a row.
@@ -734,13 +748,30 @@ class Scheduler:
                 if (blocker.get("category") or "").upper() != "QUOTA":
                     continue
                 theirs = blocker.get("auth_profile")
-                if theirs and mine and theirs != mine:
-                    continue                  # another profile's wall
-                if (theirs and self._quota_wall_profile
-                        and theirs != self._quota_wall_profile):
-                    continue                  # behind a DIFFERENT wall
-                if not self._park_wall_passed(task, blocker, now=now):
-                    continue
+                # A park behind a DIFFERENT profile's wall skips the wall
+                # checks below entirely: this process is already confirmed
+                # not in cooldown (for the CURRENT profile) above, and the
+                # other profile's own wall status is moot once the task is
+                # about to retry under a profile that isn't walled.
+                #
+                # An INFRA park (`blocker.infra`, a dead SDK session — see
+                # `test_infra_park_is_not_a_wall.py`) carries the SAME
+                # "QUOTA" category and can carry an `auth_profile` stamp too,
+                # but it is not a billing wall at all: nothing about a
+                # profile switch makes a dead transport come back to life.
+                # Routing it through the cross-profile fast path resumed it
+                # unconditionally on every restart-onto-a-new-profile,
+                # recreating the retry-wave class this file's other incident
+                # note exists to prevent — it must fall through to the same
+                # wall/own-clock gate every other park uses below.
+                cross_profile = bool(theirs and mine and theirs != mine
+                                      and not blocker.get("infra"))
+                if not cross_profile:
+                    if (theirs and self._quota_wall_profile
+                            and theirs != self._quota_wall_profile):
+                        continue                  # behind a DIFFERENT wall
+                    if not self._park_wall_passed(task, blocker, now=now):
+                        continue
                 action = await self.wake.resume_now(task, now=now)
                 if action == "resumed":
                     resumed.append(task.id)

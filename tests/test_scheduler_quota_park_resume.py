@@ -154,28 +154,118 @@ async def test_cooldown_end_triggers_the_same_sweep(store, monkeypatch):
     assert park.id in started, "the lapse itself must re-arm the resume sweep"
 
 
-async def test_other_profile_park_is_left_to_its_own_clock(store, monkeypatch):
-    """A park stamped for a DIFFERENT profile than the one active now must
-    not be swept — `nh auth use <other>` + restart is the sanctioned way
-    past that wall, and this process's wall must not reach across it."""
+async def test_restart_on_a_new_profile_resumes_the_old_profiles_parks_first(store, monkeypatch):
+    """INCIDENT (2026-08-23): three tasks (one HIGH) sat ``paused_quota``
+    under profile ``personal2``'s wall. The server was stopped, the operator
+    ran `nh auth use personal3`, and it restarted. ``personal3`` was never in
+    cooldown — `recover_quota_cooldown` correctly refuses to arm
+    ``_quota_cooldown_until`` from another profile's wall (see
+    `test_a_wall_on_another_profile_is_not_recovered` in
+    test_scheduler_quota_recovery.py) — yet the parked tasks sat stranded for
+    ~1h while 4 fresh PENDING tasks filled the freed worker slots: this
+    process's own cooldown clock was clear, but `_resume_quota_parks` was
+    unconditionally skipping every row whose ``auth_profile`` differed from
+    the one now active, with no fallback. Once the CURRENT profile is not in
+    cooldown, the OTHER profile's wall is moot — the task will retry under
+    the current (uncooled) profile — so it must resume immediately rather
+    than wait out its own hour-long `wake_check_at` clock.
+
+    Was `test_other_profile_park_is_left_to_its_own_clock`, which pinned the
+    opposite (buggy) assertion; "left to its own clock" was exactly this
+    incident's stranding, not a sanctioned wait — `nh auth use <other>` +
+    restart is supposed to BE the way past the wall, not a way to strand
+    sunk-cost work behind it.
+    """
     import no_human.core.scheduler as sched_mod
     monkeypatch.setattr(sched_mod, "active_auth_profile", lambda: "personal3")
     _RecordingOrch.started.clear()
     now = datetime.now(timezone.utc)
-    park = await _quota_park(store, now + timedelta(minutes=4),
-                              raised_at=now - timedelta(minutes=56),
+    # A long own-clock wake (56 minutes out) proves the resume is driven by
+    # "pool not in cooldown", not by the park's own wake_check_at happening
+    # to already be due.
+    park = await _quota_park(store, now + timedelta(minutes=56),
+                              raised_at=now - timedelta(minutes=4),
                               auth_profile="personal2")
-    await _pending(store, 1)
+    await _pending(store, 3)
     wake = WakeWatcher(store, {})
-    sched = Scheduler(store, _RecordingOrch, max_workers=2, wake_watcher=wake)
+    sched = Scheduler(store, _RecordingOrch, max_workers=1, wake_watcher=wake)
 
-    assert await sched.recover_quota_cooldown() is None
+    recovered = await sched.recover_quota_cooldown()
+    assert recovered is None, "another profile's wall must not arm this process's cooldown"
+    assert sched._quota_cooldown_until is None
+
     started = await sched.tick(now=now)
     await asyncio.sleep(0.05)
 
-    assert park.id not in started
+    assert started == [park.id], (
+        "the OLD profile's parked task must claim the only free slot, "
+        "resumed before any never-started pending task")
     parked = await store.get_task(park.id)
-    assert parked.status == TaskStatus.PAUSED_QUOTA
+    assert parked.status in (TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+                              TaskStatus.TESTING) or parked.id in _RecordingOrch.started
+
+
+async def _infra_park(store, wake_at: datetime, *, raised_at: datetime | None = None,
+                       auth_profile: str | None = None):
+    """A dead-SDK-session park: same ``category: QUOTA`` shape as a real
+    quota wall, but stamped ``infra: True`` — see
+    `tests/test_infra_park_is_not_a_wall.py`. It must never be swept by a
+    wall-driven path; only its own `wake_check_at` may resume it."""
+    t = Task.new("dead session", repo_path="/tmp/x")
+    await store.create_task(t)
+    blocker = {"category": "QUOTA", "wake_condition": "quota_refreshed",
+               "raised_at": (raised_at or wake_at - timedelta(hours=1)).isoformat(),
+               "root_cause_hypothesis": "JSON message exceeded maximum buffer size",
+               "infra": True}
+    if auth_profile:
+        blocker["auth_profile"] = auth_profile
+    t.blocker = blocker
+    t.wake_check_at = wake_at.isoformat()
+    await store.update_task_columns(t)
+    await store.set_status(t, TaskStatus.PAUSED_QUOTA, validate=False)
+    return t
+
+
+async def test_restart_on_a_new_profile_does_not_resume_a_cross_profile_infra_park(
+        store, monkeypatch):
+    """RED before the fix: the 2026-08-23 cross-profile fast path in
+    `_resume_quota_parks` keyed only on `category == QUOTA` and `auth_profile
+    != mine`, so it swept up INFRA parks (dead SDK sessions, `blocker.infra`)
+    exactly like real quota walls — a rotation restart onto a new profile
+    resumed a dead-transport park unconditionally, bypassing its own
+    `wake_check_at` clock and recreating the retry-wave class
+    `test_infra_park_is_not_a_wall.py` exists to prevent (an infra park must
+    be "invisible to every pool clock", scheduler.py's own incident note at
+    the top of `_resume_quota_parks`). A REAL quota park under the same
+    other-profile wall must still resume (the 08-23 fix stays intact); the
+    infra park, with an own-clock wake far in the future, must not."""
+    import no_human.core.scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "active_auth_profile", lambda: "personal3")
+    _RecordingOrch.started.clear()
+    now = datetime.now(timezone.utc)
+    real_park = await _quota_park(store, now + timedelta(minutes=56),
+                                   raised_at=now - timedelta(minutes=4),
+                                   auth_profile="personal2")
+    infra_park = await _infra_park(store, now + timedelta(hours=1),
+                                    raised_at=now - timedelta(minutes=1),
+                                    auth_profile="personal2")
+    wake = WakeWatcher(store, {})
+    sched = Scheduler(store, _RecordingOrch, max_workers=4, wake_watcher=wake)
+
+    recovered = await sched.recover_quota_cooldown()
+    assert recovered is None
+    assert sched._quota_cooldown_until is None
+
+    started = await sched.tick(now=now)
+    await asyncio.sleep(0.05)
+
+    assert real_park.id in started, (
+        "a genuine cross-profile quota park must still resume on restart")
+    assert infra_park.id not in started, (
+        "an infra park must never be swept by the cross-profile fast path — "
+        "only its own wake_check_at may resume it")
+    parked_infra = await store.get_task(infra_park.id)
+    assert parked_infra.status == TaskStatus.PAUSED_QUOTA
 
 
 async def test_park_whose_wall_has_not_passed_is_left_parked(store, monkeypatch):
