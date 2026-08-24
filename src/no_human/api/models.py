@@ -683,9 +683,11 @@ class LandedOverrideRequest(BaseModel):
     # blockers/landed_override.py's approve_landed_override.
     sha: str
     justification: str
-    # Only consulted for a `pending_never_ran` task with no recorded
-    # base_branch — the tool never guesses one (see landed_override.py's
-    # module docstring / F1). Ignored otherwise.
+    # Required only for a `pending_never_ran` task with no recorded
+    # base_branch and no project default (the tool never guesses one — see
+    # landed_override.py's module docstring / F1). When given on a task that
+    # already has a recorded or default base, it NARROWS the ancestry check
+    # to exactly this branch instead of trying the usual candidates.
     base: str | None = None
 
 

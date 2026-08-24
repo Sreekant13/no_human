@@ -310,6 +310,71 @@ async def test_doctor_accepts_report_only_design_doc_as_done(tmp_path):
         await store.close()
 
 
+def _git(repo_path, *args):
+    subprocess.run(["git", "-C", str(repo_path), *args], check=True,
+                    capture_output=True)
+
+
+def _git_out(repo_path, *args):
+    return subprocess.run(["git", "-C", str(repo_path), *args], text=True,
+                          capture_output=True, check=True).stdout.strip()
+
+
+async def test_landed_override_row_reports_no_evidence_gap(tmp_path, store):
+    """AC5: a task rescued via `approve_landed_override`'s stacked-base
+    candidate widening (the task's recorded base_branch names another
+    task's stacked branch, but content lands on the repo's real default)
+    records real evidence — `approved_landed_override` is already in
+    `DONE_EVIDENCE_KINDS` — so `nh doctor`'s evidence-gap check must not
+    flag the repaired row. Non-vacuity control: a DONE task with none of
+    DONE_EVIDENCE_KINDS on record IS still reported, so this isn't a check
+    that can't fail."""
+    from no_human.blockers.landed_override import approve_landed_override
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("orig\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "initial")
+    _git(repo, "checkout", "-b", "no-human/parent-3")
+    (repo / "stacked.txt").write_text("stacked base work\n")
+    _git(repo, "add", "stacked.txt")
+    _git(repo, "commit", "-m", "parent task: stacked work")
+    _git(repo, "checkout", "main")
+    (repo / "a.txt").write_text("actual landed change\n")
+    _git(repo, "commit", "-am", "landed: the real fix")
+    landed_sha = _git_out(repo, "rev-parse", "main")
+    default_sha = _git_out(repo, "rev-parse", "main")
+    _git(repo, "update-ref", "refs/remotes/origin/main", default_sha)
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+         "refs/remotes/origin/main")
+
+    t = Task.new("rescue", repo_path=str(repo))
+    t.context = {"base_branch": "no-human/parent-3", "pr_branch": ""}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    await approve_landed_override(
+        store, t, landed_sha,
+        "landed on main; base_branch recorded the parent task's stacked "
+        "branch by dispatch-time accident")
+
+    d = await diagnose(store)
+    assert not any(t.id[:8] in g for g in d.evidence_gaps), d.evidence_gaps
+
+    # non-vacuity control: a DONE task with NO DONE_EVIDENCE_KINDS event on
+    # record is still reported — proves the check above could have failed.
+    other = Task.new("no evidence", repo_path=str(repo), kind="feature")
+    await store.create_task(other)
+    await store.set_status(other, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
+    d2 = await diagnose(store)
+    assert any(other.id[:8] in g for g in d2.evidence_gaps), d2.evidence_gaps
+
+
 # --------------------------------------------------------------------------- #
 # Configured-but-unusable CI. Not a history check: this failure mode leaves no #
 # events at all, so no amount of event counting could ever have found it.      #

@@ -952,6 +952,44 @@ async def _base_tips(repo_path: str, base: str) -> list[str]:
     return tips
 
 
+async def resolve_project_default_branch(repo_path: str) -> str:
+    """The repo's DECLARED default branch — ``origin/HEAD`` only, ``""`` when
+    it is unset.
+
+    Unlike ``resolve_default_branch`` above, this deliberately has **no**
+    fallback to the checkout's current branch. That fallback is exactly right
+    for advisory text (nothing acts on it) and exactly wrong for a value used
+    to widen an ancestry check: the checkout's current branch is an accident
+    of whatever a worktree happens to be parked on, and inferring a base from
+    it is the false-completion shape this codebase has already been bitten by
+    (see `_base_tips`'s docstring). So this probe answers a narrower question
+    — "what does the remote say is the default?" — and fails soft to ``""``
+    rather than guess, which its caller (`blockers/landed_override.py`)
+    treats as "no default-branch candidate", never as a value to check
+    ancestry against.
+    """
+    rc, out = await _git_rc(
+        repo_path, "symbolic-ref", "-q", "refs/remotes/origin/HEAD")
+    if rc == 0 and out:
+        return out.rsplit("/", 1)[-1]
+    return ""
+
+
+async def ref_tip_sha(repo_path: str, ref: str) -> str:
+    """The 12-character tip sha of ``ref`` (tried via `_base_tips`, so its
+    remote-tracking counterpart is also considered), or ``""`` when neither
+    resolves. Never raises — best-effort, for composing human-readable text.
+    """
+    if not repo_path or not ref:
+        return ""
+    for tip in await _base_tips(repo_path, ref):
+        rc, out = await _git_rc(
+            repo_path, "rev-parse", "--verify", "--quiet", f"{tip}^{{commit}}")
+        if rc == 0 and out:
+            return out[:12]
+    return ""
+
+
 #: The ONE path held out of the containment comparison, because a landing
 #: RE-DERIVES it rather than taking the branch's rows, so it diverges on every
 #: landing and nearly every branch touches it (changing any shipped file

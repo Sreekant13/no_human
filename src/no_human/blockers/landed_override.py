@@ -29,7 +29,12 @@ Three eligible shapes, resolved by ``_resolve_shape``:
   base_branch" — a task that never ran can never have recorded one. This
   shape, and ONLY this shape, accepts an explicit ``--base``/``base=`` from
   the human when none was ever recorded (see `approve_landed_override`'s
-  base-resolution step) — it is NEVER guessed from git or a profile. An
+  base-resolution step) — it is NEVER guessed from git or a profile.
+  (Amended below: ``--base`` now narrows the candidate check for every
+  eligible shape, not only this one — but a shape that already recorded a
+  base, or resolves a project default, still never needs ``--base`` to be
+  rescued; this shape remains the one that has NOTHING to fall back on
+  without it.) An
   earlier version of this fix DID auto-default from
   ``vcs/pr_watcher.resolve_default_branch``'s ``origin/HEAD`` probe, falling
   back to the checkout's own current branch when nothing configures
@@ -68,6 +73,70 @@ the audit event's text says so explicitly, and the event's ``kind`` —
 automated path can write (``shipped``, ``approved_landed``, ``human_merged``),
 so a reader of the event log can always tell which class of evidence stands
 behind a completion.
+
+**Amended — the recorded base is a CANDIDATE, not the only accepted answer.**
+A supervising session's squash train can leave a task's ``context["base_branch"]``
+pointing at another task's stacked branch (dispatch-time recording of whatever
+was live then), while the content genuinely lands on the repo's real default
+branch. The original version of this module checked ancestry against exactly
+the recorded ``base_branch`` and nothing else, so a task like that stayed
+refused forever with no way to rescue it — ``--base`` was honoured only for
+the ``pending_never_ran`` shape, which never had a recorded base to begin
+with. ``approve_landed_override`` now tries every resolvable candidate branch
+— the project's configured/declared default branch, the recorded
+``base_branch``, and (when given) the human's ``--base`` — and accepts the
+first one ``sha`` is an ancestor of, naming which one matched in the event,
+the context, and the human-facing text. **One deliberate exception (F2,
+independent review of d6249458f):** the default-branch candidate is a rescue
+for a *wrong recorded* base, so it is only ever tried for ``awaiting_approval``
+and ``failed_pre_pr`` — both shapes that always have a recorded base to begin
+with. ``pending_never_ran`` never gets it, recorded or not: admitting it
+there would quietly readmit the pre-855f1263 auto-guess this module exists to
+refuse. ``--base`` NARROWS the candidate set to exactly itself, for every
+shape, not just ``pending_never_ran``; it still never fills in a missing
+recorded base by inference.
+
+**What "must still name a branch" actually means (F3, same review).** Every
+candidate — recorded, default, or ``--base`` — is checked with
+``refs_resolvable`` before any ancestry work, and that check is honest about
+what it accepts: any git commit-ish (a branch, a tag, or a bare commit sha),
+not only a branch, despite the CLI help text and earlier revisions of this
+docstring saying "branch." This is a pre-existing, unchanged property, not a
+new widening, and it is not a hole in the refusal *by itself* — ancestry
+still has to hold. But it does mean ``--base <sha>`` is a tautology if that
+sha is (or descends from) the same ``--landed`` sha: a commit is its own
+ancestor, so a human who fat-fingers the same value into both flags gets an
+override that "passes" while asserting nothing. Nothing here silently
+narrows what a legitimate ``--base <tag>`` or ``--base <sha>`` can do, so this
+docstring records the tautology rather than closing it: **the CLI help text
+was corrected to say so** (``cli/commands.py``'s ``--base`` option help), and
+``--because`` (required on every call, this one included) is the only actual
+control against it — a human still has to write down *why* they believe
+whatever they typed.
+
+**A narrower reopening of the same class of risk (F1, same review).**
+``_preferred_ref_form`` (below) falls back from a bare candidate name to
+``origin/<name>`` when the bare form does not resolve — see its own
+docstring for why (a checkout whose local ``main`` is absent or stale). That
+fallback hardcodes trust in a remote literally named ``origin``, whatever it
+actually points to. ``_base_tips`` in ``vcs/pr_watcher.py`` deliberately does
+**not** glob every ``refs/remotes/*/<name>`` for exactly this reason — an OSS
+fork checkout where ``origin`` is the *contributor's* fork and the canonical
+upstream lives under a differently-named remote would otherwise accept a sha
+that only landed on the fork's copy of a branch name as if it had landed on
+the real one (see that function's docstring for the full case). This
+fallback reopens a narrower version of the same risk: it trusts a SPECIFIC
+remote name rather than every remote, so a checkout with no remote literally
+named ``origin`` gets no false positive from it, but a checkout with an
+``origin`` that is itself a fork does. This is accepted, documented risk, not
+an oversight fixed by this docstring — ``tests/test_landed_override.py``
+pins the current (fork-accepting) behavior with a dedicated test rather than
+silently relying on it holding.
+
+None of the above weakens the refusal: a sha that is an ancestor of nothing
+named above is still refused, and the refusal names every branch (and its
+tip) that was tried, so a human can tell at a glance whether the tool checked
+the right places.
 """
 
 from __future__ import annotations
@@ -78,7 +147,8 @@ from typing import Any, Awaitable, Callable
 
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_watcher import (
-    commit_is_ancestor, containment_residue, resolve_default_branch,
+    commit_is_ancestor, containment_residue, ref_tip_sha, refs_resolvable,
+    resolve_default_branch, resolve_project_default_branch,
 )
 from ..vcs.task_pr import task_has_pr_evidence
 from .pr_closeout import close_task_prs_on_completion
@@ -187,6 +257,154 @@ async def _base_hint(task: Task) -> str:
     )
 
 
+async def _resolve_default_branch_value(store: Any, task: Task) -> str:
+    """A default-branch CANDIDATE for the ancestry check — never a value
+    filled into ``base``, only one more branch name tried alongside it.
+
+    Order: the project profile's configured ``default_branch``, then the
+    repo's own declared remote default (``origin/HEAD``, strict — see
+    ``pr_watcher.resolve_project_default_branch``, which has **no**
+    current-branch fallback, unlike ``resolve_default_branch`` above, which
+    this module keeps using only for non-binding hint text). Any failure (no
+    profile on record, an unreadable repo) folds to ``""``, and the caller
+    simply has one fewer candidate to try — this never raises and never
+    considers the checkout's current branch, for the same reason point 4 of
+    ``approve_landed_override``'s docstring gives.
+    """
+    prof = None
+    try:
+        prof = await store.get_profile(task.repo_path)
+    except Exception:  # noqa: BLE001 — best-effort; falls through below
+        prof = None
+    # str() first: a YAML `default_branch: yes` arrives as bool True and
+    # `.strip()` on it is an AttributeError (the same trap
+    # `Orchestrator._implicit_base_branch` guards against).
+    configured = (
+        str(getattr(prof, "default_branch", "") or "") if prof else ""
+    ).strip()
+    if configured:
+        return configured
+    try:
+        return (await resolve_project_default_branch(task.repo_path) or "").strip()
+    except Exception:  # noqa: BLE001 — never load-bearing enough to raise
+        return ""
+
+
+async def _preferred_ref_form(
+    repo_path: str, name: str, *,
+    sha: str | None = None,
+    is_ancestor: "IsAncestor | None" = None,
+) -> str:
+    """The form of *name* — bare, or ``origin/<name>`` — that ``git`` can
+    actually resolve to a commit in *repo_path*. Falls back to *name*
+    unchanged when NEITHER form resolves, so an unresolvable candidate still
+    surfaces under its original name in refusal text and fails closed
+    through ``is_ancestor``'s own git-error handling, exactly as before this
+    helper existed.
+
+    Every candidate branch name reaching this module — the repo's declared
+    default (``resolve_project_default_branch``, always a BARE name split
+    off ``origin/HEAD``), the task's recorded ``base_branch``, and a human's
+    ``--base`` — is only ever checked for ancestry through
+    ``commit_is_ancestor`` -> ``_base_tips``, which resolves a *bare*
+    branch's remote-tracking counterpart solely via ``<bare>@{upstream}``,
+    itself defined only when a LOCAL branch of that name exists. A checkout
+    whose local ``main`` is simply ABSENT — the normal shape once a task's
+    content is squash-landed and pushed from a throwaway worktree, advancing
+    ``refs/remotes/origin/main`` while no local ``main`` is ever fetched
+    into this checkout — leaves the bare name unresolvable, and
+    ``_base_tips`` has nothing else to fall back to (it does not glob
+    ``refs/remotes/*/<base>``, by design — see its own docstring). Handing
+    it the ``origin/<name>`` form directly sidesteps that gap without
+    touching ``_base_tips`` itself. Bare is preferred when it resolves, so
+    an ordinary local branch keeps reading as itself in messages and events.
+
+    **F1 (independent review of d6249458f): this hardcodes trust in a remote
+    literally named ``origin``, whatever it points to.** ``_base_tips``
+    refuses to glob every ``refs/remotes/*/<name>`` specifically to avoid an
+    OSS-fork checkout (``origin`` = the contributor's fork, canonical
+    upstream under another remote name) accepting a sha that only landed on
+    the fork's copy of a branch name. Trusting ``origin/<name>`` by name
+    alone here reopens a narrower version of that same risk — see the module
+    docstring's "Amended" section for the full accounting and why this is
+    documented rather than closed.
+
+    A local ``main`` can also be STALE rather than absent — present, with no
+    upstream configured, sitting behind the commit that actually landed (a
+    long-lived checkout that never re-fetched). ``refs_resolvable`` only
+    proves the bare name exists, never that it is caught up, so blindly
+    preferring bare would keep silently losing ancestry against a
+    perfectly-good ``origin/<name>`` in that shape. When *sha* and
+    *is_ancestor* are both supplied, a bare ref that resolves but whose tip
+    does NOT contain *sha* as an ancestor is no longer preferred
+    unconditionally: if ``origin/<name>`` also resolves AND *does* satisfy
+    ancestry, that form is returned instead, so ``matched_branch`` names the
+    ref that actually vouches for ``sha``. Callers that omit *sha*/
+    *is_ancestor* keep the exact original existence-only preference (no new
+    git calls, no behavior change) — this keeps the helper's contract
+    backward compatible for any caller that only wants a resolvable name,
+    not an ancestry-checked one.
+    """
+    if not name:
+        return name
+    origin_form = f"origin/{name}"
+    if await refs_resolvable(repo_path, name):
+        if sha and is_ancestor is not None:
+            try:
+                bare_ok = await is_ancestor(repo_path, sha, name)
+            except Exception:  # noqa: BLE001 — fail closed, fall through to bare
+                bare_ok = True
+            if not bare_ok and await refs_resolvable(repo_path, origin_form):
+                try:
+                    origin_ok = await is_ancestor(repo_path, sha, origin_form)
+                except Exception:  # noqa: BLE001 — fail closed, keep bare
+                    origin_ok = False
+                if origin_ok:
+                    return origin_form
+        return name
+    if await refs_resolvable(repo_path, origin_form):
+        return origin_form
+    return name
+
+
+_CANDIDATE_ROLE = {
+    "recorded": "the task's recorded base",
+    "default_branch": "the repo's default branch",
+    "human_asserted": "the branch you named with --base",
+}
+
+#: Same roles, phrased for the human-facing completion text rather than a
+#: refusal — see point 6 of ``approve_landed_override``'s docstring.
+_MATCHED_ROLE_TEXT = {
+    "recorded": "the task's recorded base branch",
+    "default_branch": "the repo's default branch",
+    "human_asserted": "a branch the human named with --base",
+}
+
+
+async def _candidate_phrase(repo_path: str, branch: str, source: str) -> str:
+    tip = await ref_tip_sha(repo_path, branch)
+    tip_text = f"tip {tip}" if tip else "tip unknown"
+    return f"{_CANDIDATE_ROLE[source]} {branch} ({tip_text})"
+
+
+async def _refusal_text(
+    repo_path: str, sha: str, candidates: list[tuple[str, str]],
+) -> str:
+    """The widened refusal: names every candidate branch that was actually
+    tried (and its tip), not just one. Message order favors how a human
+    reads it (recorded base first, then the default branch) — independent of
+    the priority order the ancestry check itself uses."""
+    ordered = list(reversed(candidates)) if len(candidates) > 1 else candidates
+    phrases = [await _candidate_phrase(repo_path, b, s) for b, s in ordered]
+    joined = " or ".join(phrases)
+    return (
+        f"{sha} is not an ancestor of {joined} — refusing. If it landed "
+        "somewhere else, re-run with --base <branch> (still requires "
+        "--because)."
+    )
+
+
 async def approve_landed_override(
     store: Any, task: Task, sha: str, justification: str, *,
     is_ancestor: IsAncestor | None = None,
@@ -204,28 +422,73 @@ async def approve_landed_override(
        ``PENDING`` task that never opened a PR (the never-ran shape).
     2. ``justification`` must not be blank.
     3. ``sha`` must not be blank.
-    4. ``task.repo_path`` must be recorded. ``task.context["base_branch"]``
-       must be recorded too — EXCEPT for the ``pending_never_ran`` shape,
-       where a missing base may instead be supplied explicitly via the
-       caller's ``base=`` argument (CLI: ``--base``; API: the request body's
-       ``base`` field): a task that never dispatched never got the chance to
-       record one. This is a required human ASSERTION, never a guess — if
-       neither a recorded base nor an explicit ``base=`` is present, the call
-       refuses with a non-binding hint (``_base_hint``) rather than filling
-       one in. The other two shapes keep the strict rule unconditionally (the
-       same rule ``complete_if_content_landed`` documents: a wrong guessed
-       base is worse than refusing) — they accept no ``base=`` override at
-       all, recorded or nothing.
-    5. ``sha`` must be an ancestor of ``base`` (local git only,
-       ``commit_is_ancestor`` — ``git merge-base --is-ancestor``, fail-closed
-       on any git error: a probe failure is a refusal, never a pass). This is
-       what discharges "refused for tasks whose content is NOT landed" for
-       every shape: a branch that never reached the base branch has no
-       ancestor sha to name. For ``pending_never_ran`` this check is only as
-       trustworthy as ``base`` itself, which is exactly why point 4 never
-       lets ``base`` be guessed: it is always either a value a real prior
-       dispatch recorded, or a branch the human typed explicitly for this
+    4. ``task.repo_path`` must be recorded. A CANDIDATE branch list is then
+       built — never a single ``base`` value picked in advance:
+       * When the caller passes ``base=`` (CLI: ``--base``; API: the request
+         body's ``base`` field), it must first name a branch that actually
+         resolves in this repo (``refs_resolvable``, tried both bare and as
+         ``origin/<name>`` — never guessed, never inferred from the
+         checkout's current branch); if it does not resolve, this refuses
+         immediately, before any ancestry work. A resolvable ``--base``
+         NARROWS the candidate list to exactly itself, for every eligible
+         shape — not only ``pending_never_ran`` as an earlier version of this
+         function required. This is still a required human ASSERTION, never
+         a default: omitting it never fills one in.
+       * Otherwise, for the ``awaiting_approval`` and ``failed_pre_pr``
+         shapes, the candidates are the project's default branch (project
+         profile's configured ``default_branch``, else the repo's declared
+         ``origin/HEAD`` — see ``_resolve_default_branch_value``) and
+         ``task.context["base_branch"]`` (the recorded base), whichever of
+         the two resolve, with the default branch tried first when both are
+         present and differ. Every candidate — ``--base``, the default
+         branch, and the recorded base alike — is stored in whichever of its
+         bare or ``origin/<name>`` form ``_preferred_ref_form`` finds
+         resolvable, since the ancestry check below only walks a bare
+         branch's remote-tracking counterpart when a LOCAL branch of that
+         name exists; a checkout with no local ``main`` but a current
+         ``refs/remotes/origin/main`` needs the latter form or the check
+         never resolves anything to compare against.
+         For ``pending_never_ran`` **the default-branch candidate is never
+         tried** — this is the one deliberate exception, not an oversight:
+         the shape has no recorded base to rescue with it (its whole
+         definition is that dispatch never ran), so admitting the project's
+         default branch here would silently resurrect the pre-855f1263
+         auto-guess this module was rewritten to remove (see the shape's own
+         docstring above). Without ``--base``, this shape therefore always
+         refuses (`F2, independent review of d6249458f — a resolvable
+         default branch used to be accepted here with no explicit
+         assertion at all; it no longer is`), with a non-binding hint
+         (``_base_hint``) naming what the checkout's current branch happens
+         to be — never a value the call trusts. The other two shapes keep
+         the strict "a recorded base or nothing" rule unconditionally when
+         neither the default branch nor the recorded base resolves (the same
+         rule ``complete_if_content_landed`` documents: a wrong guessed base
+         is worse than refusing).
+    5. ``sha`` must be an ancestor of the FIRST candidate it matches (local
+       git only, ``commit_is_ancestor`` — ``git merge-base --is-ancestor``,
+       fail-closed on any git error or exception: a probe failure counts as
+       "did not match", never a pass). This is what discharges "refused for
+       tasks whose content is NOT landed" for every shape: a branch that
+       never reached any candidate has no ancestor sha to name anywhere. If
+       ``sha`` is an ancestor of none of the candidates tried, the refusal
+       names every one of them — branch and tip — so a human can tell at a
+       glance whether the right places were even checked, and can retry with
+       an explicit ``--base`` if the content landed somewhere else (still
+       requires ``--because``). For ``pending_never_ran`` with no other
+       candidate, this check is only as trustworthy as the explicit ``base=``
+       itself, which is exactly why point 4 never lets it be guessed: it is
+       always either a value a real prior dispatch recorded, the repo's own
+       declared default, or a branch the human typed explicitly for this
        call — never a checkout's incidental current branch.
+    6. Whichever candidate ``sha`` matched is recorded as the MATCHED branch
+       — in the human-facing confirmation text (naming its role: recorded
+       base, default branch, or human-asserted), in the completion event
+       (``base``, ``base_source``, and ``matched_branch`` — the last one
+       added alongside the other two, never replacing them), and in
+       ``task.context`` (``landed_override_base`` / ``landed_override_base_source``
+       always; ``base_branch`` itself only when this call is the first thing
+       to ever record one — narrowing an already-recorded base with
+       ``--base`` never overwrites the original recorded value).
 
     Only once every check above has passed does this write anything: it
     records ``landed_override_sha`` (deliberately a DIFFERENT context key
@@ -240,7 +503,11 @@ async def approve_landed_override(
     ran at all).
 
     Returns ``{"sha": ..., "residue": ..., "text": ..., "shape": ...,
-    "prior_status": ...}`` for the caller's own message/response formatting.
+    "prior_status": ..., "matched_branch": ..., "base_source": ...}`` for the
+    caller's own message/response formatting — ``matched_branch`` is the
+    branch ``sha`` was actually found to be an ancestor of (see point 6
+    above), and ``base_source`` names its role (``"recorded"``,
+    ``"default_branch"``, or ``"human_asserted"``).
     """
     is_ancestor = is_ancestor or commit_is_ancestor
     residue_probe = residue_probe or containment_residue
@@ -258,21 +525,96 @@ async def approve_landed_override(
 
     base_override = (base or "").strip()
 
-    ctx = task.context or {}
-    base = ctx.get("base_branch")
-    base_source = "recorded"
-    if not base and shape == "pending_never_ran" and base_override:
-        base, base_source = base_override, "human_asserted"
-    if not base:
-        hint = await _base_hint(task) if shape == "pending_never_ran" else ""
-        raise OverrideRefused(
-            "task has no recorded base_branch — refusing" + hint)
     if not task.repo_path:
         raise OverrideRefused("task has no recorded repo_path — refusing")
 
-    if not await is_ancestor(task.repo_path, sha, base):
+    ctx = task.context or {}
+    recorded_base = ctx.get("base_branch")
+
+    if base_override:
+        resolvable = (
+            await refs_resolvable(task.repo_path, base_override)
+            or await refs_resolvable(task.repo_path, f"origin/{base_override}")
+        )
+        if not resolvable:
+            raise OverrideRefused(
+                f"--base {base_override!r} does not name a branch in this "
+                "repo — refusing"
+            )
+        # Resolve to whichever form (bare vs `origin/<name>`) `is_ancestor`
+        # can actually walk — `refs_resolvable` above only proved ONE of the
+        # two forms exists, and `commit_is_ancestor` needs the resolving one,
+        # not necessarily the bare one the human typed. Passing `sha`/
+        # `is_ancestor` also lets a STALE bare ref (present, but behind
+        # `sha`, no upstream) defer to `origin/<name>` when that form is the
+        # one that actually vouches for `sha` — see `_preferred_ref_form`'s
+        # docstring.
+        resolved_override = await _preferred_ref_form(
+            task.repo_path, base_override, sha=sha, is_ancestor=is_ancestor)
+        candidates: list[tuple[str, str]] = [(resolved_override, "human_asserted")]
+    else:
+        default_branch_raw = await _resolve_default_branch_value(store, task)
+        default_branch = (
+            await _preferred_ref_form(
+                task.repo_path, default_branch_raw, sha=sha, is_ancestor=is_ancestor)
+            if default_branch_raw else ""
+        )
+        recorded_base_form = (
+            await _preferred_ref_form(
+                task.repo_path, recorded_base, sha=sha, is_ancestor=is_ancestor)
+            if recorded_base else recorded_base
+        )
+        # F2 (independent review of d6249458f): the default-branch candidate
+        # is a RESCUE for a task that already has *some* recorded base but
+        # points it at the wrong branch (a supervising session's stacked
+        # train, see the module docstring's "Amended" section) — it must
+        # never become a second, silent way to auto-fill a base for
+        # `pending_never_ran`, which by definition has no recorded base to
+        # rescue. Before this guard, a project with a resolvable default
+        # branch (profile-configured, or a real `origin/HEAD`) let a
+        # `pending_never_ran` task complete against it with no `--base` at
+        # all — reopening, in a new shape, exactly the false-completion risk
+        # task 855f1263's fix removed (see the shape's own docstring above:
+        # "this shape, and ONLY this shape, accepts an explicit --base ...
+        # it is NEVER guessed from git or a profile").
+        candidates = []
+        if shape != "pending_never_ran":
+            if default_branch and default_branch == recorded_base_form:
+                candidates.append((recorded_base_form, "recorded"))
+            else:
+                if default_branch:
+                    candidates.append((default_branch, "default_branch"))
+                if recorded_base_form:
+                    candidates.append((recorded_base_form, "recorded"))
+        elif recorded_base_form:
+            # Unreachable today (this shape never has a recorded base — see
+            # `_seed_pending` in tests/test_landed_override.py) but kept for
+            # defense in depth rather than assumed: if a recorded base ever
+            # exists for this shape, it is still eligible on its own merits,
+            # exactly like the other two shapes.
+            candidates.append((recorded_base_form, "recorded"))
+
+    if not candidates:
+        hint = await _base_hint(task) if shape == "pending_never_ran" else ""
         raise OverrideRefused(
-            f"{sha} is not an ancestor of {base} — refusing")
+            "task has no recorded base_branch — refusing" + hint)
+
+    matched_branch: str | None = None
+    base_source: str | None = None
+    for cand_branch, cand_source in candidates:
+        try:
+            matched = await is_ancestor(task.repo_path, sha, cand_branch)
+        except Exception:  # noqa: BLE001 — fail-closed, never a pass
+            matched = False
+        if matched:
+            matched_branch, base_source = cand_branch, cand_source
+            break
+
+    if matched_branch is None:
+        raise OverrideRefused(
+            await _refusal_text(task.repo_path, sha, candidates))
+
+    base = matched_branch
 
     branch = ctx.get("pr_branch") or ctx.get("pr_draft_branch") or ""
     if not branch and shape == "failed_pre_pr":
@@ -298,8 +640,12 @@ async def approve_landed_override(
     )
 
     ts_iso = _now_iso()
-    context_patch = {"landed_override_sha": sha, "approved_at": ts_iso}
-    if base_source == "human_asserted":
+    context_patch = {
+        "landed_override_sha": sha, "approved_at": ts_iso,
+        "landed_override_base": base,
+        "landed_override_base_source": base_source,
+    }
+    if base_source == "human_asserted" and not recorded_base:
         context_patch["base_branch"] = base
     await store.merge_context(task.id, context_patch)
 
@@ -308,7 +654,8 @@ async def approve_landed_override(
         residue_note or "none (fully contained)")
     text = (
         "HUMAN OVERRIDE of automated containment (not a containment pass): "
-        f"a human asserts this task's content landed at {sha12} on {base}. "
+        f"a human asserts this task's content landed at {sha12} on {base} "
+        f"({_MATCHED_ROLE_TEXT[base_source]}). "
         f"Automated containment refused; residue at that commit: {residue_text}. "
         f"Justification: {justification}"
     )
@@ -324,6 +671,7 @@ async def approve_landed_override(
         "residue": residue,
         "base": base,
         "base_source": base_source,
+        "matched_branch": base,
         "branch": branch,
         # unix float, same clock every other emitter uses for task_events.ts
         # (a REAL column) — context["approved_at"] above stays ISO for the
@@ -348,4 +696,5 @@ async def approve_landed_override(
     return {
         "sha": sha, "residue": residue, "text": text,
         "shape": shape, "prior_status": prior_status,
+        "matched_branch": base, "base_source": base_source,
     }

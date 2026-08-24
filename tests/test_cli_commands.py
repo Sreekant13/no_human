@@ -371,6 +371,61 @@ def test_approve_landed_completes_failed_no_pr(tmp_path, monkeypatch):
     assert ev["prior_status"] == "failed"
 
 
+def test_approve_landed_with_base_narrows_and_names_matched_branch(
+    tmp_path, monkeypatch,
+):
+    """AC4 (CLI side): `--base` must be HONOURED — as a narrowing assertion
+    — even on a task that already has a recorded base_branch (seeded here as
+    "main" by `_seed_landed_task`), and the confirmation must name the
+    branch that actually matched."""
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    _git(repo, "checkout", "-b", "release/9")
+    (repo / "a.txt").write_text("release-only change\n")
+    _git(repo, "commit", "-am", "release/9: hotfix")
+    release_sha = _git_out(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", release_sha, "--base", "release/9",
+        "--because", "landed on the release branch, not main",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "release/9" in result.output
+
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.DONE
+    # narrowing an already-recorded base with --base never overwrites it
+    assert refreshed.context.get("base_branch") == "main"
+    assert refreshed.context.get("landed_override_base") == "release/9"
+    events = _list_events(db, tid)
+    ev = [e for e in events if e.get("kind") == "approved_landed_override"][0]
+    assert ev["matched_branch"] == "release/9"
+    assert ev["base_source"] == "human_asserted"
+
+
+def test_approve_landed_with_base_still_requires_because(tmp_path, monkeypatch):
+    """AC4: `--base` narrows the ancestry check, but does not make
+    `--because` optional — the justification requirement is unconditional."""
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", sha, "--base", "main",
+    ])
+
+    assert result.exit_code != 0
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+    assert _list_events(db, tid) == []
+
+
 def test_approve_without_landed_is_unchanged(tmp_path, monkeypatch):
     """Regression guard: adding --landed/--because must not disturb the plain
     `nh approve <id>` path — same assertions as test_approve_awaiting_task."""

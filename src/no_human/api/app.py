@@ -1153,7 +1153,10 @@ async def approve_landed(
 
     See ``blockers/landed_override.py`` for the full contract; this endpoint
     only cheap-guards obviously-ineligible statuses and otherwise delegates
-    every eligibility decision to that module.
+    every eligibility decision to that module. ``sha`` is checked against a
+    list of candidate base branches (the project's default, the task's
+    recorded base, and — narrowing to exactly itself when given — ``body.base``);
+    the response's ``matched_branch`` names whichever one it matched.
 
     This is deliberately additive and non-idempotent: a second call on the
     same task 409s (the task is DONE), so a replay cannot append a duplicate
@@ -1196,6 +1199,7 @@ async def approve_landed(
         "message": result["text"],
         "sha": result["sha"],
         "residue": result["residue"],
+        "matched_branch": result.get("matched_branch"),
     }
 
 

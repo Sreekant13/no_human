@@ -221,7 +221,7 @@ named here.
   **The control that does close the door is not this.** It is a check at the
   act: `nh approve` refusing inside an agent session, and the four gate-ending
   routes requiring something an agent session does not have. That check is
-  **not implemented today** — neither `nh approve` (`cli/commands.py:4604`)
+  **not implemented today** — neither `nh approve` (`cli/commands.py:4611`)
   nor the API's `approve_task` route (`api/app.py:1022`) tests for an agent
   session — so nothing here should be read as telling you to rely on it.
 

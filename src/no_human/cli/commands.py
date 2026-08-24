@@ -4596,11 +4596,18 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
               help="Required with --landed: why a human is asserting this "
                    "landed rather than letting containment decide.")
 @click.option("--base", "base_branch", default=None,
-              help="Required with --landed on a task that never dispatched "
-                   "(no base_branch was ever recorded): the branch --landed's "
-                   "commit is asserted to be an ancestor of. Ignored — and "
-                   "unnecessary — for a task that already recorded a base; "
-                   "this tool never guesses one.")
+              help="The branch --landed's commit is asserted to be an "
+                   "ancestor of. Required when the task never dispatched (no "
+                   "base_branch was ever recorded) and has no project default "
+                   "on record; optional otherwise — when given on a task that "
+                   "already has a recorded or default base, it NARROWS the "
+                   "check to exactly this branch instead of trying the usual "
+                   "candidates. Must resolve to something that exists in the "
+                   "repo (a branch, a tag, or a raw commit sha) — this tool "
+                   "never guesses one. A raw sha is accepted but is its own "
+                   "trivial ancestor, so passing the same value here as "
+                   "--landed proves nothing; name a branch if you want the "
+                   "check to mean something.")
 def approve(task_id, landed_sha, justification, base_branch):
     """Approve and merge — squash-lands the PR under the operator identity
     (the agent still never merges on its own)."""
@@ -4627,10 +4634,12 @@ def approve(task_id, landed_sha, justification, base_branch):
                     " (was failed, no PR)"
                     if result.get("prior_status") == "failed" else ""
                 )
+                matched_branch = result.get("matched_branch")
+                branch_note = f" on {matched_branch}" if matched_branch else ""
                 console.print(
                     f"[bold green]override recorded[/] — {t.id[:8]} completed"
                     f"{prior_note} on human assertion that content landed at "
-                    f"{landed_sha[:12]}. residue: {residue_text}"
+                    f"{landed_sha[:12]}{branch_note}. residue: {residue_text}"
                 )
 
         asyncio.run(_go_landed())
