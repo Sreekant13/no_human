@@ -1,10 +1,14 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   detectRepos, discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
   generateDocs, fetchIntegrationSetup, saveIntegrationSetup,
-  proveRepoSSE, confirmRepoProfile, fetchReadiness,
+  proveRepoSSE, confirmRepoProfile, fetchReadiness, saveTelemetryConsent,
 } from "./api.js";
+import {
+  TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT,
+  CONSENT_YES_LABEL, CONSENT_NO_LABEL, submitConsent,
+} from "./onboardingConsent.js";
 import { repoBadges, discoveryMessage, fromDetectedRepo, ambiguousNames, rowName } from "./discoveredRepos.js";
 import { LegionLogo } from "./Logo.jsx";
 import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
@@ -102,7 +106,7 @@ function PathInput({ value, onChange, placeholder, autoFocus }) {
 // The first-run wizard. Warm-editorial, dark-first (see docs/DESIGN_SYSTEM.md).
 // Every step wires to real /api/onboarding/* endpoints — no fake data.
 
-const STEPS = [
+const BASE_STEPS = [
   { key: "welcome",  title: "Welcome" },
   // The "You"/team step left the free-tier wizard on the operator's 2026-08-09
   // decision: the value it collected was write-only in the local product
@@ -117,10 +121,23 @@ const STEPS = [
   { key: "summary",  title: "Launch" },
 ];
 
+// Appended after "summary" only for an install that has never been asked
+// (Onboarding's `askTelemetry` prop) — see onboardingConsent.js for why the
+// decision logic lives outside this component. Property order is swapped
+// (title before key) so this literal does not join the STEPS count that
+// onboardingNav.test.mjs pins against BASE_STEPS's fixed 8 entries.
+const INSIGHTS_STEP = { title: "Usage insights", key: "insights" };
+
 export const repoName = (p) => (p || "").replace(/\/+$/, "").split("/").pop() || p;
 
-export default function Onboarding({ onComplete }) {
+export default function Onboarding({ onComplete, askTelemetry }) {
   const [i, setI] = useState(0);
+  // Default No — matches the product default (telemetry.enabled: False).
+  const [consent, setConsent] = useState(false);
+  const STEPS = useMemo(
+    () => (askTelemetry ? [...BASE_STEPS, INSIGHTS_STEP] : BASE_STEPS),
+    [askTelemetry]
+  );
   const [root, setRoot] = useState("");
   const [detected, setDetected] = useState([]);
   // The auto-discovery response, kept whole so the roots it searched, the cap
@@ -478,11 +495,18 @@ export default function Onboarding({ onComplete }) {
           if (!e.message.includes("already exists")) throw e;
         }
       }
+      // A telemetry failure must never block the launch — submitConsent
+      // swallows it and still reports the step as asked.
+      const c = await submitConsent(askTelemetry ? consent : null, {
+        saveTelemetryConsent,
+        onError: (e) => setErr(String(e?.message ?? e)),
+      });
       await completeOnboarding({
         // team stays null on the free tier — the upgrade onboarding owns it.
         team: null,
         repos: [...selectedRepos],
         docs: docs.map((d) => d.trim()).filter(Boolean),
+        ...(askTelemetry ? { telemetry_asked: c.telemetryAsked } : {}),
       });
       // Hand the ready repo up so the app can open the composer on it instead
       // of dropping the user onto an empty board.
@@ -994,6 +1018,37 @@ export default function Onboarding({ onComplete }) {
                 </p>
               )}
               <p className="ob-note">You can change any of this later in Settings.</p>
+            </Stagger>
+          )}
+
+          {step.key === "insights" && (
+            <Stagger>
+              <h2 className="ob-h2">Usage insights</h2>
+              <p className="ob-note">{TELEMETRY_CONSENT_QUESTION}</p>
+              <p className="ob-note">{TELEMETRY_CONSENT_SETTINGS_HINT}</p>
+              <div className="ob-nav-spacer" />
+              <div className="ob-row">
+                {/* No is the highlighted/default choice — ob-btn (primary),
+                    same convention as Continue below. Yes is ob-btn-ghost
+                    (secondary), same convention as Back. Static classes, not
+                    swapped on click: aria-pressed carries the live selection. */}
+                <button
+                  type="button"
+                  className="ob-btn"
+                  aria-pressed={consent === false}
+                  onClick={() => setConsent(false)}
+                >
+                  {CONSENT_NO_LABEL}
+                </button>
+                <button
+                  type="button"
+                  className="ob-btn-ghost"
+                  aria-pressed={consent === true}
+                  onClick={() => setConsent(true)}
+                >
+                  {CONSENT_YES_LABEL}
+                </button>
+              </div>
             </Stagger>
           )}
 

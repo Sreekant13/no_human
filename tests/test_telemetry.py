@@ -314,6 +314,75 @@ async def test_consent_enable_mints_stable_id_persists_and_widens_csp(
     assert yaml.safe_load(cfg_path.read_text())["telemetry"]["instance_id"] == minted
 
 
+def test_only_the_consent_endpoint_writes_telemetry_keys():
+    """The onboarding consent step must reuse PUT /api/telemetry/consent
+    verbatim — no new write path. Enforce it structurally: walk app.py's AST
+    and confirm no function OTHER than save_telemetry_consent ever writes
+    telemetry.enabled/instance_id."""
+    import ast
+
+    src = Path(app_module.__file__).read_text()
+    tree = ast.parse(src)
+    writers = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and (
+                    "telemetry.enabled" in sub.value or "telemetry.instance_id" in sub.value
+                ):
+                    writers.add(node.name)
+    assert writers == {"save_telemetry_consent"}
+
+
+@pytest.mark.asyncio
+async def test_onboarding_yes_lands_enabled_true_in_config_yaml(
+        client, tmp_path, monkeypatch):
+    """The wizard's Yes path is nothing but a call into the existing consent
+    endpoint, followed by the existing onboarding-complete endpoint recording
+    that the question was asked — both against the SAME config.yaml."""
+    import yaml
+
+    from no_human import config as config_mod
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("telemetry:\n  enabled: false\n"
+                        "  posthog_publishable: phc_test_publishable_token\n")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg_path)
+
+    origin = {"Origin": "http://127.0.0.1:8787"}
+    r = await client.put("/api/telemetry/consent", json={"enabled": True},
+                         headers=origin)
+    assert r.status_code == 200
+
+    r = await client.post("/api/onboarding/complete",
+                          json={"telemetry_asked": True})
+    assert r.status_code == 200
+
+    on_disk = yaml.safe_load(cfg_path.read_text())
+    assert on_disk["telemetry"]["enabled"] is True
+    assert len(on_disk["telemetry"]["instance_id"]) == 36
+    assert on_disk["onboarding"]["telemetry_asked"] is True
+
+
+def test_onboarding_consent_copy_matches_the_config_contract():
+    """web/src/onboardingConsent.js pins a byte-identical twin of these two
+    constants (its own header comment says so) — catch drift either way."""
+    from no_human.config import TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT
+
+    js_path = (Path(__file__).resolve().parent.parent
+               / "web" / "src" / "onboardingConsent.js")
+    js = js_path.read_text()
+
+    def _extract(name):
+        m = re.search(name + r' =\s*((?:"[^"]*"\s*\+?\s*\n?)+);', js)
+        assert m, f"could not find {name} in onboardingConsent.js"
+        parts = re.findall(r'"([^"]*)"', m.group(1))
+        return "".join(parts)
+
+    assert _extract("TELEMETRY_CONSENT_QUESTION") == TELEMETRY_CONSENT_QUESTION
+    assert _extract("TELEMETRY_CONSENT_SETTINGS_HINT") == TELEMETRY_CONSENT_SETTINGS_HINT
+    assert "never code, prompts, titles, paths or tokens" in TELEMETRY_CONSENT_QUESTION
+
+
 def test_legacy_kind_queue_lines_drain_as_name(temp_home, no_network, no_thread):
     """Queue lines from the first release carried "kind"; flush must
     normalize them to the wire's "name" so old queues drain, not 400."""

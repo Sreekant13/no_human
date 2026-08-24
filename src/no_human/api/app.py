@@ -4089,6 +4089,7 @@ class OnboardingCompleteRequest(BaseModel):
     team: str | None = None
     repos: list[str] = []
     docs: list[str] = []
+    telemetry_asked: bool = False
 
 
 def _read_onboarding(config) -> dict[str, Any]:
@@ -4619,13 +4620,19 @@ async def onboarding_complete(
     body: OnboardingCompleteRequest, request: Request
 ) -> dict[str, Any]:
     config = request.app.state.config
-    ob = _persist_onboarding(config, {
+    prior = _read_onboarding(config)
+    patch = {
         "completed": True,
         "completed_at": _now(),
         "team": body.team,
         "repos": body.repos,
         "docs": body.docs,
-    })
+    }
+    # Sticky: once asked, never un-asked — a re-run of the wizard (via
+    # onboarding/reset) must not resurrect the telemetry question.
+    if body.telemetry_asked or prior.get("telemetry_asked"):
+        patch["telemetry_asked"] = True
+    ob = _persist_onboarding(config, patch)
     return {"ok": True, "onboarding": ob}
 
 

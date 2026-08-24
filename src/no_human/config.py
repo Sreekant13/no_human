@@ -2115,6 +2115,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+# The one-time onboarding consent question (web/src/onboardingConsent.js holds
+# the byte-identical twin; tests/test_telemetry.py pins them together). The
+# wording is the SAME contract the "telemetry" block above states — never
+# widen it here without widening the comment, the Settings panel and the
+# privacy policy.
+TELEMETRY_CONSENT_QUESTION = (
+    "Share anonymous usage events and masked screen recordings of the app's "
+    "own interface — never code, prompts, titles, paths or tokens?"
+)
+TELEMETRY_CONSENT_SETTINGS_HINT = (
+    "You can change this anytime in Settings > Usage insights."
+)
+
+
 def worktree_isolation_enabled(config: dict[str, Any]) -> bool:
     """True when a task must run in its own git worktree. Default TRUE.
 

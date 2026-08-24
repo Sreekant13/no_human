@@ -256,6 +256,64 @@ async def test_reset_clears_only_the_completed_flag(client, tmp_path):
     assert on_disk["docs"] == ["/docs/adr"]
 
 
+@pytest.mark.asyncio
+async def test_complete_records_that_telemetry_was_asked(client, tmp_path):
+    """The new one-time consent step marks itself asked via this same call —
+    no separate write path; the existing endpoints are reused as-is."""
+    import yaml
+
+    payload = {"team": None, "repos": [], "docs": [], "telemetry_asked": True}
+    r = await client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 200
+    assert r.json()["onboarding"]["telemetry_asked"] is True
+
+    s = await client.get("/api/onboarding/status")
+    assert s.json()["telemetry_asked"] is True
+
+    on_disk = yaml.safe_load((tmp_path / "config.yaml").read_text())["onboarding"]
+    assert on_disk["telemetry_asked"] is True
+
+
+@pytest.mark.asyncio
+async def test_complete_without_the_flag_is_unchanged(client, tmp_path):
+    """An install that already saw the step (or a caller that never sends the
+    field at all) must not have `telemetry_asked` fabricated for it."""
+    payload = {"team": None, "repos": [], "docs": []}
+    r = await client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 200
+    assert "telemetry_asked" not in r.json()["onboarding"]
+
+    s = await client.get("/api/onboarding/status")
+    assert not s.json().get("telemetry_asked")
+
+
+@pytest.mark.asyncio
+async def test_the_ask_is_sticky_across_reset_and_re_complete(client, tmp_path):
+    """Once asked, never un-asked — a re-run of the wizard (File > Re-run
+    Setup…) must not resurrect a question the user already answered."""
+    first = {"team": None, "repos": [], "docs": [], "telemetry_asked": True}
+    assert (await client.post("/api/onboarding/complete", json=first)).status_code == 200
+
+    r = await client.post("/api/onboarding/reset")
+    assert r.status_code == 200
+    assert r.json()["telemetry_asked"] is True  # reset clears only `completed`
+
+    s = await client.get("/api/onboarding/status")
+    assert s.json()["completed"] is False
+    assert s.json()["telemetry_asked"] is True
+
+    # Re-completing the wizard WITHOUT the flag (the field the fresh form would
+    # send once shouldAskTelemetry() sees telemetry_asked=True and skips the
+    # step) must not lose the sticky bit.
+    again = {"team": None, "repos": [], "docs": []}
+    r = await client.post("/api/onboarding/complete", json=again)
+    assert r.status_code == 200
+    assert r.json()["onboarding"]["telemetry_asked"] is True
+
+    s = await client.get("/api/onboarding/status")
+    assert s.json()["telemetry_asked"] is True
+
+
 # --------------------------------------------------------------------------- #
 # GET /api/repos/discover — the typed-path replacement. The endpoint is bound  #
 # to the process's home, so these tests relocate HOME onto tmp_path rather     #

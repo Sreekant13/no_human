@@ -6,6 +6,7 @@ import Backlog from "./Backlog.jsx";
 import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
+import { shouldAskTelemetry } from "./onboardingConsent.js";
 import TaskComposer from "./TaskComposer.jsx";
 import Outcomes from "./Outcomes.jsx";
 import About from "./About.jsx";
@@ -783,12 +784,16 @@ export default function App() {
   // needs a browser reload to take effect. A poll would buy nothing: the only
   // writer is a deliberate human action that already has a reload attached.
   const [onboarded, setOnboarded] = useState(null);
+  // The full /api/onboarding/status payload, kept alongside `onboarded` so
+  // the wizard can tell whether the telemetry question was already asked
+  // (`telemetry_asked`) without a second fetch.
+  const [onboardStatus, setOnboardStatus] = useState(null);
 
   // onboarding gate
   useEffect(() => {
     fetchOnboardingStatus()
-      .then((s) => setOnboarded(!!s.completed))
-      .catch(() => setOnboarded(true));
+      .then((s) => { setOnboardStatus(s); setOnboarded(!!s.completed); })
+      .catch(() => { setOnboardStatus(null); setOnboarded(true); });
   }, []);
 
   // initial load
@@ -969,6 +974,7 @@ export default function App() {
     // rather than an empty board.
     return (
       <Onboarding
+        askTelemetry={shouldAskTelemetry(onboardStatus)}
         onComplete={(res) => {
           setOnboarded(true);
           // The path itself, not just the fact that there is one: TaskComposer
