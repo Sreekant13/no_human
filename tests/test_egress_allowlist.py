@@ -284,6 +284,8 @@ PROGRAMS: dict[str, tuple[str, str]] = {
     "grep": (LOCAL, "reads files"),
     "cp": (LOCAL, "copies files"),
     "pkill": (LOCAL, "signals local processes by pattern"),
+    "ps": (LOCAL, "reads local process metadata (start time, for the "
+           "pool-lease pid-reuse check) — no network"),
     "taskkill": (LOCAL, "the Windows pkill/kill: terminates local processes "
                  "by PID (/T takes the tree); no network reach"),
     # Network tools. These lines are documentation, not permission — the
@@ -493,6 +495,16 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "readback listing anyone else raises CredentialPermissionError)",
             _ON + "every credential-file write, on Windows only; there is no "
             "key that stops it because an unrestricted credential is worse"),
+        # ctypes is charged as a channel because in general it can name any
+        # DLL; this module loads exactly kernel32, for GetProcessTimes — the
+        # pool-lease pid-reuse start-token read (`_win_start_token_from_
+        # kernel32` / `_windows_start_token`). Same shape as cli/commands.py's
+        # kernel32 use above, different call (times, not liveness).
+        "pkg:ctypes": Allowed(
+            "nothing off this machine — kernel32 process-creation-time query "
+            "for the scheduler pool-lease start token (`process_start_token`)",
+            _ON + "every same-pid lease comparison, on Windows only; the "
+            "POSIX paths read /proc or shell out to `ps` instead"),
     },
     "cli/commands.py": {
         "http:urllib.request": Allowed(

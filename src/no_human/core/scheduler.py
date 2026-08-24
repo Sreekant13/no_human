@@ -34,7 +34,7 @@ from typing import Awaitable, Callable
 from ..agent.worker_context import WorkerContext, set_worker_context
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
-                      pid_alive, worktree_isolation_enabled)
+                      pid_alive, process_start_token, worktree_isolation_enabled)
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
@@ -427,6 +427,40 @@ class PoolLeaseLost(RuntimeError):
         super().__init__(
             f"pool lease: claim write did not land — {reason}{suffix} — "
             f"refusing to claim the pool lease and not booting")
+
+
+def _lease_sibling_is_dead(
+    *, pid: int, host: str, token: str | None, my_host: str,
+) -> bool:
+    """`_claim_pool_lease`'s SAME-HOST "is the row's writer provably gone"
+    check — the ONLY place this fix changes; `pid_alive` itself is untouched
+    (its worktree-safety callers need its err-toward-ALIVE bias, which is
+    wrong for this lease-side decision alone).
+
+    `pid_alive` is asked first, exactly as before: if it says dead, the row's
+    writer is dead, full stop. What's new sits ON TOP of that: a pid that IS
+    alive but whose CURRENT `process_start_token` no longer matches the row's
+    is not the row's writer any more — the pid was recycled to a new process
+    after the original died, and the original bug (a recycled pid read as a
+    live sibling for up to `_HEARTBEAT_STALE_S`) is exactly this case.
+
+    Falls back to the pre-fix, `pid_alive`-only answer whenever a token
+    comparison is not possible: a different host, a token-less row (written
+    before this column existed, or by a platform `process_start_token` cannot
+    read), or a live pid whose current token this host cannot read either.
+    Never LESS safe than before — only ever adds a case that was previously a
+    false "alive".
+    """
+    if host != my_host:
+        return False
+    if not pid_alive(pid):
+        return True
+    if token is None:
+        return False
+    current_token = process_start_token(pid)
+    if current_token is None:
+        return False
+    return current_token != token
 
 
 class Scheduler:
@@ -1011,12 +1045,17 @@ class Scheduler:
             `SiblingSchedulerRunning`, naming that pid/host/age so an
             operator (or the CLI/API catching this) knows exactly what to
             stop.
-          - otherwise (stale, or a same-host pid `pid_alive` says is gone) —
-            the sibling is presumed gone; take the lease over.
+          - otherwise (stale, or a same-host pid `_lease_sibling_is_dead`
+            proves is gone — see there) — the sibling is presumed gone; take
+            the lease over.
 
-        `pid_alive` is only trusted for a SAME-HOST pid: a pid number from a
-        different host means nothing here and is never treated as dead on
-        that evidence alone.
+        `pid_alive` (via `_lease_sibling_is_dead`) is only trusted for a
+        SAME-HOST pid: a pid number from a different host means nothing here
+        and is never treated as dead on that evidence alone. Every claim
+        this process writes also carries its own `process_start_token`
+        (module-level, `config.py`) alongside the pid — so a FUTURE reader
+        can tell a genuinely live same-host sibling from a new process that
+        merely reused a recycled pid within `_HEARTBEAT_STALE_S`.
 
         FAILS CLOSED, on both ends of this call:
           - a read that never succeeds raises `PoolLeaseUnreadable` — an
@@ -1037,13 +1076,16 @@ class Scheduler:
         """
         my_pid = os.getpid()
         my_host = platform.node()
+        my_token = process_start_token(my_pid)
         now = time.time()
         row = await self._read_heartbeat_with_retry()
 
         mine = row is not None and row["pid"] == my_pid and row["host"] == my_host
         if row is not None and not mine:
             age = now - float(row["ts"])
-            sibling_dead = row["host"] == my_host and not pid_alive(int(row["pid"]))
+            sibling_dead = _lease_sibling_is_dead(
+                pid=int(row["pid"]), host=row["host"],
+                token=row.get("start_token"), my_host=my_host)
             if age < self._HEARTBEAT_STALE_S and not sibling_dead:
                 raise SiblingSchedulerRunning(
                     pid=int(row["pid"]), host=row["host"], age_s=age)
@@ -1053,7 +1095,7 @@ class Scheduler:
         try:
             landed = await self.store.cas_scheduler_heartbeat(
                 pid=my_pid, host=my_host, started_at=started_at, ts=now,
-                expect=row)
+                start_token=my_token, expect=row)
         except Exception as exc:  # noqa: BLE001 — cannot prove the claim landed
             raise PoolLeaseLost(
                 reason="the CAS write raised", error=exc) from exc
@@ -1068,8 +1110,9 @@ class Scheduler:
                              and current["host"] == my_host)
             if not current_mine:
                 age = now - float(current["ts"])
-                sibling_dead = (current["host"] == my_host
-                                 and not pid_alive(int(current["pid"])))
+                sibling_dead = _lease_sibling_is_dead(
+                    pid=int(current["pid"]), host=current["host"],
+                    token=current.get("start_token"), my_host=my_host)
                 if age < self._HEARTBEAT_STALE_S and not sibling_dead:
                     raise SiblingSchedulerRunning(
                         pid=int(current["pid"]), host=current["host"],

@@ -1962,14 +1962,14 @@ def test_the_citation_table_covers_every_line_citation_in_the_three_docs():
 
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
-    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1818` inside
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1832` inside
     `update_attempt` and `orchestrator.py:4000` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
     """
-    assert "db.py:1818" in known_issues_doc, (
-        "the traceback no longer cites db.py:1818 — this test is pointed at "
+    assert "db.py:1832" in known_issues_doc, (
+        "the traceback no longer cites db.py:1832 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4000" in known_issues_doc, (
@@ -1980,13 +1980,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 1818 <= len(db_lines), "db.py is now shorter than line 1818"
-    assert db_lines[1817].strip() == "await self.db.commit()", (
-        f"db.py:1818 is now {db_lines[1817]!r}, not the commit the traceback "
+    assert 1 <= 1832 <= len(db_lines), "db.py is now shorter than line 1832"
+    assert db_lines[1831].strip() == "await self.db.commit()", (
+        f"db.py:1832 is now {db_lines[1831]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (
-        "line 1818 is no longer inside update_attempt's body"
+        "line 1832 is no longer inside update_attempt's body"
     )
 
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")

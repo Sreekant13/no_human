@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import ctypes
 import ipaddress
 import logging
 import math
 import os
 import re
+import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2184,6 +2186,130 @@ def pid_alive(pid: int) -> bool:
     except (PermissionError, OSError):
         return True
     return True
+
+
+def _parse_linux_stat_starttime(content: str) -> str | None:
+    """Extract field 22 (``starttime``) from the text of a ``/proc/<pid>/stat``
+    line. Pure string parsing, split out from the file read so it can be unit
+    tested against a fixture line without a real ``/proc``.
+
+    The ``comm`` field (2nd, parenthesized) is attacker/user controlled and may
+    itself contain spaces or ``)`` — the only safe split is from the LAST
+    ``)`` in the line, never the first. Every field after that point is
+    whitespace-delimited and fixed-position: ``state`` is 1st, ``starttime``
+    is the 20th (field 22 overall, minus the 2 consumed by pid/comm).
+    """
+    idx = content.rfind(")")
+    if idx == -1:
+        return None
+    fields = content[idx + 1:].split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+def _linux_start_token(pid: int) -> str | None:
+    """The kernel's ``starttime`` for *pid* on Linux, opaque and comparable
+    only for equality against another read of the same pid. None on any read
+    failure (dead pid, permission, unexpected format) — never raises."""
+    try:
+        content = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return _parse_linux_stat_starttime(content)
+
+
+def _macos_start_token(pid: int) -> str | None:
+    """The kernel's process start time for *pid* on macOS, opaque and
+    comparable only for equality against another read of the same pid.
+
+    Reads it via ``ps -o lstart=`` rather than hand-rolled ``ctypes`` over
+    ``sysctl(KERN_PROC_PID)``'s ``kinfo_proc`` struct: that struct is not a
+    stable ABI across Darwin releases/architectures, and a silently
+    misaligned read here would corrupt a SAFETY decision (a garbage token
+    looks like a mismatch and takes over a lease that is still live). ``ps``
+    reads the exact same kernel field through a stable, already-installed
+    system utility — no new dependency, and no private struct layout to keep
+    in sync with the OS.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    token = proc.stdout.strip()
+    return token or None
+
+
+def _win_start_token_from_kernel32(kernel32, wintypes_mod, pid: int) -> str | None:
+    """The guts of the Windows start-token read, taking the ``kernel32``
+    handle and ``ctypes.wintypes`` module as arguments so a test can inject a
+    mock ``kernel32`` (mocked ``OpenProcess``/``GetProcessTimes``/
+    ``CloseHandle``) and exercise this on any platform — the real call site,
+    `_windows_start_token`, only reaches here on ``win32``, where the actual
+    ``ctypes.windll.kernel32`` exists."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes_mod.FILETIME()
+        exit_t = wintypes_mod.FILETIME()
+        kernel_t = wintypes_mod.FILETIME()
+        user_t = wintypes_mod.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_t),
+            ctypes.byref(kernel_t), ctypes.byref(user_t))
+        if not ok:
+            return None
+        return f"{creation.dwHighDateTime:08x}{creation.dwLowDateTime:08x}"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_start_token(pid: int) -> str | None:
+    """The process creation time for *pid* on Windows via ``GetProcessTimes``
+    (kernel32, through ``ctypes`` — no new dependency), opaque and comparable
+    only for equality. Fails SOFT: any missing platform bits, a permission
+    refusal, or an unexpected error returns None rather than raising, which
+    makes the lease-side caller fall back to today's legacy (token-less,
+    ``pid_alive``-only) behaviour — never less safe, never a crash, even if
+    this exact path was never exercised live (only unit-tested with a mocked
+    handle, see `_win_start_token_from_kernel32`)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        from ctypes import wintypes
+        return _win_start_token_from_kernel32(ctypes.windll.kernel32, wintypes, pid)
+    except Exception:  # noqa: BLE001 — must fail soft, never crash the lease claim
+        return None
+
+
+def process_start_token(pid: int) -> str | None:
+    """An opaque per-process start-time token for *pid* on THIS host, or None
+    if it cannot be determined (dead pid, unsupported platform, any read
+    failure) — never raises.
+
+    Meaningful ONLY as an equality comparison across two reads of the same
+    pid number: a match means "the same OS process instance is still there";
+    a mismatch means a NEW process now holds that pid, so whatever wrote the
+    old token is provably gone. Used by `core.scheduler._lease_sibling_is_dead`
+    to catch a recycled pid `pid_alive` alone cannot distinguish from its
+    original holder — `pid_alive` itself is untouched (its other callers need
+    the err-toward-alive bias this function does not carry).
+    """
+    if sys.platform.startswith("linux"):
+        return _linux_start_token(pid)
+    if sys.platform == "darwin":
+        return _macos_start_token(pid)
+    if sys.platform == "win32":
+        return _windows_start_token(pid)
+    return None
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

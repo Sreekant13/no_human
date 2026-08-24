@@ -629,6 +629,90 @@ async def test_a_dead_sibling_pid_on_this_host_is_taken_over(store, monkeypatch)
     assert row["pid"] == os.getpid()
 
 
+async def test_a_wrong_start_token_on_a_live_pid_is_taken_over_immediately(store):
+    """THE REPRO for the pid-reuse false-sibling bug. A FRESH, same-host row
+    naming a pid that IS alive (`pid_alive` says so) must still be taken over
+    immediately when its `start_token` does not match that pid's CURRENT
+    token — that mismatch is exactly what happens when the OS recycles a pid
+    within `_HEARTBEAT_STALE_S` of the original holder dying: a brand-new,
+    unrelated process now answers to that pid number, and only the token
+    tells the two apart. Before the fix, `_claim_pool_lease` trusted
+    `pid_alive` alone for this decision and raised `SiblingSchedulerRunning`
+    here — this must FAIL on unfixed code."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    from no_human.config import process_start_token
+
+    other_pid = os.getppid()  # alive, and provably not ours
+    await store.write_scheduler_heartbeat(
+        pid=other_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(), ts=_time.time(),
+        start_token=f"not-really-{process_start_token(other_pid)}")
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    await sched._claim_pool_lease()  # must not raise — the token proves a new process
+
+    row = await store.read_scheduler_heartbeat()
+    assert row["pid"] == os.getpid()
+
+
+async def test_a_matching_start_token_on_a_live_pid_still_refuses(store):
+    """The flip side of the repro above: a FRESH, same-host row whose
+    `start_token` DOES match the named pid's current token is the genuine
+    live sibling case — `SiblingSchedulerRunning` must still be raised exactly
+    as before the fix, token or no token."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    from no_human.config import process_start_token
+
+    sibling_pid = os.getppid()  # alive, and provably not ours
+    await store.write_scheduler_heartbeat(
+        pid=sibling_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(), ts=_time.time(),
+        start_token=process_start_token(sibling_pid))
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    with pytest.raises(SiblingSchedulerRunning) as exc_info:
+        await sched._claim_pool_lease()
+
+    assert str(sibling_pid) in str(exc_info.value)
+
+
+async def test_a_token_less_legacy_row_still_refuses_exactly_as_today(store):
+    """A row written before the `start_token` column existed (or by a caller
+    that could not determine one) has `start_token IS NULL` — this must fall
+    back to the exact pre-fix, `pid_alive`-only behaviour: a fresh same-host
+    live pid still refuses. This is the explicit byte-identical-legacy-
+    behaviour acceptance criterion, in addition to the pre-existing
+    `test_a_second_scheduler_refuses_while_a_sibling_heartbeat_is_live` (which
+    also writes a token-less row)."""
+    import os
+    import platform
+    import time as _time
+    from datetime import datetime, timezone
+
+    sibling_pid = os.getppid()
+    await store.write_scheduler_heartbeat(
+        pid=sibling_pid, host=platform.node(),
+        started_at=datetime.now(timezone.utc).isoformat(), ts=_time.time())
+    row = await store.read_scheduler_heartbeat()
+    assert row["start_token"] is None, "fixture row must be token-less to test the legacy path"
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+
+    with pytest.raises(SiblingSchedulerRunning) as exc_info:
+        await sched._claim_pool_lease()
+
+    assert str(sibling_pid) in str(exc_info.value)
+
+
 async def test_the_lease_is_claimed_before_any_recovery_write(store):
     """`_claim_pool_lease` runs BEFORE `_reconcile_terminal_task_attempts` and
     `_recover_orphans` in `run_forever` — a process that fails the lease

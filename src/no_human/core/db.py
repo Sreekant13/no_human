@@ -1330,6 +1330,20 @@ class Store:
                 ts REAL NOT NULL
             )
         """)
+        # `start_token`: an opaque per-process start-time marker (see
+        # `config.process_start_token`), added for the pid-reuse fix — same
+        # host + a live pid whose CURRENT token no longer matches this row's
+        # is provably a NEW process that reused the pid, not the original
+        # holder. NULL for any row written before this column existed (or by
+        # a caller that could not determine its own token): `_claim_pool_
+        # lease` treats a NULL exactly as it always has (pid_alive alone).
+        sh_existing = {row["name"]
+                       for row in await self._fetchall(
+                           "PRAGMA table_info(scheduler_heartbeat)")}
+        if "start_token" not in sh_existing:
+            await self.db.execute(
+                "ALTER TABLE scheduler_heartbeat ADD COLUMN start_token TEXT"
+            )
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -3890,33 +3904,42 @@ class Store:
 
     async def read_scheduler_heartbeat(self) -> dict | None:
         """The current lease holder, or None if no process has ever claimed
-        one (or `clear_scheduler_heartbeat` cleared it on a clean shutdown)."""
+        one (or `clear_scheduler_heartbeat` cleared it on a clean shutdown).
+        ``start_token`` is None for any row written before that column existed
+        (or by a caller that could not determine its own token) — callers
+        must treat that exactly as the token-less legacy case."""
         row = await self._fetchone(
-            "SELECT pid, host, started_at, ts FROM scheduler_heartbeat "
-            "WHERE id = 1")
+            "SELECT pid, host, started_at, ts, start_token "
+            "FROM scheduler_heartbeat WHERE id = 1")
         return dict(row) if row else None
 
     @serialized_write
     async def write_scheduler_heartbeat(
         self, *, pid: int, host: str, started_at: str, ts: float,
+        start_token: str | None = None,
     ) -> None:
         """Claim or refresh the id=1 lease row (upsert — same
         ``ON CONFLICT ... DO UPDATE`` idiom as `upsert_profile`, since this is
-        genuinely a fixed-key upsert, not an append)."""
+        genuinely a fixed-key upsert, not an append). ``start_token`` defaults
+        to None so every existing caller (tests included) keeps writing the
+        token-less legacy row shape unless it opts in."""
         await self.db.execute(
-            """INSERT INTO scheduler_heartbeat (id, pid, host, started_at, ts)
-                 VALUES (1, :pid, :host, :started_at, :ts)
+            """INSERT INTO scheduler_heartbeat
+                 (id, pid, host, started_at, ts, start_token)
+                 VALUES (1, :pid, :host, :started_at, :ts, :start_token)
                ON CONFLICT(id) DO UPDATE SET
                  pid=excluded.pid, host=excluded.host,
-                 started_at=excluded.started_at, ts=excluded.ts""",
-            {"pid": pid, "host": host, "started_at": started_at, "ts": ts},
+                 started_at=excluded.started_at, ts=excluded.ts,
+                 start_token=excluded.start_token""",
+            {"pid": pid, "host": host, "started_at": started_at, "ts": ts,
+             "start_token": start_token},
         )
         await self.db.commit()
 
     @serialized_write
     async def cas_scheduler_heartbeat(
         self, *, pid: int, host: str, started_at: str, ts: float,
-        expect: dict | None,
+        expect: dict | None, start_token: str | None = None,
     ) -> bool:
         """Conditional claim/refresh: write the id=1 row ONLY if it is still
         exactly what the caller read (`expect`), or still absent
@@ -3934,21 +3957,25 @@ class Store:
         """
         if expect is None:
             cur = await self.db.execute(
-                """INSERT INTO scheduler_heartbeat (id, pid, host, started_at, ts)
-                     SELECT 1, :pid, :host, :started_at, :ts
+                """INSERT INTO scheduler_heartbeat
+                     (id, pid, host, started_at, ts, start_token)
+                     SELECT 1, :pid, :host, :started_at, :ts, :start_token
                      WHERE NOT EXISTS (
                        SELECT 1 FROM scheduler_heartbeat WHERE id = 1)""",
-                {"pid": pid, "host": host, "started_at": started_at, "ts": ts},
+                {"pid": pid, "host": host, "started_at": started_at, "ts": ts,
+                 "start_token": start_token},
             )
         else:
             cur = await self.db.execute(
                 """UPDATE scheduler_heartbeat
                      SET pid = :pid, host = :host,
-                         started_at = :started_at, ts = :ts
+                         started_at = :started_at, ts = :ts,
+                         start_token = :start_token
                    WHERE id = 1 AND pid = :e_pid AND host = :e_host
                      AND ts = :e_ts""",
                 {
                     "pid": pid, "host": host, "started_at": started_at, "ts": ts,
+                    "start_token": start_token,
                     "e_pid": expect["pid"], "e_host": expect["host"],
                     "e_ts": expect["ts"],
                 },
