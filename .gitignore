@@ -41,6 +41,7 @@ secrets/
 
 # web build
 web/node_modules/
+web/.board-stamp.json
 
 # north-star bench: the raw built corpus is verbatim operator conversation
 # content (personal + enterprise) — never committed. Curated specs live one

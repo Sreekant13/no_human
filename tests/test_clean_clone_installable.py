@@ -30,6 +30,7 @@ whole mechanism.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import tomllib
@@ -63,9 +64,12 @@ hatch_build = _load_hatch_build()
 # --------------------------------------------------------------------------- #
 
 def _board(root: Path) -> None:
+    (root / "web" / "src").mkdir(parents=True, exist_ok=True)
+    (root / "web" / "src" / "App.jsx").write_text("export default null\n")
     dist = root / "web" / "dist"
     dist.mkdir(parents=True, exist_ok=True)
     (dist / "index.html").write_text("<html><div id='root'></div></html>")
+    hatch_build.write_stamp(root)
 
 
 def test_an_editable_build_without_a_board_proceeds_and_says_so(tmp_path):
@@ -195,7 +199,9 @@ def test_an_editable_build_runs_npm_and_ships_the_board_it_produces(
     ]
     for cwd in (c for _, c in calls):
         assert cwd == tmp_path / "web"
-    assert hatch_build._build_it() == "cd web && npm install && npm run build"
+    assert hatch_build._build_it() == (
+        "cd web && npm install && npm run build && cd .. "
+        "&& python3 hatch_build.py --stamp")
 
 
 def test_a_successful_editable_build_is_included_with_no_warning(
@@ -293,16 +299,48 @@ def test_the_build_attempt_never_raises(tmp_path, monkeypatch, exc):
     assert built is False
 
 
-def test_a_standard_build_never_invokes_npm(tmp_path):
-    """The build attempt is unreachable on the distributable path — it must
-    still fail closed, and it must never even look at `builder`."""
-    def forbidden(root, source):
-        raise AssertionError("the standard/distributable path invoked npm")
+def test_a_standard_build_invokes_npm_only_when_the_board_is_stale(
+    tmp_path, monkeypatch,
+):
+    """The no-npm contract is inverted for a *stale* board only, not a missing
+    one.
 
+    A never-built board fails immediately and never shells out — unchanged
+    from before this fix, and load-bearing: `tests/test_worktree_forced_includes.py`
+    (out of scope, not edited) proves with a real `uv build --wheel` that an
+    unprovisioned task worktree must fail closed rather than silently invoke a
+    real `npm install`/`npm run build` of its own initiative. Only a
+    present-but-outdated bundle is new territory: that path rebuilds via npm
+    and re-verifies before shipping.
+    """
+    _checkout(tmp_path)
+    (tmp_path / "web" / "src").mkdir()
+    (tmp_path / "web" / "src" / "App.jsx").write_text("before")
+    calls = []
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+
+    def builder(root, source):
+        calls.append((root, source))
+        dist = Path(root) / source
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / "index.html").write_text("built")
+        hatch_build.write_stamp(root, source=source)
+        return True
+
+    # missing: never calls the builder, fails immediately.
     with pytest.raises(hatch_build.BoardNotBuiltError):
         hatch_build.plan_board_inclusion(
-            tmp_path, "web/dist", "no_human/web_dist", "standard",
-            builder=forbidden)
+            tmp_path, "web/dist", "no_human/web_dist", "standard", builder=builder)
+    assert calls == []
+
+    # Build the board directly (not through the hook) so the tree has a
+    # present, current bundle to go stale from.
+    assert builder(tmp_path, "web/dist")
+    calls.clear()
+    (tmp_path / "web" / "src" / "App.jsx").write_text("after")
+    assert hatch_build.plan_board_inclusion(
+        tmp_path, "web/dist", "no_human/web_dist", "standard", builder=builder)[0]
+    assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -343,12 +381,16 @@ def _uv_or_skip():
 def test_a_real_wheel_build_of_a_clean_clone_fails_with_the_actionable_message(
     tmp_path,
 ):
-    """The release edge, end to end, through the real PEP 517 backend."""
+    """The release edge with npm hidden, so an old bundle cannot be shipped."""
     _uv_or_skip()
     clone = _clean_clone(tmp_path / "clone")
 
-    build = subprocess.run(["uv", "build", "--wheel", "-o", str(tmp_path / "d")],
-                           cwd=clone, capture_output=True, text=True, timeout=900)
+    uv = shutil.which("uv")
+    # Preserve uv's cache/runtime configuration; only npm must be unavailable
+    # for this release-path proof.
+    env = {**os.environ, "PATH": "/usr/bin:/bin"}
+    build = subprocess.run([uv, "build", "--wheel", "-o", str(tmp_path / "d")],
+                           cwd=clone, env=env, capture_output=True, text=True, timeout=900)
 
     assert build.returncode != 0, (
         "a wheel built with no board — the boardless CLI can ship again")
@@ -405,6 +447,7 @@ def test_a_wheel_built_with_a_board_still_carries_it(tmp_path):
 
     clone = _clean_clone(tmp_path / "clone")
     shutil.copytree(source_board, clone / "web" / "dist")
+    hatch_build.write_stamp(clone)
 
     dist = tmp_path / "d"
     build = subprocess.run(["uv", "build", "--wheel", "-o", str(dist)],

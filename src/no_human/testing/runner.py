@@ -719,6 +719,15 @@ def _ensure_forced_build_artifacts(repo_path: Path, source_repo: Path | None) ->
     for rel in sorted(forced):
         dest = repo_path / rel
         if dest.exists() or dest.is_symlink():
+            if rel == "web/dist":
+                stamp = source_repo / "web" / ".board-stamp.json"
+                destination_stamp = repo_path / "web" / stamp.name
+                if stamp.is_file() and not destination_stamp.exists():
+                    try:
+                        shutil.copy2(stamp, destination_stamp)
+                    except OSError as exc:
+                        log.warning("board stamp provisioning failed (%s -> %s): %s",
+                                    stamp, destination_stamp, exc)
             continue
         # Only provision what git genuinely does not carry. A TRACKED forced
         # path is absent from a worktree for exactly one reason — the branch
@@ -743,6 +752,10 @@ def _ensure_forced_build_artifacts(repo_path: Path, source_repo: Path | None) ->
             if src.is_dir():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(src, dest, symlinks=True)
+                if rel == "web/dist":
+                    stamp = source_repo / "web" / ".board-stamp.json"
+                    if stamp.is_file():
+                        shutil.copy2(stamp, repo_path / "web" / stamp.name)
         except OSError as exc:
             log.warning("forced-include provisioning failed (%s -> %s): %s",
                         dest, src, exc)
