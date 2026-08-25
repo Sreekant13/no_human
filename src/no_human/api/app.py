@@ -2942,22 +2942,20 @@ async def task_events_stream(task_id: str, request: Request):
     )
 
 
-_STALE_TTL_SECONDS = 60.0
-# None means "never computed", which is NOT the same as "computed, found
-# current" (a cached None). A (0.0, None) seed conflates them, and on a
-# platform where time.monotonic() starts near zero it serves an answer nobody
-# ever calculated for the first minute of the process's life.
-_stale_cache: tuple[float, str | None] | None = None
+# Keyed by the HEAD the note was computed against, not wall clock. A time-keyed
+# cache can answer "not stale" after HEAD has moved, which is precisely the
+# restart-races-a-landing case this flag exists to detect.
+_stale_cache: tuple[str | None, str | None] | None = None
 _stale_inflight = threading.Lock()
 
 
 def _loaded_code_stale() -> str | None:
-    """The advisory staleness note, recomputed at most once a minute.
+    """The advisory staleness note, keyed by the live checkout HEAD.
 
-    HEAD moves after startup, so this cannot be a startup-time constant — but
-    every open board tab polls this endpoint on a timer and each check is a git
-    subprocess, so it is cached. Purely informational: no caller gates on it,
-    and by design nothing here can stop a task being claimed.
+    Every status read measures the checkout HEAD. The expensive ancestry check
+    is cached only while that HEAD is unchanged. Purely informational: no
+    caller gates on it, and by design nothing here can stop a task being
+    claimed.
 
     Single-flight, and NON-BLOCKING about it. A cache miss alone is not enough
     to serialize on: the miss window is however long `staleness_note` takes,
@@ -2976,7 +2974,7 @@ def _loaded_code_stale() -> str | None:
     `asyncio.to_thread`, whose executor holds `min(32, cpu_count + 4)` threads
     — 16 here — so a dozen-odd waiters parked for the full ceiling would leave
     the whole process about one worker. Serving a slightly stale advisory value
-    costs nothing: the note is already up to 60s old by design.
+    costs nothing: it is only retained while its observed HEAD is still live.
 
     With no cached value at all, a loser returns None, which renders as "no
     banner" — indistinguishable from "current". That is deliberate: during the
@@ -2986,18 +2984,15 @@ def _loaded_code_stale() -> str | None:
     """
     global _stale_cache
     cached = _stale_cache          # read once; another thread may swap it
-    now = time.monotonic()
-    if cached is not None and now - cached[0] < _STALE_TTL_SECONDS:
-        return cached[1]
     if not _stale_inflight.acquire(blocking=False):
         return cached[1] if cached is not None else None
     try:
-        from ..core.build_info import staleness_note
-        note = staleness_note()
-        # Stamp completion time, not entry time: with a slow git the two differ
-        # by most of the TTL, and stamping entry would re-arm the miss almost
-        # immediately and reopen the herd this guard just closed.
-        _stale_cache = (time.monotonic(), note)
+        from ..core.build_info import head_sha, loaded_code, staleness_note
+        head = head_sha()
+        if cached is not None and cached[0] == head:
+            return cached[1]
+        note = None if head is None else staleness_note(loaded_code(), head=head)
+        _stale_cache = (head, note)
         return note
     finally:
         _stale_inflight.release()
@@ -3034,7 +3029,8 @@ async def worker_status(request: Request) -> dict[str, Any]:
 
     `loaded_code` / `loaded_code_stale` answer a different question on the same
     poll: WHICH code is running. The server never reloads, so a merged fix is
-    not live until it restarts.
+    not live until it restarts; the stale flag re-measures the checkout HEAD on
+    every read and flips on the first read after that HEAD moves.
     """
     sched = getattr(request.app.state, "scheduler", None)
     watcher_error = getattr(request.app.state, "watcher_error", None)

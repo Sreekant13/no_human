@@ -44,7 +44,8 @@ Three honesty requirements shape the API:
   because silently printing those as clean is the same lie in a quieter voice.
 - **The snapshot is taken once, at startup.** ``loaded_code()`` caches, so a
   later call cannot silently answer with a newer HEAD than the one whose code
-  is in memory — which would defeat the entire purpose.
+  is in memory — which would defeat the entire purpose. The HEAD it is
+  compared against is re-measured on every status read.
 """
 
 from __future__ import annotations
@@ -174,8 +175,14 @@ def loaded_code() -> LoadedCode:
     return _SNAPSHOT
 
 
+def head_sha(package_root: Path | None = None) -> str | None:
+    """The checkout's current HEAD — the moving half of the staleness compare."""
+    return _git(package_root or _PACKAGE_ROOT, "rev-parse", "HEAD")
+
+
 def staleness_note(info: LoadedCode | None = None,
-                   package_root: Path | None = None) -> str | None:
+                   package_root: Path | None = None,
+                   head: str | None = None) -> str | None:
     """A human sentence when the loaded sha is a strict ANCESTOR of HEAD.
 
     Returns None when the code is current, when the tree has diverged rather
@@ -186,7 +193,7 @@ def staleness_note(info: LoadedCode | None = None,
     if not info.sha:
         return None
     root = package_root or _PACKAGE_ROOT
-    head = _git(root, "rev-parse", "HEAD")
+    head = head if head is not None else head_sha(root)
     if not head or head == info.sha:
         return None
     # `--is-ancestor` exits 0 for "yes". Combined with the inequality above,

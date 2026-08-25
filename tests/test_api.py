@@ -1,6 +1,7 @@
 """FastAPI board endpoint tests (Phase 4 DoD)."""
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import subprocess
@@ -9,9 +10,10 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
-from no_human.core.task import Task, TaskStatus
 from no_human.api.app import app
+from no_human.core.build_info import LoadedCode
 from no_human.core.db import Store
+from no_human.core.task import Task, TaskStatus
 from no_human.profile import ProjectProfile
 
 # Tests here reach ``config.load_env_var``, which reads the operator's real
@@ -1825,6 +1827,39 @@ async def test_worker_status_surfaces_the_loaded_code(client):
     # Present even when there is nothing to report, so a reader can tell
     # "checked, current" apart from "never checked".
     assert "loaded_code_stale" in body
+
+
+async def test_advancing_head_after_startup_flips_the_stale_flag(
+        client, tmp_path, monkeypatch):
+    """A cached current answer must not survive a checkout HEAD advance."""
+    build_info = importlib.import_module("no_human.core.build_info")
+    api = importlib.import_module("no_human.api.app")
+    repo = tmp_path / "repo"
+    package = repo / "src" / "no_human"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("x = 1\n")
+    _git(tmp_path, "init", "-q", str(repo))
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "initial")
+    old = _git(repo, "rev-parse", "HEAD")
+
+    monkeypatch.setattr(build_info, "_PACKAGE_ROOT", repo)
+    monkeypatch.setattr(build_info, "_SNAPSHOT", LoadedCode(sha=old, dirty=False))
+    monkeypatch.setattr(api, "_stale_cache", None)
+
+    assert (await client.get("/api/worker/status")).json()["loaded_code_stale"] is None
+
+    (repo / "newer.txt").write_text("newer\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "advance HEAD")
+    new = _git(repo, "rev-parse", "HEAD")
+
+    stale = (await client.get("/api/worker/status")).json()["loaded_code_stale"]
+    assert stale is not None
+    assert old[:8] in stale
+    assert new[:8] in stale
 
 
 async def test_queue_health_endpoint(client, store):

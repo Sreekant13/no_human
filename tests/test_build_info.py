@@ -235,6 +235,25 @@ def test_staleness_note_silent_for_a_diverged_sha(repo):
     assert staleness_note(LoadedCode(sha=side, dirty=False), package_root=repo) is None
 
 
+def test_staleness_note_accepts_a_premeasured_head(repo, monkeypatch):
+    """The status path must not run a second rev-parse after measuring HEAD."""
+    loaded = "a" * 40
+    head = "b" * 40
+
+    def git_without_a_second_head_lookup(_cwd, *args):
+        if args == ("rev-parse", "HEAD"):
+            raise AssertionError("staleness_note re-measured HEAD")
+        assert args == ("merge-base", "--is-ancestor", loaded, "HEAD")
+        return ""
+
+    monkeypatch.setattr("no_human.core.build_info._git", git_without_a_second_head_lookup)
+    note = staleness_note(LoadedCode(sha=loaded, dirty=False), package_root=repo,
+                          head=head)
+    assert note is not None
+    assert loaded[:8] in note
+    assert head[:8] in note
+
+
 # --- the record ------------------------------------------------------------
 
 
@@ -269,15 +288,21 @@ def test_concurrent_staleness_checks_spawn_one_git_at_a_time(monkeypatch):
     # submodule and silently hands back the wrong object.
     api = importlib.import_module("no_human.api.app")
 
-    started = []
+    measurement_steps = []
     release = threading.Event()
 
-    def slow_note():
-        started.append(1)
+    def slow_head():
+        measurement_steps.append("head")
         release.wait(timeout=5)
+        return "a" * 40
+
+    def slow_note(_info, *, head):
+        assert head == "a" * 40
+        measurement_steps.append("note")
         return "behind"
 
     monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr("no_human.core.build_info.head_sha", slow_head)
     monkeypatch.setattr("no_human.core.build_info.staleness_note", slow_note)
 
     threads = [threading.Thread(target=api._loaded_code_stale) for _ in range(15)]
@@ -285,11 +310,12 @@ def test_concurrent_staleness_checks_spawn_one_git_at_a_time(monkeypatch):
         t.start()
     # Give the losers time to take the fast path rather than queue behind it.
     time.sleep(0.2)
-    assert started == [1], f"{len(started)} concurrent git measurements"
+    assert measurement_steps == ["head"], (
+        f"{len(measurement_steps)} concurrent git measurements")
     release.set()
     for t in threads:
         t.join(timeout=5)
-    assert started == [1]
+    assert measurement_steps == ["head", "note"]
 
 
 def test_a_loser_does_not_block_on_the_slow_measurement(monkeypatch):
@@ -303,8 +329,9 @@ def test_a_loser_does_not_block_on_the_slow_measurement(monkeypatch):
 
     release = threading.Event()
     monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: "a" * 40)
     monkeypatch.setattr("no_human.core.build_info.staleness_note",
-                        lambda: release.wait(timeout=5) or "behind")
+                        lambda *_args, **_kwargs: release.wait(timeout=5) or "behind")
 
     winner = threading.Thread(target=api._loaded_code_stale)
     winner.start()
@@ -331,9 +358,10 @@ def test_a_loser_serves_the_last_known_value_once_there_is_one(monkeypatch):
     api = importlib.import_module("no_human.api.app")
 
     release = threading.Event()
-    monkeypatch.setattr(api, "_stale_cache", (time.monotonic() - 3600, "behind"))
+    monkeypatch.setattr(api, "_stale_cache", ("deadbeef" * 5, "behind"))
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: "a" * 40)
     monkeypatch.setattr("no_human.core.build_info.staleness_note",
-                        lambda: release.wait(timeout=5) or "behind again")
+                        lambda *_args, **_kwargs: release.wait(timeout=5) or "behind again")
 
     winner = threading.Thread(target=api._loaded_code_stale)
     winner.start()
@@ -343,22 +371,49 @@ def test_a_loser_serves_the_last_known_value_once_there_is_one(monkeypatch):
     winner.join(timeout=5)
 
 
-def test_stale_cache_is_stamped_on_completion_not_entry(monkeypatch):
-    """With a slow git, entry and completion differ by most of the TTL.
-    Stamping entry re-arms the miss almost immediately and reopens the herd."""
+def test_the_cache_is_keyed_on_head_not_on_the_clock(monkeypatch):
+    """A new HEAD invalidates a current answer without waiting for a TTL."""
     # NOT `import no_human.api.app as api`: the api package's __init__
     # binds the name `app` to the FastAPI INSTANCE, which shadows the
     # submodule and silently hands back the wrong object.
     api = importlib.import_module("no_human.api.app")
 
-    monkeypatch.setattr(api, "_stale_cache", None)
-    monkeypatch.setattr(api, "_STALE_TTL_SECONDS", 0.6)
+    old_head = "a" * 40
+    new_head = "b" * 40
+    monkeypatch.setattr(api, "_stale_cache", (old_head, None))
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: new_head)
     monkeypatch.setattr("no_human.core.build_info.staleness_note",
-                        lambda: time.sleep(0.4) or "behind")
-    api._loaded_code_stale()
-    entered_at, _ = api._stale_cache
-    # Stamped at completion, the entry is younger than the call took.
-    assert time.monotonic() - entered_at < 0.3
+                        lambda _info, *, head: "behind" if head == new_head else None)
+    assert api._loaded_code_stale() == "behind"
+    assert api._stale_cache == (new_head, "behind")
+
+
+def test_an_unchanged_head_does_not_re_run_the_ancestry_check(monkeypatch):
+    """The HEAD key retains the old TTL's protection from repeated merges."""
+    api = importlib.import_module("no_human.api.app")
+    head = "a" * 40
+    monkeypatch.setattr(api, "_stale_cache", (head, "behind"))
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: head)
+    monkeypatch.setattr("no_human.core.build_info.staleness_note",
+                        lambda *_args, **_kwargs: pytest.fail("ancestry re-ran"))
+    assert api._loaded_code_stale() == "behind"
+
+
+def test_an_unresolvable_head_reads_as_no_answer_not_as_current(monkeypatch):
+    """A failed HEAD lookup stays silent and recomputes when git recovers."""
+    api = importlib.import_module("no_human.api.app")
+    recovered_head = "b" * 40
+    heads = iter((None, recovered_head))
+    notes = []
+
+    monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: next(heads))
+    monkeypatch.setattr("no_human.core.build_info.staleness_note",
+                        lambda _info, *, head: notes.append(head) or "behind")
+    assert api._loaded_code_stale() is None
+    assert notes == []
+    assert api._loaded_code_stale() == "behind"
+    assert notes == [recovered_head]
 
 
 async def test_recorded_version_survives_later_updates(store):
