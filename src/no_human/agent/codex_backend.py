@@ -523,6 +523,86 @@ class _Usage:
         )
 
 
+# asyncio's StreamReader default is exactly 65536 bytes (asyncio.streams.
+# _DEFAULT_LIMIT). `codex exec` emits ONE JSONL event per line, and a tool
+# result carrying test output, a large file read or a long diff routinely
+# clears 64 KiB — so the default put a cliff in front of every task. Over it,
+# readline() raises ValueError("Separator is not found, and chunk exceed the
+# limit"), which escaped stream(), escaped run(), and killed task 78be079a in
+# the pool (2026-08-25, attempt 36).
+#
+# 10 MiB is the FAST PATH, not a correctness boundary: below it a line arrives
+# in ONE readuntil with no accumulation. The loop below assembles lines of any
+# length, which is the actual fix — raising the limit alone would only move
+# the cliff.
+_STDOUT_LIMIT = 10 * 1024 * 1024
+
+# THIS is the correctness boundary: past it we stop buying memory for a
+# process that may never emit a newline. Deliberately below the 256 MiB
+# floated at intake — the pool runs several tasks concurrently in ONE daemon
+# process, so 256 MiB x concurrency is an OOM in the very daemon this fix
+# exists to keep alive. 64 MiB is ~1000x the largest plausible real event.
+_LINE_ACCUM_CAP = 64 * 1024 * 1024
+
+
+class _CodexLineTruncated(Exception):
+    """stdout blew the accumulation cap mid-line, or made no progress trying
+    to. Carries a human-readable reason; the caller turns it into a terminal
+    ``result`` event rather than letting it escape ``stream()``."""
+
+
+async def _read_jsonl_line(reader: asyncio.StreamReader) -> bytes:
+    """One newline-terminated line of ANY length, or ``b''`` at clean EOF.
+
+    NOT ``readline()``: CPython's ``readline`` CLEARS the buffer before
+    re-raising ``LimitOverrunError`` as ``ValueError`` (see
+    ``asyncio.streams.StreamReader.readline``), so the bytes are already gone
+    by the time a caller could catch it — accumulation is impossible through
+    that door. Calling ``readuntil`` directly leaves the buffered prefix
+    intact across a ``LimitOverrunError``, so it can be drained with
+    ``readexactly(e.consumed)`` and the search resumed for the rest of the
+    line, of arbitrary length, capped by ``_LINE_ACCUM_CAP``.
+    """
+    buf = bytearray()
+    while True:
+        try:
+            line = await reader.readuntil(b"\n")
+            return bytes(buf) + line if buf else line
+        except asyncio.LimitOverrunError as e:
+            # `.consumed` is the amount already known NOT to contain the
+            # separator, so it is safe to drain without losing a partial
+            # match — correct for both message variants CPython has used
+            # ("...is not found..." on a real pipe, "...is found, but chunk
+            # is longer..." on a pre-filled buffer).
+            chunk = await reader.readexactly(e.consumed)
+            if not chunk:
+                # Defensive: `.consumed == 0` forever would spin without
+                # ever raising IncompleteReadError or growing `buf`.
+                raise _CodexLineTruncated(
+                    f"no progress after {len(buf)} bytes accumulated")
+            buf += chunk
+            if len(buf) > _LINE_ACCUM_CAP:
+                raise _CodexLineTruncated(
+                    f"line exceeded {_LINE_ACCUM_CAP} bytes with no newline")
+        except asyncio.IncompleteReadError as e:
+            if not buf and not e.partial:
+                return b""  # clean EOF, nothing pending
+            if buf:
+                # We already accumulated at least one LimitOverrunError round
+                # for THIS line and then hit EOF before a newline — the line
+                # is genuinely un-assemblable, not merely a process that died
+                # mid-message before ever exceeding the fast-path limit.
+                raise _CodexLineTruncated(
+                    f"stream ended after {len(buf) + len(e.partial)} bytes "
+                    "with no newline")
+            # A short, never-oversized line the process died before
+            # terminating. Returned as-is: the existing `startswith("{")` +
+            # `json.JSONDecodeError` filter in `stream()` discards a
+            # non-JSON or truncated-JSON partial harmlessly, exactly as it
+            # already does for interleaved banner lines.
+            return e.partial
+
+
 class CodexBackend:
     """Drives one ``codex exec`` session per call to :meth:`run`.
 
@@ -935,6 +1015,7 @@ class CodexBackend:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STDOUT_LIMIT,
         )
         assert proc.stdin is not None and proc.stdout is not None
         try:
@@ -946,7 +1027,21 @@ class CodexBackend:
 
         try:
             while True:
-                raw = await proc.stdout.readline()
+                try:
+                    raw = await _read_jsonl_line(proc.stdout)
+                except _CodexLineTruncated as exc:
+                    # Terminal, but a NORMAL outcome: stream()'s docstring
+                    # (above) is that the final event is always `result` — a
+                    # raise here crashes the pool worker instead of failing
+                    # the attempt. The literal "stream closed" is
+                    # LOAD-BEARING: orchestrator._classify_error matches it
+                    # in the de-wrapped result text and returns "infra", the
+                    # same marker claude_backend._TRANSPORT_FAILURE_MARKERS
+                    # uses. Producer and consumer are pinned together by
+                    # test_an_unassemblable_line_is_a_recorded_infra_failure.
+                    failure = failure or f"codex stream closed mid-line: {exc}"
+                    stop_reason = "error"
+                    break
                 if not raw:
                     break
                 line = raw.decode(errors="replace").strip()

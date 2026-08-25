@@ -602,14 +602,30 @@ def test_a_cached_share_larger_than_the_input_clamps_instead_of_going_negative()
 # 4. Codex: a whole run over a fake `codex` process                            #
 # --------------------------------------------------------------------------- #
 
-def _fake_codex(lines: list[dict], *, returncode: int = 0, stderr: bytes = b""):
+def _fake_codex(lines: list, *, returncode: int = 0, stderr: bytes = b""):
     """Monkeypatch target for ``asyncio.create_subprocess_exec``.
 
     A real subprocess is deliberately avoided: the point of these tests is the
     NORMALIZER, and shelling out would make them depend on a binary this
-    machine does not have.
+    machine does not have. ``stdout`` IS a real ``asyncio.StreamReader``
+    (not a hand-rolled list-popper): ``_read_jsonl_line`` calls
+    ``readuntil``/``readexactly``, not ``readline``, and only a real
+    ``StreamReader`` implements those — this also makes the fake honour
+    whatever ``limit=`` the production code passes, exactly like a real pipe.
+
+    Each item in ``lines`` is a dict (JSON-encoded) or a raw ``str``/``bytes``
+    line, written verbatim — for banner/malformed-JSON fixtures that must
+    not be run through ``json.dumps``.
     """
-    payload = "\n".join(json.dumps(line) for line in lines).encode() + b"\n"
+    parts = []
+    for line in lines:
+        if isinstance(line, bytes):
+            parts.append(line if line.endswith(b"\n") else line + b"\n")
+        elif isinstance(line, str):
+            parts.append(line.encode() + b"\n")
+        else:
+            parts.append(json.dumps(line).encode() + b"\n")
+    payload = b"".join(parts)
 
     class _Stdin:
         def write(self, _data): pass
@@ -625,8 +641,8 @@ def _fake_codex(lines: list[dict], *, returncode: int = 0, stderr: bytes = b""):
             return b"".join(self._lines)
 
     class _Proc:
-        def __init__(self):
-            self.stdin, self.stdout = _Stdin(), _Reader(payload)
+        def __init__(self, stdout):
+            self.stdin, self.stdout = _Stdin(), stdout
             self.stderr = _Reader(stderr)
             self.returncode = None
             self.killed = False
@@ -635,12 +651,18 @@ def _fake_codex(lines: list[dict], *, returncode: int = 0, stderr: bytes = b""):
             self.returncode = returncode
             return returncode
 
-    proc = _Proc()
-
-    async def _spawn(*_args, **_kwargs):
+    async def _spawn(*_args, **kwargs):
+        # Built HERE, not eagerly at `_fake_codex()` call time: constructing
+        # an `asyncio.StreamReader` with no explicit `loop=` needs a running
+        # loop, and `_fake_codex()` is called from plain sync test code
+        # before `asyncio.run()` starts one.
+        reader = asyncio.StreamReader(limit=kwargs.get("limit", 65536))
+        reader.feed_data(payload)
+        reader.feed_eof()
+        proc = _Proc(reader)
+        _spawn.proc = proc
         return proc
 
-    _spawn.proc = proc
     return _spawn
 
 
@@ -983,14 +1005,18 @@ def test_a_nonzero_exit_with_no_json_still_yields_a_result_event(monkeypatch):
 def test_unparseable_and_unknown_records_are_skipped_not_fatal(monkeypatch):
     """A schema drift must degrade, not read as a code failure to the bounded
     loop — which would retry three times and escalate against the wrong cause."""
-    spawn = _fake_codex([{"type": "item.completed", "item": {
-        "id": "i", "type": "agent_message", "text": "ok"}}])
+    # A banner line, a record of a type nobody here has seen, and a line
+    # that isn't even JSON — all ahead of the one real event — must all be
+    # skipped, not fatal.
+    spawn = _fake_codex([
+        b"Reading prompt from stdin...\n",
+        b'{"type":"some.future.event","x":1}\n',
+        b"{not json\n",
+        {"type": "item.completed", "item": {
+            "id": "i", "type": "agent_message", "text": "ok"}},
+    ])
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     _stub_cli(monkeypatch)
-    # Splice in a banner line and a record of a type nobody here has seen.
-    spawn.proc.stdout._lines.insert(0, b"Reading prompt from stdin...\n")
-    spawn.proc.stdout._lines.insert(1, b'{"type":"some.future.event","x":1}\n')
-    spawn.proc.stdout._lines.insert(2, b"{not json\n")
     result = asyncio.run(cx.CodexBackend(env=FAKE_ENV).run(
         "p", cwd=Path("/repo"), max_turns=9))
     assert result.is_error is False
