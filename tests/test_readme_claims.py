@@ -1792,10 +1792,10 @@ CITATION_TABLE = (
     ("security.md", "history/extractor.py:65-72", "history/extractor.py",
      "csrf_token"),
     # docs/eval.md
-    ("eval.md", "src/no_human/cli/commands.py:6747", "src/no_human/cli/commands.py",
+    ("eval.md", "src/no_human/cli/commands.py:6767", "src/no_human/cli/commands.py",
      '"--trials"'),
-    ("eval.md", ":7074-7079", "src/no_human/cli/commands.py", "asyncio.gather"),
-    ("eval.md", ":6943-6963", "src/no_human/cli/commands.py",
+    ("eval.md", ":7094-7099", "src/no_human/cli/commands.py", "asyncio.gather"),
+    ("eval.md", ":6963-6983", "src/no_human/cli/commands.py",
      "(sc.task_id, sc.trial)"),
     ("eval.md", "src/no_human/eval/northstar_card.py:443",
      "src/no_human/eval/northstar_card.py", "def pass_k_rate("),

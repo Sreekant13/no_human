@@ -374,12 +374,13 @@ Reviewer, planner, supervisor and utility stay on Claude in **both** modes —
 `CLAUDE_PINNED_ROLES` is untouched by this setting. See
 [BACKENDS.md](BACKENDS.md) for the full comparison table.
 
-**`codex_auth_mode: api_key` (default, unchanged).** `OPENAI_API_KEY`, loaded
-from `~/.no_human/.env` only — never from config.yaml, never from an ambient
-process env fallback. The CLI is invoked with
-`preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
-login that happens to be present on the machine. Default model:
-`gpt-5.3-codex` (`llm.codex_model`, overridable).
+**`codex_auth_mode: api_key` (default, unchanged).** `OPENAI_API_KEY` — never
+from `config.yaml`. Precedence is `~/.no_human/.env` first, falling back to
+the ambient process environment if the key isn't in `.env`
+(`assert_codex_api_key_mode` in `config.py`; `nh doctor`'s `credential_status`
+check agrees). The CLI is invoked with `preferred_auth_method="apikey"` so it
+cannot silently fall back to a ChatGPT login that happens to be present on the
+machine. Default model: `gpt-5.3-codex` (`llm.codex_model`, overridable).
 
 **`codex_auth_mode: subscription` (opt-in, added 2026-08-22).** Drives the
 coder from a Codex CLI session signed in via `codex login` — the operator's

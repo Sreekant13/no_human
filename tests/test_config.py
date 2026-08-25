@@ -933,11 +933,26 @@ def test_codex_auth_mode_rejects_an_unrecognised_value_rather_than_defaulting():
 def test_assert_codex_subscription_mode_scrubs_the_openai_routes(monkeypatch):
     for var in config.CODEX_SUBSCRIPTION_SCRUB_VARS:
         monkeypatch.setenv(var, "placeholder")
+    # Literal names, set independently of CODEX_SUBSCRIPTION_SCRUB_VARS: if a
+    # var is deleted from that list, the loop above would stop setting it
+    # too, and the vacuous "never set ⇒ never present" would let the
+    # membership assertions below pass even though the var is no longer
+    # scrubbed. Setting them here by name closes that hole.
+    monkeypatch.setenv("OPENAI_API_KEY", "placeholder")
+    monkeypatch.setenv("CODEX_API_KEY", "placeholder")
+    monkeypatch.setenv("OPENAI_BASE_URL", "placeholder")
+
     report = config.assert_codex_subscription_mode(
         session_check=lambda: _FakeStatus(True, "chatgpt"))
     assert set(report.removed) == set(config.CODEX_SUBSCRIPTION_SCRUB_VARS)
     for var in config.CODEX_SUBSCRIPTION_SCRUB_VARS:
         assert var not in os.environ
+    # Literal-name pins: the loops above prove nothing if a var is deleted
+    # from CODEX_SUBSCRIPTION_SCRUB_VARS itself — assert the actual scrubbed
+    # names directly so a shrunk list still fails this test.
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "CODEX_API_KEY" not in os.environ
+    assert "OPENAI_BASE_URL" not in os.environ
 
 
 def test_assert_codex_subscription_mode_refuses_when_no_session_is_found():

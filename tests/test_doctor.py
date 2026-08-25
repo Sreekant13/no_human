@@ -598,6 +598,43 @@ async def test_a_missing_openai_key_is_a_contradiction_with_a_fix_command(
     assert not d.healthy
 
 
+async def test_subscription_mode_with_a_live_session_is_healthy_not_a_contradiction(
+        store, monkeypatch, isolated_env_file):
+    """The exact defect the audit reproduced live: `mode: subscription` + a
+    live codex CLI + no OPENAI_API_KEY on file used to be reported as
+    'CODEX BACKEND UNUSABLE: no OPENAI_API_KEY on file — codex is BYO-API-key
+    only', flipping `d.healthy` (and `nh doctor`'s exit code) on every
+    correctly-configured subscription install. `codex_readiness` must be
+    mode-aware: subscription mode checks the ChatGPT session instead of a
+    key that mode never has."""
+    monkeypatch.setattr(_cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+    monkeypatch.setattr(
+        _cx, "codex_exec_help",
+        lambda path, resume=False, timeout=10.0: (
+            _MODERN_RESUME_HELP_TEXT if resume else _MODERN_HELP_TEXT
+        ),
+    )
+    monkeypatch.setattr(_cx, "codex_version",
+                        lambda path, timeout=10.0: "codex-cli 0.149.0")
+    monkeypatch.setattr(_cx, "codex_login_status",
+                        lambda cli_path=None: _cx.CodexSessionStatus(True, "chatgpt"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    d = await diagnose(
+        store,
+        {"worker": {"backend": "codex"}, "llm": {"codex_auth_mode": "subscription"}},
+    )
+
+    assert not any(
+        "BYO-API-key only" in c for c in d.contradictions
+    ), d.contradictions
+    assert not any(
+        "no OPENAI_API_KEY on file" in c for c in d.contradictions
+    ), d.contradictions
+    assert d.codex["api_key_present"] is True
+    assert d.healthy
+
+
 async def test_a_codex_readiness_crash_while_selected_is_a_contradiction_not_silence(
         store, monkeypatch, isolated_env_file):
     """Pins the exact silent-failure a prior review flagged at doctor.py:508:
@@ -1317,3 +1354,32 @@ def test_the_codex_row_makes_no_live_call(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert calls == [], "the Claude live-verify probe ran without --verify-auth"
     assert "codex backend" in result.output, result.output
+
+
+def test_a_typo_d_codex_auth_mode_is_a_contradiction_not_a_traceback(
+        monkeypatch, tmp_path):
+    """`codex_row` reads `llm.codex_auth_mode` outside any guard in the CLI
+    wiring; a typo'd value used to raise `AuthError` straight through
+    `nh doctor`, even on an install that doesn't use codex at all
+    (`worker.backend: claude`) — contradicting `codex_row`'s own docstring
+    ("a diagnostic must never crash the command that prints it"). It must
+    come back as a readable contradiction with a nonzero exit, never a
+    traceback."""
+    result, calls = _doctor(
+        monkeypatch, tmp_path,
+        config={"worker": {"backend": "claude"},
+                "llm": {"codex_auth_mode": "bogus-mode"}})
+
+    # CliRunner always reports a `SystemExit` here (that's how Click's own
+    # exit-code machinery works, even on a clean nonzero exit) — the crash
+    # this test guards against is an *unhandled* `AuthError` reaching the
+    # command, which would show up as a different exception type or as a
+    # printed traceback, not as a plain `SystemExit`.
+    assert result.exc_info[0] is SystemExit, (
+        f"nh doctor raised instead of reporting a contradiction:\n"
+        f"{result.output}\n{result.exc_info}")
+    assert "Traceback" not in result.output, result.output
+    assert result.exit_code != 0, result.output
+    assert "bogus-mode" in result.output, result.output
+    flat = " ".join(result.output.split())
+    assert "CODEX CONFIG INVALID" in flat, result.output

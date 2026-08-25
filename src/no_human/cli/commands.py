@@ -5889,6 +5889,21 @@ def doctor(verbose, verify_auth):
         for reason in backend.reasons:
             d.contradictions.append(f"CODING BACKEND UNUSABLE: {reason}")
 
+        # Codex row: computed unconditionally (codex need not be the
+        # selected backend) — pure and read-only, see doctor.codex_row's
+        # docstring. Run HERE, before the verdict is computed, so an invalid
+        # llm.codex_auth_mode (a typo, on an install that may not even use
+        # codex) is a contradiction like any other and the exit code follows
+        # it — codex_row itself never raises for this (its own docstring's
+        # rule: a diagnostic must never crash the command that prints it).
+        from ..doctor import codex_row
+
+        crow = codex_row(config.data)
+        if crow.get("error"):
+            d.contradictions.append(
+                f"CODEX CONFIG INVALID: {crow['error']}"
+            )
+
         # The gap presence-checking cannot close: a valid-SHAPED but expired or
         # revoked credential passes everything above and dies at the first task
         # (walkthrough B5). Opt-in, because the rule that doctor never spends
@@ -5951,18 +5966,21 @@ def doctor(verbose, verify_auth):
         console.print(f"[bold]coding backend[/] — claude CLI: "
                       f"[{colour}]{cli}[/]")
 
-        # Codex row: printed unconditionally (codex need not be the selected
-        # backend) — pure and read-only, see doctor.codex_row's docstring.
-        from ..doctor import codex_row
-
-        crow = codex_row(config.data)
-        codex_colour = "green" if crow["present"] else "yellow"
-        console.print(
-            f"[bold]codex backend[/] — mode: [cyan]{crow['mode']}[/]  "
-            f"credential: [{codex_colour}]{'present' if crow['present'] else 'not found'}[/]  "
-            f"model: [cyan]{crow['model']}[/]  "
-            f"cli: [dim]{crow['cli_path']}[/]"
-        )
+        # Codex row: `crow` was computed above, before the verdict, so an
+        # invalid llm.codex_auth_mode already drove the exit code via the
+        # contradiction appended there; this only decides how the row reads.
+        if crow.get("error"):
+            console.print(
+                f"[bold]codex backend[/] — [red]CONFIG INVALID[/]: {crow['error']}"
+            )
+        else:
+            codex_colour = "green" if crow["present"] else "yellow"
+            console.print(
+                f"[bold]codex backend[/] — mode: [cyan]{crow['mode']}[/]  "
+                f"credential: [{codex_colour}]{'present' if crow['present'] else 'not found'}[/]  "
+                f"model: [cyan]{crow['model']}[/]  "
+                f"cli: [dim]{crow['cli_path']}[/]"
+            )
 
         # The detailed readiness row only appears when the codex backend is
         # actually in play (worker.backend == "codex", or a live task asked
@@ -5978,7 +5996,9 @@ def doctor(verbose, verify_auth):
                           f"approval: {d.codex.get('flag_detail') or 'UNSUPPORTED'}")
             key_colour = "green" if d.codex.get("api_key_present") else "red"
             key_state = "present" if d.codex.get("api_key_present") else "MISSING"
-            console.print(f"                OPENAI_API_KEY: "
+            cx_label = ("ChatGPT session" if d.codex.get("mode") == "subscription"
+                        else "OPENAI_API_KEY")
+            console.print(f"                {cx_label}: "
                           f"[{key_colour}]{key_state}[/]  [dim](presence only)[/]")
             console.print(f"                [dim]{d.codex.get('entitlement_note')}[/]")
 

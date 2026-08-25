@@ -1188,6 +1188,12 @@ def test_subscription_child_env_holds_no_openai_credential(monkeypatch):
     from no_human import config as cfgmod
     for var in cfgmod.CODEX_SUBSCRIPTION_SCRUB_VARS:
         assert var not in env
+    # Literal-name pins: iterating CODEX_SUBSCRIPTION_SCRUB_VARS above proves
+    # nothing if a var is deleted from that list — assert the specific names
+    # directly so a shrunk list still fails this test.
+    assert "OPENAI_API_KEY" not in env
+    assert "CODEX_API_KEY" not in env
+    assert "OPENAI_BASE_URL" not in env
     assert env["PATH"] == "/bin"
 
 
@@ -1315,6 +1321,10 @@ def test_login_status_scrubs_its_own_subprocess_env(monkeypatch):
     from no_human import config as cfgmod
     for var in cfgmod.CODEX_SUBSCRIPTION_SCRUB_VARS:
         assert var not in seen_env
+    # Literal-name pin: the loop above proves nothing if OPENAI_API_KEY is
+    # deleted from CODEX_SUBSCRIPTION_SCRUB_VARS — assert the actual
+    # credential this test sets is gone, by name.
+    assert "OPENAI_API_KEY" not in seen_env
 
 
 # --------------------------------------------------------------------------- #

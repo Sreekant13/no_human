@@ -360,13 +360,29 @@ def codex_row(config: dict[str, Any] | None) -> dict[str, Any]:
     ``detail`` string a session probe returns is intentionally never
     surfaced here (only the boolean and the mode), so this row cannot leak
     anything credential-shaped.
+
+    An invalid ``llm.codex_auth_mode`` (a typo, caught fail-loud everywhere
+    else by :func:`config.codex_auth_mode`) is no exception to the "never
+    crash the command that prints it" rule above: it comes back as an
+    ``{"error": ...}``-shaped row rather than an :class:`config.AuthError`
+    raised through this function — an install that doesn't even use Codex
+    (``worker.backend: claude``) must still get a readable ``nh doctor``.
     """
     from .agent.backend import default_codex_model
     from .config import CODEX_API_KEY_VAR, ENV_PATH, _read_env_file, codex_auth_mode
 
     llm = (config or {}).get("llm") or {}
-    mode = codex_auth_mode(config or {})
     cli_path = llm.get("codex_cli_path")
+    try:
+        mode = codex_auth_mode(config or {})
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never raise
+        return {
+            "mode": None,
+            "present": False,
+            "model": str(llm.get("codex_model") or "unknown"),
+            "cli_path": cli_path or "codex (PATH)",
+            "error": str(exc),
+        }
     model = str(llm.get("codex_model") or default_codex_model(mode))
 
     present = False
@@ -460,7 +476,14 @@ def codex_readiness(
         emitted_flags,
         find_codex_cli,
     )
-    from .config import CODEX_API_KEY_VAR, credential_status
+    from .config import CODEX_API_KEY_VAR, codex_auth_mode, credential_status
+
+    # A typo'd llm.codex_auth_mode raises AuthError here; that is
+    # intentional and safe — this whole function is wrapped by the caller
+    # (`diagnose`) in `try/except Exception`, which already turns any crash
+    # here into a contradiction (codex selected) or an advisory (codex not
+    # selected) rather than letting it reach `nh doctor`'s own traceback.
+    mode = codex_auth_mode(config)
 
     llm = config.get("llm") or {}
     model = llm.get("codex_model", DEFAULT_CODEX_MODEL)
@@ -468,6 +491,7 @@ def codex_readiness(
     contradictions: list[str] = []
     row: dict[str, Any] = {
         "selected": True,
+        "mode": mode,
         "cli_path": cli,
         "version": None,
         "flags_ok": False,
@@ -492,7 +516,7 @@ def codex_readiness(
         try:
             args = approval_args(help_text, version)
             row["flag_detail"] = " ".join(args)
-            backend = CodexBackend(cli_path=cli)
+            backend = CodexBackend(cli_path=cli, auth_mode=mode)
             cmd = backend._command(Path.cwd(), effort=None, resume=None)
             resume_cmd = backend._command(
                 Path.cwd(), effort=None, resume="doctor-probe-thread"
@@ -523,17 +547,33 @@ def codex_readiness(
                 f"{exc}"
             )
 
-    # Presence only — the value is never read into the row, a contradiction,
-    # or a log line.
-    row["api_key_present"] = credential_status([CODEX_API_KEY_VAR]).get(
-        CODEX_API_KEY_VAR, False
-    )
-    if not row["api_key_present"]:
-        contradictions.append(
-            "CODEX BACKEND UNUSABLE: no OPENAI_API_KEY on file — codex is "
-            "BYO-API-key only; expected in ~/.no_human/.env (chmod 600) or "
-            "the environment."
+    # Presence only — the value (key or session detail) is never read into
+    # the row, a contradiction, or a log line. Which credential is checked
+    # is mode-aware: subscription mode has no OPENAI_API_KEY to check at
+    # all — it lives and dies on the `codex login` session — so checking
+    # for a key there would fail every correctly-configured subscription
+    # install (the exact defect this branch replaces).
+    if mode == "subscription":
+        from .agent.codex_backend import codex_login_status
+
+        status = codex_login_status(cli)
+        row["api_key_present"] = bool(status.present and status.via != "api_key")
+        if not row["api_key_present"]:
+            contradictions.append(
+                "CODEX BACKEND UNUSABLE: no live ChatGPT session found — "
+                "llm.codex_auth_mode is 'subscription'; run `codex login` "
+                "first, or switch codex_auth_mode to 'api_key'."
+            )
+    else:
+        row["api_key_present"] = credential_status([CODEX_API_KEY_VAR]).get(
+            CODEX_API_KEY_VAR, False
         )
+        if not row["api_key_present"]:
+            contradictions.append(
+                "CODEX BACKEND UNUSABLE: no OPENAI_API_KEY on file — "
+                "expected in ~/.no_human/.env (chmod 600) or the "
+                "environment."
+            )
     return row, contradictions
 
 
