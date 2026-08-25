@@ -43,6 +43,19 @@ def _git(cwd, *args, check=True):
     )
 
 
+def _seeded_repo(tmp_path) -> Path:
+    """A repo with a real commit, so `snapshot` succeeds on the unpatched
+    path. A bare `git init` has no resolvable HEAD and makes `snapshot` raise
+    for the WRONG reason."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "f.txt").write_text("v1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    return repo
+
+
 @pytest.fixture
 def worktree_env(tmp_path):
     """A reviewer worktree built through the product's own `add_worktree`,
@@ -318,6 +331,60 @@ def test_snapshot_fails_closed_for_a_non_git_directory(tmp_path):
     not_a_repo.mkdir()
     with pytest.raises(rw.WorktreeCheckFailed):
         rw.snapshot(not_a_repo, timeout=_TIMEOUT)
+
+
+def test_a_git_timeout_fails_closed_rather_than_reporting_a_clean_snapshot(
+    tmp_path, monkeypatch,
+):
+    """A slow git must raise, never degrade to a "don't know" that reads as clean.
+
+    `snapshot` is the reviewer-integrity instrument: if it cannot obtain a
+    trustworthy answer it must say so. `_run_git` catches
+    `subprocess.TimeoutExpired` and re-raises `WorktreeCheckFailed`; nothing
+    else in the tree drives a timeout into this module, so without this the
+    branch ships uncovered. Recovered from the superseded PR #706.
+
+    Two things are asserted, and the second is why the first is worth having.
+    Converting a timeout is useless if a timeout can never HAPPEN: drop
+    `timeout=timeout` from the `subprocess.run` call and the `except
+    TimeoutExpired` clause becomes permanently dead code, real git hangs
+    forever, and a stub that raises unconditionally would still be green. So
+    the stub records what it was called with and the forwarded value is
+    asserted — reading `kwargs["timeout"]`, never `kwargs.get(...)` with a
+    default, which would paper over the very omission being tested.
+
+    The repo is seeded with a real commit so the UNPATCHED path returns
+    normally. Against a bare directory `snapshot` raises `WorktreeCheckFailed`
+    anyway (no resolvable HEAD), which would leave `match=` as the only thing
+    separating a true pass from a monkeypatch that silently failed to apply.
+    """
+    repo = _seeded_repo(tmp_path)
+    # Control: unpatched, this repo snapshots cleanly. Anything raising below
+    # is therefore the timeout, not the fixture.
+    assert rw.snapshot(repo, timeout=_TIMEOUT).head
+
+    recorded: dict = {}
+
+    def _always_times_out(*args, **kwargs):
+        # Records, then raises with a LITERAL timeout: reading kwargs here
+        # would turn a missing `timeout=` into a KeyError inside the stub,
+        # which is red for the wrong reason and reports the wrong cause. The
+        # assertion after the block is the discriminator.
+        recorded.update(kwargs)
+        raise subprocess.TimeoutExpired(
+            cmd=args[0] if args else ["git"], timeout=_TIMEOUT,
+        )
+
+    monkeypatch.setattr(rw.subprocess, "run", _always_times_out)
+
+    with pytest.raises(rw.WorktreeCheckFailed, match="timed out after"):
+        rw.snapshot(repo, timeout=_TIMEOUT)
+
+    # `.get` deliberately: a MISSING key is the defect under test, and it
+    # must read as a failed comparison, not as a KeyError from the assertion.
+    assert recorded.get("timeout") == _TIMEOUT, (
+        "_run_git did not forward its timeout to subprocess.run, so the "
+        f"TimeoutExpired branch is unreachable in production: {recorded}")
 
 
 def test_guard_config_defaults_and_fallback():
