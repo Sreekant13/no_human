@@ -21,9 +21,9 @@ from .orchestrator import Orchestrator
 def task_backend_override(task: Any) -> str | None:
     """The backend THIS task asked for, or None to follow `worker.backend`.
 
-    `nh task add --backend codex` and the API's `backend` field record the
-    choice on `task.config["backend"]` (the board's composer has no picker
-    yet). Until public issue #5 that value was
+    `nh task add --backend codex`, the API's `backend` field, and (since the
+    board's coder-backend picker) the task composer all record the choice on
+    `task.config["backend"]`. Until public issue #5 that value was
     only displayed; the coder still ran on the global key, so the flag looked
     like a per-task switch and was not one. Here it becomes one — for the
     CODER only: `make_backend` ignores any override for a non-coder role (see

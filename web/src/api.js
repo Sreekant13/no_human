@@ -35,11 +35,17 @@ export async function fetchDiff(id) {
   return r.text();
 }
 
-export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id }) {
+export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend }) {
   const r = await fetch(`${BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id }),
+    // `backend` is "" unless the composer's picker was touched — the server
+    // treats a missing OR falsy value as "use worker.backend" (see
+    // CreateTaskRequest.backend and the `if body.backend:` check in the POST
+    // handler), so an untouched control's empty string is handled exactly
+    // like an absent field and behaves exactly as it did before the picker
+    // existed.
+    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));

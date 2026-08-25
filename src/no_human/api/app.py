@@ -687,10 +687,11 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     if pinned_base:
         task.context = {**(task.context or {}), "base_branch": pinned_base}
     if body.backend:
-        # Per-task coder backend (public issue #5) — set by API clients; the
-        # board's composer has no picker yet. Validated against the one
-        # tuple `make_backend` accepts, so a typo is a 422 here instead of a
-        # BackendUnavailable on the first attempt.
+        # Per-task coder backend (public issue #5) — set by API clients, and
+        # by the board's composer, whose picker options come from GET
+        # /api/config's `coder_backends` field (see show_config). Validated
+        # against the one tuple `make_backend` accepts, so a typo is a 422
+        # here instead of a BackendUnavailable on the first attempt.
         from ..agent.backend import SUPPORTED_BACKENDS
         chosen = body.backend.strip().lower()
         if chosen not in SUPPORTED_BACKENDS:
@@ -3533,10 +3534,29 @@ def _scrub_secrets(value: Any) -> Any:
 
 @app.get("/api/config")
 async def show_config(request: Request) -> dict[str, Any]:
-    """Return the current config (safe subset — no secrets)."""
+    """Return the current config (safe subset — no secrets), plus two
+    read-only, server-derived fields the board's task composer uses to
+    build its coder-backend picker:
+
+    * ``coder_backends`` — the tuple ``agent.backend.SUPPORTED_BACKENDS``
+      accepts. A backend added to that tuple shows up here, and therefore in
+      the composer, with no JS change — the composer must never hardcode its
+      own copy of this list.
+    * ``claude_pinned_roles`` — ``agent.backend.CLAUDE_PINNED_ROLES``, the
+      roles that stay on Claude no matter which coder backend is chosen, so
+      the composer can say so instead of asserting it as a second literal
+      that could drift from the one `make_backend` actually enforces.
+
+    Both are computed fresh on every call (not config data), so they can
+    never be "scrubbed" or otherwise altered by ``_scrub_secrets``.
+    """
     cfg = request.app.state.config
     data = copy.deepcopy(cfg.data)
-    return _scrub_secrets(data)
+    scrubbed = _scrub_secrets(data)
+    from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS
+    scrubbed["coder_backends"] = list(SUPPORTED_BACKENDS)
+    scrubbed["claude_pinned_roles"] = list(CLAUDE_PINNED_ROLES)
+    return scrubbed
 
 
 @app.get("/api/version")

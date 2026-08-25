@@ -157,11 +157,81 @@ test("SCRUM-3: client request limit matches the backend clamp (50, not 20)", () 
 
 test("createTask forwards source (undefined for every typed task, unchanged wire shape)", () => {
   assert.match(apiJs, /export async function createTask\(\{[^}]*\bsource\b[^}]*\}\)/s);
-  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id \}\)/);
+  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend \}\)/);
 });
 
-test("createTask no longer sends a backend field (single in-process Claude backend; no picker)", () => {
-  assert.doesNotMatch(apiJs, /createTask\([^)]*\bbackend\b/s);
+// The board can now pick a coder backend (claude|codex|local) — this test
+// used to pin the OPPOSITE ("single in-process Claude backend; no picker").
+// That premise is gone: SUPPORTED_BACKENDS in agent/backend.py always had
+// codex/local, and only the board's composer lacked a way to reach them.
+// Updated per that feature, not deleted, per the "no net reduction in tests
+// or assertions" rule.
+test("createTask forwards backend to the wire body (board coder-backend picker)", () => {
+  assert.match(apiJs, /export async function createTask\(\{[^}]*\bbackend\b[^}]*\}\)/s);
+  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend \}\)/);
+});
+
+// ── TaskComposer.jsx — coder-backend picker (public issue #5) ──────────────
+// The board's task composer must gain a coder-backend picker whose options
+// come from the server (agent.backend.SUPPORTED_BACKENDS via GET
+// /api/config's `coder_backends`), not a hardcoded JS array, and the picker
+// must never let a user believe it changes who REVIEWS the work. There's no
+// jsdom renderer here (see the file banner), so these read source, like every
+// other .jsx assertion in this file.
+
+test("the composer's backend picker options are server-derived, never a hardcoded array", () => {
+  assert.match(composerJsx, /backendOptions\s*=\s*config\?\.coder_backends\s*\?\?\s*\[\]/,
+    "options must come from GET /api/config's coder_backends field");
+  assert.match(composerJsx, /backendOptions\.map\(/,
+    "the <option> list must be rendered FROM that server value");
+  // A backend added to SUPPORTED_BACKENDS must appear with no web change — so
+  // there must be no second, hand-written copy of the backend list anywhere
+  // in this file (e.g. ["claude", "codex", "local"]).
+  assert.doesNotMatch(composerJsx, /\[\s*["']claude["']\s*,\s*["']codex["']\s*,\s*["']local["']\s*\]/,
+    "the picker must not hardcode its own copy of SUPPORTED_BACKENDS");
+});
+
+test("the picker states, in the UI, that the choice affects the coder only", () => {
+  // Pinned roles must likewise be server-derived (agent.backend.CLAUDE_PINNED_ROLES
+  // via /api/config's claude_pinned_roles), never a second literal that could
+  // drift from the one make_backend actually enforces.
+  assert.match(composerJsx, /claudePinnedRoles\s*=\s*config\?\.claude_pinned_roles\s*\?\?\s*\[\]/);
+  // The statement must be in permanently-visible UI text, not only a hover
+  // tooltip, so a user glancing at the form can't come away believing a
+  // local/Codex model reviews its own work.
+  assert.match(composerJsx, /Coder backend only/);
+  assert.match(composerJsx, /claudePinnedRoles\.join\(", "\)/);
+  assert.match(composerJsx, /always run on Claude/);
+});
+
+test("choosing 'local' with llm.local_base_url unset is refused at COMPOSE TIME, naming the missing key", () => {
+  // Fail closed: mirrors agent.backend.make_backend's own local-config check,
+  // just moved earlier — to the picker, before task creation — never a silent
+  // fallback to claude.
+  assert.match(composerJsx,
+    /localBackendUnconfigured\s*=\s*\n?\s*backend === "local" && !String\(config\?\.llm\?\.local_base_url \|\| ""\)\.trim\(\)/);
+  // It must block submission, not just warn.
+  assert.match(composerJsx, /!localBackendUnconfigured && !busy/);
+  // The refusal message must name the actual missing config key.
+  assert.match(composerJsx, /llm\.local_base_url/);
+});
+
+test("an untouched backend control behaves exactly as before the picker existed", () => {
+  // "" (untouched) is the initial state and is forwarded as-is — the server
+  // treats a falsy `backend` as "use worker.backend", so this never overrides
+  // the config default unless the operator actually picked something.
+  assert.match(composerJsx, /const \[backend, setBackend\] = useState\(initial\?\.backend \?\? ""\)/);
+});
+
+test("App.jsx forwards the composer's chosen backend into createTask, unrecomputed", () => {
+  // Criterion 5, enforced by a CI-run gate (not the un-run Playwright suite):
+  // the value that reaches CreateTaskRequest.backend must be the exact field
+  // the composer produced, not something App.jsx derives on its own.
+  assert.match(appJsx, /backend: fields\.backend,/);
+});
+
+test("TaskComposer's onStart payload includes the chosen backend", () => {
+  assert.match(composerJsx, /onStart\(\{[\s\S]*?\bbackend,[\s\S]*?\}\)/);
 });
 
 // ── Backlog.jsx — the list ──────────────────────────────────────────────────

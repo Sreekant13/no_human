@@ -88,6 +88,13 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   const [prUrl, setPrUrl] = useState(initial?.prUrl ?? "");
   const [priority, setPriority] = useState(initial?.priority ?? "medium");
   const [planApproval, setPlanApproval] = useState(initial?.planApproval ?? false);
+  // Coder-backend picker. "" = untouched — leave it out of the request and
+  // let the server fall back to worker.backend, exactly like before this
+  // control existed. Options are never hardcoded here: they come from
+  // config.coder_backends, fetched below (GET /api/config, sourced from
+  // agent.backend.SUPPORTED_BACKENDS) — a backend added there appears in
+  // this <select> with no change to this file.
+  const [backend, setBackend] = useState(initial?.backend ?? "");
   const [files, setFiles] = useState(initial?.files ?? []);
   // undefined = fetch in flight · [] = genuinely none. The initial-[]
   // ambiguity showed 'No projects yet' during the load window and then
@@ -316,7 +323,18 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   // counts too — pasting the URL there must never be blocked by the URL field.
   const prRefMissing = needsPrUrl(kind) && !hasPrRef(prompt) && !hasPrRef(prUrl);
   const hasRepo = customRepo ? repoPath.trim() : selectedProjectId || repoPath.trim();
-  const canSubmit = Boolean(title) && Boolean(hasRepo) && !prRefMissing && !busy;
+  // Server-derived — never a second copy of SUPPORTED_BACKENDS/
+  // CLAUDE_PINNED_ROLES. Empty until GET /api/config resolves, so the
+  // picker below offers nothing (not a guess) while it is in flight.
+  const backendOptions = config?.coder_backends ?? [];
+  const claudePinnedRoles = config?.claude_pinned_roles ?? [];
+  // Fail closed at compose time (never a silent fallback to claude): 'local'
+  // needs llm.local_base_url, exactly what agent.backend.make_backend checks
+  // before the first attempt — this just moves the same refusal earlier.
+  const localBackendUnconfigured =
+    backend === "local" && !String(config?.llm?.local_base_url || "").trim();
+  const canSubmit =
+    Boolean(title) && Boolean(hasRepo) && !prRefMissing && !localBackendUnconfigured && !busy;
   // With no projects, the free-text path IS the only input — a toggle there would
   // be a no-op button whose only effect is wiping what was typed.
   const loaded = projects !== undefined;
@@ -394,6 +412,10 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
       kind,
       priority,
       planApproval,
+      // "" (untouched) is sent as-is: CreateTaskRequest.backend is falsy-or-
+      // None-means-default, so this never overrides worker.backend unless the
+      // operator actually picked something.
+      backend,
       files,
       repoPath: freeTextRepo ? repoPath.trim() || null : repoPath || null,
       projectId: !customRepo && selectedProjectId ? selectedProjectId : null,
@@ -829,6 +851,33 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
                 <option value="low">low priority</option>
               </SelectPill>
 
+              {/* Coder-backend picker. Options come from the server
+                  (GET /api/config's coder_backends, sourced from
+                  agent.backend.SUPPORTED_BACKENDS) — never a hardcoded list
+                  here, so a backend added there shows up with no web change.
+                  Affects the coder ONLY: reviewer/planner/supervisor/utility/
+                  intake stay on Claude regardless of this choice (see the
+                  title/help text below and CLAUDE_PINNED_ROLES). */}
+              {backendOptions.length > 0 && (
+                <SelectPill
+                  onPanel
+                  value={backend}
+                  onChange={(e) => setBackend(e.target.value)}
+                  aria-label="Coder backend"
+                  title={
+                    claudePinnedRoles.length > 0
+                      ? `Affects the CODER only. ${claudePinnedRoles.join(", ")} always run on Claude, ` +
+                        "no matter what you pick here — a local or Codex model never reviews its own work."
+                      : "Affects the coder only."
+                  }
+                >
+                  <option value="">worker.backend (config default)</option>
+                  {backendOptions.map((b) => (
+                    <option key={b} value={b}>{b} (coder only)</option>
+                  ))}
+                </SelectPill>
+              )}
+
               {/* GAP 1: the one toggle that answers "I am not letting an agent
                   burn millions of tokens on its own reading of my ticket".
                   Off by default - an unattended run stays unattended. */}
@@ -858,6 +907,31 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
               </div>
             </div>
           </div>
+
+          {/* Always visible, not just on hover (the SelectPill's title tooltip
+              says the same thing) — a reviewer or an operator glancing at the
+              form must not be able to come away believing this choice picks
+              who reviews the work, only who codes it. */}
+          {backendOptions.length > 0 && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">
+              Coder backend only
+              {claudePinnedRoles.length > 0
+                ? ` — ${claudePinnedRoles.join(", ")} always run on Claude, no matter what you pick here.`
+                : "."}
+            </p>
+          )}
+
+          {localBackendUnconfigured && (
+            <p
+              role="alert"
+              className="mt-2 px-5 font-ui text-sm"
+              style={{ color: "var(--red)" }}
+            >
+              The 'local' coder backend needs llm.local_base_url set in
+              config.yaml before it can be chosen here — set it, or pick a
+              different backend.
+            </p>
+          )}
 
           {files.length > 0 && (
             <div className="mt-3 px-5 font-ui text-sm text-text-muted ph-no-capture">

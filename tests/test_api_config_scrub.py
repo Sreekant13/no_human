@@ -92,3 +92,28 @@ async def test_show_config_passes_through_empty_secret_values(client):
     data = r.json()
     assert data["notify"]["password"] == ""
     assert data["notify"]["token"] is None
+
+
+@pytest.mark.asyncio
+async def test_show_config_exposes_coder_backends_from_the_one_source_of_truth(client):
+    """The board's task composer must build its coder-backend picker from
+    this field, not a hardcoded JS array — pin that the field exists and is
+    exactly `agent.backend.SUPPORTED_BACKENDS`, so a backend added there
+    shows up here (and therefore in the UI) automatically."""
+    from no_human.agent.backend import SUPPORTED_BACKENDS
+
+    r = await client.get("/api/config")
+    data = r.json()
+    assert data["coder_backends"] == list(SUPPORTED_BACKENDS)
+
+
+@pytest.mark.asyncio
+async def test_show_config_exposes_claude_pinned_roles_from_the_one_source_of_truth(client):
+    """The composer's "coder only" disclaimer must be able to name the
+    pinned roles from the same tuple `make_backend` enforces, never a second
+    literal that could drift from it."""
+    from no_human.agent.backend import CLAUDE_PINNED_ROLES
+
+    r = await client.get("/api/config")
+    data = r.json()
+    assert data["claude_pinned_roles"] == list(CLAUDE_PINNED_ROLES)

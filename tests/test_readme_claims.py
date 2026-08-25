@@ -1754,7 +1754,7 @@ CITATION_TABLE = (
     ("security.md", "cli/commands.py:2785", "cli/commands.py",
      '"gh", "pr", "merge"'),
     ("security.md", "cli/commands.py:4611", "cli/commands.py", "def approve("),
-    ("security.md", "api/app.py:1022", "api/app.py", "async def approve_task("),
+    ("security.md", "api/app.py:1023", "api/app.py", "async def approve_task("),
     ("security.md", "updates.py:44", "updates.py", "PYPI_JSON_URL"),
     ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
     ("security.md", "desktop/main.mjs:213", "desktop/main.mjs",

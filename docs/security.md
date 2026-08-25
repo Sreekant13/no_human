@@ -222,7 +222,7 @@ named here.
   act: `nh approve` refusing inside an agent session, and the four gate-ending
   routes requiring something an agent session does not have. That check is
   **not implemented today** — neither `nh approve` (`cli/commands.py:4611`)
-  nor the API's `approve_task` route (`api/app.py:1022`) tests for an agent
+  nor the API's `approve_task` route (`api/app.py:1023`) tests for an agent
   session — so nothing here should be read as telling you to rely on it.
 
   The paragraph overstated between 2026-08-12 and 2026-08-22, when `nh approve`

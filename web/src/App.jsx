@@ -366,6 +366,13 @@ function NewTaskModal({
         // GAP 1: the composer's "review plan first" toggle. Omitted-as-false
         // keeps every other caller on the unattended path.
         plan_approval: !!fields.planApproval,
+        // Coder-backend picker (issue: board can't select claude|codex|local).
+        // Untouched control → fields.backend is "" → sent as an empty string,
+        // which CreateTaskRequest.backend and the POST handler's `if
+        // body.backend:` both treat exactly like an absent field → server
+        // falls back to worker.backend, unchanged from today. Forwarded
+        // verbatim: never recomputed from other state.
+        backend: fields.backend,
       });
       // Attach any screenshots/documents to the new task (best-effort — a failed
       // upload must not lose the task that was already created).
