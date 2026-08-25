@@ -8301,6 +8301,25 @@ class Orchestrator:
             len(task.acceptance_criteria or []),
         )
 
+    async def _fail_already_satisfied(
+        self, task: Task, decision: ReviewDecision, *, attempt_id: str,
+        attempt_n: int | None, reviewed_sha: str, detail: str,
+    ) -> TaskOutcome:
+        """Record one failed already-satisfied round and its retry feedback."""
+        failed = decision.blocking_items or decision.failed_items
+        await self.store.update_attempt(
+            attempt_id, review_checklist=decision.as_dict(), review_passed=0,
+            status="failed", failure_reason=detail,
+        )
+        # Unlike `_run_review`, this gate calls `_run_reviewer` directly, so
+        # it must conclude the round and persist the feedback itself.
+        fail_round = await self._conclude_review_round(
+            task, decision, sha=reviewed_sha)
+        await self._record_review_feedback(
+            task, failed, decision.suggested_next, attempt_n=attempt_n,
+            review_round=fail_round)
+        return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
     async def _gate_already_satisfied(
         self, task: Task, repo: GitRepo, attempt_id: str, claim: str, *,
         branch: str | None, attempt_n: int | None = None,
@@ -8317,18 +8336,29 @@ class Orchestrator:
             "zero-diff ALREADY-SATISFIED claim — verifying every citation "
             "against the code",
         )
-        # Resolved ONCE, before the gate runs, and reused for the post-review
-        # stamp below (:7652) — the same string the reviewer chokepoint is
-        # handed is what `_append_review_history` records, so the two can
-        # never cite different commits (same contract as `_run_review`, C4).
-        try:
-            reviewed_sha = repo.head_sha()
-        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
-            reviewed_sha = ""
+        # Resolve and classify the exact tree BEFORE a reviewer can spend a
+        # token on it. An already-satisfied verdict is meaningful only for a
+        # tree a delivery could actually ship.
+        (shippable, reviewed_sha, subject, subject_reason, subject_on_main,
+         ship_ref) = await self._already_satisfied_subject(
+            task, repo, base=base, branch=branch)
         try:
             reviewed_branch = repo.current_branch()
         except Exception:  # noqa: BLE001 — advisory label only
             reviewed_branch = ""
+        if not shippable:
+            detail = "already-satisfied claim refused: " + subject_reason
+            self._emit_review(
+                "already_satisfied_unshippable", detail,
+                reviewed_sha=reviewed_sha, branch=branch or "",
+                ship_ref=ship_ref,
+            )
+            decision = ReviewDecision(passed=False, checklist=[ChecklistItem(
+                "already-satisfied subject tree", False, subject_reason,
+                severity="high")])
+            return await self._fail_already_satisfied(
+                task, decision, attempt_id=attempt_id, attempt_n=attempt_n,
+                reviewed_sha=reviewed_sha, detail=detail)
         advisory_pass = False
         if self.reviewer is None:
             if not (self.config.get("reviewer") or {}).get("allow_advisory", False):
@@ -8382,27 +8412,9 @@ class Orchestrator:
             failed = decision.blocking_items or decision.failed_items
             detail = "already-satisfied claim refuted: " + "; ".join(
                 f"{i.label}: {i.evidence}" for i in failed[:3])
-            await self.store.update_attempt(
-                attempt_id, review_checklist=decision.as_dict(), review_passed=0,
-                status="failed", failure_reason=detail,
-            )
-            # The refuted citations feed the next attempt's prompt, exactly like
-            # review findings on a diff. Detail differs from _NO_CHANGES_DETAIL
-            # on purpose: a refuted claim resets the zero-diff streak and gets
-            # the normal bounded retries.
-            #
-            # This route reviews via `self.reviewer.review` directly, NOT via
-            # `_run_review`, so nothing has appended this round to
-            # `review_history` yet — conclude the round explicitly (on the
-            # never-truncated `review_round_seq` counter, not on
-            # `len(review_history)`, which collides once that list has been
-            # trimmed) so the feedback is stamped with the round it belongs to.
-            fail_round = await self._conclude_review_round(
-                task, decision, sha=reviewed_sha)
-            await self._record_review_feedback(
-                task, failed, decision.suggested_next, attempt_n=attempt_n,
-                review_round=fail_round)
-            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+            return await self._fail_already_satisfied(
+                task, decision, attempt_id=attempt_id, attempt_n=attempt_n,
+                reviewed_sha=reviewed_sha, detail=detail)
         # A PASS here is a review-only round (no new commit): the branch head
         # this round actually judged, resolved at review start, exactly as
         # `_run_review` stamps it (C4, :8571-8578). Without this, `nh approve`'s
@@ -8445,7 +8457,8 @@ class Orchestrator:
             "already-satisfied claim verified by the review gate",
             review_round=review_round, reviewed_sha=reviewed_sha,
             criteria=len(task.acceptance_criteria or []),
-            advisory=advisory_pass, pr_url=pr_url,
+            advisory=advisory_pass, pr_url=pr_url, subject=subject,
+            subject_on_main=subject_on_main,
         )
 
         # Rebuild the PR body through the SAME _gather_evidence/_pr_body chain
@@ -8513,10 +8526,12 @@ class Orchestrator:
         # review, low): advisory mode says so explicitly.
         detail = (
             "already satisfied (ADVISORY — claim NOT verified, no reviewer "
-            "configured); no code change needed, awaiting your confirmation"
+            f"configured) against {subject}; no code change needed, awaiting "
+            "your confirmation"
             if advisory_pass else
             "already satisfied — the review verified every cited "
-            "criterion; no code change needed, awaiting your confirmation")
+            f"criterion against {subject}; no code change needed, awaiting "
+            "your confirmation")
         self.emit("state", detail, status="awaiting_approval")
         return TaskOutcome(task, status=TaskStatus.AWAITING_APPROVAL,
                            pr_url=(pr_url if promoted else None), detail=detail, report=claim)
@@ -9428,6 +9443,126 @@ class Orchestrator:
                 f"reviewed sha (passing rounds stamped: {sorted(shas)}) "
                 f"(human_gated_resume={human_gated_resume})")
         return tip
+
+    async def _already_satisfied_subject(
+        self, task: Task, repo, *, base: str | None, branch: str | None,
+    ) -> tuple[bool, str, str, str, bool, str]:
+        """Classify the exact tree an already-satisfied claim may judge.
+
+        A claim can describe an existing shipping tree, or the exact pushed
+        tip a delivery offers. Everything else fails closed: a reviewer must
+        never verify an unpushable checkpoint and turn it into approval proof.
+        """
+        del task  # The policy is solely about the candidate delivery tree.
+        try:
+            head = repo.head_sha().strip()
+        except Exception as exc:  # noqa: BLE001 — unreadable means unshippable
+            return False, "", "", (
+                "the sha the claim would be judged against is unresolvable "
+                f"({exc})"), False, ""
+        if not head:
+            return False, "", "", (
+                "the sha the claim would be judged against is empty"), False, ""
+
+        names: list[str] = []
+
+        def add_refs(name: str | None) -> None:
+            name = (name or "").strip()
+            if not name:
+                return
+            candidates = ((name, name.removeprefix("origin/"))
+                          if name.startswith("origin/") else
+                          (f"origin/{name}", name))
+            for candidate in candidates:
+                if candidate and candidate not in names:
+                    names.append(candidate)
+
+        try:
+            add_refs(repo.default_branch(local_only=True))
+        except Exception:  # noqa: BLE001 — candidate resolution below is proof
+            pass
+        # Some local repositories do not configure origin/HEAD (including a
+        # freshly initialized repository whose default is still main). Keep a
+        # conventional shipping ref as the final locally-verifiable fallback.
+        add_refs("main")
+        # `base` can be a historical diff baseline during recovery; it is a
+        # shipping target only when no actual default/main ref is available.
+        add_refs(base)
+
+        ship_ref = ""
+        ship_sha = ""
+        for candidate in names:
+            try:
+                ship_sha = repo.branch_sha(candidate).strip()
+            except Exception:  # noqa: BLE001 — try the next local ref
+                continue
+            if ship_sha:
+                ship_ref = candidate
+                break
+        if not ship_sha:
+            target = (base or "the default branch").strip() or "the default branch"
+            return False, head, "", (
+                f"cannot resolve the branch this task would ship to ({target})"), \
+                False, ""
+
+        try:
+            on_ship_ref = repo.is_ancestor(head, ship_sha)
+        except Exception as exc:  # noqa: BLE001 — cannot prove shipping truth
+            return False, head, "", (
+                f"cannot determine whether {head} is on {ship_ref} ({exc})"), \
+                False, ship_ref
+        if on_ship_ref:
+            return True, head, f"{head[:12]} (on {ship_ref})", "", True, ship_ref
+
+        prefix = f"{head} is not on {ship_ref}"
+        try:
+            subject = repo._run("log", "-1", "--format=%s", head,
+                                check=False).strip()
+        except Exception:  # noqa: BLE001 — the sha was resolved above
+            subject = ""
+        if subject.startswith(("[WIP-BLOCKED]", "[WIP-PARTIAL]")):
+            return False, head, "", (
+                f"{prefix}; its unfinished checkpoint subject is {subject!r}"), \
+                False, ship_ref
+        if not branch:
+            return False, head, "", (
+                f"{prefix}; no delivery branch was offered for this commit"), \
+                False, ship_ref
+        try:
+            branch_sha = repo.branch_sha(branch).strip()
+        except Exception as exc:  # noqa: BLE001 — an unresolved branch cannot ship
+            return False, head, "", (
+                f"{prefix}; delivery branch {branch!r} is unresolvable ({exc})"), \
+                False, ship_ref
+        if branch_sha != head:
+            return False, head, "", (
+                f"{prefix}; delivery branch {branch!r} points at {branch_sha}, "
+                "not the reviewed sha"), False, ship_ref
+        try:
+            remote_url = repo.remote_url()
+        except Exception as exc:  # noqa: BLE001 — a remote check must be proof
+            return False, head, "", (
+                f"{prefix}; cannot resolve origin remote ({exc})"), False, ship_ref
+        if remote_url is None:
+            return False, head, "", (
+                f"{prefix}; no origin remote exists, so nothing could have been pushed"), \
+                False, ship_ref
+        try:
+            relation = await asyncio.to_thread(repo.remote_branch_relation, branch)
+        except Exception as exc:  # noqa: BLE001 — external check must fail closed
+            return False, head, "", (
+                f"{prefix}; cannot verify pushed branch {branch!r} ({exc})"), \
+                False, ship_ref
+        if relation == "up_to_date":
+            label = f"{head[:12]} (pushed branch {branch}, not on {ship_ref})"
+            return True, head, label, "", False, ship_ref
+        relation_reason = {
+            "behind": "the remote branch contains commits the reviewer did not judge",
+            "diverged": "the remote branch diverged from the reviewed commit",
+            "unknown": "the pushed branch could not be verified",
+        }.get(relation, f"the pushed branch relation is unrecognized ({relation!r})")
+        return False, head, "", (
+            f"{prefix}; {relation_reason}"), False, ship_ref
 
     def _already_satisfied_eligible(
         self, task: Task, repo, base: str | None,

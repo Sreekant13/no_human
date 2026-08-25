@@ -4060,9 +4060,7 @@ async def test_review_only_recovery_stamp_does_not_cover_a_later_rewrite(
 async def test_review_only_recovery_round_fails_closed_on_unresolvable_head(
     bare_repo, tmp_path, store, monkeypatch
 ):
-    """If the review-only round cannot resolve the head it just judged, it
-    must NOT stamp anything — an unstamped PASS stays unmergeable rather than
-    lying about what it reviewed. Pins the fail-closed branch explicitly."""
+    """An unresolvable already-satisfied subject is refused without a stamp."""
     branch = "no-human/task-f27f3b73-unresolvable"
     _git(bare_repo, "checkout", "-b", branch)
     _commit_real_work(bare_repo)
@@ -4094,14 +4092,10 @@ async def test_review_only_recovery_round_fails_closed_on_unresolvable_head(
         attempt_n=2,
     )
 
-    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.status is TaskStatus.FAILED
     refreshed = await store.find_task(t.id)
     history = (refreshed.context or {}).get("review_history") or []
-    assert history, "the round itself must still be recorded"
-    assert history[-1]["sha"] == "", (
-        "an unresolvable head must degrade to an empty stamp, never a "
-        "fabricated one"
-    )
+    assert not history, "an unresolvable head must not fabricate a review stamp"
     monkeypatch.undo()
     real_head = repo.head_sha()
     passed, evidence = _review_pass_evidence(refreshed.context or {}, real_head, repo)
