@@ -796,6 +796,62 @@ def test_the_task_scoped_guard_lists_are_mutable_like_the_claude_backends():
     assert be._guard_events("Write", {"file_path": ".env"}) is None  # no longer listed
 
 
+def test_hygiene_violation_does_not_kill_the_attempt(monkeypatch):
+    """The `~/.cache/uv` false-positive this fix addresses: on the codex
+    backend a guard denial used to ALWAYS kill the attempt, so a false
+    "outside the worktree" venv-install verdict (advisory-shaped — bad
+    install-target hygiene, not an attack) took the whole attempt down with
+    it. A `GUARD_HYGIENE`-severity decision must instead fail only the one
+    observed call (recorded in `denials` and as a "denied" event) and let the
+    SAME already-running codex subprocess keep going — proven here by the
+    later "pushed" message still reaching the transcript, which
+    `test_a_guard_violation_kills_the_session_and_fails_the_attempt` (the
+    GUARD_DESTRUCTIVE case, unchanged) proves does NOT happen when the
+    violation is terminating."""
+    def _hygiene_decision(*_a, **_kw):
+        return cx.guard.GuardDecision(
+            False,
+            "install blocked: resolves to ~/.cache/uv, outside this "
+            "session's worktree",
+            severity=cx.guard.GUARD_HYGIENE,
+        )
+    monkeypatch.setattr(cx.guard, "evaluate", _hygiene_decision)
+    events: list[AgentEvent] = []
+    result, _proc = _run(cx.CodexBackend(env=FAKE_ENV), monkeypatch,
+                         _PUSH_TO_MAIN, on_event=events.append)
+    assert result.is_error is False
+    assert result.stop_reason != "guard"
+    assert result.denials and "cache/uv" in result.denials[0]
+    assert any(e.kind == "text" and "pushed" in e.text for e in events)
+    denied = [e for e in events if e.kind == "denied"]
+    assert len(denied) == 1
+    assert denied[0].meta["severity"] == cx.guard.GUARD_HYGIENE
+    assert denied[0].meta["terminating"] is False
+
+
+def test_destructive_violation_still_kills_the_attempt(monkeypatch):
+    """The taxonomy's default direction, checked explicitly: a
+    GUARD_DESTRUCTIVE (or GUARD_EXFILTRATION) decision still terminates the
+    attempt exactly as every post-hoc denial did before this fix — adding the
+    hygiene-class escape hatch must not soften the default."""
+    def _destructive_decision(*_a, **_kw):
+        return cx.guard.GuardDecision(
+            False, "rm -rf outside the worktree",
+            severity=cx.guard.GUARD_DESTRUCTIVE,
+        )
+    monkeypatch.setattr(cx.guard, "evaluate", _destructive_decision)
+    events: list[AgentEvent] = []
+    result, proc = _run(cx.CodexBackend(env=FAKE_ENV), monkeypatch,
+                        _PUSH_TO_MAIN, on_event=events.append)
+    assert result.is_error is True
+    assert result.stop_reason == "guard"
+    assert proc.killed is True
+    assert not any(e.kind == "text" and "pushed" in e.text for e in events)
+    denied = [e for e in events if e.kind == "denied"]
+    assert len(denied) == 1
+    assert denied[0].meta["terminating"] is True
+
+
 # --------------------------------------------------------------------------- #
 # 6. Codex: bounds, failures, and refusals                                     #
 # --------------------------------------------------------------------------- #

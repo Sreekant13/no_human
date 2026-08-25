@@ -70,12 +70,19 @@ WHAT THIS BACKEND CANNOT DO, stated here and declared in
 
   * **No PreToolUse veto.** ``codex exec`` has no hook that can deny a proposed
     tool call. ``agent.guard`` is therefore evaluated on the OBSERVED event —
-    detection, not prevention. A violation kills the session at the next event
-    boundary and fails the attempt, so the guard still has teeth, but the
-    offending command has ALREADY RUN when we see it. The sandbox flag
-    (``--sandbox read-only`` / ``workspace-write``) is the only true
-    prevention available, and it enforces "inside the workspace", not
-    "not ``.env``" and not "not a protected branch".
+    detection, not prevention — and the offending command has ALREADY RUN
+    when we see it. What happens next depends on the violation's
+    ``GuardDecision.severity``: a ``GUARD_DESTRUCTIVE``/``GUARD_EXFILTRATION``
+    violation kills the session at the next event boundary and fails the
+    attempt, same as always. A ``GUARD_HYGIENE`` violation (advisory —
+    install-target hygiene, not an attack) is recorded as a "denied" event
+    and left in ``AgentResult.denials`` for the next attempt, but does NOT
+    kill the session: the call already happened, so terminating the attempt
+    over it would only add a fatal false-positive on top of an
+    already-harmless mistake. The sandbox flag (``--sandbox read-only`` /
+    ``workspace-write``) is the only true prevention available, and it
+    enforces "inside the workspace", not "not ``.env``" and not "not a
+    protected branch".
   * **No PostToolUse hooks**, so ``supervisor_hook`` and ``lint_hook`` cannot
     fire. Passing one is an error rather than a silent no-op: a supervisor that
     never runs is worse than no supervisor, because the orchestrator reports
@@ -692,12 +699,17 @@ class CodexBackend:
     # ------------------------------------------------------------- events --
 
     def _guard_events(self, tool_name: str, tool_input: dict,
-                      cwd: str | None = None) -> str | None:
+                      cwd: str | None = None) -> tuple[str, str] | None:
         """The guard's verdict on an ALREADY-EXECUTED tool call, or None.
 
         Same pure policy as the Claude path (``agent.guard.evaluate``) — the
-        difference is entirely in the timing, and the caller acts on it by
-        killing the session rather than by denying the call. ``cwd`` is the
+        difference is entirely in the timing, and the caller acts on the
+        returned ``(reason, severity)`` pair by killing the session for
+        ``GUARD_DESTRUCTIVE``/``GUARD_EXFILTRATION`` violations, or merely
+        recording ``GUARD_HYGIENE`` ones and letting the same subprocess run
+        on — the call already happened either way, so a hygiene-class
+        violation (e.g. installing outside the worktree's own ``.venv``) has
+        nothing left to prevent by killing the attempt. ``cwd`` is the
         session's worktree, for the guard's file-existence questions.
         """
         decision = guard.evaluate(
@@ -707,7 +719,7 @@ class CodexBackend:
             readonly=self.readonly,
             cwd=cwd,
         )
-        return None if decision.allow else decision.reason
+        return None if decision.allow else (decision.reason, decision.severity)
 
     def _translate(self, msg: dict) -> list[AgentEvent]:
         """One Codex JSONL record → zero or more :class:`AgentEvent`.
@@ -969,11 +981,24 @@ class CodexBackend:
                 for event in self._translate(msg):
                     if event.kind == "tool_use":
                         turns += 1
-                        reason = self._guard_events(
+                        verdict = self._guard_events(
                             event.tool_name or "", event.tool_input or {},
                             cwd=str(cwd))
-                        if reason:
+                        if verdict:
+                            reason, severity = verdict
                             denials.append(reason)
+                            # GUARD_HYGIENE (e.g. installing outside the
+                            # worktree's own .venv) is advisory: the call
+                            # already happened and there is nothing left to
+                            # prevent by killing the attempt, so it is
+                            # recorded — visible in `denials` and as a
+                            # "denied" event — and the SAME codex subprocess
+                            # is left running. GUARD_DESTRUCTIVE and
+                            # GUARD_EXFILTRATION still terminate the attempt;
+                            # for those, the call already happened and cannot
+                            # be undone, so stopping the session is the only
+                            # remaining safety action.
+                            terminating = severity != guard.GUARD_HYGIENE
                             yield AgentEvent(
                                 "denied", text=reason,
                                 tool_name=event.tool_name,
@@ -981,12 +1006,17 @@ class CodexBackend:
                                 # DETECTION, not prevention: the call already
                                 # ran. Marked on the event so no reader can
                                 # mistake this for the Claude path's veto.
-                                meta={"post_hoc": True},
+                                meta={
+                                    "post_hoc": True,
+                                    "severity": severity,
+                                    "terminating": terminating,
+                                },
                             )
-                            stop_reason = "guard"
-                            failure = failure or (
-                                "safety guard violated (post-hoc — the codex "
-                                f"backend cannot block a call before it runs): {reason}")
+                            if terminating:
+                                stop_reason = "guard"
+                                failure = failure or (
+                                    "safety guard violated (post-hoc — the codex "
+                                    f"backend cannot block a call before it runs): {reason}")
                     elif event.kind == "text":
                         final_text = event.text or final_text
                     elif event.kind == "usage":

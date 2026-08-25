@@ -430,10 +430,30 @@ def _effective_prefixes(
         val = _flag_value(tok, nxt, _TARGET_FLAGS)
         if not val:
             continue
-        real = _safe_realpath(_join(cwd, val))
+        joined = _join(cwd, val)
+        real = _safe_realpath(joined)
         if not real:
             continue
-        owning = _venv_root_of(real) if os.path.isfile(real) else None
+        # `_venv_root_of` is asked about `joined` (the value AS GIVEN,
+        # cwd-resolved but symlinks NOT followed) rather than `real` (fully
+        # symlink-followed). `--python .venv/bin/python3` names a file
+        # inside the worktree's own venv, but `.venv/bin/python3` is
+        # routinely a SYMLINK to a base interpreter that lives entirely
+        # elsewhere — uv's managed-Python cache (`~/.cache/uv/...`),
+        # Homebrew, pyenv, `/usr/bin`, all bookkeeping/shared locations a
+        # `uv`/venv invocation touches without them being the install
+        # DESTINATION. Following that symlink before asking "which venv
+        # owns this" answers "where does the interpreter file physically
+        # live", not "which venv did the invocation name" — the wrong
+        # question. A `pyvenv.cfg` two directories above the NAMED path
+        # decides it instead: `.venv`'s own pyvenv.cfg is found before the
+        # symlink is ever followed, so the worktree's own venv resolves
+        # in-tree regardless of where its interpreter binary is symlinked
+        # to. A value naming no venv at all (a bare system interpreter,
+        # e.g. `--python /usr/bin/python3.11`) still falls through to
+        # `real` unchanged, so a genuine out-of-tree target is still
+        # blocked.
+        owning = _venv_root_of(joined) if os.path.isfile(real) else None
         candidates.add(owning or real)
 
     # The venv owning each resolved installer — for pip/python only. `pip`/

@@ -136,6 +136,12 @@ def test_verdict2_separator_inside_quoted_payload_is_denied(tmp_path):
 
 
 def test_verdict2_direct_spelling_twin_is_also_denied(tmp_path):
+    """Also stands in for verdict 3's own "direct spelling twin": both
+    verdicts' un-laundered form reduces to the exact same sequential
+    command (`cd {primary} && uv sync`), so a second, byte-identical test
+    under the verdict-3 heading tested nothing this one does not already
+    cover — consolidated here rather than kept as a duplicate (test-count
+    invariant; see this task's PR for the accounting)."""
     primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
     cmd = f"cd {primary} && uv sync"
     r = venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env)
@@ -169,12 +175,9 @@ def test_verdict3_punctuation_runs_and_groups_are_denied(tmp_path):
         assert not d.allow, f"must be blocked via evaluate(): {cmd}"
 
 
-def test_verdict3_direct_spelling_twin_is_also_denied(tmp_path):
-    primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
-    cmd = f"cd {primary} && uv sync"
-    r = venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env)
-    assert r is not None
-    assert primary in r
+# (verdict 3's own "direct spelling twin" is covered by
+# test_verdict2_direct_spelling_twin_is_also_denied above — see its
+# docstring; both verdicts' unwrapped form is the same command.)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,68 @@ def test_control_production_env_uv_commands_stay_allowed(tmp_path):
         assert r is None, f"must stay allowed under production env: {cmd} — {r}"
         d = _ev("Bash", {"command": cmd}, cwd=wt, env=prod_env)
         assert d.allow, f"must stay allowed via evaluate(): {cmd} — {d.reason}"
+
+
+# ---------------------------------------------------------------------------
+# `~/.cache/uv` false positive (the defect this task fixes). `--python`/`-p`
+# names an interpreter FILE, and a worktree's own `.venv/bin/python3` is
+# routinely a SYMLINK to a base interpreter uv manages in a cache directory
+# (`~/.cache/uv/...`) — never itself an install destination. On the codex
+# backend a guard denial is post-hoc and TERMINATES the attempt, so a false
+# "outside the worktree" verdict here was fatal, not merely a blocked call
+# (fixed separately in codex_backend.py's severity routing; these two tests
+# cover the guard's own resolution logic in isolation). Simulated with a
+# real symlink so no assumption about an actual `~/.cache/uv` layout on the
+# test machine is required.
+# ---------------------------------------------------------------------------
+
+def _mk_cache_interpreter(tmp_path):
+    """A real interpreter file OUTSIDE both `primary`/`wt` — stand-in for
+    uv's managed-Python cache, which every uv invocation touches but which
+    is never itself an install destination."""
+    cache_dir = tmp_path / "cache-uv" / "python3.12"
+    cache_dir.mkdir(parents=True)
+    interpreter = cache_dir / "python3"
+    interpreter.write_text("#!/bin/sh\nexit 0\n")
+    st = os.stat(interpreter)
+    os.chmod(interpreter, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return os.path.realpath(interpreter)
+
+
+def test_python_flag_naming_worktree_venv_via_cache_symlink_is_allowed(tmp_path):
+    """Acceptance criterion (a). The worktree's own `.venv/bin/python3` is a
+    symlink into the (simulated) uv cache — an install genuinely targeting
+    the worktree's own venv must be ALLOWED despite that cache access. RED
+    against the pre-fix code: resolving `_venv_root_of` against the fully
+    symlink-followed path finds no `pyvenv.cfg` above the cache file and
+    mis-adds the cache path itself as an out-of-tree candidate."""
+    primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
+    cached = _mk_cache_interpreter(tmp_path)
+    linked = os.path.join(wt_venv, "bin", "python3")
+    os.remove(linked)
+    os.symlink(cached, linked)
+    cmd = f"uv pip install --python {linked} foo"
+    r = venv_install_guard.denial_reason(cmd, cwd=wt, env=wt_env)
+    assert r is None, f"must stay allowed despite the cache symlink: {cmd} — {r}"
+    d = _ev("Bash", {"command": cmd}, cwd=wt, env=wt_env)
+    assert d.allow, f"must be allowed via evaluate(): {cmd} — {d.reason}"
+
+
+def test_python_flag_naming_a_genuinely_external_interpreter_stays_denied(tmp_path):
+    """Acceptance criterion (b), negative control for (a). A `--python`
+    value naming no venv at all — the same simulated cache file, named
+    DIRECTLY rather than through the worktree's own symlink — must still be
+    denied. Proves the fix does not become allow-everything: only a value
+    that structurally NAMES the worktree's own venv is spared, never an
+    arbitrary out-of-tree path."""
+    primary, primary_venv, wt, wt_venv, prod_env, wt_env = _session(tmp_path)
+    cached = _mk_cache_interpreter(tmp_path)
+    cmd = f"uv pip install --python {cached} foo"
+    r = venv_install_guard.denial_reason(cmd, cwd=wt, env=wt_env)
+    assert r is not None, f"must still be denied: {cmd}"
+    assert cached in r, f"reason must name {cached}: {r}"
+    d = _ev("Bash", {"command": cmd}, cwd=wt, env=wt_env)
+    assert not d.allow, f"must be blocked via evaluate(): {cmd}"
 
 
 # ---------------------------------------------------------------------------

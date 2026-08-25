@@ -1869,10 +1869,39 @@ _FORGE_WRITE = re.compile(
 )
 
 
+# Violation severity classes carried on a denying `GuardDecision`. Only a
+# backend that evaluates `evaluate()` POST-HOC (after the tool call already
+# ran — `BackendCapabilities.blocks_tool_calls=False`, currently the codex
+# backend) reads this: a pre-hoc backend (Claude) vetoes the ONE call before
+# it runs regardless of class, so the class is inert there. On a post-hoc
+# backend the call has already happened by the time the denial is seen, so
+# "deny" can only mean "kill the whole attempt" or "note it and let the
+# session continue" — and those are very different costs for very different
+# violations:
+#   GUARD_HYGIENE      advisory — bad install/dev-loop practice, not an
+#                       attack (e.g. installing outside the worktree's own
+#                       venv). Fail the one tool result and record it as an
+#                       instruction; the attempt is not killed for it.
+#   GUARD_DESTRUCTIVE  irreversible / data-loss risk (rm -rf, destructive
+#                       git, a forced/protected push, killing a live
+#                       server, ...). Still kills the attempt.
+#   GUARD_EXFILTRATION forbidden-path / credential / secret leak risk.
+#                       Still kills the attempt.
+# `GUARD_DESTRUCTIVE` is the default for every `GuardDecision` below that
+# does not explicitly opt into a different class — it reproduces the
+# terminate-on-any-denial behaviour every post-hoc check had before this
+# taxonomy existed, so adding the field cannot silently soften an existing
+# guard.
+GUARD_HYGIENE = "hygiene"
+GUARD_DESTRUCTIVE = "destructive"
+GUARD_EXFILTRATION = "exfiltration"
+
+
 @dataclass
 class GuardDecision:
     allow: bool
     reason: str = ""
+    severity: str = GUARD_DESTRUCTIVE
 
 
 def _path_forbidden(path: str, forbidden: list[str]) -> bool:
@@ -2634,7 +2663,11 @@ def evaluate(
         # about the operator's real primary checkout, not the repo's content.
         venv_reason = _venv_install_denial(cmd, cwd)
         if venv_reason:
-            return GuardDecision(False, venv_reason)
+            # Hygiene-class: bad install-target practice, not an attack — see
+            # GUARD_HYGIENE above. Only changes behaviour on a post-hoc
+            # backend (codex), which fails the one tool result instead of
+            # killing the attempt for it.
+            return GuardDecision(False, venv_reason, severity=GUARD_HYGIENE)
         # Kept as-is: catches `git push` spelled in ways argv analysis does not
         # reach (inside a heredoc, an alias, a quoted fragment of a larger
         # script). The argv analysis below is additive, never a replacement.
@@ -2659,6 +2692,7 @@ def evaluate(
         # `venv_install_guard`'s module docstring for the full spec.
         venv_reason = venv_install_guard.denial_reason(cmd, cwd=cwd, env=env)
         if venv_reason:
-            return GuardDecision(False, venv_reason)
+            # Hygiene-class, same reasoning as `_venv_install_denial` above.
+            return GuardDecision(False, venv_reason, severity=GUARD_HYGIENE)
 
     return GuardDecision(True)
