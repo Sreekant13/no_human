@@ -15835,11 +15835,105 @@ class Orchestrator:
             self.emit("review_routing", rt_why, route=rt_route.value)
             if rt_route is review_routing.Route.SINGLE_TURN:
                 kwargs["single_turn"] = True
-        return await self.reviewer.review(
+
+        # Worktree integrity guard (task d115e22f). Bash stays enabled for
+        # the reviewer (`docs/security.md`), so a shell redirect
+        # (`echo x > calc.py`) is not a tool call `agent/guard.py`'s
+        # PreToolUse hook ever sees — a compromised or careless review
+        # session could write into the very worktree the gate is about to
+        # judge. This snapshots the tree immediately before the ONE
+        # `self.reviewer.review(...)` call below and re-diffs it immediately
+        # after, so the check applies no matter which of the four modes
+        # reached this chokepoint.
+        #
+        # Fail-CLOSED: if the check machinery itself can't snapshot, diff, or
+        # revert, this raises `ReviewerUnavailable` — routed to escalation,
+        # never charged as a bounded coder attempt — instead of assuming the
+        # reviewer wrote nothing. A real write is reverted (targeted only —
+        # never `reset --hard`/`clean -fdx`/`stash`) and the verdict is
+        # discarded for every caller, replaced with a fresh FAIL. "Could not
+        # tell" and "the reviewer wrote something" both mean the caller does
+        # not get the session's opinion.
+        from . import reviewer_worktree
+
+        repo_path = kwargs["repo_path"]
+        timeout = reviewer_worktree.guard_config(self.config)
+
+        try:
+            before = reviewer_worktree.snapshot(repo_path, timeout=timeout)
+        except reviewer_worktree.WorktreeCheckFailed as exc:
+            self.emit(
+                "reviewer_worktree_uncheckable",
+                f"could not snapshot the worktree before the review: {exc}")
+            raise ReviewerUnavailable(
+                f"reviewer worktree could not be snapshotted: {exc}") from exc
+
+        decision = await self.reviewer.review(
             task,
             confirmed_rules=self._format_reviewer_memories() or "",
             **kwargs,
         )
+
+        try:
+            delta = reviewer_worktree.compare(repo_path, before, timeout=timeout)
+        except reviewer_worktree.WorktreeCheckFailed as exc:
+            self.emit(
+                "reviewer_worktree_uncheckable",
+                f"could not diff the worktree after the review: {exc}")
+            raise self._reviewer_worktree_unavailable(
+                f"gate integrity could not be established: {exc}", decision) from exc
+
+        if delta.is_empty():
+            return decision
+
+        reviewer_id = (f"{type(self.reviewer).__name__}:"
+                       f"{(self.config.get('llm') or {}).get('review_model', '')}")
+        self.emit(
+            "reviewer_wrote",
+            "the reviewer session modified the worktree it was reviewing",
+            reviewer_id=reviewer_id,
+            at=datetime.now(timezone.utc).isoformat(),
+            added=delta.added,
+            modified=delta.modified,
+            deleted=delta.deleted,
+            baseline_commit=before.head,
+        )
+
+        try:
+            reviewer_worktree.revert(repo_path, before, delta, timeout=timeout)
+        except reviewer_worktree.WorktreeCheckFailed as exc:
+            self.emit(
+                "reviewer_worktree_uncheckable",
+                f"could not revert the reviewer's writes: {exc}")
+            raise self._reviewer_worktree_unavailable(
+                f"gate integrity could not be established: {exc}", decision) from exc
+
+        fresh = ReviewDecision(
+            passed=False,
+            checklist=[ChecklistItem(
+                "reviewer worktree integrity", False,
+                "the reviewer wrote to the worktree it was judging "
+                f"({len(delta.added)} added, {len(delta.modified)} modified, "
+                f"{len(delta.deleted)} deleted) — reverted to the reviewed "
+                "baseline and the verdict discarded")],
+        )
+        self._carry_reviewer_usage(fresh, decision)
+        return fresh
+
+    @staticmethod
+    def _carry_reviewer_usage(target: Any, source: Any) -> None:
+        """Copy the four reviewer usage fields from *source* onto *target* —
+        the compromised/uncheckable round was still paid for, and this is
+        the one accounting channel (mirrors `reviewer._carry_usage`)."""
+        target.tokens_used = getattr(source, "tokens_used", 0)
+        target.cache_read_tokens = getattr(source, "cache_read_tokens", 0)
+        target.cache_creation_tokens = getattr(source, "cache_creation_tokens", 0)
+        target.output_tokens = getattr(source, "output_tokens", None)
+
+    def _reviewer_worktree_unavailable(self, detail: str, decision: Any) -> ReviewerUnavailable:
+        exc = ReviewerUnavailable(detail)
+        self._carry_reviewer_usage(exc, decision)
+        return exc
 
     def _resume_digest(self, task: Task) -> str:
         """Seed a resumed session with the prior blocker + reply (22.5).

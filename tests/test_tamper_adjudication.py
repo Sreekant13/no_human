@@ -141,7 +141,34 @@ async def _task(store, **ctx):
     return task
 
 
+def _ensure_git_repo(path):
+    """Make `path` a real, minimal git repo, idempotently.
+
+    `_adjudicate_tamper` routes through `orch._run_reviewer`, which snapshots
+    `repo_path` via `reviewer_worktree.snapshot()` unconditionally — for
+    every mode, `tamper_adjudication` included — before the reviewer ever
+    runs; it needs a resolvable `git rev-parse HEAD`. Production `diff_repo`
+    is always the coder's real checkout (`orchestrator.py`'s tamper-fire call
+    sites pass `repo.path`); a bare `tmp_path` is not, so these tests failed
+    closed with `WorktreeCheckFailed` before the adjudicator was ever asked
+    anything. One empty commit is enough: `before_ref="HEAD~1"` deliberately
+    still fails to resolve, matching `runner.test_file_diff`'s documented
+    best-effort `""` fallback that these tests assert on (the "TEST-FILE
+    diff" slot exists "even when git had nothing to show").
+    """
+    import subprocess
+
+    if (path / ".git").exists():
+        return
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "base"], cwd=path,
+                   check=True)
+
+
 async def _fire(orch, task, tmp_path, **kw):
+    _ensure_git_repo(tmp_path)
     return await orch._handle_tamper_fire(
         task, REPORT, repo=None, branch="nh/x", attempt_id="attempt-1",
         attempt_n=1, diff_repo=tmp_path, before_ref="HEAD~1", **kw)

@@ -55,6 +55,29 @@ def _orch(store, tmp_path, events, cfg_overlay=None):
                         event_sink=events.append)
 
 
+def _git_init(path):
+    """Make `path` a real, minimal git repo.
+
+    `orch._run_reviewer` snapshots `repo_path` via
+    `reviewer_worktree.snapshot()` unconditionally, for every mode, before the
+    reviewer ever runs — it needs a resolvable `git rev-parse HEAD`. Production
+    `repo_path` is always a real checkout; a bare `tmp_path` is not, so these
+    tests fail closed with `WorktreeCheckFailed` before `_changed_paths` (which
+    every one of them monkeypatches) is ever consulted. One empty commit is
+    enough — no test here reads real git history.
+    """
+    import subprocess
+
+    def run(*a):
+        return subprocess.run(["git", *a], cwd=path, check=True,
+                              capture_output=True)
+
+    run("init", "-q")
+    run("config", "user.email", "t@t")
+    run("config", "user.name", "t")
+    run("commit", "--allow-empty", "-qm", "base")
+
+
 def _task(**kw):
     defaults = dict(id="aaa", source="test", title="t",
                     status=TaskStatus.PENDING, acceptance_criteria=[])
@@ -338,6 +361,7 @@ async def test_a_diff_that_leaves_the_predicate_revokes_before_review(
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths",
                         lambda *a, **k: ["src/no_human/core/orchestrator.py"])
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
 
@@ -363,6 +387,7 @@ async def test_an_unreadable_diff_revokes_the_tier(store, tmp_path, monkeypatch)
     orch = _orch(store, tmp_path, [])
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths", _boom)
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
     assert not is_trivial(t)
@@ -382,6 +407,7 @@ async def test_a_prose_diff_keeps_the_bounded_review(store, tmp_path,
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths",
                         lambda *a, **k: ["notes/positioning.md"])
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
     assert is_trivial(t)
@@ -481,6 +507,7 @@ async def test_an_agent_instruction_diff_gets_the_FULL_review(
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths",
                         lambda *a, **k: [".agents/reviewer.md"])
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
 
@@ -593,6 +620,7 @@ async def test_a_gate_control_diff_gets_the_FULL_review(store, tmp_path,
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths",
                         lambda *a, **k: ["EXPORT_CLASSIFICATION.txt"])
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
     assert not is_trivial(t)
@@ -797,6 +825,7 @@ async def test_a_dependency_manifest_diff_gets_the_FULL_review(store, tmp_path,
     orch.reviewer = _Reviewer()
     monkeypatch.setattr("no_human.review.reviewer._changed_paths",
                         lambda *a, **k: ["requirements.txt", "docs/x.md"])
+    _git_init(tmp_path)
 
     await orch._run_reviewer(t, repo_path=tmp_path)
     assert not is_trivial(t), (
