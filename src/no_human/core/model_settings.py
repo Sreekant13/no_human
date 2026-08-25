@@ -22,6 +22,7 @@ from .. import config as _config
 from ..blockers.taxonomy import human_event
 from .model_catalog import (
     CODER_BACKEND_REASON,
+    REVIEWER_COST_NOTE,
     ROLES,
     _is_claude_id,
     defaults,
@@ -86,6 +87,14 @@ def _option_dict(opt: Any) -> dict[str, Any]:
         "is_default": opt.is_default,
         "note": opt.note,
         "requires_backend": opt.requires_backend,
+        # The exact sentence a PUT of this id would be refused with —
+        # options_for() leaves the coder role's `note` blank, so without this
+        # a requires_backend option would otherwise reach the browser with no
+        # explanatory text at all. Empty string (never null) for an option a
+        # PUT would accept.
+        "disabled_reason": (
+            CODER_BACKEND_REASON.format(model_id=opt.id) if opt.requires_backend else ""
+        ),
     }
 
 
@@ -117,6 +126,10 @@ def models_payload(
             "current": running[key],
             "default": defaults()[key],
             "options": [_option_dict(opt) for opt in options_for(role)],
+            # The reviewer-only cost/quality note (REVIEWER_COST_NOTE); every
+            # other role carries "" — the A/B evidence only exists for this
+            # role's tier decision (see model_catalog.py / config.py).
+            "cost_note": REVIEWER_COST_NOTE if role == "reviewer" else "",
         }
         for role, key in ROLES.items()
     ]

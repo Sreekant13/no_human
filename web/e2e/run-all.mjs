@@ -36,6 +36,7 @@ const SUITES = [
   ["onboarding summary counts", "onboarding-summary-counts.mjs"],
   ["settings a11y", "settings-a11y.mjs"],
   ["settings account", "settings-account.mjs"],
+  ["models pane", "models-pane.mjs"],
   ["rules archive", "rules-archive.mjs"],
   ["failure reason", "failure-reason.mjs"],
   ["grill a11y", "grill-a11y.mjs"],

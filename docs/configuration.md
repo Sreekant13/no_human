@@ -473,6 +473,27 @@ calls, and prints a `restart required` reminder on success. A refusal exits
 non-zero with the same message text the API would have returned in its 422
 body.
 
+**Settings → Models** (board UI) is a third front door onto the same two
+endpoints — it adds no new server behavior. It renders one row per role in
+the order `GET /api/models` returns them, each row's `<select>` built
+entirely from that role's `options`: an option the server marked
+`requires_backend` is rendered `disabled`, with the server's
+`disabled_reason` as the option's title (the coder role is the only one that
+can have such an option today — the other four roles are pinned to Claude
+ids, so there is nothing on their menu to disable). A role whose `note` is
+non-empty (every pinned role) shows it under the row; the reviewer row alone
+may also carry a `cost_note` — the same evidence sentence documented next to
+`review_model`'s default, describing the operator's A/B revert — and no
+other role has one. "Save" PUTs only the roles the user actually changed;
+"Reset to defaults" PUTs every role currently off its default back to it,
+or an empty body if nothing has drifted. Either action refreshes the pane
+from the response, and a `restart_required: true` on that response shows the
+same restart banner the Account panel uses for a profile switch. A `422`
+reverts every pending edit in the pane, not just the field that caused it —
+the server validates the whole submitted body before writing any of it, so a
+partial revert would misrepresent what's actually on disk — and shows the
+server's message text verbatim.
+
 ## `learning:` — memory lifecycle
 
 Memory lifecycle C (`docs/design/memory-lifecycle-triage.md`) — retirement and

@@ -197,6 +197,27 @@ def test_the_note_says_vendor_not_tier():
 
 
 # --------------------------------------------------------------------------
+# reviewer cost note (model picker part 3 — Settings pane's costNote)
+# --------------------------------------------------------------------------
+
+
+def test_reviewer_cost_note_is_non_empty_and_names_the_measured_numbers():
+    note = mc.REVIEWER_COST_NOTE
+    assert note != ""
+    # It must cite the actual A/B measurements, not just assert a conclusion —
+    # this is the evidence sentence the Settings pane's reviewer row shows
+    # verbatim (ModelsPanel.jsx's costNote), so a vague restatement would be a
+    # silent regression even though it stays non-empty.
+    assert "2026-08-11" in note
+    assert "claude-opus-5" in note
+    assert "claude-opus-4-8" in note
+    assert "15/16" in note and "2/4" in note
+    assert "14/16" in note and "0/4" in note
+    assert "3x" in note
+    assert "7x" in note
+
+
+# --------------------------------------------------------------------------
 # vendor rule
 # --------------------------------------------------------------------------
 

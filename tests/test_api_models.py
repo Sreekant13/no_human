@@ -128,6 +128,42 @@ async def test_get_models_restart_required_true_when_disk_diverges_from_running(
     assert util["current"] == "claude-haiku-4-5"
 
 
+@pytest.mark.asyncio
+async def test_get_models_disabled_reason_matches_requires_backend_exactly(client):
+    """Model picker part 3 (Settings pane) renders an option `disabled` iff
+    the server marked it `requires_backend`, using `disabled_reason` as the
+    reason text — so the wire contract must hold both directions: every
+    `requires_backend: true` option carries a non-empty reason naming
+    `worker.backend` (the knob the pane's note tells the user to use
+    instead), and every `requires_backend: false` option carries `""`, never
+    a stale leftover reason."""
+    r = await client.get("/api/models")
+    body = r.json()
+    for row in body["roles"]:
+        for opt in row["options"]:
+            if opt["requires_backend"]:
+                assert opt["disabled_reason"] != "", (row["role"], opt["id"])
+                assert "worker.backend" in opt["disabled_reason"]
+                assert opt["id"] in opt["disabled_reason"]
+            else:
+                assert opt["disabled_reason"] == "", (row["role"], opt["id"])
+
+
+@pytest.mark.asyncio
+async def test_get_models_cost_note_is_reviewer_only_and_matches_the_catalog(client):
+    """Only the reviewer row may carry a `cost_note` (the A/B-revert evidence
+    ModelsPanel.jsx renders under that row) — every other role's is `""`, and
+    the reviewer's is the catalog constant verbatim, not a re-derived or
+    truncated copy."""
+    r = await client.get("/api/models")
+    body = r.json()
+    for row in body["roles"]:
+        if row["role"] == "reviewer":
+            assert row["cost_note"] == mc.REVIEWER_COST_NOTE
+        else:
+            assert row["cost_note"] == ""
+
+
 # --------------------------------------------------------------------------- #
 # PUT /api/config/models — refusals                                          #
 # --------------------------------------------------------------------------- #

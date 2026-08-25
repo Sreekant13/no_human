@@ -391,6 +391,27 @@ export async function setAuthToken(profile, token) {
   return _put("/api/auth/token", { profile, token });
 }
 
+// Settings → Models pane. Returns null when the endpoint is absent (an older
+// server build) OR when the SPA catch-all answers with `index.html` at status
+// 200 instead of real JSON — `r.json()` on an HTML body throws, and that
+// throw is caught here the same way a network failure is, so the pane always
+// degrades to its "unavailable" note rather than rendering an empty select.
+export async function fetchModels() {
+  try {
+    const r = await fetch(`${BASE}/api/models`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+// Write a `{config_key: model_id}` subset to llm.*. `_put` throws
+// Error(detail) verbatim on a 422 — a single unattributed string naming
+// nothing was written, since apply_model_changes validates every submitted
+// key before writing any of them.
+export const saveModels = (body) => _put("/api/config/models", body);
+
 // C3-G3: the repos the operator knows (for the repo-understanding picker).
 export async function fetchRepos() {
   try {

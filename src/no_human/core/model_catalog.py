@@ -55,6 +55,7 @@ __all__ = [
     "PINNED_ROLES",
     "VENDOR_PIN_NOTE",
     "CODER_BACKEND_REASON",
+    "REVIEWER_COST_NOTE",
     "PriceInfo",
     "ModelOption",
     "options_for",
@@ -102,6 +103,21 @@ CODER_BACKEND_REASON = (
     "{model_id!r} cannot be set as llm.primary_model: only the Claude backend "
     "reads that key (agent/backend.py make_backend). Choose the backend with "
     "worker.backend, and set llm.codex_model / llm.local_model for those."
+)
+
+# Cost/quality honesty for the reviewer row: the operator's own 2026-08-11 A/B
+# (config.py, next to the `review_model` default) is a comment today, which no
+# payload can read. This constant quotes the same measured numbers rather than
+# re-summarizing them, so a future re-measurement has one place to update in
+# code (config.py's comment) and one place to update in text (here) — neither
+# moves or restates the other. Reviewer-only: no other role has this evidence.
+REVIEWER_COST_NOTE = (
+    "The operator's 2026-08-11 A/B reverted this role from claude-opus-5 back "
+    "to claude-opus-4-8: 4.8 scored higher on the same review prompt "
+    "(15/16 recall + 2/4 specificity vs. opus-5's 14/16 + 0/4), and opus-5 as "
+    "reviewer measured about 3x the round duration (360s -> ~1078s) and about "
+    "7x the session cost from tool-call sprawl. See config.py's review_model "
+    "default for the full evidence."
 )
 
 # Coarse price-class thresholds, on the INPUT rate ($/MTok). Named constants

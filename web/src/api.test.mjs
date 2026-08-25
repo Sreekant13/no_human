@@ -16,7 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   uploadAttachment, finishReview, replyTask, chooseBlockerOption, sendBack,
-  approveTask, createTask, fetchIntegrations,
+  approveTask, createTask, fetchIntegrations, fetchModels, saveModels,
 } from "./api.js";
 
 /** Make the next fetch answer with `status` and the given JSON body. */
@@ -147,4 +147,51 @@ test("fetchIntegrations does not mistake an HTML 200 from the SPA catch-all for 
     json: async () => { throw new SyntaxError("Unexpected token <"); },
   });
   assert.deepEqual(await fetchIntegrations(), { integrations: [] });
+});
+
+// ── fetchModels / saveModels (Settings → Models pane) ───────────────────────
+
+test("fetchModels resolves with the payload on a healthy 200", async () => {
+  const payload = { roles: [{ role: "coder", key: "primary_model" }], restart_required: false };
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => payload });
+  assert.deepEqual(await fetchModels(), payload);
+});
+
+test("fetchModels returns null on a non-ok response, never throws", async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  assert.equal(await fetchModels(), null);
+});
+
+test("fetchModels returns null when the request never got an answer at all", async () => {
+  globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+  assert.equal(await fetchModels(), null);
+});
+
+test("fetchModels returns null on an HTML 200 from the SPA catch-all (older server build)", async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+  });
+  assert.equal(await fetchModels(), null);
+});
+
+test("saveModels PUTs exactly the given body to /api/config/models", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url: String(url), method: opts?.method, body: JSON.parse(opts.body) });
+    return { ok: true, status: 200, json: async () => ({ roles: [], restart_required: true }) };
+  };
+  await saveModels({ review_model: "claude-opus-5" });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/api\/config\/models$/);
+  assert.equal(calls[0].method, "PUT");
+  assert.deepEqual(calls[0].body, { review_model: "claude-opus-5" });
+});
+
+test("saveModels throws the server's 422 detail verbatim, and nothing else", async () => {
+  const detail = "'gpt-5.4' is not a Claude model. This role always runs on the Claude backend.";
+  stubFetch({ status: 422, body: { detail } });
+  const err = await saveModels({ review_model: "gpt-5.4" }).then(() => null, (e) => e);
+  assert.ok(err instanceof Error);
+  assert.equal(err.message, detail);
 });

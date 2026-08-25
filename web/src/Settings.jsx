@@ -29,6 +29,7 @@ import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
 import { updateNotice } from "./updateNotice.js";
 import IntegrationsPanel from "./Integrations.jsx";
+import ModelsPanel from "./ModelsPanel.jsx";
 
 const SECTIONS = [
   { key: "projects",  label: "Projects" },
@@ -36,6 +37,7 @@ const SECTIONS = [
   { key: "skills",    label: "Skills" },
   { key: "learnings", label: "Learnings" },
   { key: "integrations", label: "Integrations" },
+  { key: "models",    label: "Models" },
   { key: "account",   label: "Account" },
   { key: "insights",  label: "Usage insights" },
   { key: "updates",   label: "Updates" },
@@ -489,6 +491,7 @@ export default function SettingsOverlay({ onClose }) {
             {section === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
             {section === "learnings" && <LearningsPanel />}
             {section === "integrations" && <IntegrationsPanel />}
+            {section === "models"      && <ModelsPanel />}
             {section === "account"     && <AuthPanel />}
             {section === "insights"    && <UsageInsightsPanel />}
             {section === "updates"     && <UpdatesPanel />}
