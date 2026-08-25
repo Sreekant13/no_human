@@ -2178,3 +2178,48 @@ def test_verification_md_publishes_the_recall_figure(verification_doc):
         "verification.md still claims no recall number is published, but "
         "one now is"
     )
+
+
+_BOUNDS_SECTION = ("## When it cannot finish", "\n## ")
+_BOUNDS_DOC_LOCATION = 'docs/verification.md:175-176 ("When it cannot finish")'
+
+
+def _bounds_paragraph(verification_doc: str) -> str:
+    """Return the bounded-loop paragraph, or "" if its heading was removed."""
+    return _slice_between(verification_doc, *_BOUNDS_SECTION)
+
+
+def test_verification_md_bounds_numbers_match_config(verification_doc):
+    """Pin the paragraph's three bounded-loop defaults to the actual config.
+
+    ``max_turns_per_attempt`` is also covered by
+    ``test_prose_default_matches_config``, but that guard scans every documented
+    surface. This one is deliberately narrower: it pins this one paragraph and
+    is the only guard for ``max_attempts`` and ``lifetime_attempts``.
+    """
+    paragraph = _bounds_paragraph(verification_doc)
+    assert paragraph, (
+        f"{_BOUNDS_DOC_LOCATION} - bounds section is missing; this guard "
+        "must not pass vacuously"
+    )
+    normalized = re.sub(r"\s+", " ", paragraph)
+
+    for key in ("max_attempts", "max_turns_per_attempt", "lifetime_attempts"):
+        actual = DEFAULT_CONFIG["bounds"][key]
+        matches = re.findall(
+            rf"`?bounds\.{key}`?[^.]*?(?:\(defaults?\s*(?:to)?\s*:?\s*(\d+)\)|"
+            rf"\bis\s+(\d+)\b|\bdefaults?\s+to\s+(\d+)\b)",
+            normalized,
+        )
+        stated = [int(next(value for value in match if value)) for match in matches]
+        assert stated, (
+            f"{_BOUNDS_DOC_LOCATION} - bounds.{key}: no stated default found; "
+            "the claim was dropped (this guard was about to pass vacuously) or "
+            "reworded past this pattern — widen the pattern"
+        )
+        for found in stated:
+            assert found == actual, (
+                f"{_BOUNDS_DOC_LOCATION} - bounds.{key}: expected {actual} "
+                f'(DEFAULT_CONFIG["bounds"]["{key}"], src/no_human/config.py), '
+                f'found {found} in the "When it cannot finish" paragraph'
+            )
