@@ -29,7 +29,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 import re
+import stat
 import shutil
 import subprocess
 from pathlib import Path
@@ -1783,3 +1785,578 @@ def test_the_docs_state_the_verified_cli_version_and_the_entitlement_rule():
     assert "/v1/responses" in docs, (
         "the docs must state model entitlement needs a billed /v1/responses "
         "call — a doctor pass is not proof the configured model works")
+
+
+# --------------------------------------------------------------------------- #
+# 13. The write site owns its target.                                          #
+#                                                                              #
+#     PROPERTY: every path `materialise_api_key_auth` writes to resolves       #
+#     strictly inside no_human's own root.                                     #
+#                                                                              #
+#     Before this section `materialise_api_key_auth` had NO direct test of any #
+#     kind, and trusted its `home` argument. `home = Path.home() / ".codex"`   #
+#     passed the whole suite — including                                       #
+#     `test_no_source_file_touches_the_chatgpt_credential_file`, which forbids #
+#     the TEXT "auth.json" while this module assembles that filename from two  #
+#     fragments. A lexical guard cannot enforce a capability; these tests       #
+#     exercise the write itself.                                               #
+# --------------------------------------------------------------------------- #
+
+_CRED = "auth" + ".json"
+
+
+def test_materialise_writes_a_600_credential_inside_no_human_root(tmp_path):
+    """Positive control. Without it, every refusal test below would pass
+    equally well against a function that refuses everything."""
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+
+    cx.materialise_api_key_auth("sk-live-key", home, base=nh_root)
+
+    written = home / _CRED
+    assert json.loads(written.read_text()) == {
+        "auth_mode": "apikey", "OPENAI_API_KEY": "sk-live-key",
+    }
+    assert oct(written.stat().st_mode)[-3:] == "600"
+
+
+def test_materialise_refuses_the_operators_own_credential_directory(tmp_path):
+    """THE ATTACK, constructed rather than described.
+
+    This is the defect the review found: the write happens BEFORE
+    `assert_api_key_billing_path`, so a later refusal cannot un-destroy the
+    file. The assertion is on the victim's BYTES, not on the exception —
+    raising after clobbering would still be a total failure.
+    """
+    fake_home = tmp_path / "home"
+    nh_root = fake_home / ".no_human"
+    nh_root.mkdir(parents=True)
+    operators_codex = fake_home / ".codex"
+    operators_codex.mkdir()
+    victim = operators_codex / _CRED
+    victim.write_bytes(b'{"tokens":{"access_token":"REAL-CHATGPT-SESSION"}}')
+    before = victim.read_bytes()
+
+    with pytest.raises(cx.CodexAuthError):
+        cx.materialise_api_key_auth("sk-x", operators_codex, base=nh_root)
+
+    assert victim.read_bytes() == before, (
+        "materialise_api_key_auth overwrote the operator's live ChatGPT "
+        "credential — the file this product is required never to read, "
+        "parse, copy or overwrite, in either auth mode"
+    )
+
+
+def test_materialise_refuses_a_symlink_that_points_out_of_the_root(tmp_path):
+    """The string-vs-capability test.
+
+    `link` is LITERALLY under the root — any implementation comparing path
+    text passes this and still destroys the victim. Only resolving both sides
+    catches it.
+    """
+    nh_root = tmp_path / ".no_human"
+    nh_root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / _CRED
+    victim.write_bytes(b"REAL-CREDENTIAL")
+    link = nh_root / "codex-home"
+    link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(cx.CodexAuthError):
+        cx.materialise_api_key_auth("sk-x", link, base=nh_root)
+
+    assert victim.read_bytes() == b"REAL-CREDENTIAL"
+
+
+def test_materialise_refuses_a_parent_traversal_back_out_of_the_root(tmp_path):
+    nh_root = tmp_path / ".no_human"
+    (nh_root / "codex-home").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / _CRED
+    victim.write_bytes(b"REAL-CREDENTIAL")
+
+    escape = nh_root / "codex-home" / ".." / ".." / "elsewhere"
+    with pytest.raises(cx.CodexAuthError):
+        cx.materialise_api_key_auth("sk-x", escape, base=nh_root)
+
+    assert victim.read_bytes() == b"REAL-CREDENTIAL"
+
+
+def test_materialise_cannot_truncate_through_a_symlinked_temp_path(tmp_path):
+    """Containment covers the DIRECTORY; this covers the final component.
+
+    The temp open used `O_TRUNC`, which follows a planted symlink and
+    truncates the victim BEFORE any rename — the directory check alone was
+    not enough. This test originally asserted `pytest.raises(OSError)`, which
+    pinned the MECHANISM (`O_NOFOLLOW` rejecting the link) rather than the
+    property. Unlink-then-`O_EXCL` now drops our name for the link and writes
+    correctly instead of raising — strictly better behaviour that the old
+    assertion called a failure. The assertion is therefore on what actually
+    matters: the victim's bytes, and the credential landing in the right file.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / "precious"
+    victim.write_bytes(b"PRECIOUS")
+    (home / f".{cx._CODEX_HOME_CRED_NAME}.tmp").symlink_to(victim)
+
+    cx.materialise_api_key_auth("sk-x", home, base=nh_root)
+
+    assert victim.read_bytes() == b"PRECIOUS", (
+        "a symlink at the temp path captured the write")
+    assert json.loads((home / _CRED).read_text())["OPENAI_API_KEY"] == "sk-x"
+
+
+# --------------------------------------------------------------------------- #
+# 14. The api_key gate fails CLOSED on every observation that is not an        #
+#     unambiguous api_key session.                                             #
+#                                                                              #
+#     The `via` values below are written out by hand, NOT read back from       #
+#     `codex_login_status`. A set derived from the code under test could only  #
+#     ever confirm the code agrees with itself; it could not notice a new      #
+#     wording the parser starts emitting, which is exactly the case that must  #
+#     refuse. The list therefore includes values the parser does not currently #
+#     produce ("", "apikey", "API_KEY").                                       #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("via", [
+    "chatgpt", "unknown", "none", "", "apikey", "API_KEY", "api key", "oauth",
+])
+def test_the_gate_refuses_every_via_that_is_not_exactly_api_key(
+    monkeypatch, tmp_path, via,
+):
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda *a, **k: cx.CodexSessionStatus(present=True, via=via, detail="d"),
+    )
+    with pytest.raises(cx.CodexAuthError):
+        cx.assert_api_key_billing_path("/bin/codex", tmp_path, timeout_s=1.0)
+
+
+def test_the_gate_refuses_an_absent_session_even_when_via_says_api_key(
+    monkeypatch, tmp_path,
+):
+    """`present=False` is how a timeout, a missing CLI, a permission error and
+    a non-zero exit all arrive. Each must refuse exactly as a missing key
+    does — never be read as 'no evidence of a problem'."""
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda *a, **k: cx.CodexSessionStatus(
+            present=False, via="api_key", detail="timeout"),
+    )
+    with pytest.raises(cx.CodexAuthError):
+        cx.assert_api_key_billing_path("/bin/codex", tmp_path, timeout_s=1.0)
+
+
+def test_the_gate_admits_a_genuine_api_key_session(monkeypatch, tmp_path):
+    """Positive control for section 14 — proves the eight refusals above are
+    the gate discriminating, not the gate refusing everything."""
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda *a, **k: cx.CodexSessionStatus(
+            present=True, via="api_key", detail="d"),
+    )
+    status = cx.assert_api_key_billing_path("/bin/codex", tmp_path, timeout_s=1.0)
+    assert status.via == "api_key"
+
+
+def test_the_gate_never_puts_the_probe_detail_in_the_refusal(
+    monkeypatch, tmp_path,
+):
+    """`detail` can echo account identifiers, so it must not reach the
+    message an operator sees or a log captures."""
+    secret = "account-id-4815162342"
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda *a, **k: cx.CodexSessionStatus(
+            present=True, via="chatgpt", detail=secret),
+    )
+    with pytest.raises(cx.CodexAuthError) as exc:
+        cx.assert_api_key_billing_path("/bin/codex", tmp_path, timeout_s=1.0)
+    assert secret not in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# 15. Two escapes an independent review found AFTER section 13 was written.    #
+#     Both reached an inode outside the root through a name inside it, which   #
+#     is the class a path-resolution check structurally cannot see.            #
+# --------------------------------------------------------------------------- #
+
+def test_a_hard_link_at_the_temp_path_cannot_capture_the_write(tmp_path):
+    """`O_NOFOLLOW` did NOT cover this, though a comment claimed it did.
+
+    A symlink at the temp path is rejected by `O_NOFOLLOW`; a HARD LINK is
+    indistinguishable from the file itself, so the write landed in a victim
+    outside the root — destroying it and copying the API key into it, which
+    is strictly worse than the truncation the symlink case defends against,
+    under the same precondition. Unlink-then-`O_EXCL` drops our name for the
+    link before opening, so the victim keeps its own.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"PRECIOUS")
+    os.link(victim, home / f".{_CRED}.tmp")
+
+    cx.materialise_api_key_auth("sk-ATTACKER-KEY", home, base=nh_root)
+
+    assert victim.read_bytes() == b"PRECIOUS", (
+        "a hard link at the temp path captured the write: the victim outside "
+        "the root was overwritten")
+    assert b"sk-ATTACKER-KEY" not in victim.read_bytes()
+    assert json.loads((home / _CRED).read_text())["OPENAI_API_KEY"] == "sk-ATTACKER-KEY"
+
+
+def test_codex_api_key_home_refuses_before_it_chmods_anything(tmp_path):
+    """The guard has to run in the CALLER too.
+
+    `codex_api_key_home` did `mkdir(exist_ok=True)` then `chmod(0o700)` with
+    no check of its own. `mkdir` succeeds on an existing symlink and `chmod`
+    FOLLOWS it, so a symlinked `codex-home` re-permissioned a directory
+    outside the root a full call before the write-site guard could refuse —
+    the same act-then-refuse shape, moved into the caller.
+
+    The assertion is the victim directory's MODE, not the exception: raising
+    after chmodding would still be a failure.
+
+    ON ABLATION, so a reviewer does not re-derive it: `codex_api_key_home`
+    carries TWO checks that each independently prevent this — the
+    `is_symlink` loop and the pre-`mkdir` containment call. Removing EITHER
+    alone leaves this test green, because the other still refuses; removing
+    BOTH turns it red (measured). What is pinned here is the PROPERTY
+    "nothing outside the root is mutated", not either mechanism. That is
+    deliberate redundancy, not two uncovered ablations — but it does mean
+    this test cannot tell you which check is load-bearing, and neither can
+    the suite.
+    """
+    nh_root = tmp_path / ".no_human"
+    nh_root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    outside.chmod(0o755)
+    before = stat.S_IMODE(outside.stat().st_mode)
+    (nh_root / "codex-home").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(cx.CodexAuthError):
+        cx.codex_api_key_home(base=nh_root)
+
+    assert stat.S_IMODE(outside.stat().st_mode) == before, (
+        "codex_api_key_home chmod'd a directory outside no_human's root "
+        "through a symlink, before any containment check ran")
+
+
+def test_codex_api_key_home_returns_a_usable_home_when_nothing_is_planted(tmp_path):
+    """Positive control for the two refusals above."""
+    nh_root = tmp_path / ".no_human"
+    home = cx.codex_api_key_home(base=nh_root)
+    assert home == (nh_root / "codex-home").resolve()
+    assert home.is_dir() and not home.is_symlink()
+    assert oct(home.stat().st_mode)[-3:] == "700"
+
+
+def test_the_root_itself_is_not_an_acceptable_credential_home(tmp_path):
+    """`strictly inside` is now literally true.
+
+    The check used to read `resolved != root and root not in resolved.parents`,
+    which ADMITTED `home == root` while three docstrings said "strictly
+    inside". Nothing pinned it in either direction, so the wording and the
+    code could drift apart unnoticed. `codex_api_key_home` never returns the
+    root, so admitting it was latitude with no caller — removed, and pinned
+    here.
+    """
+    nh_root = tmp_path / ".no_human"
+    nh_root.mkdir()
+    with pytest.raises(cx.CodexAuthError):
+        cx.materialise_api_key_auth("sk-x", nh_root, base=nh_root)
+    assert not (nh_root / _CRED).exists()
+
+
+def test_a_symlink_loop_refuses_as_CodexAuthError_not_as_RuntimeError(tmp_path):
+    """The contract is CodexAuthError; a symlink LOOP used to escape untyped.
+
+    `Path.resolve()` reports a loop as RuntimeError on CPython <=3.12, NOT as
+    OSError, so the `except OSError` clause did not catch it and the caller saw
+    a bare RuntimeError from a function whose docstring promises CodexAuthError.
+    Fail-closed held either way — nothing was written — but the exception type
+    is part of the contract, and an untyped escape is what callers cannot
+    handle. This pins the TYPE, which is the whole defect.
+    """
+    nh_root = tmp_path / ".no_human"
+    nh_root.mkdir()
+    home = nh_root / "codex-home"
+    loop = nh_root / "loop-partner"
+    home.symlink_to(loop)
+    loop.symlink_to(home)
+    # Control: this really is a loop on this interpreter, not a missing path.
+    with pytest.raises(RuntimeError):
+        home.resolve()
+    with pytest.raises(cx.CodexAuthError):
+        cx.materialise_api_key_auth("sk-x", home, base=nh_root)
+    assert not (nh_root / _CRED).exists()
+
+
+# --------------------------------------------------------------------------- #
+# 16. The three mechanisms in the temp-file open, pinned SEPARATELY.           #
+#                                                                              #
+#     A prior commit message claimed "O_EXCL reverted to O_TRUNC -> RED (2)".  #
+#     An independent review re-ran it flag by flag and measured GREEN: the     #
+#     mutation had ALSO dropped the `unlink`, and the unlink alone was         #
+#     carrying the whole defence. `O_EXCL` and `O_NOFOLLOW` were pinned by     #
+#     nothing while being asserted as pinned — the worst state for a security  #
+#     mechanism, because the next refactor deletes it silently.                #
+#                                                                              #
+#     Each test below neutralises `unlink` so the FLAG is what is under test.  #
+#     A no-op unlink is not artificial: it is precisely the state a lost       #
+#     unlink->open race leaves behind.                                         #
+# --------------------------------------------------------------------------- #
+
+def _neuter_unlink(monkeypatch):
+    monkeypatch.setattr(Path, "unlink", lambda self, missing_ok=False: None)
+
+
+def test_O_EXCL_alone_stops_a_hard_link_when_the_unlink_is_lost(
+    tmp_path, monkeypatch,
+):
+    """Isolates `O_EXCL`. With the unlink neutered, only `O_EXCL` stands
+    between a planted hard link and the victim's bytes."""
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"PRECIOUS")
+    os.link(victim, home / f".{_CRED}.tmp")
+    _neuter_unlink(monkeypatch)
+
+    with pytest.raises(OSError):
+        cx.materialise_api_key_auth("sk-ATTACKER", home, base=nh_root)
+
+    assert victim.read_bytes() == b"PRECIOUS", (
+        "O_EXCL did not stop the write when the unlink was lost")
+    assert b"sk-ATTACKER" not in victim.read_bytes()
+
+
+def test_a_symlink_at_the_temp_path_cannot_capture_the_write(
+    tmp_path, monkeypatch,
+):
+    """Same construction as the hard-link test, for a symlink.
+
+    NOT named for `O_NOFOLLOW`: measured, NEITHER flag carries this test alone.
+    `O_CREAT|O_EXCL` raises `FileExistsError` on a symlink and `O_NOFOLLOW`
+    raises `ELOOP`, so removing EITHER one alone leaves this test green and only
+    removing BOTH turns it red. The test is carried by their disjunction, and
+    neither flag is individually pinned here — said explicitly because a test
+    name is a coverage claim, and an earlier name claimed coverage this test
+    does not have.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"PRECIOUS")
+    (home / f".{_CRED}.tmp").symlink_to(victim)
+    _neuter_unlink(monkeypatch)
+
+    with pytest.raises(OSError):
+        cx.materialise_api_key_auth("sk-ATTACKER", home, base=nh_root)
+
+    assert victim.read_bytes() == b"PRECIOUS", (
+        "O_NOFOLLOW did not stop the write when the unlink was lost")
+
+
+def test_a_symlink_planted_at_close_cannot_capture_the_mode_change(
+    tmp_path, monkeypatch,
+):
+    """Isolates `os.fchmod` from a path-based `os.chmod`.
+
+    The previous version of this test planted NO symlink and asserted a victim
+    it could not reach — structurally incapable of failing on the mechanism its
+    name claimed. An independent review measured the single-mechanism mutation
+    (`os.fchmod(fh.fileno(), ...)` -> `os.chmod(tmp, ...)` after close) as
+    GREEN while the commit message asserted that row was RED.
+
+    The window is real and this closes it deterministically rather than by
+    racing: the file object's `close` is wrapped so the symlink is planted at
+    exactly the moment the descriptor goes away. `fchmod` runs INSIDE the
+    `with`, on the descriptor, so it is already done; a path-based `chmod`
+    after the `with` would follow the freshly planted link and re-permission a
+    file outside the root.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"PRECIOUS")
+    victim.chmod(0o644)
+    tmp = home / f".{_CRED}.tmp"
+
+    real_fdopen = os.fdopen
+
+    def planting_fdopen(fd, *a, **k):
+        fh = real_fdopen(fd, *a, **k)
+        real_close = fh.close
+
+        def close_then_plant():
+            real_close()
+            tmp.unlink(missing_ok=True)
+            tmp.symlink_to(victim)
+
+        fh.close = close_then_plant
+        return fh
+
+    monkeypatch.setattr(os, "fdopen", planting_fdopen)
+
+    try:
+        cx.materialise_api_key_auth("sk-x", home, base=nh_root)
+    except OSError:
+        pass  # refusing outright is also an acceptable outcome
+
+    assert oct(victim.stat().st_mode)[-3:] == "644", (
+        "a symlink planted at close captured the mode change — the chmod "
+        "followed a path instead of acting on the descriptor")
+    assert victim.read_bytes() == b"PRECIOUS"
+
+
+def test_the_open_mode_narrows_the_file_before_any_bytes_are_written(
+    tmp_path, monkeypatch,
+):
+    """Pins the explicit `0o600` on `os.open`, which was load-bearing and
+    unpinned while the commit message called it pinned.
+
+    `fchmod` runs AFTER the payload is written, so without the explicit open
+    mode the whole credential sits on disk at the umask default — measured at
+    0755 under umask 022 — for the duration of the write. Asserting the final
+    mode cannot see that; this asserts the mode observed at the moment
+    `fchmod` is called, which is the last instant the earlier window is still
+    visible.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    seen: dict[str, int] = {}
+    real_fchmod = os.fchmod
+
+    def spy(fd, mode):
+        seen["before"] = stat.S_IMODE(os.fstat(fd).st_mode)
+        return real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", spy)
+    previous = os.umask(0o022)
+    try:
+        cx.materialise_api_key_auth("sk-x", home, base=nh_root)
+    finally:
+        os.umask(previous)
+
+    assert seen.get("before") == 0o600, (
+        f"the credential was written into a {oct(seen.get('before', 0))} file "
+        "and only narrowed afterwards — the explicit mode on os.open is what "
+        "prevents that window")
+
+
+# --------------------------------------------------------------------------- #
+# 17. A RELOCATED STORE still works.                                           #
+#                                                                              #
+#     `config.ensure_private_dir` documents NO_HUMAN_HOME itself being a       #
+#     symlink — "the operator relocated the store to another disk" — warns and #
+#     continues. Symlinking is the ONLY relocation mechanism, because          #
+#     NO_HUMAN_HOME is hard-coded. A revision of this file refused a symlinked #
+#     root outright, which made api_key mode UNUSABLE for such an operator and #
+#     shipped with no test and no mention. This is the positive control whose  #
+#     absence let that through.                                               #
+# --------------------------------------------------------------------------- #
+
+def test_a_relocated_store_root_is_accepted_not_refused(tmp_path):
+    real = tmp_path / "other-disk"
+    real.mkdir()
+    nh_root = tmp_path / ".no_human"
+    nh_root.symlink_to(real, target_is_directory=True)
+
+    home = cx.codex_api_key_home(base=nh_root)
+    cx.materialise_api_key_auth("sk-relocated", home, base=nh_root)
+
+    assert json.loads((home / _CRED).read_text())["OPENAI_API_KEY"] == "sk-relocated"
+    assert (real / "codex-home" / _CRED).exists(), (
+        "the credential did not land inside the relocated store")
+    # Discriminates `return resolved` from `return home`, which the section-15
+    # control could NOT: there the expected value was built with the same
+    # `resolve()` the code uses, on an already-canonical tmp_path, so both
+    # spellings satisfied it. Here the root IS a symlink, so the two differ.
+    assert home == home.resolve(), "codex_api_key_home returned an unresolved path"
+    assert home != (nh_root / "codex-home"), (
+        "the returned path still goes through the symlink — the check and the "
+        "write would name different directories")
+
+
+def test_the_credential_is_0600_even_under_a_hostile_umask(tmp_path):
+    """Pins `fchmod`. `os.open(..., 0o600)` is a REQUEST: umask can only
+    remove bits from it, so a process umask of 0o377 yields 0400 and the file
+    is not even writable by its owner. Measured, not assumed — that is why the
+    mode is set explicitly after the write rather than left to the open.
+
+    The umask is process-global; it is restored in `finally` so a failure here
+    cannot leak into another test.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    previous = os.umask(0o377)
+    try:
+        cx.materialise_api_key_auth("sk-x", home, base=nh_root)
+    finally:
+        os.umask(previous)
+    assert oct((home / _CRED).stat().st_mode)[-3:] == "600", (
+        "the umask stripped the credential's mode and nothing restored it")
+
+
+def test_a_stale_temp_file_from_a_crashed_run_does_not_wedge_the_write(tmp_path):
+    """The ORDINARY operational case, which had no test.
+
+    `O_EXCL` refuses to open anything that already exists, so without the
+    unlink a leftover temp from a crashed or killed run would make api_key
+    mode fail permanently until someone deleted the file by hand. The unlink
+    is what keeps `O_EXCL` safe to use here, and this is the test that says so.
+    """
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    (home / f".{_CRED}.tmp").write_bytes(b"leftover from a crashed run")
+
+    cx.materialise_api_key_auth("sk-after-crash", home, base=nh_root)
+
+    assert json.loads((home / _CRED).read_text())["OPENAI_API_KEY"] == "sk-after-crash"
+    assert not (home / f".{_CRED}.tmp").exists(), "the temp file was left behind"
+
+
+def test_rewriting_the_same_key_is_byte_identical_and_a_rotation_replaces_it(
+    tmp_path,
+):
+    """`materialise_api_key_auth`'s docstring claims idempotence and that a
+    rotated key simply overwrites. Neither was tested; the word "idempotent"
+    appeared nowhere in this file."""
+    nh_root = tmp_path / ".no_human"
+    home = nh_root / "codex-home"
+    home.mkdir(parents=True)
+    cred = home / _CRED
+
+    cx.materialise_api_key_auth("sk-one", home, base=nh_root)
+    first = cred.read_bytes()
+    cx.materialise_api_key_auth("sk-one", home, base=nh_root)
+    assert cred.read_bytes() == first, "re-writing the same key was not idempotent"
+
+    cx.materialise_api_key_auth("sk-two", home, base=nh_root)
+    assert json.loads(cred.read_text())["OPENAI_API_KEY"] == "sk-two"
+    assert oct(cred.stat().st_mode)[-3:] == "600", "the rotation lost the mode"

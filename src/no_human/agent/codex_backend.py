@@ -537,12 +537,104 @@ def codex_api_key_home(base: Path | None = None) -> Path:
     """
     root = base if base is not None else Path.home() / ".no_human"
     home = root / "codex-home"
+    # EVERY check runs BEFORE the first filesystem mutation. `mkdir(
+    # exist_ok=True)` SUCCEEDS on an existing symlink and `chmod` FOLLOWS it,
+    # so a symlinked `codex-home` let this function chmod a directory outside
+    # the root one whole call before the write-site guard could refuse — the
+    # act-then-refuse shape that guard exists to end, relocated into its
+    # caller. `is_symlink` lstats, so it never follows what it is testing.
+    # ONLY `codex-home`. An earlier revision also refused a symlinked ROOT,
+    # which broke a configuration this product explicitly supports:
+    # `config.ensure_private_dir` documents NO_HUMAN_HOME itself being a
+    # symlink ("the operator relocated the store to another disk"), warns and
+    # continues, and symlinking is the ONLY relocation mechanism since
+    # NO_HUMAN_HOME is hard-coded. That refusal made api_key mode unusable for
+    # such an operator and bought nothing: `_assert_home_is_no_human_owned`
+    # resolves BOTH sides, so a symlinked root resolves consistently and
+    # containment already holds.
+    if home.is_symlink():
+        raise CodexAuthError(
+            "refusing to use a symlinked codex-home as the api_key "
+            "credential directory. no_human must own this directory "
+            "outright: a link can be repointed at the operator's own "
+            "credential store between the check and the write.")
+    # A SECOND, INDEPENDENT refusal before any mutation. A review called this
+    # dead — `home` is built from `root` and was just proven not to be a
+    # symlink, so containment "cannot fail" — and a probe over adversarial
+    # ROOTS (containing `..`, symlinked, relative) agreed. Both were wrong:
+    # the case it catches is a symlinked `codex-home`, which resolves OUTSIDE
+    # the root, and calling it directly on that input refuses. It is genuinely
+    # redundant with the `is_symlink` check above, not dead, and removing
+    # either alone leaves the suite green because the other still refuses.
+    # Kept: two independent refusals before the first filesystem mutation is
+    # what this function is for.
+    _assert_home_is_no_human_owned(home, base=base)
     home.mkdir(parents=True, exist_ok=True)
     home.chmod(0o700)
-    return home
+    return _assert_home_is_no_human_owned(home, base=base)
 
 
-def materialise_api_key_auth(key: str, home: Path) -> None:
+def _assert_home_is_no_human_owned(home: Path, base: Path | None = None) -> Path:
+    """Refuse any ``home`` that does not resolve strictly inside no_human's own
+    root, and return the RESOLVED path the caller must write to.
+
+    The property: *every path :func:`materialise_api_key_auth` writes to
+    resolves strictly inside no_human's own root.* It is enforced here, at the
+    write site, rather than trusted from the caller — because the damage is
+    done by the write, not by the caller's intent. Handing it the operator's own hidden CLI credential directory would
+    ``os.replace`` their live ChatGPT session file — which this product is
+    required never to read, parse, copy or overwrite, in either auth mode.
+    That directory is deliberately not spelled out here: a docstring is
+    exactly where a stray literal path creeps into shipped source.
+
+    ``resolve()`` on BOTH sides is what makes this a capability check and not a
+    string check: a ``..`` segment, or a symlink at ``codex-home`` pointing at
+    the real credential directory, both collapse to a path that fails
+    containment. The resolved path is returned so the check and the
+    write name the same directory rather than two spellings of it. This IS
+    pinned: `test_a_relocated_store_root_is_accepted_not_refused` builds a
+    symlinked store root, where the resolved and unresolved spellings differ,
+    and returning the unresolved one turns it RED. An earlier revision of this
+    docstring called it "defence in depth, not a demonstrated fix" because the
+    then-current control derived its expected value with the same `resolve()`
+    the code uses, on an already-canonical `tmp_path`, so it could not tell the
+    two apart. The claim was unprovable against that control, not unprovable.
+    It still does not close the window between check and write — see the
+    TOCTOU note below.
+
+    The repo-wide literal scan (``test_no_source_file_touches_the_chatgpt_
+    credential_file``) cannot do this job: it forbids the TEXT, and this
+    module's own credential filename is assembled from two fragments, so the
+    scan does not see it. A lexical guard cannot enforce a capability.
+
+    ``base`` exists for tests only, mirroring :func:`codex_api_key_home`.
+    """
+    root_raw = base if base is not None else Path.home() / ".no_human"
+    try:
+        root = root_raw.resolve()
+        resolved = home.resolve()
+    # RuntimeError is not redundant: on CPython <=3.12 `Path.resolve()` reports a
+    # symlink LOOP as RuntimeError, not OSError (measured on 3.12.13), so catching
+    # OSError alone let a loop escape as an untyped exception even though this
+    # function's contract is CodexAuthError. Both refuse before any write.
+    except (OSError, RuntimeError) as exc:
+        raise CodexAuthError(
+            "refusing to write an api_key credential: the target directory "
+            f"could not be resolved ({exc.__class__.__name__})"
+        ) from exc
+    if root not in resolved.parents:
+        raise CodexAuthError(
+            "refusing to write an api_key credential outside no_human's own "
+            f"directory: {resolved} does not resolve inside {root}. This "
+            "guard exists so no_human can never overwrite the operator's own "
+            "credential store."
+        )
+    return resolved
+
+
+def materialise_api_key_auth(
+    key: str, home: Path, *, base: Path | None = None,
+) -> None:
     """Write the CLI's own api_key-mode credential file into ``home`` ONLY.
 
     Shape measured live 2026-08-25 against codex-cli 0.149.0:
@@ -553,17 +645,36 @@ def materialise_api_key_auth(key: str, home: Path) -> None:
     byte-identical content; a rotated key simply overwrites on the next
     call. Never logs, echoes or raises with the key in the message.
     """
+    home = _assert_home_is_no_human_owned(home, base=base)
     payload = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key})
     target = home / _CODEX_HOME_CRED_NAME
     tmp = home / f".{_CODEX_HOME_CRED_NAME}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Unlink-then-O_EXCL, NOT O_TRUNC. `O_NOFOLLOW` alone was not enough: it
+    # rejects a SYMLINK at the temp path, but a HARD LINK is indistinguishable
+    # from the file itself, so a planted hard link sent the write straight
+    # into a victim outside the root — destroying it AND copying the key into
+    # it. Unlinking first drops our name for whatever is there (the victim's
+    # own link keeps its data), and `O_EXCL` then refuses to open anything
+    # that still exists, so a re-plant loses loudly instead of silently.
+    # `O_NOFOLLOW` is kept for the same reason belt and braces are kept.
+    tmp.unlink(missing_ok=True)
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(payload)
+            fh.flush()
+            # fchmod on the OPEN DESCRIPTOR, never a path. A path-based
+            # `os.chmod(tmp, ...)` after the file is closed follows a symlink
+            # planted in between, which re-permissioned a victim OUTSIDE the
+            # root to 0600. The fd cannot be redirected.
+            os.fchmod(fh.fileno(), 0o600)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.chmod(tmp, 0o600)
     os.replace(tmp, target)
 
 
