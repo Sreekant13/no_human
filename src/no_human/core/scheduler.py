@@ -923,6 +923,10 @@ class Scheduler:
     # NOT done here: it would change the PR #585 takeover behaviour that
     # `tests/test_status_clobber.py::test_a_stale_sibling_heartbeat_is_taken_over`
     # pins (a live parent pid at age 600s IS taken over there, on purpose).
+    # The 600s divergence this creates is an ACCEPTED design decision, not a
+    # deferral — see docs/design/lease-takeover-vs-orphan-grace.md and
+    # `_LEASE_ORPHAN_DIVERGENCE_S` below; `tests/test_scheduler_lease_orphan_window.py`
+    # pins it.
     _STRANDED_GRACE_S = 900.0
 
     # `_claim_pool_lease` only: how old a sibling's heartbeat may be before
@@ -938,10 +942,21 @@ class Scheduler:
     # See the reconciliation note on `_STRANDED_GRACE_S` above: this value
     # is a THIRD of that one, on purpose, and the gap it opens (a live-but-
     # quiet holder can lose the LEASE well before its mid-run rows would be
-    # considered orphaned) is a documented, deliberate deferral — not fixed
-    # here because it would change the PR #585 takeover test this fix must
-    # leave unedited and green.
+    # considered orphaned) is an ACCEPTED design decision, not a deferral —
+    # see docs/design/lease-takeover-vs-orphan-grace.md and
+    # `_LEASE_ORPHAN_DIVERGENCE_S` below; `tests/test_scheduler_lease_orphan_window.py`
+    # pins it.
     _HEARTBEAT_STALE_S = 300.0
+
+    # The ACCEPTED divergence between the two questions above, as a first-class
+    # value rather than an arithmetic accident: for this many seconds a holder
+    # that is alive but quiet is "too stale to keep the lease" and simultaneously
+    # "too recently active to have its rows requeued". Both halves err toward not
+    # destroying live work, which is why this is accepted rather than closed.
+    # Derived, never hand-typed: change either constant and the derivation moves
+    # with it, and the pin in tests/test_scheduler_lease_orphan_window.py fails so
+    # the design doc gets re-read instead of silently going stale.
+    _LEASE_ORPHAN_DIVERGENCE_S = _STRANDED_GRACE_S - _HEARTBEAT_STALE_S
 
     # `_claim_pool_lease`'s read step only: how many times to retry a read
     # that raised before refusing to claim. Bounded and short — this
@@ -1097,6 +1112,14 @@ class Scheduler:
             if age < self._HEARTBEAT_STALE_S and not sibling_dead:
                 raise SiblingSchedulerRunning(
                     pid=int(row["pid"]), host=row["host"], age_s=age)
+            log.warning(
+                "pool lease: taking over the lease held by pid %s on %s "
+                "(heartbeat age %.0fs >= %.0fs). If that process is alive "
+                "but quiet, its mid-run rows stay protected for up to a "
+                "further %.0fs (_STRANDED_GRACE_S) — an accepted window, "
+                "see docs/design/lease-takeover-vs-orphan-grace.md",
+                row["pid"], row["host"], age, self._HEARTBEAT_STALE_S,
+                self._LEASE_ORPHAN_DIVERGENCE_S)
 
         started_at = (row["started_at"] if mine
                       else datetime.now(timezone.utc).isoformat())
