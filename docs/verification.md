@@ -116,6 +116,18 @@ by a tautology, or a behaviour-faking `autouse` fixture appearing in a
 `conftest.py`. No model judgement is involved. It covers Python, JS/TS, Java and
 the `e2e/` tree.
 
+## A structural-size ratchet over the codebase itself
+
+[`tests/test_structural_budget.py`](../tests/test_structural_budget.py) walks
+every file under `src/no_human` with the stdlib `ast` module and freezes
+today's offenders against three thresholds: a function longer than 300
+lines, a function with an estimated cyclomatic complexity over 60, or a file
+longer than 2,500 lines. It fails if a new offender appears outside the
+freeze, if a frozen entry grows past its frozen value, or if a frozen entry
+shrinks below its threshold (or its symbol disappears) without being deleted
+from the allow-list — the budget can only move down. It is a size ratchet,
+not a design review or a lint config, and adds no dependency.
+
 ## A reproduction gate that proves the fix fixed the bug
 
 [`src/no_human/testing/repro_gate.py`](../src/no_human/testing/repro_gate.py)
