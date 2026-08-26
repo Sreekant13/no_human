@@ -7,6 +7,7 @@ doom-looping on an impossible task or stacking corrections on a stale context.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hashlib
 import re
@@ -316,6 +317,98 @@ class StuckDetector:
         self._edit_counts.clear()
 
 
+# The CLI states the reset time in prose: "resets 4:20am (Asia/Jerusalem)" or
+# "resets Jul 24 at 6pm (Europe/London)". Matched loosely (optional ":MM",
+# case-insensitive am/pm) with the IANA zone required in parentheses — a
+# message with no zone cannot be resolved to an absolute time and must fall
+# back (see `parse_quota_reset`).
+_QUOTA_RESET_RE = re.compile(
+    r"resets\s+"
+    r"(?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s+at\s+)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+    r"\s*\(\s*(?P<zone>[^)]+?)\s*\)",
+    re.IGNORECASE,
+)
+
+_QUOTA_RESET_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# Clamp bounds for a parsed reset time, named so `QuotaExhausted` and its
+# tests share one definition of "too soon" / "too far" rather than
+# re-deriving the numbers.
+_QUOTA_RESET_MIN_WAIT_S = 300      # 5 minutes
+_QUOTA_RESET_MAX_WAIT_S = 6 * 3600  # 6 hours
+
+
+def parse_quota_reset(message: str, *, now: datetime) -> datetime | None:
+    """Extract the wall's own reset time from a quota-exhaustion message.
+
+    Recognises the CLI's two phrasings — ``"resets 4:20am (Asia/Jerusalem)"``
+    and ``"resets Jul 24 at 6pm (Europe/London)"`` — resolves the zone with
+    `zoneinfo`, and returns the next occurrence of that wall-clock time at or
+    after ``now`` as an aware UTC datetime. Returns ``None`` when the message
+    doesn't match, the zone is missing or unknown, or the result parses so far
+    out that a wrong parse is more likely than a real "days from now" wall
+    (see the upper clamp below).
+
+    The result is clamped: below ``now + 5min`` it is raised to ``now + 5min``
+    (a reset that is about to pass is still worth a short wait, not an
+    immediate re-park); above ``now + 6h`` this returns ``None`` so the caller
+    falls back to the fixed retry hour instead of trusting a parse that says
+    "days".
+    """
+    if not message:
+        return None
+    m = _QUOTA_RESET_RE.search(message)
+    if not m:
+        return None
+    try:
+        zone = ZoneInfo(m.group("zone").strip())
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    if not (1 <= hour <= 12 and 0 <= minute <= 59):
+        return None
+    ampm = m.group("ampm").lower()
+    hour %= 12
+    if ampm == "pm":
+        hour += 12
+
+    local_now = now.astimezone(zone)
+    month_name = m.group("month")
+    if month_name:
+        month = _QUOTA_RESET_MONTHS.get(month_name[:3].lower())
+        if month is None:
+            return None
+        try:
+            candidate = local_now.replace(
+                month=month, day=int(m.group("day")), hour=hour, minute=minute,
+                second=0, microsecond=0)
+        except ValueError:
+            return None
+        # No year in the message; a date+time more than a day in the past is
+        # next year's occurrence, not today's.
+        if candidate < local_now - timedelta(days=1):
+            candidate = candidate.replace(year=candidate.year + 1)
+    else:
+        candidate = local_now.replace(hour=hour, minute=minute, second=0,
+                                       microsecond=0)
+        if candidate < local_now:
+            candidate += timedelta(days=1)
+
+    result = candidate.astimezone(timezone.utc)
+    lower_bound = now + timedelta(seconds=_QUOTA_RESET_MIN_WAIT_S)
+    if result < lower_bound:
+        return lower_bound
+    if result > now + timedelta(seconds=_QUOTA_RESET_MAX_WAIT_S):
+        return None
+    return result
+
+
 class QuotaExhausted(Exception):
     """Raised when a subscription usage limit is hit mid-task.
 
@@ -325,7 +418,8 @@ class QuotaExhausted(Exception):
     """
 
     # How long to wait before a parked task tries again, when the caller does
-    # not know the real reset time.
+    # not know the real reset time (`parse_quota_reset` returned None) — no
+    # zone, no match, or a parse outside the clamp window below.
     RETRY_AFTER_S = 3600
 
     def __init__(self, message: str = "subscription quota exhausted",
@@ -350,12 +444,20 @@ class QuotaExhausted(Exception):
         # one at a time. That is the observed incident: 4 tasks, 12 attempts,
         # one billing wall.
         #
-        # A fixed hour rather than the reset time parsed out of the message.
-        # The CLI phrases it "resets 2pm (<zone>)" or "resets Jul 24 at
-        # 6pm (...)", and getting that wrong is bad in both directions — too
-        # far ahead stalls the whole pool for days, too near thrashes. An hour
-        # is self-correcting: if the wall is still up the task re-parks, which
-        # is cheap because the CLI rejects it before any model call.
+        # The CLI phrases the wall's own reset time as "resets 2pm (<zone>)"
+        # or "resets Jul 24 at 6pm (...)" — `parse_quota_reset` extracts it
+        # when `resets_at` isn't already given. A FIXED HOUR is the FALLBACK,
+        # not the default: getting a parse wrong is bad in both directions —
+        # too far ahead stalls the whole pool for days, too near thrashes —
+        # so the parse is clamped to [now+5min, now+6h] (`parse_quota_reset`)
+        # and anything outside that window (unparseable message, missing/
+        # unknown zone, or a result past the 6h ceiling) falls back to this
+        # fixed hour, which is self-correcting: if the wall is still up the
+        # task re-parks, which is cheap because the CLI rejects it before any
+        # model call.
+        now = datetime.now(timezone.utc)
+        if resets_at is None:
+            parsed = parse_quota_reset(message, now=now)
+            resets_at = parsed.isoformat() if parsed is not None else None
         self.resets_at = resets_at or (
-            datetime.now(timezone.utc)
-            + timedelta(seconds=self.RETRY_AFTER_S)).isoformat()
+            now + timedelta(seconds=self.RETRY_AFTER_S)).isoformat()

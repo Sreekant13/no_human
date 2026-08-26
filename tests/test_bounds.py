@@ -1,6 +1,11 @@
 """Termination bounds + stuck detection (§3.5)."""
 
-from no_human.core.bounds import Bounds, StuckDetector, error_signature
+from datetime import datetime, timedelta, timezone
+
+from no_human.core.bounds import (
+    Bounds, QuotaExhausted, StuckDetector, error_signature,
+    parse_quota_reset,
+)
 from no_human.core.pricing import weighted_tokens
 
 
@@ -342,3 +347,145 @@ def test_pdf_page_walk_is_progress_and_replace_all_is_a_different_edit():
     e2 = _summarize_tool_sig("Edit", {"file_path": _WT, "old_string": "a",
                                       "new_string": "b", "replace_all": True})
     assert e1 != e2
+
+
+# --------------------------------------------------------------------------- #
+# parse_quota_reset — the wall's own reset time, not a fixed hour            #
+# --------------------------------------------------------------------------- #
+
+def test_parse_quota_reset_short_form():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)  # 04:03:55 Jerusalem
+    r = parse_quota_reset(
+        "You've hit your session limit · resets 4:20am (Asia/Jerusalem)",
+        now=now)
+    assert r == datetime(2026, 8, 22, 1, 20, 0, tzinfo=timezone.utc)
+
+
+def test_parse_quota_reset_long_form_with_month_and_day():
+    now = datetime(2026, 8, 22, 10, 0, 0, tzinfo=timezone.utc)  # 13:00 Jerusalem
+    r = parse_quota_reset("resets Aug 22 at 2pm (Asia/Jerusalem)", now=now)
+    assert r == datetime(2026, 8, 22, 11, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_quota_reset_bare_hour_no_minutes():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    r = parse_quota_reset("resets 5am (Asia/Jerusalem)", now=now)
+    assert r == datetime(2026, 8, 22, 2, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_quota_reset_midnight_and_noon():
+    midnight_soon = datetime(2026, 8, 22, 20, 50, 0, tzinfo=timezone.utc)  # 23:50 Jerusalem
+    assert parse_quota_reset("resets 12:00am (Asia/Jerusalem)", now=midnight_soon) == (
+        datetime(2026, 8, 22, 21, 0, 0, tzinfo=timezone.utc))
+
+    noon_soon = datetime(2026, 8, 22, 8, 50, 0, tzinfo=timezone.utc)  # 11:50 Jerusalem
+    assert parse_quota_reset("resets 12:00pm (Asia/Jerusalem)", now=noon_soon) == (
+        datetime(2026, 8, 22, 9, 0, 0, tzinfo=timezone.utc))
+
+
+def test_parse_quota_reset_earlier_today_rolls_to_tomorrow():
+    """23:50 local, message names 00:00 — already past today, so it must
+    resolve to tomorrow's occurrence, not today's (already-passed) one."""
+    now = datetime(2026, 8, 22, 20, 50, 0, tzinfo=timezone.utc)  # 23:50 Jerusalem
+    r = parse_quota_reset("resets 12:00am (Asia/Jerusalem)", now=now)
+    assert r is not None and r > now
+    assert r == datetime(2026, 8, 22, 21, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_quota_reset_missing_zone_is_none():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    assert parse_quota_reset("resets 2pm", now=now) is None
+
+
+def test_parse_quota_reset_unknown_zone_is_none():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    assert parse_quota_reset("resets 2pm (Not/AZone)", now=now) is None
+
+
+def test_parse_quota_reset_unrecognized_text_is_none():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    assert parse_quota_reset("garbage text with no reset in it", now=now) is None
+    assert parse_quota_reset("", now=now) is None
+
+
+def test_parse_quota_reset_invalid_hour_or_minute_is_none():
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    assert parse_quota_reset("resets 13pm (Asia/Jerusalem)", now=now) is None
+    assert parse_quota_reset("resets 4:70am (Asia/Jerusalem)", now=now) is None
+
+
+def test_parse_quota_reset_clamps_to_the_five_minute_floor():
+    """A reset five seconds out is still worth a short wait, not an
+    immediate re-park — clamped up to now+5min rather than trusted as-is."""
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    r = parse_quota_reset("resets 4:04am (Asia/Jerusalem)", now=now)
+    assert r == now + timedelta(minutes=5)
+
+
+def test_parse_quota_reset_beyond_six_hours_falls_back_to_none():
+    """A parse landing days out is treated as wrong, not trusted — the caller
+    (`QuotaExhausted`) falls back to the fixed RETRY_AFTER_S hour instead."""
+    now = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+    r = parse_quota_reset("resets Aug 25 at 6pm (Asia/Jerusalem)", now=now)
+    assert r is None
+
+
+# --------------------------------------------------------------------------- #
+# QuotaExhausted wiring — parse wins, fallback is unchanged                  #
+# --------------------------------------------------------------------------- #
+
+class _FixedNow(datetime):
+    """A `datetime` subclass whose `.now()` always returns a fixed instant,
+    swapped in for `bounds.datetime` so `QuotaExhausted.__init__` (which
+    calls the real clock, not an injectable `now=`) is deterministic."""
+
+    _fixed = datetime(2026, 8, 22, 1, 3, 55, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+def test_quota_exhausted_carries_the_walls_own_reset_time(monkeypatch):
+    import no_human.core.bounds as bounds_mod
+    monkeypatch.setattr(bounds_mod, "datetime", _FixedNow)
+
+    exc = QuotaExhausted(
+        "You've hit your session limit · resets 4:20am (Asia/Jerusalem)")
+
+    assert exc.resets_at == "2026-08-22T01:20:00+00:00"
+
+
+def test_quota_exhausted_falls_back_on_an_unparseable_message(monkeypatch):
+    import no_human.core.bounds as bounds_mod
+    monkeypatch.setattr(bounds_mod, "datetime", _FixedNow)
+
+    exc = QuotaExhausted("You've hit your weekly limit")
+
+    expected = (_FixedNow._fixed
+                + timedelta(seconds=QuotaExhausted.RETRY_AFTER_S)).isoformat()
+    assert exc.resets_at == expected
+
+
+def test_quota_exhausted_explicit_resets_at_still_wins(monkeypatch):
+    """A caller that already knows the reset time is never overridden by
+    parsing the message."""
+    import no_human.core.bounds as bounds_mod
+    monkeypatch.setattr(bounds_mod, "datetime", _FixedNow)
+
+    exc = QuotaExhausted(
+        "resets 4:20am (Asia/Jerusalem)",
+        resets_at="2030-01-01T00:00:00+00:00")
+
+    assert exc.resets_at == "2030-01-01T00:00:00+00:00"
+
+
+def test_quota_exhausted_beyond_six_hours_falls_back_not_days_out(monkeypatch):
+    import no_human.core.bounds as bounds_mod
+    monkeypatch.setattr(bounds_mod, "datetime", _FixedNow)
+
+    exc = QuotaExhausted("resets Aug 25 at 6pm (Asia/Jerusalem)")
+
+    expected = (_FixedNow._fixed
+                + timedelta(seconds=QuotaExhausted.RETRY_AFTER_S)).isoformat()
+    assert exc.resets_at == expected

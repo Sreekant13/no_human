@@ -213,6 +213,9 @@ INERT_IMPORTS: frozenset[str] = frozenset({
     "textwrap", "threading", "time", "tomllib", "traceback", "types", "typing",
     "unicodedata", "unittest", "uuid", "warnings", "weakref", "zipfile",
     "zlib",
+    # reads bundled/system tzdata off disk to resolve IANA zone names; opens
+    # and accepts nothing.
+    "zoneinfo",
     # `asyncio` and `pty` are inert as IMPORTS; their networking entry points
     # (open_connection/start_server) and their exec entry points are matched on
     # the CALL instead, so `import asyncio` alone charges nothing. Same reason

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from no_human.core.bounds import parse_quota_reset
 from no_human.core.db import Store
 from no_human.core import scheduler as scheduler_mod
 from no_human.core import slot_wait
@@ -290,6 +291,38 @@ async def test_quota_pause_gates_the_whole_pool(store):
 
     after = await sched.tick(now=now + timedelta(hours=2))
     assert len(after) == 1                         # resumes once quota is back
+
+
+async def test_quota_pause_honors_a_reset_the_message_states_past_the_fixed_hour(store):
+    """RED before the parser: a park's `wake_check_at` used to be the fixed
+    `RETRY_AFTER_S` hour (+60min) no matter what the CLI's own banner said.
+    Here the wall states a reset 76 minutes out — past the old fixed-hour
+    mark — so a wake fired at +60min would land 16 minutes before the wall
+    actually lifts and re-park (the incident this task fixes). The pool must
+    stay gated at +60min and only resume once the STATED reset has passed."""
+    now = datetime(2026, 8, 22, 1, 4, 0, tzinfo=timezone.utc)  # 04:04 Jerusalem
+    resets = parse_quota_reset(
+        "You've hit your session limit · resets 5:20am (Asia/Jerusalem)",
+        now=now)
+    assert resets is not None
+    assert resets - now == timedelta(minutes=76), resets - now
+
+    fake = FakeOrch(store, quota_first=True, quota_resets=resets.isoformat())
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2)
+    await _mk_tasks(store, 1)
+
+    await sched.tick(now=now)
+    await sched.wait_idle()
+    assert sched._quota_cooldown_until == resets
+
+    # A fixed-hour wake (+60min) must NOT re-dispatch — the wall is still up.
+    await _mk_tasks(store, 1)
+    at_sixty = await sched.tick(now=now + timedelta(minutes=60))
+    assert at_sixty == [], "re-dispatched into a wall that hadn't lifted yet"
+
+    # Past the STATED reset, the pool resumes.
+    after = await sched.tick(now=now + timedelta(minutes=77))
+    assert len(after) == 1
 
 
 async def test_infra_breaker_cooldown_is_exposed_as_infra_not_quota(store):
