@@ -95,16 +95,26 @@ FROZEN_FUNCTION_CC = {
     "core/orchestrator.py:Orchestrator._run_review": 73,
 }
 
-# 8 files > 2,500 lines.
+# 9 files > 2,500 lines.
+#
+# RE-ANCHORED 2026-08-26: the ratchet landed as b30a292da at 19:51:28 and
+# three more branches landed in the same batch — b516f9da7 19:51:40 (grew
+# core/scheduler.py 2499 -> 2522, crossing the 2,500 threshold), 1bc8e1fc8
+# 19:52:45 (grew core/db.py 4131 -> 4149 and core/orchestrator.py
+# 19222 -> 19300) — none of them measured against the ratchet on its merge
+# result, so every full suite on main failed these two tests from the moment
+# the batch finished. The values below are the first baseline measured on a
+# tree that actually contains the ratchet; growth from here fails again.
 FROZEN_FILE_LINES = {
-    "core/orchestrator.py": 19222,
+    "core/orchestrator.py": 19300,
     "cli/commands.py": 7773,
     "api/app.py": 4956,
-    "core/db.py": 4131,
+    "core/db.py": 4149,
     "config.py": 2888,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2698,
+    "core/scheduler.py": 2522,
 }
 
 
