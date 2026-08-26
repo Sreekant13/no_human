@@ -782,6 +782,19 @@ class _Usage:
 # the cliff.
 _STDOUT_LIMIT = 10 * 1024 * 1024
 
+#: Seconds to wait for a KILLED child to be reaped before giving up.
+#: The teardown's true ceiling is this PLUS `_STDERR_DRAIN_WAIT` (both run
+#: on the same exit path), and that SUM must stay below the tightest budget
+#: any caller imposes — 30s in the codex test files; production callers
+#: allow 90-900s. The inequality is asserted by
+#: test_the_teardown_bound_is_shorter_than_every_callers_budget, not
+#: trusted to this comment.
+_TEARDOWN_WAIT = 5
+
+#: Seconds to wait for the post-kill stderr drain before giving up on the
+#: hint it might carry. Counted into the teardown ceiling above.
+_STDERR_DRAIN_WAIT = 5
+
 # THIS is the correctness boundary: past it we stop buying memory for a
 # process that may never emit a newline. Deliberately below the 256 MiB
 # floated at intake — the pool runs several tasks concurrently in ONE daemon
@@ -846,6 +859,125 @@ async def _read_jsonl_line(reader: asyncio.StreamReader) -> bytes:
             # non-JSON or truncated-JSON partial harmlessly, exactly as it
             # already does for interleaved banner lines.
             return e.partial
+
+
+async def _kill_and_reap(proc: Any) -> tuple[int, bytes]:
+    """Kill the codex child and reap it within a bound; drain stderr.
+
+    The whole teardown of `stream()`'s `finally` lives here — extracted
+    verbatim (the structural budget caught `stream` crossing 300 lines on
+    the teardown's documentation, and the alternative, freezing a new
+    offender one landing after the ratchet's re-anchor, would have
+    normalised exactly what the guard exists to stop). Returns
+    `(with_code, stderr)`; interpreting the code is the caller's job.
+    """
+    # Kill on EVERY exit path, including the exception `on_event`
+    # raises into `run` (CancelRequested / BudgetAbort / StuckAbort).
+    # Without this a cancelled attempt leaves a live `codex` writing to
+    # the working tree that is about to be diffed and committed.
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            # BELT AND BRACES. On this CPython this branch is
+            # UNREACHABLE by invariant, and an earlier version of this
+            # comment wrongly claimed it had been OBSERVED:
+            #
+            #   `kill()` -> `_check_proc()` raises only when the
+            #   transport's `_proc is None`; `_proc` becomes None only
+            #   in `_call_connection_lost`, reachable only from
+            #   `_try_finish`, which returns early while
+            #   `_returncode is None`. `Process.returncode` IS that
+            #   `_returncode`. So the `if` above already excludes the
+            #   only state that can raise. Separately,
+            #   `Popen.send_signal` suppresses `ProcessLookupError`
+            #   (bpo-40550).
+            #
+            # What produced the exception during development was a
+            # TEST PROXY reporting `returncode is None` for a process
+            # that had already exited — the fixture lying, not the
+            # runtime racing.
+            #
+            # The guard stays: the invariant is the stdlib's, not
+            # ours, and it is version-dependent. It is one inert line
+            # and cannot mask a real failure — the process is gone
+            # either way.
+            #
+            # IT IS NOT PINNED BY A TEST. A review reported reaching
+            # it by deferring EOF OBSERVATION (delivering every byte,
+            # so nothing starves) until all pipes disconnect and the
+            # transport clears `_proc`. Three attempts at that fixture
+            # here passed identically with AND without the guard —
+            # they never reached the branch — so they were removed
+            # rather than shipped as coverage they do not provide.
+            pass
+    stderr = b""
+    try:
+        if proc.stderr is not None:
+            stderr = await asyncio.wait_for(
+                proc.stderr.read(), _STDERR_DRAIN_WAIT)
+    except Exception:  # noqa: BLE001 — draining stderr must never
+        stderr = b""  # break the attempt; a timeout here loses a hint.
+    # BOUNDED, and the VALUE matters as much as the bound. An
+    # unbounded wait here strands a worker slot forever in the very
+    # daemon this module's 64 KiB fix exists to keep alive. On main
+    # this line is a bare `await proc.wait()` with no bound at all —
+    # it was never 30s; an earlier note in this programme said so and
+    # was wrong.
+    #
+    # The bound must be materially SHORTER than any caller's own
+    # timeout or it can never fire in time to help: nearly every test in
+    # tests/test_codex_oversized_jsonl_line.py wraps `run()` in
+    # `asyncio.wait_for(..., 30)` (one uses 60), so a 30s teardown bound loses that
+    # race every time and rescues nothing. Measured: with the bound at
+    # 60 the defect below still reproduces at 30.3s. That ordering is
+    # an invariant across three separate literals in two files, so it
+    # is asserted by test rather than left to this comment.
+    #
+    # THE MECHANISM, measured rather than asserted. CPython's
+    # `_wait()` fast-paths when the returncode is already known;
+    # otherwise it awaits a future resolved only by
+    # `_call_connection_lost`, which requires every pipe to have
+    # disconnected. A StreamReader whose buffer exceeds its `limit`
+    # PAUSES its transport, and a paused transport never sees EOF — so
+    # the future is never resolved. The hang therefore needs BOTH a
+    # not-yet-reaped child AND a paused reader, which is why it is
+    # load-dependent and why an idle run never shows it.
+    #
+    # An earlier version of this comment said a flooding fake CLI "did
+    # not reproduce it through `stream()`". That is REFUTED: an
+    # instrumented probe of
+    # tests/test_codex_oversized_jsonl_line.py::test_an_unassemblable_line_is_a_recorded_infra_failure
+    # observed `is_reading=False` with 65536 bytes stranded at teardown,
+    # i.e. the paused state IS reached through `stream()`. Delaying the
+    # reap by 3s makes that test fail at 30.3s with
+    # `CancelledError` on `await waiter` without this bound, and pass
+    # at 5.3s with it. Draining stdout here as well would also fix the
+    # mechanism and is not carried — see ticket b7090c45.
+    try:
+        with_code = await asyncio.wait_for(proc.wait(), _TEARDOWN_WAIT)
+    except (asyncio.TimeoutError, TimeoutError):
+        # SIGKILL DELIVERY is unblockable, so what hung here is
+        # almost always asyncio's transport bookkeeping rather than
+        # the child. "Almost": a process in uninterruptible sleep is
+        # killed but not yet reaped, and on that path `-9` describes a
+        # child that is not dead YET. Rare on a local filesystem, and
+        # stated rather than claimed away.
+        #
+        # -9 is the code for "we killed it" and is already the value
+        # the caller's exit-code check treats as normal, so a teardown
+        # timeout does not manufacture a failure the run did not
+        # have. What the test pins is exactly that: no invented
+        # failure (a substitute code OUTSIDE the accepted (0, -9)
+        # pair turns it red; 0 and -9 are indistinguishable
+        # downstream today, so the pair's members are not separately
+        # pinnable). The asymmetry this leaves, stated rather than
+        # claimed away: the timeout path is also INVISIBLE — no
+        # event, no log, is_error stays False — so a run that timed
+        # out here reads downstream as a clean success. Making it
+        # observable is ticket ec24f443, not this bound.
+        with_code = proc.returncode if proc.returncode is not None else -9
+    return with_code, stderr
 
 
 class CodexBackend:
@@ -1483,19 +1615,7 @@ class CodexBackend:
                         f"Reached maximum number of turns ({max_turns})")
                     break
         finally:
-            # Kill on EVERY exit path, including the exception `on_event`
-            # raises into `run` (CancelRequested / BudgetAbort / StuckAbort).
-            # Without this a cancelled attempt leaves a live `codex` writing to
-            # the working tree that is about to be diffed and committed.
-            if proc.returncode is None:
-                proc.kill()
-            stderr = b""
-            try:
-                if proc.stderr is not None:
-                    stderr = await asyncio.wait_for(proc.stderr.read(), 5)
-            except Exception:  # noqa: BLE001 — draining stderr must never
-                stderr = b""  # break the attempt; a timeout here loses a hint.
-            with_code = await proc.wait()
+            with_code, stderr = await _kill_and_reap(proc)
             if with_code not in (0, -9) and not failure:
                 failure = (stderr.decode(errors="replace").strip()[-2000:]
                            or f"codex exited {with_code}")
