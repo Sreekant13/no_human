@@ -113,7 +113,7 @@ FROZEN_FILE_LINES = {
     "config.py": 2888,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
-    "agent/guard.py": 2721,
+    "agent/guard.py": 2801,
     "core/scheduler.py": 2522,
 }
 

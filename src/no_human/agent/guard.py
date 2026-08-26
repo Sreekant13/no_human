@@ -144,6 +144,13 @@ _NO_HUMAN_YML_WRITE = re.compile(
     r"(?:sed\s+-i|>\s*|>>\s*|tee\s+)[^|;&]*\.no_human\.ya?ml", re.IGNORECASE)
 
 _RM_RF = re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-rf|-fr)\b")
+# `find` primaries that WRITE or RUN — none of them matched by `_RM_RF`.
+_SCAN_MUTATION_PRIMARIES = frozenset({
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fls", "-fprint", "-fprint0", "-fprintf"})
+#: shlex's `punctuation_chars=True` default set — an operator token is made
+#: only of these; a quoted pattern token is not.
+_SHELL_PUNCT = frozenset("();<>|&")
 _GIT_DESTRUCTIVE = re.compile(
     r"\bgit\s+(push\s+.*--force|push\s+.*-f\b|reset\s+--hard\s+\S|"
     r"clean\s+-[a-z]*f|filter-branch|update-ref\s+-d)"
@@ -364,6 +371,75 @@ def root_scan_denial(cmd: str, cwd: "str | None") -> "str | None":
             return _REPO_SCOPE_REASON.format(
                 cmd=seg, root="<repo>", target="the current directory (cwd unknown)")
     return None
+
+
+def _scan_is_pure_read(cmd: str) -> bool:
+    """True only when a denied scan `cmd` can be PROVEN to read and nothing
+    else — the sole case where downgrading its denial to HYGIENE
+    (non-terminating) is safe. Fails CLOSED: anything not provably a clean
+    read is DESTRUCTIVE, costing one attempt rather than risking data.
+
+    Decided by shell STRUCTURE, never a regex over raw text (a regex over the
+    joined string mis-read `1>`/`| xargs rm` as reads and a quoted `=>` pattern
+    as a redirect — the round-2 findings). Disqualifiers, all structural:
+    (1) any `find` action primary (`-delete`, `-exec`, …) in a scan segment's
+    argv — exact token match, so it cannot hide in a quoted arg; (2) any pipe
+    `|`, input redirect `<`, or command/process substitution (`$(…)`, `` `…` ``,
+    `<(…)`) ANYWHERE — any of them can run a writer/exfiltrator; (3) any
+    output redirect to a real target — a redirect to a FILE (including a
+    numeric-named one like `>3`) exfiltrates, while `2>/dev/null` (discard)
+    and the fd-dup `2>&1` are benign and are the 20.7% bucket's own shape.
+    `punctuation_chars` emits the operators as their own tokens and leaves a
+    quoted `=>`/`->` a word; a backtick is not punctuation so it is checked
+    against the raw string."""
+    if "`" in cmd:
+        return False  # backtick command substitution
+    try:
+        punct = list(shlex.shlex(cmd, posix=True, punctuation_chars=True))
+    except ValueError:
+        return False  # unlexable -> not provable -> DESTRUCTIVE
+    # An operator token is made ENTIRELY of shell punctuation; a quoted
+    # `=>`/`a->b` pattern keeps non-punctuation chars and is a word token.
+    for i, tok in enumerate(punct):
+        if not (set(tok) <= _SHELL_PUNCT and tok):
+            continue
+        if "|" in tok or "<" in tok or "(" in tok or ")" in tok:
+            return False  # pipe, input redirect, or command/process substitution
+        if ">" in tok:
+            target = punct[i + 1] if i + 1 < len(punct) else ""
+            # A digit target is a real FILE under a plain `>` (`>3` writes
+            # ./3); it is an fd only under an fd-dup operator, which ENDS with
+            # `&` (`>&`, `<&`). The both-streams-to-a-file operators `&>`/`&>>`
+            # also contain `&` but END with `>`, so `endswith` — not `in` —
+            # is what tells `&>1` (writes ./1) from `2>&1` (dups to fd 1).
+            fd_dup = tok.endswith("&") and target.isdigit()
+            if target != "/dev/null" and not fd_dup:
+                return False  # redirect to a real file -> exfiltration
+    # Segment on the SAME quote-aware `punct` stream, not `_CMD_SEP.split`
+    # (a raw regex that fragments on a quoted `&&`/`|`/`;` and made a pure
+    # compound read like `grep X /Users && grep -E 'a|b' /Users` fail closed
+    # to DESTRUCTIVE). By here the first loop has already rejected every
+    # unquoted `|`/`<`/`>`/`(`/`)`, so the only operator tokens left are
+    # separators (`;`, `&`, `&&`, newline) — safe to break a segment on.
+    seg_words: list[str] = []
+    for tok in punct:
+        if set(tok) <= _SHELL_PUNCT and tok:
+            if _segment_scans_and_mutates(seg_words):
+                return False
+            seg_words = []
+        else:
+            seg_words.append(tok)
+    if _segment_scans_and_mutates(seg_words):
+        return False
+    return True
+
+
+def _segment_scans_and_mutates(words: list[str]) -> bool:
+    """A single command segment (already quote-split into argv words) that is
+    a scan carrying a `find` mutation primary."""
+    argv = _strip_wrappers(words, _is_scan_exe_name)
+    return (bool(argv) and PurePosixPath(argv[0]).name in _SCAN_EXECUTABLES
+            and any(a in _SCAN_MUTATION_PRIMARIES for a in argv[1:]))
 
 # --------------------------------------------------------------------------- #
 # Installing into the shared developer venv — defence in depth. A coder
@@ -1910,21 +1986,26 @@ _FORGE_WRITE = re.compile(
 #                       server, ...). Still kills the attempt.
 #   GUARD_EXFILTRATION forbidden-path / credential / secret leak risk.
 #                       Still kills the attempt.
-# `GUARD_DESTRUCTIVE` is the default for every `GuardDecision` below that
-# does not explicitly opt into a different class — it reproduces the
-# terminate-on-any-denial behaviour every post-hoc check had before this
-# taxonomy existed, so adding the field cannot silently soften an existing
-# guard.
-GUARD_HYGIENE = "hygiene"
-GUARD_DESTRUCTIVE = "destructive"
-GUARD_EXFILTRATION = "exfiltration"
+# There is NO DEFAULT: every denial states its class and one that states none
+# raises in `__post_init__`. The default WAS `GUARD_DESTRUCTIVE`; 23 of the 25
+# denial sites never overrode it, so a denied READ-ONLY `find` — which changed
+# nothing and had already run — killed 21 codex attempts / 56.5M weighted
+# tokens in one day, 20.7% of that day's spend. A fail-closed default is
+# inherited by authors who never considered the question; a crash is not.
+GUARD_HYGIENE, GUARD_DESTRUCTIVE, GUARD_EXFILTRATION = _GUARD_SEVERITIES = (
+    "hygiene", "destructive", "exfiltration")
 
 
 @dataclass
 class GuardDecision:
     allow: bool
     reason: str = ""
-    severity: str = GUARD_DESTRUCTIVE
+    severity: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.allow and self.severity not in _GUARD_SEVERITIES:
+            raise ValueError("a denying GuardDecision must state severity= explicitly, "
+                             f"one of {_GUARD_SEVERITIES} (got {self.severity!r}, reason={self.reason!r})")
 
 
 def _path_forbidden(path: str, forbidden: list[str]) -> bool:
@@ -2549,16 +2630,17 @@ def evaluate(
     """
     # 0. Interactive prompts — denied in every role, readonly or not.
     if tool_name in INTERACTIVE_TOOLS:
-        return GuardDecision(False, _NO_HUMAN_REASON.format(tool=tool_name))
+        return GuardDecision(False, _NO_HUMAN_REASON.format(tool=tool_name), severity=GUARD_DESTRUCTIVE)
 
     # 1. Reviewer / read-only mode: block ALL writes, and the polling tools that
     #    let a planner invent a busy-wait loop instead of doing its job.
     if readonly and tool_name in WRITE_TOOLS:
-        return GuardDecision(False, f"read-only session: {tool_name} blocked")
+        return GuardDecision(False, f"read-only session: {tool_name} blocked", severity=GUARD_DESTRUCTIVE)
     if readonly and tool_name in BACKGROUND_TOOLS:
-        return GuardDecision(False, _NO_POLLING_REASON.format(tool=tool_name))
+        # HYGIENE: busy-waiting wastes turns; it changes and leaks nothing.
+        return GuardDecision(False, _NO_POLLING_REASON.format(tool=tool_name), severity=GUARD_HYGIENE)
     if readonly and tool_name in SPAWN_TOOLS:
-        return GuardDecision(False, _NO_SPAWN_REASON.format(tool=tool_name))
+        return GuardDecision(False, _NO_SPAWN_REASON.format(tool=tool_name), severity=GUARD_DESTRUCTIVE)
 
     # 1b. Phase C: unbounded reads of huge files are redirected, not denied.
     # ONLY in the coder loop (readonly reviewer/researcher sessions are one-shot
@@ -2570,12 +2652,12 @@ def evaluate(
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
         n = _line_count(path)
         if n > _READ_LINES_BUDGET and ext not in _WHOLE_READ_OK_EXTS:
+            # HYGIENE: a context nudge about a READ that changed nothing.
             return GuardDecision(
-                False,
-                f"{path} is {n} lines — reading it whole puts all of it in "
+                False, f"{path} is {n} lines — reading it whole puts all of it in "
                 f"context and RE-SENDS it on every remaining turn. Read the "
                 f"part you need (offset/limit), or Grep for the symbol first. "
-                f"Whole-file reads are fine under {_READ_LINES_BUDGET} lines.")
+                f"Whole-file reads are fine under {_READ_LINES_BUDGET} lines.", severity=GUARD_HYGIENE)
 
     # 2. Writes to forbidden paths.
     if tool_name in WRITE_TOOLS:
@@ -2586,13 +2668,12 @@ def evaluate(
             or ""
         )
         if path and _path_forbidden(str(path), forbidden_paths):
-            return GuardDecision(False, f"write to forbidden path blocked: {path}")
+            return GuardDecision(False, f"write to forbidden path blocked: {path}", severity=GUARD_EXFILTRATION)
         if path and str(path).rstrip("/").endswith((".no_human.yml", ".no_human.yaml")):
             return GuardDecision(
-                False,
-                ".no_human.yml is the operator's contract with the agent — "
+                False, ".no_human.yml is the operator's contract with the agent — "
                 "the agent never edits it. Propose the change in the PR body "
-                "instead.")
+                "instead.", severity=GUARD_DESTRUCTIVE)
 
     # 3. Shell command policy.
     if tool_name == "Bash":
@@ -2606,45 +2687,40 @@ def evaluate(
                 sub, _rest = _git_subcommand(gargv)
                 if sub in _GIT_WRITE_SUBCOMMANDS:
                     return GuardDecision(
-                        False,
-                        f"read-only session: git/forge write blocked: {cmd}. "
+                        False, f"read-only session: git/forge write blocked: {cmd}. "
                         "Read the repo and report; you do not change it.",
-                    )
+                        severity=GUARD_DESTRUCTIVE)
             for fargv in _forge_invocations(cmd):
                 if _forge_subcommand(fargv) in _FORGE_WRITE_PAIRS:
                     return GuardDecision(
-                        False,
-                        f"read-only session: git/forge write blocked: {cmd}. "
+                        False, f"read-only session: git/forge write blocked: {cmd}. "
                         "Read the repo and report; you do not change it.",
-                    )
+                        severity=GUARD_DESTRUCTIVE)
         if readonly and (_GIT_WRITE.search(cmd) or _FORGE_WRITE.search(cmd)):
             return GuardDecision(
-                False,
-                f"read-only session: git/forge write blocked: {cmd}. Read the "
+                False, f"read-only session: git/forge write blocked: {cmd}. Read the "
                 "repo and report; you do not change it.",
-            )
+                severity=GUARD_DESTRUCTIVE)
         if _RM_TESTS.search(cmd):
             return GuardDecision(
-                False,
-                f"deleting test files is blocked at tool time: {cmd}. Renames "
+                False, f"deleting test files is blocked at tool time: {cmd}. Renames "
                 "go through `git mv`; a genuine removal needs the human "
                 "(state it in the PR body) — the tamper gate would fail this "
                 "attempt at the end anyway, so this denial saves you the "
-                "attempt.")
+                "attempt.", severity=GUARD_DESTRUCTIVE)
         if _NO_HUMAN_YML_WRITE.search(cmd):
             return GuardDecision(
-                False,
-                ".no_human.yml is the operator's contract with the agent — "
-                "the agent never edits it.")
+                False, ".no_human.yml is the operator's contract with the agent — "
+                "the agent never edits it.", severity=GUARD_DESTRUCTIVE)
         if _RM_RF.search(cmd):
-            return GuardDecision(False, f"destructive command blocked (rm -rf): {cmd}")
+            return GuardDecision(False, f"destructive command blocked (rm -rf): {cmd}", severity=GUARD_DESTRUCTIVE)
         if _GIT_DESTRUCTIVE.search(cmd):
-            return GuardDecision(False, f"destructive git command blocked: {cmd}")
+            return GuardDecision(False, f"destructive git command blocked: {cmd}", severity=GUARD_DESTRUCTIVE)
         # Applies to EVERY session, coder included — see the block comment on
         # `_git_worktree_denial`. `_GIT_WRITE` above only ever ran for readonly.
         worktree_reason = _git_worktree_denial(cmd, cwd)
         if worktree_reason:
-            return GuardDecision(False, worktree_reason)
+            return GuardDecision(False, worktree_reason, severity=GUARD_DESTRUCTIVE)
         # `_approve_denial` below covers the product's own CLI, the
         # in-process paths and the local API — all argv-shaped. This one stays
         # lexical: it matches forge spellings whose grammar we do not own.
@@ -2654,34 +2730,39 @@ def evaluate(
         for fargv in _forge_invocations(cmd):
             if _forge_subcommand(fargv) in _FORGE_MERGE_PAIRS:
                 return GuardDecision(
-                    False,
-                    "merging a pull/merge request is blocked — the agent never "
+                    False, "merging a pull/merge request is blocked — the agent never "
                     "merges. Open the PR, push your fixes to its branch, and "
                     "stop. A human merges it (`nh approve`).",
-                )
+                    severity=GUARD_DESTRUCTIVE)
         if _FORGE_MERGE.search(cmd):
             return GuardDecision(
-                False,
-                "merging a pull/merge request is blocked — the agent never "
+                False, "merging a pull/merge request is blocked — the agent never "
                 "merges. Open the PR, push your fixes to its branch, and stop. "
                 "A human merges it (`nh approve`).",
-            )
+                severity=GUARD_DESTRUCTIVE)
         # BOTH layers, argv first (its messages are more specific), then the
         # lexical one. Additive: nothing main denies may become allowed here.
         approve_reason = _approve_denial(cmd)
         if approve_reason:
-            return GuardDecision(False, approve_reason)
+            return GuardDecision(False, approve_reason, severity=GUARD_DESTRUCTIVE)
         lex = _join_continuations(cmd)
         if _LEXICAL_MERGE_STACK.search(lex):
-            return GuardDecision(False, _MERGE_STACK_REASON)
+            return GuardDecision(False, _MERGE_STACK_REASON, severity=GUARD_DESTRUCTIVE)
         if _LEXICAL_LIVE_SERVER.search(lex):
-            return GuardDecision(False, _LIVE_SERVER_REASON)
+            return GuardDecision(False, _LIVE_SERVER_REASON, severity=GUARD_DESTRUCTIVE)
         # Applies to EVERY session mode, coder included — a whole-filesystem
         # sweep is never the right probe, and gating it on `readonly` would
         # leave the expensive coder path unprotected.
         scan_reason = root_scan_denial(cmd, cwd)
         if scan_reason:
-            return GuardDecision(False, scan_reason)
+            # HYGIENE (non-terminating) ONLY for a provable clean read — a
+            # `find … -delete`/`-exec rm`, a `| xargs rm`, or a redirected
+            # `grep` mutates/exfiltrates and stays DESTRUCTIVE (it already ran;
+            # stopping is the only safety left). Fails closed: see
+            # `_scan_is_pure_read`.
+            sev = (GUARD_HYGIENE if _scan_is_pure_read(cmd)
+                   else GUARD_DESTRUCTIVE)
+            return GuardDecision(False, scan_reason, severity=sev)
         # Applies to EVERY session mode, like `_LIVE_SERVER` above — this is
         # about the operator's real primary checkout, not the repo's content.
         venv_reason = _venv_install_denial(cmd, cwd)
@@ -2698,14 +2779,13 @@ def evaluate(
             cmd, never_push_to
         ):
             return GuardDecision(
-                False,
-                f"push to protected branch blocked: {cmd}. Push to your own "
+                False, f"push to protected branch blocked: {cmd}. Push to your own "
                 "branch and open a PR instead — pushing to the base branch is "
                 "merging without review.",
-            )
+                severity=GUARD_DESTRUCTIVE)
         push_reason = _push_denial_reason(cmd, never_push_to)
         if push_reason:
-            return GuardDecision(False, push_reason)
+            return GuardDecision(False, push_reason, severity=GUARD_DESTRUCTIVE)
         # Structural (resolved-executable) venv-install guard — task
         # 16a798c1's three review verdicts each defeated a lexical/regex
         # rule here via shell segmentation, not a missing pattern; this is
