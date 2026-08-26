@@ -169,3 +169,32 @@ async def test_prior_work_medium_outranks_fresh_high(store):
     assert started == [with_pr.id], (
         "the sunk-cost medium task must still be claimed before the fresh "
         f"high-priority task; got {started}")
+
+
+async def test_prior_work_high_outranks_older_prior_work_low(store):
+    """Priority also sorts WITHIN the prior-work group itself — a high task
+    carrying sunk cost must outrank an older low task that also carries sunk
+    cost, even though FIFO alone would put the older one first."""
+    _RecordingOrch.started.clear()
+    now = datetime.now(timezone.utc)
+
+    older_low = Task.new("older prior work, low", repo_path="/tmp/x")
+    older_low.priority = "low"
+    await store.create_task(older_low)
+    older_low.context = await store.merge_context(
+        older_low.id, {"pr_branch": "nh/task-a"})
+
+    newer_high = Task.new("newer prior work, high", repo_path="/tmp/x")
+    newer_high.priority = "high"
+    await store.create_task(newer_high)
+    newer_high.context = await store.merge_context(
+        newer_high.id, {"pr_branch": "nh/task-b"})
+
+    sched = Scheduler(store, _RecordingOrch, max_workers=2)
+    started = await sched.tick(now=now)
+    await asyncio.sleep(0.05)
+
+    assert started == [newer_high.id, older_low.id], (
+        "both tasks are prior-work, so the prior/fresh split is a no-op and "
+        "only priority-within-prior-work ordering can produce this order; "
+        f"got {started}")
