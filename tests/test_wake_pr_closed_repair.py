@@ -299,7 +299,9 @@ def test_restore_approval_stamps_the_repaired_url(tmp_path, monkeypatch):
     _Cfg.db_path = db
     monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
     monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
-    monkeypatch.setattr(cmd_mod, "_running_pool_stats", lambda _cfg: None)
+    monkeypatch.setattr(
+        cmd_mod, "_probe_pool",
+        lambda _cfg: cmd_mod.PoolProbe(None, cmd_mod.POOL_REFUSED))
     runner = CliRunner()
 
     result = runner.invoke(task_restore_approval, [task_id[:8]])

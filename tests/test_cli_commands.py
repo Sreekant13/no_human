@@ -7,9 +7,12 @@ aiosqlite connection is never reused across event loops.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import os
 import signal
+import socket
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -19,6 +22,11 @@ import uvicorn
 from click.testing import CliRunner
 
 from no_human.cli.commands import cli
+from no_human.cli.pool_probe import (
+    POOL_BAD_BODY, POOL_HTTP_ERROR, POOL_LIVE, POOL_NO_SCHEDULER, POOL_REFUSED,
+    POOL_TIMEOUT, POOL_UNREACHABLE, PROBE_TIMEOUT_S, PoolProbe, _pool_note,
+    _probe_pool,
+)
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 
@@ -123,8 +131,12 @@ def _make_runner(path: Path, monkeypatch) -> CliRunner:
     # socket to 127.0.0.1:8420 — the operator's own install answers it on a dev
     # box. Default it to "no server" so these tests read a fixed number; the
     # tests that are ABOUT that width stub the HTTP call itself. Same reason
-    # test_task_lifecycle stubs `_server_owns_worker`.
-    monkeypatch.setattr(cmd_mod, "_running_pool_stats", lambda _cfg: None)
+    # test_task_lifecycle stubs `_server_owns_worker`. `status` calls
+    # `_probe_pool` directly (not `_running_pool_stats`), so THIS is the name
+    # that must be patched or `nh status` opens a real socket on a dev box.
+    monkeypatch.setattr(
+        cmd_mod, "_probe_pool",
+        lambda _cfg: cmd_mod.PoolProbe(None, cmd_mod.POOL_REFUSED))
     return CliRunner()
 
 
@@ -1133,10 +1145,34 @@ def _status_runner_with_config_width(db: Path, monkeypatch, width: int) -> CliRu
     return CliRunner()
 
 
-def _stub_health(monkeypatch, payload, *, status: int = 200):
+def _stub_health(monkeypatch, payload, *, status: int = 200, exc=None,
+                  body=None, seen=None):
     """Stub the queue-health HTTP call at the socket boundary, so the CLI's own
     parsing of the endpoint is exercised rather than mocked away. `payload` of
-    None raises, standing in for "no server listening"."""
+    None raises, standing in for "no server listening" — by default the exact
+    exception `urlopen` raises on a closed local port: `URLError` wrapping a
+    real `ConnectionRefusedError` (NOT a bare string reason, which the
+    outcome classifier would misread as unreachable). Pass `exc` to choose a
+    DIFFERENT failure at the socket boundary (a timeout, a DNS failure, …),
+    `status` to answer with a non-200, `body` to answer with raw bytes the
+    JSON parser has to cope with (truncated, empty, not JSON at all), and
+    `seen` (a list) to capture the keyword arguments `urlopen` was called
+    with, so a test can assert what timeout the probe really waited.
+
+    `status` models what real `urlopen` DOES, which is not the same as what a
+    naive stub does. `urllib`'s `HTTPErrorProcessor` routes every non-2xx into
+    the opener's error path, which RAISES `HTTPError` for anything no handler
+    claims — 4xx and 5xx among them — so a 500/503/404 never reaches the
+    caller as a returned object with `.status == 500`; that shape does not
+    exist. The stub therefore raises for a 4xx/5xx `status` and returns only
+    for 2xx, so a probe that classifies a 500 correctly here classifies it
+    correctly in production. (`HTTPError` is a `URLError`, hence an `OSError`,
+    so it lands in the probe's general connection-failure except tuple: unless
+    the probe names it there it degrades silently to "unreachable".)
+
+    3xx is NOT modelled: `HTTPRedirectHandler` claims 301/302/303/307/308 and
+    FOLLOWS them, so the caller sees whatever the redirect resolved to, and
+    neither raising nor returning a 3xx here would be faithful."""
     import urllib.error
     import urllib.request
 
@@ -1145,7 +1181,7 @@ def _stub_health(monkeypatch, payload, *, status: int = 200):
             self.status = status
 
         def read(self):
-            return json.dumps(payload).encode()
+            return body if body is not None else json.dumps(payload).encode()
 
         def __enter__(self):
             return self
@@ -1155,11 +1191,372 @@ def _stub_health(monkeypatch, payload, *, status: int = 200):
 
     def _fake_urlopen(url, timeout=None):
         assert "/api/queue/health" in url, f"status must read the live pool: {url}"
+        if seen is not None:
+            seen.append({"url": url, "timeout": timeout})
+        if exc is not None:
+            raise exc
         if payload is None:
-            raise urllib.error.URLError("connection refused")
+            raise urllib.error.URLError(
+                ConnectionRefusedError(61, "Connection refused"))
+        assert not 300 <= status < 400, (
+            f"this stub does not model redirects; {status} would be FOLLOWED")
+        if not 200 <= status < 300:
+            raise urllib.error.HTTPError(
+                url, status, f"stub status {status}", {}, None)
         return _Resp()
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+
+class _ProbeCfg:
+    """The minimal config `_probe_pool` needs: `server.host`/`server.port`
+    default via `.get`, matching what `config.get("server", {})` sees."""
+
+    def get(self, key, default=None):
+        return {} if key == "server" else default
+
+
+#: The URL `_probe_pool` builds from `_ProbeCfg`'s defaults. Used only as the
+#: `filename` the hand-built `HTTPError` rows carry, so they look like the ones
+#: `urlopen` raises rather than carrying a placeholder.
+_HEALTH_URL = "http://127.0.0.1:8420/api/queue/health"
+
+
+#: One row per way the probe can fail to learn the pool's width, as
+#: (id, `_stub_health` kwargs, outcome, the words the operator must see).
+#: NONE of them may classify as REFUSED and none may render "server not
+#: running": each row names a cause where the server may well be up, and two
+#: of them (the non-200 rows, the unreadable-body rows) are causes where the
+#: server demonstrably ANSWERED. The same table drives three tests — the
+#: classifier, the note, and the rendered `nh status` line — so a cause
+#: cannot be classified without also being given honest words.
+_PROBE_FAILURE_CAUSES = [
+    ("read-timeout", dict(payload=None, exc=TimeoutError("timed out")),
+     POOL_TIMEOUT, "no answer in"),
+    ("socket-timeout", dict(payload=None, exc=socket.timeout("timed out")),
+     POOL_TIMEOUT, "no answer in"),
+    ("urlerror-wrapping-timeout",
+     dict(payload=None, exc=urllib.error.URLError(TimeoutError("timed out"))),
+     POOL_TIMEOUT, "no answer in"),
+    ("dns-failure",
+     dict(payload=None,
+          exc=urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))),
+     POOL_UNREACHABLE, "could not get a readable answer"),
+    # `http.client` errors are NOT `OSError` or `URLError` subclasses; before
+    # `HTTPException` joined the except tuple they escaped the probe and
+    # crashed `nh status` outright.
+    ("bad-status-line",
+     dict(payload=None, exc=http.client.BadStatusLine("\x16\x03\x01")),
+     POOL_UNREACHABLE, "could not get a readable answer"),
+    ("invalid-url",
+     dict(payload=None, exc=http.client.InvalidURL("nonnumeric port: ''")),
+     POOL_UNREACHABLE, "could not get a readable answer"),
+    ("incomplete-read",
+     dict(payload=None, exc=http.client.IncompleteRead(b"{\"max_wo", 42)),
+     POOL_UNREACHABLE, "could not get a readable answer"),
+    # The RAISED shape, which is the only shape a real 500/503/404 has:
+    # `urllib`'s error path turns a 4xx/5xx into a raised `HTTPError`, and
+    # `HTTPError` is a `URLError` is an `OSError`, so these
+    # rows are the ones that go red if the probe leaves an answered non-2xx to
+    # its general connection-failure handler.
+    ("http-500-raised",
+     dict(payload=None,
+          exc=urllib.error.HTTPError(_HEALTH_URL, 500, "Internal Server Error",
+                                     {}, None)),
+     POOL_HTTP_ERROR, "server answered HTTP 500"),
+    ("http-503-raised",
+     dict(payload=None,
+          exc=urllib.error.HTTPError(_HEALTH_URL, 503, "Service Unavailable",
+                                     {}, None)),
+     POOL_HTTP_ERROR, "server answered HTTP 503"),
+    ("http-404-raised",
+     dict(payload=None,
+          exc=urllib.error.HTTPError(_HEALTH_URL, 404, "Not Found", {}, None)),
+     POOL_HTTP_ERROR, "server answered HTTP 404"),
+    # Same 500 reached through the stub's own modelling of `urlopen` (it
+    # raises for a 4xx/5xx `status=`), so the fixture and the probe agree.
+    ("http-500", dict(payload={"max_workers": 8}, status=500),
+     POOL_HTTP_ERROR, "server answered HTTP 500"),
+    # 2xx-but-not-200 is the one non-200 that really is RETURNED: the error
+    # processor passes 2xx through, so this row exercises the return path.
+    ("http-204-empty", dict(payload={}, status=204, body=b""),
+     POOL_HTTP_ERROR, "server answered HTTP 204"),
+    ("body-is-not-json", dict(payload={}, body=b"{not json"),
+     POOL_BAD_BODY, "server answered but the response was unreadable"),
+    ("body-truncated", dict(payload={}, body=b'{"max_workers": 8'),
+     POOL_BAD_BODY, "server answered but the response was unreadable"),
+    ("body-is-not-an-object", dict(payload={}, body=b'"a string"'),
+     POOL_BAD_BODY, "server answered but the response was unreadable"),
+    ("width-is-not-a-number", dict(payload={"max_workers": "wide"}),
+     POOL_BAD_BODY, "server answered but the response was unreadable"),
+]
+
+_PROBE_CAUSE_IDS = [row[0] for row in _PROBE_FAILURE_CAUSES]
+
+
+def test_probe_pool_classifies_connection_refused_as_not_running(monkeypatch):
+    _stub_health(monkeypatch, None)  # faithful URLError(ConnectionRefusedError)
+
+    assert _probe_pool(_ProbeCfg()) == PoolProbe(None, POOL_REFUSED)
+
+
+@pytest.mark.parametrize("_id,kwargs,outcome,_words", _PROBE_FAILURE_CAUSES,
+                          ids=_PROBE_CAUSE_IDS)
+def test_probe_pool_classifies_each_failure_by_what_it_established(
+        monkeypatch, _id, kwargs, outcome, _words):
+    """A stall, a DNS failure, a protocol error, a non-200 and an unreadable
+    body are five DIFFERENT facts. None of them is evidence the server isn't
+    running, so none may classify as REFUSED — and none may be flattened into
+    the others, because the note the operator reads is chosen by this
+    outcome."""
+    _stub_health(monkeypatch, **kwargs)
+
+    result = _probe_pool(_ProbeCfg())
+
+    assert result.outcome == outcome, result.outcome
+    assert result.outcome != POOL_REFUSED, result.outcome
+    assert result.stats is None, result.stats
+
+
+def test_probe_pool_carries_the_status_code_it_saw(monkeypatch):
+    """The HTTP-error note names the code, so the probe has to carry it."""
+    _stub_health(monkeypatch, {"max_workers": 8}, status=503)
+
+    result = _probe_pool(_ProbeCfg())
+
+    assert result == PoolProbe(None, POOL_HTTP_ERROR, 503), result
+
+
+@pytest.mark.parametrize("code", [500, 503, 404])
+def test_probe_pool_classifies_a_raised_httperror_by_the_code_it_carries(
+        monkeypatch, code):
+    """A real 500 arrives as a RAISED `HTTPError`, not as a returned response
+    with `.status == 500`: `urllib`'s `HTTPErrorProcessor` hands every non-2xx
+    to the error path, which raises for a 4xx/5xx (nothing claims those the
+    way the redirect handler claims a 3xx). And `HTTPError` is a `URLError`,
+    which is an `OSError` — so it lands in the probe's connection-failure
+    except tuple.
+    Unless the handler names it there, it falls through to that tuple's
+    `POOL_UNREACHABLE` default and every real HTTP error reads as "no readable
+    answer", losing the one fact the response established: the server
+    answered, with this code."""
+    import urllib.error
+
+    # The subclassing that puts an answered non-2xx in the connection-failure
+    # handler in the first place, asserted rather than asserted-in-prose.
+    assert issubclass(urllib.error.HTTPError, urllib.error.URLError)
+    assert issubclass(urllib.error.URLError, OSError)
+    _stub_health(monkeypatch, None, exc=urllib.error.HTTPError(
+        _HEALTH_URL, code, "stub", {}, None))
+
+    result = _probe_pool(_ProbeCfg())
+
+    assert result == PoolProbe(None, POOL_HTTP_ERROR, code), result
+    assert str(code) in _pool_note(result.outcome, result.http_status)
+
+
+def test_probe_pool_reads_a_2xx_that_is_not_200_off_the_returned_response(
+        monkeypatch):
+    """The other side of the same boundary: 2xx is the range `urlopen` really
+    does RETURN, so a 204 (no body to parse a pool width out of) has to be
+    classified off the returned object's status, not off an exception. This
+    test walks the stub itself first, to show the row reaches the probe
+    through the return path and not the raise path."""
+    import urllib.request
+
+    _stub_health(monkeypatch, {}, status=204, body=b"")
+
+    with urllib.request.urlopen(_HEALTH_URL) as resp:   # returns; no raise
+        assert resp.status == 204
+
+    assert _probe_pool(_ProbeCfg()) == PoolProbe(None, POOL_HTTP_ERROR, 204)
+
+
+@pytest.mark.parametrize("_id,kwargs,outcome,words", _PROBE_FAILURE_CAUSES,
+                          ids=_PROBE_CAUSE_IDS)
+def test_pool_note_says_only_what_that_outcome_established(
+        monkeypatch, _id, kwargs, outcome, words):
+    """The outcome->note relation, driven directly (no console scraping).
+    "server not running" is REFUSED's alone: every other outcome here is a
+    cause the server may have survived, and the non-200 / unreadable-body
+    ones are causes where it demonstrably answered."""
+    _stub_health(monkeypatch, **kwargs)
+    probe = _probe_pool(_ProbeCfg())
+
+    note = _pool_note(probe.outcome, probe.http_status)
+
+    assert words in note, note
+    assert "server not running" not in note, note
+    assert "(configured;" in note, note
+
+
+def test_pool_note_for_refused_is_the_one_that_says_not_running():
+    """The other half of the relation: connection refused IS evidence there
+    is no listener, and must not be softened into "unreachable"."""
+    assert _pool_note(POOL_REFUSED) == " [dim](configured; server not running)[/]"
+
+
+def test_pool_note_for_no_scheduler_says_the_server_answered():
+    assert _pool_note(POOL_NO_SCHEDULER) == (
+        " [dim](configured; server up, no pool attached)[/]")
+
+
+@pytest.mark.parametrize("exc", [
+    # The server answered 200 and sent bytes; the stream ended early.
+    http.client.IncompleteRead(b"{\"max_wo", 42),
+    # The server sent bytes that were not a status line (a TLS listener on a
+    # plaintext port sends `\x16\x03\x01`) — bytes are an answer of a kind.
+    http.client.BadStatusLine("\x16\x03\x01"),
+], ids=["incomplete-read-after-200", "bad-status-line"])
+def test_pool_note_for_unreachable_claims_no_mechanism(monkeypatch, exc):
+    """POOL_UNREACHABLE covers causes where the server DID send bytes, so the
+    note may not describe HOW it failed. It used to say "the connection failed
+    before any answer", which for these two is false: an `IncompleteRead`
+    happens after a 200 and a `BadStatusLine` is bytes that arrived. The note
+    is allowed to say only the outcome — no readable answer, pool state
+    unknown, and the printed width may therefore be wrong."""
+    _stub_health(monkeypatch, None, exc=exc)
+    probe = _probe_pool(_ProbeCfg())
+    assert probe.outcome == POOL_UNREACHABLE, probe
+
+    note = _pool_note(probe.outcome, probe.http_status)
+
+    assert "pool state unknown" in note, note
+    assert "this width may be wrong" in note, note
+    for false_mechanism in ("before any answer", "the connection failed",
+                            "server not running"):
+        assert false_mechanism not in note, (false_mechanism, note)
+
+
+def test_pool_note_default_for_an_unknown_outcome_claims_nothing_but_unknown():
+    """The `.get` default. An outcome nobody has written a note for gets the
+    note that asserts least about the server: not "not running" (which only a
+    refusal establishes) and not a mechanism either (nothing is known about
+    the mechanism of a failure nobody enumerated) — only that the pool state
+    is unknown and the width being printed may be wrong."""
+    note = _pool_note("an-outcome-from-the-future")
+
+    assert note == _pool_note(POOL_UNREACHABLE)
+    assert "pool state unknown" in note, note
+    assert "server not running" not in note, note
+    assert "the connection failed" not in note, note
+
+
+def test_pool_note_for_a_status_code_the_probe_could_not_read():
+    """`http_status` is None when the response object carried no status. The
+    note still has to be a sentence, and still may not claim a code."""
+    note = _pool_note(POOL_HTTP_ERROR, None)
+
+    assert "pool state unknown" in note, note
+    assert "None" not in note, note
+
+
+def test_pool_note_timeout_is_rendered_from_the_timeout_the_probe_waits():
+    """The operator-facing number and the number `urlopen` is given are ONE
+    constant. Expectation is FORMATTED from the constant, not typed as a
+    literal, so moving `PROBE_TIMEOUT_S` moves both or fails here."""
+    assert f"no answer in {PROBE_TIMEOUT_S}s" in _pool_note(POOL_TIMEOUT)
+
+
+def test_probe_pool_waits_exactly_the_timeout_the_note_advertises(monkeypatch):
+    """The other end of the same coupling: the note's number is only honest if
+    it is what was actually passed to `urlopen`."""
+    seen = []
+    _stub_health(monkeypatch, {"max_workers": 4}, seen=seen)
+
+    _probe_pool(_ProbeCfg())
+
+    assert [c["timeout"] for c in seen] == [PROBE_TIMEOUT_S], seen
+
+
+def test_probe_pool_reports_no_scheduler_for_a_zero_width_pool(monkeypatch):
+    _stub_health(monkeypatch, {"max_workers": 0})
+
+    assert _probe_pool(_ProbeCfg()) == PoolProbe(None, POOL_NO_SCHEDULER)
+
+
+def test_probe_pool_returns_live_stats_unchanged(monkeypatch):
+    """Pins the wrapper's contract for `task_show`: `_probe_pool`'s `.stats`
+    is the exact `(busy, width, pause)` tuple `_running_pool_stats` returns
+    today for the same payload."""
+    _stub_health(monkeypatch, {
+        "max_workers": 8, "workers_busy": 2,
+        "paused": True, "paused_reason": "quota",
+        "paused_until": "2026-08-20T17:20:00+00:00",
+        "paused_profile": "personal2",
+    })
+
+    result = _probe_pool(_ProbeCfg())
+
+    assert result.outcome == POOL_LIVE, result.outcome
+    assert result.stats == (2, 8, {
+        "reason": "quota",
+        "until": "2026-08-20T17:20:00+00:00",
+        "profile": "personal2",
+    })
+
+
+@pytest.mark.parametrize("busy_raw", ["many", "2.5", [1], {"a": 1}, -3],
+                          ids=["word", "decimal-string", "list", "object",
+                               "negative"])
+def test_probe_pool_degrades_an_unreadable_busy_but_keeps_the_observed_width(
+        monkeypatch, busy_raw):
+    """The judgement this pins: a junk NUMERATOR does not discredit a width
+    the server really did report. The server answered 200 and `max_workers`
+    parsed, so the outcome is LIVE and the denominator is an observation; only
+    `workers_busy` is dropped, to exactly the `None` an ABSENT `workers_busy`
+    already produces (`_running_pool_stats`' documented contract: absent or
+    unparseable both mean "answered, but reported no numerator", and the
+    caller then counts rows for the numerator).
+
+    Not POOL_BAD_BODY: that would throw away the observed width and print the
+    configured guess instead, which is a worse number, and would claim the
+    response was unreadable when all of it but one field was read.
+
+    Not an exception either — the probe may never raise. `-3` is here for the
+    other unreadable case: a numerator that parses but cannot be true, since
+    `workers_busy` is `len(inflight_ids)` and a set has no negative size."""
+    _stub_health(monkeypatch, {"max_workers": 8, "workers_busy": busy_raw})
+
+    result = _probe_pool(_ProbeCfg())
+
+    assert result == PoolProbe((None, 8, None), POOL_LIVE), result
+
+
+def test_probe_pool_still_reports_no_scheduler_when_busy_is_unreadable(
+        monkeypatch):
+    """The width decides the outcome, and it is read first: a zero width with
+    a junk numerator is still "server up, no pool attached", not a live pool
+    and not a crash."""
+    _stub_health(monkeypatch, {"max_workers": 0, "workers_busy": "many"})
+
+    assert _probe_pool(_ProbeCfg()) == PoolProbe(None, POOL_NO_SCHEDULER)
+
+
+def test_status_counts_rows_for_the_numerator_when_workers_busy_is_unreadable(
+        tmp_path, monkeypatch):
+    """What the operator actually reads for the degraded case. The width is
+    the observed 8, NOT the configured 2, and it carries no note — because
+    nothing about it is a guess. The numerator falls back to counting rows,
+    the same fallback an absent `workers_busy` takes
+    (`test_status_keeps_counting_rows_when_health_omits_workers_busy`), so the
+    line makes no claim the payload failed to support: no "server not
+    running", no "configured" label on an observed number, and no `None`
+    leaking into the ratio."""
+    db = tmp_path / "test.db"
+    for _ in range(3):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 8, "workers_busy": "many"})
+
+    result = runner.invoke(cli, ["status"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "working 3/8" in out, out
+    assert "configured" not in out, out
+    assert "server not running" not in out, out
+    assert "None" not in out, out
 
 
 def test_status_prints_the_running_pool_width_not_the_configured_one(tmp_path, monkeypatch):
@@ -1194,10 +1591,58 @@ def test_status_falls_back_to_config_and_says_so_when_no_server(tmp_path, monkey
     assert "(configured; server not running)" in out, out
 
 
+def test_status_does_not_claim_the_server_is_down_when_the_probe_timed_out(tmp_path, monkeypatch):
+    """A single stall past the probe's timeout used to render as the
+    definitive "server not running", because every non-refusal failure took
+    the same branch as a refusal. A timeout establishes "could not reach it in
+    the time it had", never "not running"."""
+    db = tmp_path / "test.db"
+    for _ in range(7):
+        _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 4)
+    _stub_health(monkeypatch, None, exc=TimeoutError("timed out"))
+
+    result = runner.invoke(cli, ["status"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "server not running" not in out, out
+    assert "unreachable" in out, out
+    assert "configured" in out, out
+    # The advertised number is the one the probe waits, formatted from the
+    # constant rather than typed here.
+    assert f"no answer in {PROBE_TIMEOUT_S}s" in out, out
+
+
+@pytest.mark.parametrize("_id,kwargs,_outcome,words", _PROBE_FAILURE_CAUSES,
+                          ids=_PROBE_CAUSE_IDS)
+def test_status_renders_what_each_probe_failure_established(
+        tmp_path, monkeypatch, _id, kwargs, _outcome, words):
+    """Every cause, driven through the real render path. `nh status` must
+    exit 0 (a probe that cannot classify a failure must never crash the
+    command), must fall back to the labelled config width, and must print the
+    words for THAT cause — never "server not running", which only a refusal
+    establishes."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, **kwargs)
+
+    result = runner.invoke(cli, ["status"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "working 1/2" in out, out
+    assert words in out, out
+    assert "server not running" not in out, out
+
+
 def test_status_does_not_trust_a_zero_width_pool(tmp_path, monkeypatch):
     """A reachable server with no scheduler attached reports max_workers 0.
     Printing `working 1/0` would be an impossible ratio, and treating 0 as an
-    observation would be a claim about a pool that isn't draining anything."""
+    observation would be a claim about a pool that isn't draining anything.
+    The server DID answer 200, though — "server not running" is falsified by
+    the probe's own evidence, so the note must say something else."""
     db = tmp_path / "test.db"
     _seed_task(db, TaskStatus.IMPLEMENTING)
     runner = _status_runner_with_config_width(db, monkeypatch, 2)
@@ -1206,7 +1651,8 @@ def test_status_does_not_trust_a_zero_width_pool(tmp_path, monkeypatch):
     out = " ".join(runner.invoke(cli, ["status"]).output.split())
 
     assert "working 1/2" in out, out
-    assert "(configured; server not running)" in out, out
+    assert "server not running" not in out, out
+    assert "server up, no pool attached" in out, out
 
 
 def test_status_json_is_unchanged_by_the_live_width(tmp_path, monkeypatch):
@@ -1222,6 +1668,28 @@ def test_status_json_is_unchanged_by_the_live_width(tmp_path, monkeypatch):
     assert set(out) == {"needs you", "queued", "working", "waiting", "failed",
                         "done", "unattributed_usage"}
     assert out["working"] == 1
+
+
+def test_status_json_is_unchanged_by_the_probe_outcome(tmp_path, monkeypatch):
+    """The probe's classification of WHY there are no stats is a note on the
+    human-readable line only — `--json` carries no note today and must not
+    grow one no matter which failure mode tripped the probe."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    expected_keys = {"needs you", "queued", "working", "waiting", "failed",
+                      "done", "unattributed_usage"}
+
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, None, exc=TimeoutError("timed out"))
+    timeout_out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, None)  # connection refused
+    refused_out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+
+    assert set(timeout_out) == expected_keys, timeout_out
+    assert set(refused_out) == expected_keys, refused_out
+    assert set(timeout_out) == set(refused_out)
 
 
 def test_status_working_numerator_comes_from_workers_busy(tmp_path, monkeypatch):

@@ -72,6 +72,10 @@ _NETWORK_CLIS = frozenset({"curl", "wget", "gh", "glab"})
 LOOPBACK_ONLY: dict[str, str] = {
     "cli/api_client.py":
         "DEFAULT_BASE_URL = http://127.0.0.1:8420 — the CLI calling our own API",
+    "cli/pool_probe.py":
+        "urlopen(http://<server host, 127.0.0.1 by default>:<port>/api/queue/"
+        "health) — `nh status` probing our own local server, same trust model "
+        "as cli/api_client.py (the CLI calling our own API)",
     "intake/mcp_bridge.py":
         "BASE_URL = http://127.0.0.1:8420 — the MCP bridge calling our own API",
     "history/extractor.py":

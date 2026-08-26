@@ -445,6 +445,14 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "http:httpx": Allowed("no_human's own API", "loopback: 127.0.0.1:8420 "
                               "(DEFAULT_BASE_URL) — the CLI calling our server"),
     },
+    # Split out of cli/commands.py, which keeps its own urllib line for
+    # `_server_owns_worker` / `_post_server_cancel`. Same destination, same
+    # gate: one GET of our own queue-health endpoint, for `nh status`.
+    "cli/pool_probe.py": {
+        "http:urllib.request": Allowed(
+            "no_human's own API", "loopback: http://{server.host}:{server.port}"
+            "/api/queue/health, server.host defaults to 127.0.0.1"),
+    },
     "intake/mcp_bridge.py": {
         "http:httpx": Allowed("no_human's own API", "loopback: 127.0.0.1:8420 "
                               "(BASE_URL) — the MCP bridge calling our server"),
@@ -2004,11 +2012,13 @@ def test_loopback_entries_really_bind_loopback() -> None:
             if entry.gate.startswith("loopback:"):
                 checked += 1
                 assert "127.0.0.1" in (PKG / module).read_text(), (module, channel)
-    # 11 = the 10 that predate the UI evidence runner + its readiness probe
+    # 12 = the 10 that predate the UI evidence runner, + its readiness probe
     # (one connection to a validated 127.0.0.1/localhost base_url, redirects
-    # refused). The runner's BROWSER is deliberately NOT loopback: a page it
+    # refused), + `cli/pool_probe.py`, which is `nh status`'s queue-health GET
+    # split out of cli/commands.py — a move of an existing channel, not a new
+    # destination. The runner's BROWSER is deliberately NOT loopback: a page it
     # loads can fetch from anywhere, so that channel is config-gated instead.
-    assert checked == 11, f"expected 11 loopback channels, found {checked}"
+    assert checked == 12, f"expected 12 loopback channels, found {checked}"
 
 
 def test_no_unused_local_classifications() -> None:

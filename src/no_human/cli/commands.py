@@ -52,6 +52,14 @@ from ..intake import (
 )
 from ..notify import build_notifier
 from ..vcs.task_pr import PR_EVENT_KINDS, task_has_pr_evidence
+# Re-exported, not just used: `nh status` calls `_probe_pool` through THIS
+# module's globals, and that is the name the CLI tests monkeypatch to keep
+# themselves off the dev box's real 127.0.0.1:8420 listener.
+from .pool_probe import (  # noqa: F401
+    POOL_BAD_BODY, POOL_HTTP_ERROR, POOL_LIVE, POOL_NO_SCHEDULER, POOL_REFUSED,
+    POOL_TIMEOUT, POOL_UNREACHABLE, PROBE_TIMEOUT_S, PoolProbe, _pool_note,
+    _probe_pool,
+)
 
 console = Console()
 
@@ -205,38 +213,15 @@ def _running_pool_stats(config) -> tuple[int | None, int, dict | None] | None:
     server not running)` while a 3-wide serve pool is in fact draining. Fixing
     that needs `serve` to expose the width somewhere a second process can read
     (a status endpoint or a pid-file field), which is not this change.
-    """
-    import json as _json
-    import urllib.error
-    import urllib.request
 
-    srv = config.get("server", {}) or {}
-    host = srv.get("host", "127.0.0.1")
-    port = srv.get("port", 8420)
-    try:
-        with urllib.request.urlopen(
-            f"http://{host}:{port}/api/queue/health", timeout=1.5
-        ) as resp:
-            if resp.status != 200:
-                return None
-            payload = _json.loads(resp.read() or b"{}") or {}
-            width = int(payload.get("max_workers", 0))
-            if width < 1:
-                return None
-            busy_raw = payload.get("workers_busy")
-            busy = int(busy_raw) if busy_raw is not None else None
-            if busy is not None and busy < 0:
-                busy = None
-            pause = None
-            if payload.get("paused"):
-                pause = {
-                    "reason": payload.get("paused_reason"),
-                    "until": payload.get("paused_until"),
-                    "profile": payload.get("paused_profile"),
-                }
-            return busy, width, pause
-    except (urllib.error.URLError, OSError, ValueError, TypeError, TimeoutError):
-        return None
+    This is a thin wrapper over `pool_probe._probe_pool`, which also carries
+    WHY there are no stats (`PoolProbe.outcome`) — a timeout, an HTTP 500 and
+    a connection refused are three different facts, and `nh status` uses that
+    distinction to choose its words; this function keeps the pre-existing
+    `(busy, width, pause) | None` contract for callers (like `task_show`) that
+    only need the stats.
+    """
+    return _probe_pool(config).stats
 
 
 def _local_hhmm(iso: str | None) -> str:
@@ -3951,7 +3936,8 @@ def status(as_json):
             # break, and the alternative (reverting AC3's already-landed,
             # already-tested human-readable fix) would mean weakening a
             # passing test, which is not allowed.
-            stats = _running_pool_stats(config)
+            probe = _probe_pool(config)
+            stats = probe.stats
             pause = stats[2] if stats is not None else None
             # While the pool is paused nothing is competing for a slot, so
             # calling a recorded wait a *live* slot wait is the same class of
@@ -3990,7 +3976,7 @@ def status(as_json):
                 return
             if stats is None:
                 mw = config.data.get("concurrency", {}).get("max_workers", 1)
-                mw_note = " [dim](configured; server not running)[/]"
+                mw_note = _pool_note(probe.outcome, probe.http_status)
                 working_n, queued_n = buckets["working"], buckets["queued"]
             else:
                 busy, mw, pause = stats

@@ -135,7 +135,7 @@ named here.
   `git fetch origin` (`vcs/git.py:767`, `:797`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:2785`). This is *your* command, not the agent's — an agent
+  (`cli/commands.py:2770`). This is *your* command, not the agent's — an agent
   session's Bash is denied it for the spellings the rule models
   (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
   in both session modes; see §2 for the bound.
@@ -221,7 +221,7 @@ named here.
   **The control that does close the door is not this.** It is a check at the
   act: `nh approve` refusing inside an agent session, and the four gate-ending
   routes requiring something an agent session does not have. That check is
-  **not implemented today** — neither `nh approve` (`cli/commands.py:4611`)
+  **not implemented today** — neither `nh approve` (`cli/commands.py:4597`)
   nor the API's `approve_task` route (`api/app.py:1023`) tests for an agent
   session — so nothing here should be read as telling you to rely on it.
 
@@ -326,7 +326,7 @@ config key that turns it on and the default that keeps it off.
 
 The CLI, the desktop app and the MCP bridge talk to no_human's **own** API on
 `127.0.0.1:8420` (`cli/api_client.py`, `intake/mcp_bridge.py:29`,
-`cli/commands.py:64-70`), and the transcript-research reader probes a language
+`cli/commands.py:78`), and the transcript-research reader probes a language
 server on localhost (`history/extractor.py:65-72`). These never leave the
 machine, and `server.host` defaults to `127.0.0.1`.
 
