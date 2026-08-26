@@ -81,11 +81,19 @@ METERED_AUTH_VARS = (
 # operator ran `codex login`, asked "can't we support both options?" and
 # instructed "do it" / "you have it"):
 #
-# * "api_key" — YOUR OWN OpenAI API key, from ~/.no_human/.env. Unchanged
-#   behaviour: no browser-login flow, no `codex login` call from no_human,
-#   and the Codex CLI is invoked with `preferred_auth_method="apikey"` so it
-#   cannot silently fall back to a ChatGPT credential that happens to exist
-#   on the machine.
+# * "api_key" — YOUR OWN OpenAI API key, from ~/.no_human/.env. No
+#   browser-login flow, no `codex login` call from no_human. The Codex CLI
+#   IS still invoked with `preferred_auth_method="apikey"`, but that flag is
+#   NOT what stops a silent fallback to a ChatGPT credential that happens to
+#   exist on the machine — codex-cli 0.149.0 silently IGNORES it (measured
+#   live 2026-08-25: a bogus key, with a ChatGPT session already present,
+#   still billed the ChatGPT plan). The actual gate is CLI-verified, not
+#   claimed: `agent.codex_backend.assert_api_key_billing_path` writes the key
+#   into a no_human-owned `CODEX_HOME` (`~/.no_human/codex-home`, never the
+#   operator's own credential directory) and refuses the run unless
+#   `codex login status` against THAT directory reports an api_key-backed
+#   session. See `assert_codex_api_key_mode` below and
+#   `agent/codex_backend.py`'s module docstring.
 # * "subscription" — the operator's own ChatGPT sign-in, done by the
 #   operator running `codex login` themselves (no_human never calls, wraps
 #   or shells out to `codex login` — only `codex login status`). no_human
@@ -580,6 +588,16 @@ def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
     Kept byte-identical in signature and control flow (2026-08-22 amendment):
     only the message text below changed, to drop the now-unsourced "OpenAI's
     terms prohibit..." absolute and name the sibling mode instead.
+
+    This function only resolves and scrubs — it does NOT verify the key
+    actually bills OpenAI rather than a live ChatGPT session. That
+    CLI-verified check happens later, once per run, in
+    :func:`no_human.agent.codex_backend.assert_api_key_billing_path`, gating
+    :meth:`CodexBackend._child_env_api_key`: it points the CLI at a
+    no_human-owned ``CODEX_HOME`` holding only this key and refuses the run
+    unless ``codex login status`` against THAT directory reports an
+    api_key-backed session. See the module comment above (:86) and
+    ``agent/codex_backend.py``'s module docstring for the full mechanism.
     """
     env_path = ENV_PATH if env_path is None else env_path
     key = _read_env_file(env_path).get(CODEX_API_KEY_VAR) or os.environ.get(

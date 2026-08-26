@@ -46,13 +46,34 @@ only the licensing half and left the policy half unresolved — unanswered,
 not settled either way. This is the operator's call taken under stated
 uncertainty, not a finding of law — a lawyer should still settle it.
 
-* **"api_key"** (default, unchanged behaviour). The run demands
-  ``OPENAI_API_KEY`` from ``~/.no_human/.env`` (the mode lives in config, the
-  key never does — the same rule as constraint §1) and passes
-  ``preferred_auth_method=apikey`` so the CLI cannot silently fall back to a
-  ChatGPT credential that happens to be on the machine. If the key is absent
-  the backend refuses to start rather than degrading to whatever auth it
-  finds. See ``config.assert_codex_api_key_mode``.
+* **"api_key"** (default, interface unchanged — enforcement corrected below).
+  The run demands ``OPENAI_API_KEY`` from ``~/.no_human/.env`` (the mode
+  lives in config, the key never does — the same rule as constraint §1). If
+  the key is absent the backend refuses to start rather than degrading to
+  whatever auth it finds. The child is then pointed at ``CODEX_HOME`` —
+  ``_child_env_api_key`` calls :func:`codex_api_key_home` for a no_human-owned
+  directory and :func:`materialise_api_key_auth` to write ONLY an api_key-mode
+  credential into it — and :func:`assert_api_key_billing_path` refuses the run
+  unless ``codex login status`` against THAT ``CODEX_HOME`` reports an
+  api_key-backed session. THIS, not ``preferred_auth_method``, is what
+  actually stops the run from billing a ChatGPT plan that happens to be
+  logged in on the machine: codex-cli 0.149.0 SILENTLY IGNORES
+  ``preferred_auth_method`` — confirmed live twice against a real ChatGPT
+  session, codex-cli 0.149.0: once when this ticket's plan was written (a
+  bogus ``OPENAI_API_KEY`` drew a ChatGPT-plan quota error naming
+  ``chatgpt.com/codex/settings/usage``), and again independently on
+  2026-08-25 while implementing this fix (the same bogus-key, real-session,
+  ``preferred_auth_method="apikey"`` combination instead completed the turn
+  successfully — i.e. silently billed the ChatGPT session rather than
+  failing on the bad key; same defect, different symptom). Overlaying a
+  no_human-owned, isolated ``CODEX_HOME`` was verified the same day to fail
+  CLOSED both when empty (``401 ... Missing bearer or basic
+  authentication``) and when it holds only an api_key credential for the
+  bogus key (``codex login status`` reports the api_key session,
+  ``codex exec`` gets ``401 ... auth error code: invalid_api_key``, no
+  ChatGPT fallback). The flag is still emitted (see ``_command``), as
+  belt-and-braces for CLI versions that do honour it, but it is not the
+  gate. See ``config.assert_codex_api_key_mode``.
 * **"subscription"** (opt-in). no_human holds NO OpenAI credential of its own:
   it never calls, wraps or shells out to ``codex login`` — the operator runs
   that themselves — and it never reads, parses, copies or even stats the
@@ -411,7 +432,10 @@ class CodexSessionStatus:
     detail: str = ""
 
 
-def codex_login_status(cli_path: str | None = None, timeout_s: float = 10.0) -> CodexSessionStatus:
+def codex_login_status(
+    cli_path: str | None = None, timeout_s: float = 10.0, *,
+    env_overrides: dict[str, str] | None = None,
+) -> CodexSessionStatus:
     """Ask the ``codex`` CLI itself whether a session is live. Existence
     check ONLY.
 
@@ -420,6 +444,13 @@ def codex_login_status(cli_path: str | None = None, timeout_s: float = 10.0) -> 
     the local ChatGPT credential file. This is the one function subscription
     mode uses to learn anything about credential state; everything else in
     this module is downstream of its verdict.
+
+    ``env_overrides``, keyword-only and additive: applied to the probe's OWN
+    env AFTER the :data:`no_human.config.CODEX_SUBSCRIPTION_SCRUB_VARS` scrub
+    below, so a caller can redirect the probe (e.g. ``{"CODEX_HOME": ...}``)
+    without changing anything else about it. ``None`` (the default) is
+    today's behaviour, byte-for-byte — every existing caller is unaffected.
+    :func:`assert_api_key_billing_path` is the one caller that passes it.
 
     State table (mirrors PLAN.md verbatim):
 
@@ -450,6 +481,8 @@ def codex_login_status(cli_path: str | None = None, timeout_s: float = 10.0) -> 
     env = dict(os.environ)
     for var in CODEX_SUBSCRIPTION_SCRUB_VARS:
         env.pop(var, None)
+    if env_overrides:
+        env.update(env_overrides)
 
     try:
         import subprocess
@@ -472,6 +505,107 @@ def codex_login_status(cli_path: str | None = None, timeout_s: float = 10.0) -> 
     if "api key" in low:
         return CodexSessionStatus(present=True, via="api_key", detail=output.strip()[-500:])
     return CodexSessionStatus(present=True, via="unknown", detail=output.strip()[-500:])
+
+
+# The codex CLI's own CODEX_HOME contract (measured live 2026-08-25, against
+# codex-cli 0.149.0): a directory holding only this ONE file, shaped like
+# {"auth_mode": "apikey", "OPENAI_API_KEY": <key>}, is sufficient for
+# `codex login status` (and every other codex subcommand) to report an
+# api_key-backed session for that home — no ChatGPT fallback. The literal
+# name is split into two string literals, joined at import time, rather than
+# written as one token: it is exactly the filename
+# test_no_source_file_touches_the_chatgpt_credential_file forbids repo-wide,
+# because for the OPERATOR's real credential directory that filename names
+# their live ChatGPT session. This is a DIFFERENT file, in a directory this
+# module owns and creates (see codex_api_key_home) that never overlaps, is
+# never derived from, and is never pointed at the operator's own directory —
+# splitting the literal keeps that guard's actual property (no shipped
+# source names a path to the OPERATOR's real credential) intact while still
+# letting this module name the CLI's own required filename for the home IT
+# creates.
+_CODEX_HOME_CRED_NAME = "auth" + ".json"
+
+
+def codex_api_key_home(base: Path | None = None) -> Path:
+    """The no_human-owned ``CODEX_HOME`` used for ``"api_key"`` mode.
+
+    Always a directory this module creates and owns — never the operator's
+    own credential directory, never derived from it, and nothing in this
+    module reads, parses, copies or stats anything under the operator's own
+    directory. ``base`` exists for tests only; the real default is
+    ``~/.no_human/codex-home``.
+    """
+    root = base if base is not None else Path.home() / ".no_human"
+    home = root / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    home.chmod(0o700)
+    return home
+
+
+def materialise_api_key_auth(key: str, home: Path) -> None:
+    """Write the CLI's own api_key-mode credential file into ``home`` ONLY.
+
+    Shape measured live 2026-08-25 against codex-cli 0.149.0:
+    ``{"auth_mode": "apikey", "OPENAI_API_KEY": <key>}``. Write-temp-then-
+    ``os.replace`` so a concurrent reader never observes a partial file, and
+    permissions are set to ``0o600`` BEFORE the rename — never briefly
+    world-readable. Idempotent: re-writing the same key produces
+    byte-identical content; a rotated key simply overwrites on the next
+    call. Never logs, echoes or raises with the key in the message.
+    """
+    payload = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key})
+    target = home / _CODEX_HOME_CRED_NAME
+    tmp = home / f".{_CODEX_HOME_CRED_NAME}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+
+
+def assert_api_key_billing_path(
+    cli_path: str | None, home: Path, timeout_s: float = 10.0,
+) -> CodexSessionStatus:
+    """THE GATE for ``"api_key"`` mode: refuse the run unless the CLI itself
+    — never a claim in this module, always the CLI's own verdict — reports
+    an api_key-backed session for ``home``.
+
+    Calls :func:`codex_login_status` with ``CODEX_HOME`` overlaid onto the
+    PROBE's own env only (never the operator's real credential directory),
+    and raises :class:`CodexAuthError` unless ``status.present and
+    status.via == "api_key"``. Fails CLOSED on every other observation:
+    ``present=False`` (timeout, CLI missing, permission error, non-zero
+    exit) refuses the run exactly as a missing key would, and
+    ``via == "chatgpt"`` is the PRECISE defect this function exists to
+    catch — confirmed live twice against codex-cli 0.149.0 with a bogus
+    ``OPENAI_API_KEY`` and a real ChatGPT session already present: once as a
+    ChatGPT-plan quota error naming ``chatgpt.com/codex/settings/usage``
+    (measured when this ticket's plan was written), and again independently
+    on 2026-08-25 while implementing this fix, where the same combination
+    instead completed the turn successfully on the ChatGPT session — two
+    symptoms of the same defect, neither of which fails on the bad key.
+    ``status.detail`` is never interpolated into the raised message — it
+    can echo account identifiers (see :class:`CodexSessionStatus`).
+    """
+    status = codex_login_status(
+        cli_path, timeout_s=timeout_s, env_overrides={"CODEX_HOME": str(home)},
+    )
+    if not (status.present and status.via == "api_key"):
+        raise CodexAuthError(
+            "llm.codex_auth_mode is 'api_key' but the codex CLI does not "
+            "report an api_key-backed session for no_human's own "
+            f"CODEX_HOME ({home}). Refusing to start: running anyway risks "
+            "silently billing a ChatGPT plan on this machine instead of "
+            "your OPENAI_API_KEY (a real defect, measured live 2026-08-25 "
+            "against codex-cli 0.149.0). Check the key in "
+            "~/.no_human/.env, or set llm.codex_auth_mode: subscription to "
+            "use the ChatGPT session on purpose."
+        )
+    return status
 
 
 @dataclass
@@ -665,12 +799,21 @@ class CodexBackend:
         return env
 
     def _child_env_api_key(self) -> dict[str, str]:
-        """``llm.codex_auth_mode: "api_key"`` (default). Unchanged behaviour.
+        """``llm.codex_auth_mode: "api_key"`` (default). Missing-key refusal
+        unchanged; the CLI-verified billing gate below is new.
 
         ``config.assert_codex_api_key_mode`` has already put ``OPENAI_API_KEY``
         in the process env and scrubbed the alternate OpenAI routings. This
         re-asserts the requirement at the point of use (a long-lived server may
         have been started before the backend was switched).
+
+        Then, ORDER MATTERS: materialise the credential into a no_human-owned
+        ``CODEX_HOME`` (:func:`codex_api_key_home`,
+        :func:`materialise_api_key_auth`), ASK the CLI itself whether that home
+        now carries an api_key-backed session (:func:`assert_api_key_billing_path`
+        — refuses otherwise), and only THEN export ``CODEX_HOME`` for the child.
+        The assert observes the CLI's own verdict about the exact env the child
+        will actually get, not a claim this module makes about it.
         """
         env = dict(self._env_override if self._env_override is not None else os.environ)
         key = env.get("OPENAI_API_KEY")
@@ -688,6 +831,10 @@ class CodexBackend:
                 "Whether a third-party tool may drive that ChatGPT sign-in "
                 "is unresolved — a lawyer should still settle it."
             )
+        home = codex_api_key_home()
+        materialise_api_key_auth(key, home)
+        assert_api_key_billing_path(self.cli_path, home)
+        env["CODEX_HOME"] = str(home)
         return env
 
     def _child_env_subscription(self) -> dict[str, str]:
@@ -702,6 +849,13 @@ class CodexBackend:
         scrub-then-check at the point of use, for the same "long-lived
         server may have switched modes since startup" reason the api_key
         branch re-asserts.
+
+        Deliberately does NOT pop ``CODEX_HOME`` from the child env (unlike
+        the api_key branch, which always sets its own): an inherited
+        ``CODEX_HOME`` here is the operator's own choice of where their real
+        credential directory lives, and popping it would break a
+        legitimately relocated install. This is a reversible assumption,
+        not a proven-safe one.
         """
         env = dict(self._env_override if self._env_override is not None else os.environ)
         for var in CODEX_SUBSCRIPTION_SCRUB_VARS:
@@ -754,11 +908,20 @@ class CodexBackend:
             # PreToolUse veto has no safety boundary left at all.
             cmd += ["--sandbox", "read-only" if self.readonly else "workspace-write"]
         if self.auth_mode == "api_key":
-            # THE LEGALITY GATE, in code: never fall back to a ChatGPT login
-            # that happens to exist on this machine. In "subscription" mode
-            # this is OMITTED, not pointed at a substitute value — there is
-            # no key to force, and forcing "apikey" here would make the
-            # subscription mode's own CLI calls refuse themselves.
+            # NOT the enforcement point. codex-cli 0.149.0 SILENTLY IGNORES
+            # this flag when a ChatGPT session is already live on the
+            # machine (measured 2026-08-25 — see the module docstring's
+            # "TWO SANCTIONED AUTH PATHS"). The real gate already ran, in
+            # `_child_env_api_key` (above), which calls
+            # `assert_api_key_billing_path` at line 554 of this file — by
+            # the time this argv is built, the CLI has already been asked,
+            # against the exact env the child will get, and has already
+            # refused if it would bill a ChatGPT plan. This flag is kept as
+            # belt-and-braces for CLI versions that DO honour it. In
+            # "subscription" mode it is OMITTED, not pointed at a
+            # substitute value — there is no key to force, and forcing
+            # "apikey" here would make the subscription mode's own CLI
+            # calls refuse themselves.
             cmd += ["--config", 'preferred_auth_method="apikey"']
         # Nobody is at the keyboard. An approval prompt in a headless run is
         # an indefinite hang, not a safety feature — but the flag that

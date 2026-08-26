@@ -26,6 +26,7 @@ the literal string "not-a-real-key".
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -97,15 +98,24 @@ _MODERN_RESUME_HELP_TEXT = (
 
 def _stub_cli(monkeypatch, *, help_text=_MODERN_HELP_TEXT,
               resume_help_text=_MODERN_RESUME_HELP_TEXT,
-              version="codex-cli 0.149.0", cli="/bin/codex"):
-    """Stub the read-only CLI probes `_command` makes, so no test in
-    this file spawns a real subprocess for them. Defaults mirror the
-    installed CLI this backend was fixed against, live, in this repo.
+              version="codex-cli 0.149.0", cli="/bin/codex",
+              login_status=None):
+    """Stub the read-only CLI probes `_command` (and, via
+    `assert_api_key_billing_path`, `run`) make, so no test in this file
+    spawns a real subprocess for them. Defaults mirror the installed CLI
+    this backend was fixed against, live, in this repo.
 
     `codex_exec_help` is keyed by `resume` because the real CLI documents a
     DIFFERENT, narrower flag surface for `codex exec resume --help` than for
     `codex exec --help` — a stub that ignored the kwarg would let a resume-only
-    flag regression pass by validating against the wrong help text."""
+    flag regression pass by validating against the wrong help text.
+
+    `login_status` defaults to a present, api_key-backed session — the
+    verdict `_child_env_api_key`'s billing gate needs to let a fake run
+    proceed to the subprocess-spawn point at all. Tests that exercise the
+    gate itself, or subscription mode, pass an explicit `CodexSessionStatus`
+    (or monkeypatch `codex_login_status` themselves without going through
+    this helper, as every subscription-mode test in this file already does)."""
     monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: cli)
     monkeypatch.setattr(
         cx, "codex_exec_help",
@@ -115,6 +125,12 @@ def _stub_cli(monkeypatch, *, help_text=_MODERN_HELP_TEXT,
     )
     monkeypatch.setattr(cx, "codex_version",
                         lambda path, timeout=10.0: version)
+    status = (login_status if login_status is not None
+              else cx.CodexSessionStatus(True, "api_key", "stub"))
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda cli_path=None, timeout_s=10.0, *, env_overrides=None: status,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -234,9 +250,17 @@ def test_the_codex_model_is_its_own_config_key_not_a_claude_tier(monkeypatch):
 def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
     """`llm.codex_auth_mode: "api_key"` is the DEFAULT (unchanged since before
     the 2026-08-22 amendment that added the sibling "subscription" mode).
-    `preferred_auth_method="apikey"` is what stops the CLI falling back to a
-    ChatGPT login that happens to be on the machine when THIS mode is
-    selected, so it is pinned here rather than left to the CLI's default.
+    `preferred_auth_method="apikey"` is still emitted here (positive control
+    for the source-text guards below, and belt-and-braces for CLI versions
+    that honour it), so it stays pinned in this argv — but it is NOT what
+    stops the CLI falling back to a ChatGPT login that happens to be on the
+    machine: codex-cli 0.149.0 silently ignores it (confirmed live,
+    2026-08-25 — see `codex_backend.py`'s module docstring and
+    `assert_api_key_billing_path`). The real gate runs earlier, in
+    `_child_env_api_key`, before this argv is ever built: it demands the CLI
+    itself report an api_key-backed session against a no_human-owned
+    `CODEX_HOME`. This test only pins argv shape, not the gate; the gate is
+    covered by its own tests below.
     (Subscription mode's own command construction, which omits this flag
     entirely, is covered separately below.)
 
@@ -334,6 +358,27 @@ def test_a_missing_codex_cli_is_an_absence_with_a_name(monkeypatch):
     with pytest.raises(BackendUnavailable) as exc:
         cx.CodexBackend()._command(Path("/repo"), effort=None, resume=None)
     assert "npm install -g @openai/codex" in str(exc.value)
+
+
+def test_api_key_gate_timeout_refuses_the_run(monkeypatch, tmp_path):
+    """`assert_api_key_billing_path` has no dedicated direct test elsewhere in
+    this file — every other exercise of it goes through `_child_env_api_key`
+    with `_stub_cli`'s passing default. Call it directly here, with a hung
+    `codex login status` (TimeoutExpired), and confirm the gate fails CLOSED:
+    a probe that cannot report a verdict must never be treated as api_key
+    session evidence, which is exactly the defect this whole ticket is about
+    — a silent unverified fallback billing the wrong account."""
+    cx.reset_probe_caches()
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["codex", "login", "status"], timeout=10.0)
+
+    monkeypatch.setattr(cx.subprocess, "run", _timeout)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    with pytest.raises(cx.CodexAuthError) as exc:
+        cx.assert_api_key_billing_path("/bin/codex", home, timeout_s=1.0)
+    assert str(home) in str(exc.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +494,38 @@ def test_codex_version_falls_back_to_a_placeholder_when_unspawnable():
     assert cx.codex_version("/no/such/codex/binary") == "unknown version"
 
 
+def test_exec_help_timeout_makes_approval_args_refuse_to_launch(monkeypatch):
+    """`codex_exec_help`'s except clause names `OSError,
+    subprocess.TimeoutExpired, UnicodeDecodeError` together, so a plain
+    unspawnable-binary test (above) exercises the tuple but never proves the
+    TimeoutExpired member specifically fires. A CLI that hangs past the
+    timeout must degrade exactly like one that was never found — `None` help
+    text, which then makes `approval_args` refuse rather than launch a
+    session with no known way to suppress its approval prompt."""
+    cx.reset_probe_caches()
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["codex", "exec", "--help"], timeout=10.0)
+
+    monkeypatch.setattr(cx.subprocess, "run", _timeout)
+    help_text = cx.codex_exec_help("/bin/codex")
+    assert help_text is None
+    with pytest.raises(BackendUnavailable):
+        cx.approval_args(help_text, "codex-cli 0.149.0")
+
+
+def test_codex_version_timeout_degrades_to_the_placeholder(monkeypatch):
+    """Same TimeoutExpired-specific proof for `codex_version`: a hang must
+    degrade to the placeholder string, not raise or hang the caller."""
+    cx.reset_probe_caches()
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["codex", "--version"], timeout=10.0)
+
+    monkeypatch.setattr(cx.subprocess, "run", _timeout)
+    assert cx.codex_version("/bin/codex") == "unknown version"
+
+
 # --------------------------------------------------------------------------- #
 # 2c. The legal wording is sourced, honest, and behaviour-free                 #
 # --------------------------------------------------------------------------- #
@@ -482,6 +559,166 @@ def test_no_shipped_file_asserts_an_unsourced_openai_prohibition():
         if banned.search(text) or literal in text:
             offenders.append(str(path.relative_to(root)))
     assert not offenders, f"unsourced OpenAI prohibition claim in: {offenders}"
+
+
+def test_the_api_key_comment_names_the_real_enforcement_and_not_the_ignored_flag():
+    """AC2: the module docstring's ``"api_key"`` bullet must name the REAL
+    enforcement path (`assert_api_key_billing_path`, `CODEX_HOME`,
+    `_child_env_api_key`) rather than resting on the false claim that
+    `preferred_auth_method` alone stops a silent ChatGPT fallback —
+    codex-cli 0.149.0 silently ignores that flag (see the module docstring
+    and `assert_api_key_billing_path`'s own docstring for the live evidence).
+
+    Retired claim, verbatim as it shipped before this fix: 'so the CLI cannot
+    silently fall back to a ChatGPT credential that happens to be on the
+    machine' — adjacent to `preferred_auth_method` in the same bullet. That
+    sentence must be gone from every shipped .py/.md file."""
+    doc = " ".join(cx.__doc__.split())
+    for name in ("assert_api_key_billing_path", "CODEX_HOME", "_child_env_api_key"):
+        assert name in doc, f"module docstring is missing: {name!r}"
+
+    retired = re.compile(
+        r"preferred_auth_method.{0,80}cannot silently fall back"
+        r"|cannot silently fall back.{0,80}preferred_auth_method",
+        re.I | re.S,
+    )
+    # Positive control: the scanner itself catches the retired sentence.
+    needle = (
+        'passes ``preferred_auth_method=apikey`` so the CLI cannot silently '
+        "fall back to a ChatGPT credential that happens to be on the machine."
+    )
+    assert retired.search(needle), "the scanner's own regex is broken"
+
+    root = Path(cx.__file__).resolve().parents[3]
+    scanned = list((root / "src").rglob("*.py")) + list((root / "docs").rglob("*.md"))
+    assert scanned, "the scan must not be scanning nothing"
+    assert any(
+        p.name == "codex_backend.py" and "preferred_auth_method" in p.read_text()
+        for p in scanned
+    ), "positive control failed — preferred_auth_method not found anywhere scanned"
+
+    offenders = [
+        str(p.relative_to(root))
+        for p in scanned
+        if retired.search(p.read_text(encoding="utf-8"))
+    ]
+    assert not offenders, f"retired false claim still shipped in: {offenders}"
+
+
+_TIMEOUT_GUARD_NAMES = {"TimeoutExpired", "SubprocessError", "Exception", "BaseException"}
+
+
+def _handler_names(expr):
+    """Every dotted/bare name an `except` clause's type expression names,
+    e.g. `except (OSError, subprocess.TimeoutExpired):` -> {"OSError",
+    "TimeoutExpired"}. Only the LAST attribute segment is kept, so both
+    `subprocess.TimeoutExpired` and a bare `TimeoutExpired` (post
+    `from subprocess import TimeoutExpired`) match the same guard name."""
+    if isinstance(expr, ast.Tuple):
+        names = set()
+        for elt in expr.elts:
+            names |= _handler_names(elt)
+        return names
+    if isinstance(expr, ast.Name):
+        return {expr.id}
+    if isinstance(expr, ast.Attribute):
+        return {expr.attr}
+    return set()
+
+
+def _unguarded_subprocess_run_lines(source: str) -> list[int]:
+    """AC3: return the line number of every `subprocess.run(...)` call in
+    `source` that is NOT lexically inside a `try` whose `except` handlers
+    name `TimeoutExpired` (or a class that already catches it —
+    `SubprocessError`, `Exception`, `BaseException`, or a bare `except:`).
+
+    A PROPERTY check over the whole syntax tree, not a remembered line-number
+    list — it covers every `subprocess.run` call written today and any added
+    to either file later, per the standing rule that an enumeration in a
+    clear-list reproduces the very bug an exhaustive check would catch."""
+    tree = ast.parse(source)
+    offenders = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.try_stack = []
+
+        def _guarded(self):
+            for handlers in self.try_stack:
+                for h in handlers:
+                    if h.type is None:  # bare `except:`
+                        return True
+                    if _handler_names(h.type) & _TIMEOUT_GUARD_NAMES:
+                        return True
+            return False
+
+        def visit_Try(self, node):
+            self.try_stack.append(node.handlers)
+            self.generic_visit(node)
+            self.try_stack.pop()
+
+        def visit_Call(self, node):
+            func = node.func
+            is_subprocess_run = (
+                isinstance(func, ast.Attribute) and func.attr == "run"
+                and isinstance(func.value, ast.Name) and func.value.id == "subprocess"
+            )
+            if is_subprocess_run and not self._guarded():
+                offenders.append(node.lineno)
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return offenders
+
+
+def test_every_auth_path_subprocess_probe_catches_TimeoutExpired():
+    """AC3's durable regression proof: every `subprocess.run` call in the
+    Codex auth-probe surface (`codex_backend.py`) and its caller
+    (`doctor.py`) must sit inside a `try` that would catch a hang, not just
+    the OSError-shaped absences the fixture-based tests above already cover.
+    A future probe added to either file without a matching `except` would be
+    exactly this ticket's class of defect: a silent path that never fails
+    closed on a hang.
+
+    Proved non-vacuous with three synthetic sources before trusting it on
+    the real files: an unguarded call (must be flagged), an OSError-only
+    guard (must still be flagged — OSError alone does not catch
+    TimeoutExpired), and a TimeoutExpired-guarded call (must NOT be
+    flagged)."""
+    unguarded = "import subprocess\nsubprocess.run(['x'])\n"
+    assert _unguarded_subprocess_run_lines(unguarded) == [2]
+
+    wrong_guard = (
+        "import subprocess\n"
+        "try:\n"
+        "    subprocess.run(['x'])\n"
+        "except OSError:\n"
+        "    pass\n"
+    )
+    assert _unguarded_subprocess_run_lines(wrong_guard) == [3]
+
+    right_guard = (
+        "import subprocess\n"
+        "try:\n"
+        "    subprocess.run(['x'])\n"
+        "except (OSError, subprocess.TimeoutExpired):\n"
+        "    pass\n"
+    )
+    assert _unguarded_subprocess_run_lines(right_guard) == []
+
+    root = Path(cx.__file__).resolve().parents[3]
+    targets = [
+        root / "src" / "no_human" / "agent" / "codex_backend.py",
+        root / "src" / "no_human" / "doctor.py",
+    ]
+    for target in targets:
+        assert target.is_file(), f"scan target missing: {target}"
+        offenders = _unguarded_subprocess_run_lines(
+            target.read_text(encoding="utf-8"))
+        assert not offenders, (
+            f"{target.relative_to(root)}: subprocess.run at line(s) "
+            f"{offenders} not guarded against TimeoutExpired"
+        )
 
 
 def test_the_module_docstring_cites_its_primary_source_and_both_halves():
@@ -1381,6 +1618,25 @@ def test_login_status_timeout_or_oserror_never_raises(monkeypatch):
     assert status.present is False
 
 
+def test_login_status_timeout_is_absent_not_present(monkeypatch):
+    """The test above proves a timeout never raises; this one pins the
+    specific verdict it must degrade to. `status.via` matters here, not just
+    `status.present`: `assert_api_key_billing_path` refuses on `present is
+    False` OR `via != "api_key"`, so either a wrong-but-truthy `via` or a
+    `present=True` on a hang would both be silent-fallback-shaped defects
+    that `test_login_status_timeout_or_oserror_never_raises` alone would not
+    catch, since it never inspects `via` on the timeout branch."""
+    monkeypatch.setattr(cx, "find_codex_cli", lambda explicit=None: "/bin/codex")
+
+    def _timeout(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd="codex", timeout=10.0)
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    status = cx.codex_login_status()
+    assert status.present is False
+    assert status.via == "none"
+    assert "timed out" in status.detail
+
+
 def test_login_status_scrubs_its_own_subprocess_env(monkeypatch):
     """A stray `OPENAI_API_KEY` on the machine running the probe must not
     make the CLI answer 'logged in with an API key' and slip a key-backed
@@ -1443,6 +1699,28 @@ def test_an_unrelated_vendor_failure_is_not_misclassified(monkeypatch):
     ])
     assert result.is_error is True
     assert result.stop_reason != "model_unsupported"
+
+
+def test_the_bad_key_401_shapes_are_not_misclassified_as_model_unsupported():
+    """Negative control, personally confirmed live this ticket against a
+    bogus `OPENAI_API_KEY`: an invalid key produces a 401-shaped vendor
+    error, worded either 'Missing bearer or basic authentication' or 'auth
+    error code: invalid_api_key' — NEITHER of which is a model/account
+    mismatch. Both `model_error_from_failure` (the 404 "model not found"
+    classifier) and `_classify_vendor_error` (the "wrong account type for
+    this model" classifier) must fall through and return None for both, or
+    an operator debugging a bad key would be misdirected at
+    `llm.codex_model`/`llm.codex_auth_mode` instead of `~/.no_human/.env`."""
+    for message in (
+        "Missing bearer or basic authentication",
+        "auth error code: invalid_api_key",
+    ):
+        assert cx.model_error_from_failure(
+            {"type": "turn.failed", "error": {"message": message}},
+            "gpt-5.3-codex",
+        ) is None
+        assert cx._classify_vendor_error(
+            message, mode="api_key", model="gpt-5.3-codex") is None
 
 
 # --------------------------------------------------------------------------- #

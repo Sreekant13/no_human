@@ -378,9 +378,15 @@ Reviewer, planner, supervisor and utility stay on Claude in **both** modes —
 from `config.yaml`. Precedence is `~/.no_human/.env` first, falling back to
 the ambient process environment if the key isn't in `.env`
 (`assert_codex_api_key_mode` in `config.py`; `nh doctor`'s `credential_status`
-check agrees). The CLI is invoked with `preferred_auth_method="apikey"` so it
-cannot silently fall back to a ChatGPT login that happens to be present on the
-machine. Default model: `gpt-5.3-codex` (`llm.codex_model`, overridable).
+check agrees). The CLI is still invoked with `preferred_auth_method="apikey"`,
+but codex-cli 0.149.0 silently ignores that flag — it is not what stops a
+silent ChatGPT fallback. Enforcement is via an isolated `CODEX_HOME`
+(`~/.no_human/codex-home/`, this module's own, never the operator's) holding
+only the configured key, gated by `assert_api_key_billing_path()`
+(`agent/codex_backend.py`), which calls `codex login status` against that
+home and refuses the run unless the CLI itself reports an api_key-backed
+session for it. Default model: `gpt-5.3-codex` (`llm.codex_model`,
+overridable).
 
 **`codex_auth_mode: subscription` (opt-in, added 2026-08-22).** Drives the
 coder from a Codex CLI session signed in via `codex login` — the operator's

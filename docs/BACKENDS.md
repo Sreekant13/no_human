@@ -101,9 +101,16 @@ failure naming `llm.codex_model`, not a doctor contradiction.
 `llm.codex_auth_mode` selects how the Codex coder backend authenticates.
 **`"api_key"` is the default and is unchanged** from the original Codex
 integration: a `OPENAI_API_KEY` the operator pays OpenAI for
-directly, loaded from `~/.no_human/.env` only. The CLI is invoked with
-`preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
-credential that happens to be on the machine.
+directly, loaded from `~/.no_human/.env` only. The CLI is still invoked with
+`preferred_auth_method="apikey"`, but that flag is not what stops a silent
+ChatGPT fallback — codex-cli 0.149.0 silently ignores it and will still bill
+a live ChatGPT session on the machine if the key is bad. What actually
+enforces this: every `api_key`-mode run is pointed at a `CODEX_HOME` this
+module owns (`codex_api_key_home()`, under `~/.no_human/codex-home/`) holding
+only the configured key, and `assert_api_key_billing_path()` calls
+`codex login status` against that isolated home and refuses the run unless
+the CLI itself reports an api_key-backed session for it — never a ChatGPT
+one, never absent. See `_child_env_api_key()` in `agent/codex_backend.py`.
 
 **`"subscription"` is an opt-in** added 2026-08-22, letting a Codex CLI signed
 in via `codex login` (a ChatGPT plan) drive the coder. no_human is never the
