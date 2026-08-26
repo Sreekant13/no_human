@@ -245,6 +245,61 @@ def test_the_codex_model_is_its_own_config_key_not_a_claude_tier(monkeypatch):
     assert not be2.model.startswith("claude")
 
 
+def test_the_network_grant_is_wired_through_make_backend_and_defaults_on(
+        monkeypatch):
+    """`llm.codex_network_access` is the operator's opt-out (default True: an
+    operator who changes nothing gets the network grant this ticket adds).
+    Covers the full path config.py -> make_backend -> CodexBackend, not just
+    the constructor default in isolation."""
+    be_default = make_backend(model="claude-sonnet-5",
+                              config={"worker": {"backend": "codex"}})
+    assert be_default.network_access is True
+
+    be_off = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_network_access": False},
+    })
+    assert be_off.network_access is False
+    _stub_cli(monkeypatch)
+    cmd = be_off._command(Path("/repo"), effort=None, resume=None)
+    assert "network_access" not in " ".join(cmd)
+
+    be_on = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_network_access": True},
+    })
+    assert be_on.network_access is True
+
+    # The two shapes that used to resolve to the OPPOSITE of what was written.
+    # Asserted through make_backend, NOT against the coercion helper directly:
+    # reverting the call site to `bool(cfg.get(...))` left every helper-level
+    # test green, so a helper test does not pin this wiring.
+    be_quoted = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_network_access": "false"},   # quoted in YAML
+    })
+    assert be_quoted.network_access is False, (
+        "a quoted `false` silently kept the sandbox's network on — "
+        "bool('false') is True, so the operator's opt-out was ignored")
+
+    be_null = make_backend(model="claude-sonnet-5", config={
+        "worker": {"backend": "codex"},
+        "llm": {"codex_network_access": None},      # `null` in YAML
+    })
+    assert be_null.network_access is True, (
+        "`null` must mean THE DEFAULT, as it does for `codex_model` and "
+        "`codex_cli_path`; bool(None) used to turn the grant off instead")
+
+
+def test_the_default_config_grants_network_to_the_codex_coder():
+    """The actual shipped default (`config.py`'s `DEFAULT_CONFIG`, not a test
+    fixture) is `True` — an operator running an unmodified install gets the
+    fix, not just a documented opt-in."""
+    from no_human import config as cfgmod
+
+    assert cfgmod.DEFAULT_CONFIG["llm"]["codex_network_access"] is True
+
+
 # --------------------------------------------------------------------------- #
 # 2. Codex: command construction and the legality gate                         #
 # --------------------------------------------------------------------------- #
@@ -283,6 +338,11 @@ def test_the_command_forces_api_key_auth_and_never_offers_a_login(monkeypatch):
     assert "--ask-for-approval" not in cmd
     assert 'approval_policy="never"' in cmd
     assert 'model_reasoning_effort="high"' in cmd
+    # The coder's sandbox is granted network by default (see
+    # tests/test_codex_sandbox_network.py for the measured proof of why this
+    # is needed and why it is safe) — never `danger-full-access`.
+    assert "--config" in cmd and "sandbox_workspace_write.network_access=true" in cmd
+    assert "danger-full-access" not in joined
     # AC1's own check, inline: every flag this test's cmd emits appears in the
     # help text it was resolved against — proves the stub isn't lying to itself.
     for flag in cx.emitted_flags(cmd):
@@ -307,6 +367,19 @@ def test_a_readonly_codex_session_gets_the_sandbox_that_enforces_it(monkeypatch)
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
 
 
+def test_a_readonly_codex_session_is_never_granted_network(monkeypatch):
+    """`--sandbox read-only` has no `sandbox_workspace_write` table for
+    `network_access` to attach to — emitting the key anyway would be inert at
+    best and a false signal at worst. `network_access=True` is still the
+    constructor default here (readonly wins unconditionally), so this proves
+    the guard is `not self.readonly`, not merely "nobody passed the flag"."""
+    _stub_cli(monkeypatch)
+    cmd = cx.CodexBackend(readonly=True, network_access=True)._command(
+        Path("/repo"), effort=None, resume=None)
+    joined = " ".join(cmd)
+    assert "network_access" not in joined
+
+
 def test_resume_continues_a_thread(monkeypatch):
     _stub_cli(monkeypatch)
     cmd = cx.CodexBackend()._command(Path("/repo"), effort=None, resume="th_1")
@@ -321,8 +394,149 @@ def test_resume_continues_a_thread(monkeypatch):
     # Everything else non-resume attempts also get is still present.
     assert "--json" in cmd
     assert "--model" in cmd
+    # The network grant is NOT gated on `is_resume`: a resumed thread inherits
+    # its sandbox MODE from the session it is resuming (that's why `--sandbox`
+    # itself is absent above), but `-c`/`--config` overrides are layered
+    # in-memory on every invocation, not stored once at session start — so
+    # dropping this on resume would silently lose the grant from turn 2 on.
+    assert "--config" in cmd and "sandbox_workspace_write.network_access=true" in cmd
     for flag in cx.emitted_flags(cmd):
         assert flag in _MODERN_RESUME_HELP_TEXT, flag
+
+
+#: The two argv shapes that would hand a codex session an unsandboxed or
+#: fully-open filesystem/network boundary. Neither may ever appear in a
+#: built command, under ANY constructor/`_command` combination — this is
+#: the safety floor the network-access fix (`sandbox_workspace_write.
+#: network_access=true`, always paired with an explicit `--sandbox
+#: workspace-write`) must never be confused with or degrade into. Named as
+#: a module constant, not inlined per-test, so every configuration below is
+#: swept against the SAME list — adding a new dangerous flag here protects
+#: every case at once instead of requiring N separate edits.
+_FORBIDDEN_SANDBOX_BYPASS_TOKENS = (
+    "--dangerously-bypass-approvals-and-sandbox",
+    "danger-full-access",
+)
+
+
+@pytest.mark.parametrize(
+    "ctor_kwargs,call_kwargs",
+    [
+        pytest.param({}, {"effort": None, "resume": None}, id="default"),
+        pytest.param({}, {"effort": "high", "resume": None}, id="with-effort"),
+        pytest.param({}, {"effort": None, "resume": "th_1"}, id="resume"),
+        pytest.param(
+            {"readonly": True}, {"effort": None, "resume": None}, id="readonly"),
+        pytest.param(
+            {"network_access": False}, {"effort": None, "resume": None},
+            id="network-off"),
+        pytest.param(
+            {"readonly": True, "network_access": True},
+            {"effort": None, "resume": None}, id="readonly-network-requested"),
+        pytest.param(
+            {"auth_mode": "subscription"}, {"effort": None, "resume": None},
+            id="subscription-auth"),
+        pytest.param(
+            {"auth_mode": "subscription", "readonly": True},
+            {"effort": "high", "resume": "th_2"}, id="subscription-readonly-resume"),
+    ],
+)
+def test_the_built_argv_never_bypasses_the_sandbox(
+        monkeypatch, ctor_kwargs, call_kwargs):
+    """Property sweep, not a spot check: whatever combination of readonly /
+    network_access / auth_mode / resume `_command` is asked to build, the
+    two flags that would remove the sandbox boundary entirely
+    (`--dangerously-bypass-approvals-and-sandbox`, `danger-full-access`)
+    must never appear in the resulting argv. `CodexBackend` never passes
+    either — there is no code path that emits them — so this is a permanent
+    regression guard against a future edit (e.g. "just make it faster/less
+    naggy") reaching for one of them instead of the measured, narrower
+    `sandbox_workspace_write.network_access=true` grant."""
+    _stub_cli(monkeypatch)
+    resume = call_kwargs.pop("resume")
+    cmd = cx.CodexBackend(**ctor_kwargs)._command(
+        Path("/repo"), resume=resume, **call_kwargs)
+    joined = " ".join(cmd)
+    for token in _FORBIDDEN_SANDBOX_BYPASS_TOKENS:
+        assert token not in joined, (ctor_kwargs, call_kwargs, cmd)
+
+
+#: Every `--config KEY=VALUE` key `_command` is ALLOWED to emit. This list is
+#: hand-written from a deliberate decision about each key, NOT read back out of
+#: `codex_backend.py` — a list derived from the code under test would admit
+#: whatever that code grew next and guard nothing.
+#:
+#: WHY AN ALLOWLIST AND NOT A DENYLIST. The sibling sweep above forbids two
+#: named tokens. An independent review defeated it in one line: this change is
+#: the FIRST to emit `--config sandbox_workspace_write.*`, and nothing
+#: constrained what else could ride that channel. Adding
+#: `sandbox_workspace_write.writable_roots=["/"]` next to the network grant left
+#: all 98 tests GREEN, and against the real CLI it granted write access to the
+#: WHOLE FILESYSTEM. `emitted_flags()` cannot see it either: it validates flag
+#: NAMES against `--help`, and `--config` is a perfectly valid name whatever
+#: follows it. A denylist of two strings cannot cover a channel that accepts
+#: arbitrary keys, so the guard is inverted here.
+_ALLOWED_CONFIG_KEYS = frozenset({
+    "approval_policy",
+    "preferred_auth_method",
+    "model_reasoning_effort",
+    "sandbox_workspace_write.network_access",
+})
+
+
+@pytest.mark.parametrize(
+    "ctor_kwargs,call_kwargs",
+    [
+        pytest.param({}, {"effort": None, "resume": None}, id="default"),
+        pytest.param({}, {"effort": "high", "resume": None}, id="with-effort"),
+        pytest.param({}, {"effort": None, "resume": "th_1"}, id="resume"),
+        pytest.param(
+            {"readonly": True}, {"effort": None, "resume": None}, id="readonly"),
+        pytest.param(
+            {"network_access": False}, {"effort": None, "resume": None},
+            id="network-off"),
+        pytest.param(
+            {"readonly": True, "network_access": True},
+            {"effort": None, "resume": None}, id="readonly-network-requested"),
+        pytest.param(
+            {"auth_mode": "subscription"}, {"effort": None, "resume": None},
+            id="subscription-auth"),
+        pytest.param(
+            {"auth_mode": "subscription", "readonly": True},
+            {"effort": "high", "resume": "th_2"}, id="subscription-readonly-resume"),
+    ],
+)
+def test_command_emits_no_config_key_outside_the_allowlist(
+        monkeypatch, ctor_kwargs, call_kwargs):
+    """The `--config` channel this change opened may carry ONLY known keys.
+
+    Sweeps the same constructor/call matrix as the bypass-token test. Any
+    `--config` key `_command` learns to emit that is not in the allowlist fails
+    here, which is what a denylist of dangerous spellings structurally cannot
+    do. In particular `sandbox_workspace_write.writable_roots` — the mutation
+    that granted `/`-wide write with the whole suite green — is caught by this
+    and by nothing else.
+    """
+    _stub_cli(monkeypatch)
+    resume = call_kwargs.pop("resume")
+    cmd = cx.CodexBackend(**ctor_kwargs)._command(
+        Path("/repo"), resume=resume, **call_kwargs)
+
+    seen = [cmd[i + 1] for i, a in enumerate(cmd)
+            if a == "--config" and i + 1 < len(cmd)]
+    # Control: this sweep must actually observe the channel it guards, or a
+    # future refactor that stops emitting --config would make it vacuously green.
+    assert seen, (
+        f"no --config pair in the built argv at all; this guard is inspecting "
+        f"nothing: {cmd}")
+
+    for pair in seen:
+        key = pair.split("=", 1)[0]
+        assert key in _ALLOWED_CONFIG_KEYS, (
+            f"_command emitted an unapproved --config key {key!r}. If this is "
+            f"deliberate, add it to _ALLOWED_CONFIG_KEYS with a reason - do not "
+            f"widen the sandbox by way of a key nothing reviews. "
+            f"argv={cmd}")
 
 
 def test_a_missing_openai_key_refuses_rather_than_finding_other_auth():
@@ -1494,6 +1708,8 @@ def test_subscription_mode_omits_the_api_key_forcing_flag(monkeypatch):
     # Still never an unsandboxed run, and still never offers to log in itself.
     assert "--sandbox" in cmd and "workspace-write" in cmd
     assert "login" not in joined
+    # The network grant does not depend on which auth mode pays for the run.
+    assert "sandbox_workspace_write.network_access=true" in joined
 
 
 def test_subscription_child_env_holds_no_openai_credential(monkeypatch):

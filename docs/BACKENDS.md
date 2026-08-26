@@ -32,6 +32,7 @@ llm:
   codex_model: null                 # null ⇒ per-mode default, see below
   codex_reasoning_effort: null      # null ⇒ the CLI's own default
   codex_cli_path: null              # null ⇒ resolve `codex` on PATH
+  codex_network_access: true        # default; false ⇒ no network in the sandbox
 ```
 
 ```bash
@@ -175,6 +176,21 @@ The mitigation that *is* real prevention is the sandbox: coder sessions run
 `--dangerously-bypass-approvals-and-sandbox` is never used. But a sandbox
 enforces "inside the workspace"; it does not know about `.env` or about which
 branches are protected.
+
+A coder session also needs the network (git fetch/push, `gh`, pip installs)
+to do its job at all. codex-cli's `workspace-write` sandbox has **no**
+network access by default — measured directly (`git ls-remote` inside a bare
+`workspace-write` sandbox fails with "Could not resolve host"; the same
+command outside any sandbox, or with the grant below, succeeds). The fix is
+`sandbox_workspace_write.network_access=true`, paired with an explicit
+`--sandbox workspace-write` override — the key is silently inert unless that
+mode is active, which is why a naive `-c
+sandbox_workspace_write.network_access=true` with no `sandbox_mode` override
+still measures blocked. `llm.codex_network_access` (default `true`) controls
+this grant; setting it `false` restores the network-less default. It is
+never emitted for a read-only session, which has no `sandbox_workspace_write`
+table for the key to attach to. See `tests/test_codex_sandbox_network.py`
+for the measured evidence.
 
 **2. No supervisor, no lint feedback, no scope guard.**
 All three are PostToolUse hooks. `codex exec` has none, so the orchestrator

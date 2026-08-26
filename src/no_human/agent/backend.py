@@ -366,6 +366,53 @@ def _local_child_env(llm_cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
+#: YAML spellings a human plausibly writes for a boolean. Hand-written; a
+#: config file is text, and `bool("false")` is True.
+_FALSEY_CONFIG_STRINGS = frozenset({"false", "no", "off", "0", ""})
+_TRUTHY_CONFIG_STRINGS = frozenset({"true", "yes", "on", "1"})
+
+
+def _codex_network_access(cfg: dict) -> bool:
+    """Resolve `llm.codex_network_access`, refusing to GUESS.
+
+    `bool(cfg.get(key, True))` had two measured defects, both of which made the
+    operator's stated intent the opposite of what ran:
+
+      `codex_network_access: "false"`  (quoted in YAML) -> bool("false") is
+          True, so the opt-out was SILENTLY IGNORED and the capability stayed
+          on. That is the dangerous direction for a sandbox control.
+      `codex_network_access: null`     -> bool(None) is False, so the key was
+          turned OFF, inverting the `null means use the default` convention
+          every sibling key documents (`codex_model: null`,
+          `codex_cli_path: null`).
+
+    Absent or null therefore means the default (on). A real bool is honoured.
+    A string is parsed against the spellings above. Anything else RAISES rather
+    than resolving to a guess: silently choosing either direction for a
+    capability control is how an operator ends up with a sandbox they did not
+    ask for, and a loud config error at startup is cheaper than discovering it
+    from a coder's network trace.
+    """
+    raw = cfg.get("codex_network_access", None)
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _FALSEY_CONFIG_STRINGS:
+            return False
+        if s in _TRUTHY_CONFIG_STRINGS:
+            return True
+        raise ValueError(
+            f"llm.codex_network_access must be a boolean, got {raw!r}. "
+            f"Write `true` or `false` (unquoted).")
+    if isinstance(raw, int):
+        return bool(raw)
+    raise ValueError(
+        f"llm.codex_network_access must be a boolean, got {type(raw).__name__}")
+
+
 def make_backend(
     *,
     model: str,
@@ -448,6 +495,7 @@ def make_backend(
             forbidden_paths=forbidden_paths,
             never_push_to=never_push_to,
             readonly=readonly,
+            network_access=_codex_network_access(cfg),
         )
 
     if name == "local":

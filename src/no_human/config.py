@@ -1369,6 +1369,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Absolute path to the `codex` binary, for installs where it is not on
         # PATH. None ⇒ resolve it the way the CLI itself is normally found.
         "codex_cli_path": None,
+        # Whether the codex CODER's workspace-write sandbox is granted network
+        # access (git fetch/push, gh, pip). Without it the CLI's sandbox blocks
+        # the network outright — measured 000 vs a 200 control on codex-cli
+        # 0.149.0. This grants NETWORK ONLY: `workspace-write` still confines
+        # writes to the workspace, and an independent review re-measured the
+        # file boundary as byte-for-byte identical with and without this key
+        # (writes to $HOME, /private/var/tmp and /usr/local are denied either
+        # way). An earlier version of this comment said the coder's file access
+        # was "already unsandboxed at the FILE level"; that was false and
+        # contradicted docs/BACKENDS.md in the same commit. Default True: an
+        # operator who changes nothing gets the network the Claude backend
+        # already has.
+        # False opts back into the CLI's own network-free default — never
+        # forwarded when the session is readonly (a read-only session gets
+        # `--sandbox read-only`, which has no `sandbox_workspace_write`
+        # table to attach this key to in the first place). This key never
+        # widens the FILE sandbox and never touches `danger-full-access`.
+        "codex_network_access": True,
         # --- Local model backend (only read when worker.backend == "local") ---
         "local_model": None,        # model id the local server exposes
         "local_base_url": None,     # e.g. http://localhost:8000 — REQUIRED in local mode

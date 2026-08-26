@@ -867,6 +867,7 @@ class CodexBackend:
         forbidden_paths: list[str] | None = None,
         never_push_to: list[str] | None = None,
         readonly: bool = False,
+        network_access: bool = True,
         env: dict[str, str] | None = None,
     ):
         self.model = model
@@ -883,6 +884,11 @@ class CodexBackend:
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
         self.never_push_to = never_push_to or ["main", "master", "release/*"]
         self.readonly = readonly
+        # Grants the workspace-write sandbox network access (see `_command`).
+        # Ignored (never emitted) when `readonly` — a read-only session gets
+        # `--sandbox read-only`, which has no `sandbox_workspace_write` table
+        # for this key to attach to.
+        self.network_access = network_access
         self._env_override = env
 
     @property
@@ -1018,6 +1024,79 @@ class CodexBackend:
             # `danger-full-access` is never used: an unsandboxed agent with no
             # PreToolUse veto has no safety boundary left at all.
             cmd += ["--sandbox", "read-only" if self.readonly else "workspace-write"]
+        if self.network_access and not self.readonly:
+            # MEASURED on codex-cli 0.149.0 (`codex sandbox -- curl ...`, the
+            # CLI's own direct-run subcommand, used as a bare instrument):
+            # bare `workspace-write` scores curl at 000 (no route to host) —
+            # the coder's git fetch/push, `gh`, and pip all fail the same way.
+            # Adding this key alone, WITHOUT an active `sandbox_mode=
+            # "workspace-write"`, still scores 000: `network_access` is a
+            # field of the `sandbox_workspace_write` policy table and is
+            # silently inert unless that policy is the one actually in
+            # force. That is why the naive
+            # `codex sandbox -c sandbox_workspace_write.network_access=true`
+            # measurement (no `sandbox_mode` set) still failed — do NOT
+            # re-derive it that way; there is nothing to attach to without
+            # the `--sandbox workspace-write` above already in the argv it
+            # measures. With BOTH set, curl scores 200; `network_access=false`
+            # is the negative control (000 again); `danger-full-access` is a
+            # positive control confirming the SANDBOX, not the host, was
+            # blocking it. This grants network only — it never widens file
+            # access and never approaches `danger-full-access`/
+            # `--dangerously-bypass-approvals-and-sandbox`, which stay unused
+            # for the reason above. codex-cli 0.149.0 offers no narrower grant
+            # (`sandbox_workspace_write.allowed_domains` and any per-host
+            # proxy config are unknown fields on this version — probed via
+            # `codex exec --strict-config`, which errors loudly on an unknown
+            # key instead of silently ignoring it); a future version that adds
+            # one should use it instead of this all-or-nothing flag. Emitted
+            # on resume too, but ITS EFFECT THERE IS UNVERIFIED and an
+            # earlier version of this comment asserted a mechanism that
+            # measurement contradicts. Stated honestly so nobody inherits it:
+            # the resume argv carries this key WITHOUT a `sandbox_mode` in
+            # force (`--sandbox` is refused on resume), and that is exactly the
+            # shape `test_the_naive_fix_the_ticket_already_tried_still_fails`
+            # proves is INERT — replaying the resume override-set through
+            # `codex sandbox` scores 128, not 0. codex-cli also persists a
+            # fully RESOLVED `sandbox_policy` struct into the session rollout
+            # (`network_access` baked in as a value, not a reference to the
+            # config table), so the old claim that this key is "layered
+            # in-memory over that session's own config on every invocation"
+            # has no evidence behind it. Nothing depends on the answer today:
+            # the ONLY production `resume=` caller is the zero-diff reformat
+            # nudge (`max_turns=1`, `effort="low"`), which runs no git/gh/pip
+            # and needs no network. Emitting it is harmless either way; if a
+            # resumed coder turn ever needs the grant, verify it FIRST — do not
+            # assume this line delivers it. `readonly` still wins
+            # over this unconditionally: a read-only session gets `--sandbox
+            # read-only`, which has no `sandbox_workspace_write` table for
+            # this key to attach to, so it is never emitted for one.
+            #
+            # RE-MEASURED with `git ls-remote` (not just `curl`, and with each
+            # command's own exit code captured directly — never piped through
+            # `head`, which reports its own status): bare `--sandbox
+            # workspace-write` → `git ls-remote https://github.com/octocat/
+            # Hello-World.git HEAD` exits 128 ("Could not resolve host"); the
+            # same command with `sandbox_workspace_write.network_access=true`
+            # added exits 0 and returns the real SHA; a no-sandbox control
+            # also exits 0. Same three-way result as the curl probe.
+            #
+            # `codex sandbox -- <cmd>` (the instrument used for every
+            # measurement above) is not merely analogous to what a real
+            # `codex exec` tool call does — it is the SAME code path. Traced
+            # in the open-source codex-rs sources (openai/codex): the
+            # `sandbox` debug subcommand (`cli/src/debug_sandbox.rs`) and the
+            # real shell-tool executor (`core/src/exec.rs`, function around
+            # `SandboxManager::new().transform(SandboxTransformRequest {
+            # permissions: permission_profile, sandbox: sandbox_type, .. })`)
+            # both build their sandboxed argv through the identical
+            # `SandboxManager::transform` / `create_seatbelt_command_args_
+            # with_profile` machinery in `sandboxing/src/manager.rs` and
+            # `sandboxing/src/seatbelt.rs`, driven by the same resolved
+            # `Config`/policy table this `--config` override edits. There is
+            # no separate, weaker sandbox construction for the debug
+            # subcommand — measuring one measures the other.
+            cmd += ["--config", "sandbox_workspace_write.network_access=true"]
         if self.auth_mode == "api_key":
             # NOT the enforcement point. codex-cli 0.149.0 SILENTLY IGNORES
             # this flag when a ChatGPT session is already live on the

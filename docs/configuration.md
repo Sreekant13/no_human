@@ -406,6 +406,23 @@ ChatGPT account," so the api_key default is not reused here.
 Each mode scrubs the other's metered routes (`assert_codex_mode` in
 `config.py`) so a run bills exactly one path.
 
+### `llm.codex_network_access` — network for the `codex` coder's sandbox
+
+Default `true`. codex-cli's `--sandbox workspace-write` has no network access
+on its own — a coder session needs it for `git fetch`/`push`, `gh`, and
+dependency installs. When this is `true` (and the session is not `readonly`),
+`_command` emits an explicit `--sandbox workspace-write` paired with
+`--config sandbox_workspace_write.network_access=true`; both must be present
+together, since the grant is silently inert unless that sandbox mode is
+actively selected. (One exception, stated rather than glossed: on a `resume`
+invocation `--sandbox` is refused by the CLI, so the grant is emitted without
+it and its effect there is untested. The only resume caller is the zero-diff
+reformat nudge, which needs no network.) Set to `false` to keep the coder network-less (the CLI's
+default). Never emitted for a read-only session — `--sandbox read-only` has
+no `sandbox_workspace_write` table for the key to attach to. See
+[BACKENDS.md](BACKENDS.md) and `tests/test_codex_sandbox_network.py` for the
+measured evidence behind this default.
+
 ### `llm.local_model` / `llm.local_base_url` / `llm.local_cli_path`
 
 Reserved for `worker.backend: local`. `local_base_url` is **required** in
