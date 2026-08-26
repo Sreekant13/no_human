@@ -1620,3 +1620,251 @@ async def test_the_floor_refusal_reads_differently_from_the_over_cap_refusal(sto
     assert "floor" in floor_blocker.root_cause_hypothesis
     assert "minimum viable attempt" in floor_blocker.root_cause_hypothesis
     assert floor_blocker.root_cause_hypothesis != over_blocker.root_cause_hypothesis
+
+
+# --------------------------------------------------------------------------- #
+# The orphaned-ledger scope statement + residual: the gate's own totals are
+# FROM attempts only, so a BUDGET_EXHAUSTED blocker's evidence must say so and
+# name this task's spend in the unattributed ledger (site prefix
+# ORPHANED_SITE_PREFIX) alongside it — never counted against the cap, never
+# silently omitted either.
+# --------------------------------------------------------------------------- #
+
+async def _orphan(store, task_id, *, tier="utility_", **classes):
+    """Book one orphaned aux-tier row on ``task_id`` — the shape
+    `Orchestrator._flush_orphaned_aux_usage` writes when no attempt claims
+    aux spend: `site="orphaned_<tier>usage"`, this task's id."""
+    return await store.record_unattributed_usage(
+        site=f"orphaned_{tier}usage", task_id=task_id, **classes)
+
+
+async def test_budget_blocker_states_it_excludes_the_orphaned_ledger(store):
+    """AC1: the scope sentence must appear even with ZERO orphaned rows — a
+    sentence that only shows up when non-zero would teach a human to read
+    its absence as "there is none"."""
+    t = Task.new("task", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 1_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=2, tokens_each=1_000_000)  # 1.1M weighted > 1.0M cap
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None
+    assert "sum over this task's ATTEMPT rows only" in b.evidence
+    assert "orphaned_" in b.evidence
+    assert "unattributed ledger" in b.evidence.lower()
+    assert "0 calls, 0 cost-weighted tokens" in b.evidence
+
+
+async def test_budget_blocker_reports_this_tasks_orphaned_residual(store):
+    """AC2: two orphaned rows on this task, one on a different task, and one
+    non-orphaned INTAKE row (site "api.grill", no "orphaned_" prefix) on
+    this same task — the blocker must name `2` calls and THIS task's
+    orphaned-only weighted total; neither the other task's spend nor this
+    task's own intake-site spend may leak in (the intake row is what
+    catches a dropped `attributed=True` filter — without it, intake sites
+    on the same task_id would count too)."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+    other = Task.new("other", repo_path="/tmp/x")
+    await store.create_task(other)
+
+    await _orphan(store, t.id, tokens_used=100_000)
+    await _orphan(store, t.id, cache_read_tokens=200_000)
+    await _orphan(store, other.id, tokens_used=9_000_000)
+    await store.record_unattributed_usage(
+        site="api.grill", task_id=t.id, tokens_used=7_000_000)
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None
+    expected = weighted_tokens(
+        tokens_used=100_000, cache_read_tokens=200_000,
+        cache_creation_tokens=0)
+    assert f"2 calls, {expected:,} cost-weighted tokens" in b.evidence
+    assert "9,000,000" not in b.evidence, (
+        "the other task's orphaned spend must not appear in this blocker")
+    assert "7,000,000" not in b.evidence, (
+        "this task's own non-orphaned intake-site spend must not appear "
+        "in the orphaned-ledger residual")
+
+
+async def test_orphaned_residual_is_weighted_not_raw(store):
+    """AC3: a row dominated by cache-read tokens must be priced with
+    `pricing.weighted_tokens`, not summed raw — raw is ~4x weighted here and
+    must never be presented as the residual."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+
+    await _orphan(
+        store, t.id, tokens_used=100_000, cache_read_tokens=1_000_000,
+        cache_creation_tokens=100_000)
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None
+    expected = weighted_tokens(
+        tokens_used=100_000, cache_read_tokens=1_000_000,
+        cache_creation_tokens=100_000)
+    assert f"{expected:,}" in b.evidence
+    assert "1,200,000" not in b.evidence, (
+        "the raw sum of the three classes must never be presented as the "
+        "residual")
+
+
+async def test_startup_floor_blocker_also_states_scope_and_residual(store):
+    """AC1/AC2 for the SECOND caller: `_check_attempt_startup_floor` shares
+    `_budget_exhausted_blocker`'s body, so the same scope sentence and
+    residual must appear there too — this is what makes the shared-body
+    decision testable."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="succeeded", cache_read_tokens=1_500_000)
+    await store.save_events(t.id, [await _burn_event(1, read=1_600_000)])
+    await _orphan(store, t.id, tokens_used=50_000)
+
+    o = _orch(store, {"lifetime_tokens": 300_000})
+    assert await o._check_lifetime_budget(t) is None
+    b = await o._check_attempt_startup_floor(t)
+    assert b is not None
+    assert "sum over this task's ATTEMPT rows only" in b.evidence
+    assert "orphaned_" in b.evidence
+    expected = weighted_tokens(tokens_used=50_000)
+    assert f"1 calls, {expected:,} cost-weighted tokens" in b.evidence
+
+
+async def test_orphaned_spend_does_not_move_the_cap(store):
+    """AC4: no policy change. A task UNDER cap with a large orphaned
+    residual (3M weighted) must still return None, and the `lifetime_budget`
+    event's `tokens_used`/`tokens_weighted` must be unchanged from the
+    identical no-orphan case. The raise option's `lifetime_tokens` must also
+    be identical with and without the residual, for a task that IS over
+    cap."""
+    t_plain = Task.new("plain", repo_path="/tmp/x")
+    await store.create_task(t_plain)
+    await _spend(store, t_plain.id, attempts=2, tokens_each=1_000_000)
+
+    t_orphaned = Task.new("orphaned", repo_path="/tmp/x")
+    await store.create_task(t_orphaned)
+    await _spend(store, t_orphaned.id, attempts=2, tokens_each=1_000_000)
+    await _orphan(store, t_orphaned.id, tokens_used=3_000_000)  # 3M weighted
+
+    events_plain, events_orphaned = [], []
+    o_plain = _orch(store)
+    o_plain._sink = events_plain.append
+    o_orphaned = _orch(store)
+    o_orphaned._sink = events_orphaned.append
+
+    assert await o_plain._check_lifetime_budget(t_plain) is None
+    assert await o_orphaned._check_lifetime_budget(t_orphaned) is None
+
+    ev_plain = next(e for e in events_plain if e["kind"] == "lifetime_budget")
+    ev_orphaned = next(
+        e for e in events_orphaned if e["kind"] == "lifetime_budget")
+    assert ev_plain["tokens_used"] == ev_orphaned["tokens_used"]
+    assert ev_plain["tokens_weighted"] == ev_orphaned["tokens_weighted"]
+
+    # Same check for the raise option, on a task that IS over cap.
+    t_over_a = Task.new("over-a", repo_path="/tmp/x")
+    await store.create_task(t_over_a)
+    await _spend(store, t_over_a.id, attempts=9, tokens_each=100)
+    b_no_orphan = await _orch(
+        store, config=ASK_THE_HUMAN)._check_lifetime_budget(t_over_a)
+
+    t_over_b = Task.new("over-b", repo_path="/tmp/x")
+    await store.create_task(t_over_b)
+    await _spend(store, t_over_b.id, attempts=9, tokens_each=100)
+    await _orphan(store, t_over_b.id, tokens_used=3_000_000)
+    b_with_orphan = await _orch(
+        store, config=ASK_THE_HUMAN)._check_lifetime_budget(t_over_b)
+
+    def _raise_tokens(b):
+        opt = next(o for o in b.options if o.action and "set_task_config" in o.action)
+        return opt.action["set_task_config"]["lifetime_tokens"]
+
+    assert _raise_tokens(b_no_orphan) == _raise_tokens(b_with_orphan)
+
+
+async def test_a_failing_ledger_read_never_blocks_the_gate(store, monkeypatch):
+    """Robustness: a broken ledger read must never suppress the
+    BUDGET_EXHAUSTED blocker — the accounting failure degrades the evidence,
+    not the gate."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(store, "unattributed_usage_totals", _boom)
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None
+    assert b.category is BlockerCategory.BUDGET_EXHAUSTED
+    assert "unavailable" in b.evidence
+
+
+async def test_an_aged_out_orphaned_row_still_reads_as_a_qualified_zero(store):
+    """AGED-OUT shape: a real orphaned row is booked on this task, then rolls
+    past the retention window — `compact_unattributed_usage` re-inserts the
+    group with `task_id = NULL` (a group can span many tasks), so the
+    task-scoped read goes from `(1, weighted)` to `(0, 0)`. The blocker must
+    still say so is qualified, not print a bare zero that reads as "there was
+    never any spend"."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+    row_id = await _orphan(store, t.id, tokens_used=2_000_000)
+
+    before = await store.unattributed_usage_totals(t.id, attributed=True)
+    assert before["calls"] == 1
+    assert before["tokens_used"] == 2_000_000
+
+    await store.db.execute(
+        "UPDATE unattributed_usage SET ts = ? WHERE id = ?",
+        ("2020-01-01T00:00:00+00:00", row_id))
+    await store.db.commit()
+    collapsed = await store.compact_unattributed_usage(retention_days=1)
+    assert collapsed == 1
+
+    after = await store.unattributed_usage_totals(t.id, attributed=True)
+    assert after == {
+        "calls": 0, "tokens_used": 0, "cache_read_tokens": 0,
+        "cache_creation_tokens": 0, "total": 0,
+    }, "the roll-up must drop task_id, taking this row off the task-scoped read"
+
+    b = await _orch(store)._check_lifetime_budget(t)
+    assert b is not None
+    assert (
+        "0 calls, 0 cost-weighted tokens "
+        "(aged-out or not-yet-flushed spend is not shown)"
+    ) in b.evidence
+
+
+async def test_unflushed_aux_spend_is_not_yet_in_the_qualified_residual(store):
+    """NOT-YET-FLUSHED shape: `_flush_orphaned_aux_usage` runs in
+    `_drive_watched`'s `finally`, AFTER `_check_lifetime_budget` builds its
+    blocker — so a task can be sitting on real, unflushed aux-tier spend (in
+    the orchestrator's in-memory `_<tier>usage` accumulator, drained by
+    `_pop_aux_usage`) while the ledger read still returns zero. The blocker
+    must carry the same qualifier for that zero, not present it as "this task
+    has no orphaned spend"."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+
+    o = _orch(store)
+    # Real pending spend that has not been flushed to `unattributed_usage`
+    # yet — mirrors what `_note_tier_usage("utility_", ...)` leaves behind
+    # mid-attempt, before `_pop_aux_usage`/`_flush_orphaned_aux_usage` drains it.
+    o._utility_usage = {
+        "tokens_used": 3_000_000, "cache_read_tokens": 0,
+        "cache_creation_tokens": 0, "output_tokens": None,
+    }
+
+    b = await o._check_lifetime_budget(t)
+    assert b is not None
+    assert (
+        "0 calls, 0 cost-weighted tokens "
+        "(aged-out or not-yet-flushed spend is not shown)"
+    ) in b.evidence

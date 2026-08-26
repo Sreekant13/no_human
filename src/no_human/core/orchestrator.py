@@ -12991,7 +12991,7 @@ class Orchestrator:
             if used_attempts >= cap_attempts
             else f"cost-weighted tokens {used_tokens:,}/{cap_tokens:,}"
         )
-        return self._budget_exhausted_blocker(
+        return await self._budget_exhausted_blocker(
             task,
             root_cause=f"lifetime budget exhausted: {over}",
             evidence=(
@@ -13018,7 +13018,45 @@ class Orchestrator:
             used_attempts=used_attempts, used_tokens=used_tokens, over=over,
         )
 
-    def _budget_exhausted_blocker(
+    async def _orphaned_ledger_residual(
+        self, task: Task
+    ) -> tuple[int, int] | None:
+        """(calls, cost-weighted tokens) this task has in the unattributed
+        ledger under ORPHANED_SITE_PREFIX — aux-tier spend (planner/utility/
+        supervisor/distill) that `_flush_orphaned_aux_usage` booked with this
+        task's id because no attempt claimed it. The budget gate's own
+        totals (`Store.lifetime_usage_by_class`) are FROM attempts only, so
+        this is real spend on this task that the cap never saw. `None` when
+        the read fails — accounting must never change a task's outcome, the
+        same fail-open discipline `_flush_orphaned_aux_usage` itself follows
+        at its own `except Exception` (orchestrator.py, above).
+
+        Retention caveat: `compact_unattributed_usage` drops `task_id` when
+        it rolls aged rows up into a cross-task group, so this residual can
+        UNDER-report once rows age past the retention window — it never
+        over-reports.
+        """
+        try:
+            totals = await self.store.unattributed_usage_totals(
+                task.id, attributed=True)
+        except Exception as exc:  # noqa: BLE001 — accounting never blocks a task
+            log.warning(
+                "orphaned ledger residual not read for %s: %s",
+                task.id[:8], exc)
+            return None
+        # Explicit keyword-by-keyword, NOT a splat of `totals`: that dict
+        # also carries `calls` and `total`, which `weighted_tokens` does not
+        # accept (`calls` would TypeError). There is no `output_tokens`
+        # column on `unattributed_usage`, so the output premium is
+        # legitimately absent here — a missing column, not a bug.
+        weighted = _weighted_tokens(
+            tokens_used=totals["tokens_used"],
+            cache_read_tokens=totals["cache_read_tokens"],
+            cache_creation_tokens=totals["cache_creation_tokens"],
+        )
+        return totals["calls"], weighted
+
+    async def _budget_exhausted_blocker(
         self, task: Task, *, root_cause: str, evidence: str,
         used_attempts: int, used_tokens: int, over: str,
         min_raise_tokens: int | None = None,
@@ -13045,7 +13083,47 @@ class Orchestrator:
         same floor immediately (review finding, attempt 2). Folding in
         `used_tokens + min_raise_tokens` guarantees the offered raise leaves
         `remaining >= floor` once applied.
+
+        `async` (both callers already are) so it can read the orphaned
+        ledger residual and append a scope sentence to `evidence` — every
+        BUDGET_EXHAUSTED blocker states unconditionally that its figure is
+        attempt-row spend only, and never counts the residual against the
+        cap: `used_tokens`/`raise_to` below are untouched by it.
         """
+        residual = await self._orphaned_ledger_residual(task)
+        if residual is None:
+            residual_text = "unavailable (read failed)"
+        else:
+            calls, weighted = residual
+            residual_text = f"{calls:,} calls, {weighted:,} cost-weighted tokens"
+            if calls == 0:
+                # A bare "0" reads as "there is none", which is only one of
+                # three cases: (a) genuinely none, (b) the rows aged out —
+                # `compact_unattributed_usage` drops `task_id` when it rolls
+                # aged rows into a cross-task group, so they stop being THIS
+                # task's residual, or (c) this attempt's aux spend has not
+                # been flushed yet — `_flush_orphaned_aux_usage` runs in
+                # `_drive_watched`'s `finally`, AFTER this blocker is built.
+                # Qualify it so the absence of a number is not mistaken for
+                # the absence of spend, same reasoning as printing this line
+                # unconditionally in the first place.
+                residual_text += (
+                    " (aged-out or not-yet-flushed spend is not shown)"
+                )
+        # Printed UNCONDITIONALLY, including 0 calls / 0 tokens: a sentence
+        # that only appears when non-zero would teach a human to read its
+        # absence as "there is none", when it equally means "the read
+        # failed" or "this build predates the change".
+        evidence = evidence + (
+            f" SCOPE: the {used_tokens:,} cost-weighted tokens above are "
+            "the sum over this task's ATTEMPT rows only. They do NOT "
+            "include aux-tier spend (planner/utility/supervisor/distill) "
+            "recorded against this task in the unattributed ledger under "
+            "site prefix 'orphaned_' — that spend is real and is not "
+            f"charged to this cap. Unattributed ledger for this task: "
+            f"{residual_text}. Raising the cap from the figure above is "
+            "raising it from attempt-row spend, not from this task's total."
+        )
         # The raise is proportional to what the task has actually spent — a
         # human raising the budget buys roughly one more bounded loop, not
         # unbounded life. Rounded to 100k, not 1M: the caps are weighted now
@@ -13210,7 +13288,7 @@ class Orchestrator:
             attempts_used=used_attempts,
         )
         over = f"cost-weighted tokens {used_tokens:,}/{cap_tokens:,}"
-        return self._budget_exhausted_blocker(
+        return await self._budget_exhausted_blocker(
             task,
             root_cause=(
                 f"lifetime budget floor: remaining {remaining:,} < minimum "

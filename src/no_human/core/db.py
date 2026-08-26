@@ -97,7 +97,7 @@ AUX_USAGE_TIERS: tuple[str, ...] = tuple(
     t for t in USAGE_ROLES if t not in ("", "review_"))
 
 # Sites whose rows ARE recorded against a task: `_flush_orphaned_aux_usage`
-# (orchestrator.py:2097) writes `site=f"orphaned_{tier}usage"` for every tier
+# (orchestrator.py:2396) writes `site=f"orphaned_{tier}usage"` for every tier
 # in AUX_USAGE_TIERS, always with the task's id. `unattributed_usage_totals`
 # uses this prefix (not `task_id`) to split the ledger — see that method's
 # docstring for why.
@@ -2342,6 +2342,24 @@ class Store:
         ``included[name] + excluded[name]`` always equals what an
         unconditional ``SUM`` over that column would have returned, which is
         exactly how ``lifetime_usage`` reconstructs the old all-in raw total.
+
+        SCOPE, stated once because a budget gate reads this as the whole
+        truth: both totals are ``FROM attempts`` ONLY. Spend this task has
+        booked in ``unattributed_usage`` under ``ORPHANED_SITE_PREFIX``
+        (aux-tier planner/utility/supervisor/distill spend that
+        ``Orchestrator._flush_orphaned_aux_usage`` wrote there with this
+        task's id because no attempt claimed it) is on NEITHER axis here —
+        not ``included``, not ``excluded``. It is real spend recorded
+        against this task that this method simply never reads. The
+        reconciling read is ``unattributed_usage_totals(task_id,
+        attributed=True)``. Measured 2026-08-22: 73 calls / 5,425,168
+        weighted tokens fleet-wide in that ledger, worst single task
+        744,666 (18.6% of the 4M default ``lifetime_tokens`` cap
+        (``bounds.py``) — the 8M figures elsewhere in this file are
+        historical prose about the pre-2026-07-31 raw cap, not the current
+        default) — enough that a human raising a cap from this method's
+        ``tokens_used`` alone can be raising it from a number that already
+        undercounts.
         """
         # The three raw classes PLUS the output share, which is a slice of the
         # first of them rather than a fourth class — see
