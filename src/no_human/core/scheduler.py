@@ -1116,8 +1116,8 @@ class Scheduler:
                 "pool lease: taking over the lease held by pid %s on %s "
                 "(heartbeat age %.0fs >= %.0fs). If that process is alive "
                 "but quiet, its mid-run rows stay protected for up to a "
-                "further %.0fs (_STRANDED_GRACE_S) — an accepted window, "
-                "see docs/design/lease-takeover-vs-orphan-grace.md",
+                "further %.0fs (_LEASE_ORPHAN_DIVERGENCE_S) — an accepted "
+                "window, see docs/design/lease-takeover-vs-orphan-grace.md",
                 row["pid"], row["host"], age, self._HEARTBEAT_STALE_S,
                 self._LEASE_ORPHAN_DIVERGENCE_S)
 

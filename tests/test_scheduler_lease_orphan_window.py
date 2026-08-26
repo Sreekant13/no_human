@@ -162,6 +162,13 @@ async def test_a_takeover_inside_the_window_logs_the_accepted_window(
         f"expected exactly one takeover warning naming pid {sibling_pid}, "
         f"got: {[(r.message, r.args) for r in caplog.records]}")
     assert 600.0 in takeover_records[0].args
+    # The 600s figure IS `_LEASE_ORPHAN_DIVERGENCE_S`; `_STRANDED_GRACE_S`
+    # is 900. An operator reading the log learns which knob to turn from the
+    # parenthetical, so the label must name the constant whose value is
+    # printed (found in review of PR #818, plan §66).
+    rendered = takeover_records[0].getMessage()
+    assert "further 600s (_LEASE_ORPHAN_DIVERGENCE_S)" in rendered, rendered
+    assert "(_STRANDED_GRACE_S)" not in rendered, rendered
 
 
 async def test_a_self_refresh_does_not_log_a_takeover(store, caplog):
