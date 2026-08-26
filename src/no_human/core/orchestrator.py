@@ -562,6 +562,68 @@ _REPORT_KINDS = ("investigation", "design_doc")
 #: than being spelled out at each site.
 _NO_CHANGES_DETAIL = "agent produced no file changes"
 
+# How many paths per bucket the reviewer-worktree integrity failure names
+# before it summarises the rest. The message is persisted and read by the
+# next attempt, so it must be actionable without being unbounded.
+_INTEGRITY_PATHS_SHOWN = 5
+
+
+def _integrity_failure_detail(delta: Any) -> str:
+    """The reviewer-worktree integrity failure text, NAMING THE PATHS.
+
+    This string is the only account of the discard that the next attempt and
+    the operator ever see. It used to carry counts alone — "0 added, 1
+    modified, 0 deleted" — which is not actionable: tasks were killed by this
+    guard and every diagnosis had to be made by querying `reviewer_wrote`
+    events out of the database to learn that the "modification" was git's own
+    bookkeeping (`.git/common/config`) and not a source file at all. The paths
+    are already on that event; withholding them here bought nothing and cost
+    every one of those diagnoses.
+
+    Capped per bucket because a delta can be large and this text is persisted;
+    the counts stay, so a truncated list is never mistaken for the whole one.
+    """
+    shown = [f"+{p}" for p in delta.added[:_INTEGRITY_PATHS_SHOWN]]
+    shown += [f"~{p}" for p in delta.modified[:_INTEGRITY_PATHS_SHOWN]]
+    shown += [f"-{p}" for p in delta.deleted[:_INTEGRITY_PATHS_SHOWN]]
+    total = len(delta.added) + len(delta.modified) + len(delta.deleted)
+    more = total - len(shown)
+    # ".git/"-prefixed paths are deliberately NOT claimed reverted: `revert`
+    # never touches them (hash-only inventory, no bytes to restore) — the
+    # discard of the verdict IS the protection there. Saying "reverted"
+    # about them welded a false clause onto persisted operator-read text,
+    # and every path in the incident data was exactly that class.
+    has_git = any(p.startswith(".git/")
+                  for p in (*delta.added, *delta.modified, *delta.deleted))
+    tail = (" — worktree paths reverted to the reviewed baseline; "
+            ".git-path changes are flagged, not reverted; "
+            "the verdict is discarded" if has_git else
+            " — reverted to the reviewed baseline and the verdict discarded")
+    return (
+        "the reviewer wrote to the worktree it was judging "
+        f"({len(delta.added)} added, {len(delta.modified)} modified, "
+        f"{len(delta.deleted)} deleted): "
+        + ", ".join(shown)
+        + (f" and {more} more" if more > 0 else "")
+        + tail
+    )
+
+
+def _integrity_failure_decision(delta: Any) -> "ReviewDecision":
+    """The whole verdict a reviewer-worktree integrity failure produces.
+
+    Extracted so the WIRING is testable, not just the text. Nothing asserted
+    that the checklist item carries the detail at all — `grep "reviewer
+    worktree integrity" tests/` found nothing — so the label and the message
+    could drift apart, or the detail could be dropped, with the suite green.
+    """
+    return ReviewDecision(
+        passed=False,
+        checklist=[ChecklistItem(
+            "reviewer worktree integrity", False,
+            _integrity_failure_detail(delta))],
+    )
+
 
 def _fingerprint_detail(detail: str | None) -> str:
     """The failure detail as the failed-restoration fingerprint sees it.
@@ -16121,15 +16183,7 @@ class Orchestrator:
             raise self._reviewer_worktree_unavailable(
                 f"gate integrity could not be established: {exc}", decision) from exc
 
-        fresh = ReviewDecision(
-            passed=False,
-            checklist=[ChecklistItem(
-                "reviewer worktree integrity", False,
-                "the reviewer wrote to the worktree it was judging "
-                f"({len(delta.added)} added, {len(delta.modified)} modified, "
-                f"{len(delta.deleted)} deleted) — reverted to the reviewed "
-                "baseline and the verdict discarded")],
-        )
+        fresh = _integrity_failure_decision(delta)
         self._carry_reviewer_usage(fresh, decision)
         return fresh
 

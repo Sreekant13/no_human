@@ -112,9 +112,46 @@ def _plant_symlinked_hook(path: Path, canary: Path, target_dir: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 def test_git_inventory_is_nonempty_for_a_linked_worktree(worktree_env):
+    """The inventory covers the EXECUTION SURFACES of a real linked worktree.
+
+    `admin/HEAD` IS present and IS watched — it is this worktree's own and
+    no other process writes it; rewriting it to the raw sha leaves
+    `git rev-parse HEAD` byte-identical, so only the inventory sees the
+    detach. The SHARED copy (`common/HEAD`) is ALSO inventoried: an earlier
+    revision path-skipped it because ordinary `git checkout` in the primary
+    checkout writes it and that discarded completed verdicts, but a round-10
+    review measured the skip hiding a write that repointed the primary
+    checkout. It is now content-adjudicated in `compare()` instead —
+    symref -> symref is clean, anything else is a violation — so the
+    inventory must carry it for `compare()` to see the change at all.
+    """
     inv = rw._git_dir_inventory(worktree_env["wt"], timeout=_TIMEOUT)
     assert inv, "the .git inventory is empty for a real linked worktree"
+    hooks = [k for k in inv if "hooks/" in k]
+    assert hooks, (
+        "no hook path in the inventory — the guard is watching nothing that "
+        f"git can execute: {sorted(inv)[:20]}")
     assert "admin/HEAD" in inv, sorted(inv)[:20]
+    assert "common/HEAD" in inv, (
+        "the SHARED HEAD left the inventory — compare()'s content-shape "
+        f"adjudication has nothing to adjudicate: {sorted(inv)[:20]}")
+
+
+def test_a_head_change_is_reported_via_the_dedicated_HEAD_comparison(
+        worktree_env):
+    """The other half of the test above: whatever the inventory carries,
+    a reviewer's commit must never be invisible. `compare()` compares the
+    resolved HEAD separately and reports it as a synthetic entry."""
+    wt = worktree_env["wt"]
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+    (wt / "moved.txt").write_text("x\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-qm", "the reviewer committed")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+
+    assert not delta.is_empty(), delta
+    assert any(m.startswith("HEAD:") for m in delta.modified), delta.modified
 
 
 def test_planted_git_hook_between_snapshot_and_compare_is_detected(worktree_env):

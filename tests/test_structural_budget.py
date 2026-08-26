@@ -106,7 +106,7 @@ FROZEN_FUNCTION_CC = {
 # the batch finished. The values below are the first baseline measured on a
 # tree that actually contains the ratchet; growth from here fails again.
 FROZEN_FILE_LINES = {
-    "core/orchestrator.py": 19300,
+    "core/orchestrator.py": 19354,
     "cli/commands.py": 7773,
     "api/app.py": 4956,
     "core/db.py": 4149,

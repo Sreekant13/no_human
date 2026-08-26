@@ -34,6 +34,7 @@ the other's job — both are required.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import stat
 import subprocess
@@ -58,7 +59,13 @@ class WorktreeCheckFailed(RuntimeError):
 class Snapshot:
     head: str
     entries: dict[str, str]
-    git_entries: dict[str, tuple[int, int, int, str]]
+    git_entries: dict[str, tuple[int, int, str]]
+    #: The shared HEAD's literal content at snapshot time (linked worktrees
+    #: only; None on a lone checkout or when unreadable). `compare` needs the
+    #: BYTES, not the inventory hash, to tell an ordinary branch switch
+    #: (symref -> symref) from a detach or garbage write — the hash alone
+    #: cannot say which shape either side had.
+    common_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -187,12 +194,20 @@ _SKIPPED_GIT_DIR_PREFIXES = frozenset({
     # `core.hooksPath` already points only inside its own admin dir
     # (`push_hook.py`), never another worktree's.
     "worktrees/",
-    # Git's content-addressed object store. An existing object's bytes are
-    # immutable — it is identified BY their sha256, so an in-place
-    # "modification" is a cryptographic contradiction — the only possible
-    # write is an ADDITION, and the shared object store gains new objects
-    # constantly from every OTHER concurrent task's linked worktree, not just
-    # this review. Walking and content-hashing it anyway was both a real
+    # Git's content-addressed object store. An existing OBJECT's bytes are
+    # immutable — it is identified BY their sha256 — but do NOT read that as
+    # "nothing under this tree can be modified": an earlier revision claimed
+    # the only possible write here is an ADDITION and that claim is FALSE.
+    # `objects/info/alternates` is an ordinary mutable file that git READS, and
+    # rewriting it makes a foreign object store resolvable through this repo
+    # while `compare()` reports an empty delta (measured: `git cat-file` on a
+    # foreign blob goes 128 -> 0). The counter-example and the full residual
+    # are in `_is_volatile_git_path`'s docstring below; it is named here too
+    # because this is where a reader auditing the exclusion list arrives, and
+    # the refuted sentence used to be all they found. The store also gains new
+    # objects constantly from every OTHER concurrent task's linked worktree,
+    # not just this review.
+    # Walking and content-hashing it anyway was both a real
     # perf cost (measured on this checkout: 150MB across 2628 files, read
     # three times per review — snapshot, compare, and revert's own internal
     # compare — and growing with repo history) and a false-positive source
@@ -223,8 +238,111 @@ _SKIPPED_GIT_DIR_PREFIXES = frozenset({
 # worktree).
 
 
-def _is_volatile_git_path(rel: str) -> bool:
-    return rel in _VOLATILE_GIT_EXACT or rel.startswith(_VOLATILE_GIT_PREFIX)
+def _is_volatile_git_path(rel: str, label: str) -> bool:
+    """Is this `.git`-relative path one git rewrites as DATA and never runs?
+
+    A DENYLIST, deliberately, and the inversion that replaced it in an earlier
+    revision of this commit was WRONG. That revision asked "is this an
+    execution surface?" and watched only `hooks/**`, `*config*` and
+    `info/attributes`. An independent review broke it by EXECUTION in four
+    ways — a submodule's `modules/<sub>/hooks/`, a `core.hooksPath` more than
+    one level deep, a `HEAD` rewrite preserving the resolved sha, and, the one
+    that settles the design, `include.path`: a WATCHED file (`config`) can
+    NAME an UNWATCHED one, and rewriting the included file got `git pwn` to
+    run while `compare()` reported empty. Main caught every one of them.
+
+    So the executable set under `.git` is NOT CLOSED under any finite list of
+    names, and an allowlist cannot be made safe by lengthening it. Watching
+    everything and excluding as little as possible is the only shape that
+    fails closed, and unknown-therefore-watched is the correct default for a
+    gate whose whole job is catching what nobody predicted.
+
+    THE EXCLUSIONS ARE NOT ALL "PROVABLY INERT", and an earlier version of
+    this paragraph said they were. `objects/` is skipped on the argument that
+    its contents are content-addressed and immutable, so the only possible
+    write is an addition. That is false for at least one path inside it:
+    `objects/info/alternates` is an ordinary mutable file that git READS, and
+    rewriting it makes a foreign object store resolvable through this repo
+    while `compare()` reports empty.
+
+    STATE THE PROPERTY, NOT ONE INSTANCE OF IT. Two earlier revisions of
+    this paragraph each framed the hole one size too small — first as
+    needing a config `include.path` under a pruned tree, then as "anything
+    written under a pruned tree". A round-10 review measured the second
+    framing short too. The real property:
+
+        ANYTHING WRITTEN OUTSIDE THE WATCHED SET DURING A REVIEW IS
+        INVISIBLE TO THIS GUARD — INCLUDING AN EXECUTABLE GIT WILL RUN —
+        AND THE WATCHED SET DOES NOT FOLLOW POINTERS.
+
+    A pre-existing `core.hooksPath` (watched, and unchanged, so nothing
+    trips) is enough whenever its target is not effectively watched, and
+    the effectively-watched set is EXACTLY: the `.git` inventory minus its
+    walk-pruned trees (`_SKIPPED_GIT_DIR_PREFIXES`: `objects/`, `refs/`,
+    `worktrees/`) and minus the excused volatile names/prefix
+    (`_VOLATILE_GIT_EXACT`, `logs/`), minus, under `common` only, the two
+    label-scoped names `COMMIT_EDITMSG`/`info/refs` (this function's third
+    excuse branch, below); with `common/HEAD` walked but adjudicated by
+    CONTENT SHAPE in `compare()`, so a symref -> symref repoint is not
+    reported (see the `common/HEAD` paragraph below); plus the worktree
+    paths `git status --untracked-files=all --ignored=no` reports. So a target in a pruned
+    `.git` tree, outside both `.git` and the worktree, or in a GITIGNORED
+    worktree directory (`.venv/`, `build/`, `__pycache__/`, … — every one
+    writable) all execute with an empty delta; only an untracked-and-not-
+    ignored worktree target is caught (measured: that planted hook shows as
+    `added`, while the same hook under a gitignored dir executed with
+    `delta.is_empty() == True` — round-12 review, positive control run).
+    This paragraph has now mis-drawn this boundary four times; the
+    constant names above are the boundary, not a summary of it.
+
+    That bypass is PRE-EXISTING — it reproduces identically against main, so
+    nothing here introduces or widens it — but it is a live hole and it is
+    recorded rather than implied. Closing it would require RESOLVING the
+    pointer targets (`core.hooksPath`, `include.path`, and any future kin)
+    and watching wherever they land; unpruning the `.git` trees alone would
+    not reach a target outside `.git` at all.
+
+    `label` is "admin" (this worktree's own git dir) or "common" (the SHARED
+    one, which on a linked-worktree install IS the primary checkout's `.git`).
+    The distinction is load-bearing: the excused names are written by
+    whoever is using the primary checkout, and NOTHING here can establish
+    which process wrote a common-dir file — the excuse rests on the write's
+    SHAPE being ordinary, never on who made it. `admin/HEAD` is the reviewed
+    worktree's own and rewriting it — to the raw sha, say — silently
+    detaches the branch the pipeline pushes; it stays watched.
+
+    `common/HEAD` is deliberately NOT in the excuse list: a path-level skip
+    would also hide a reviewer-side write that repoints the PRIMARY
+    checkout's HEAD (measured: such a write moved the primary checkout to a
+    decoy branch), and with `refs/` pruned for cost that flip would be the
+    hijack's last visible step. It is handled by CONTENT SHAPE in `compare`
+    instead: symref -> symref (an ordinary branch switch) is clean, anything
+    else — a raw sha, garbage — is a violation. The stated residual: a
+    symref -> symref rewrite of `common/HEAD` by the reviewer itself is
+    indistinguishable from the operator switching branches and is NOT
+    detected here; pointing it at a NEW decoy ref, though, needs a write
+    under `refs/heads/` in a packed or loose form the primary checkout would
+    then act on — a channel `refs/` pruning already concedes on main too.
+    """
+    if rel in _VOLATILE_GIT_EXACT or rel.startswith(_VOLATILE_GIT_PREFIX):
+        return True
+    # Written by ordinary work in the SHARED git dir, by whoever is using the
+    # primary checkout. Each measured discarding a completed verdict:
+    #   primary `git commit`   -> COMMIT_EDITMSG (git's editor buffer)
+    #   primary `git gc`       -> info/refs      (a generated ref cache)
+    # (`git checkout` -> common/HEAD was the third measured writer; it is
+    # content-adjudicated in `compare`, not path-skipped — see above.)
+    # Neither excused name is ever executed by git.
+    #
+    # BOTH ARE SCOPED TO "common", which is where the concurrent writer
+    # is. An earlier revision left COMMIT_EDITMSG and info/refs unscoped, which
+    # blinded the ADMIN side too — this worktree's OWN git dir, where no other
+    # process writes — and a review measured that as a detection regression
+    # against main for both. Scoping them costs nothing (the false positives
+    # all arrive via "common") and is pinned in both directions below.
+    if label == "common" and rel in ("COMMIT_EDITMSG", "info/refs"):
+        return True
+    return False
 
 
 def _resolve_git_root(repo_path: Path, arg: str, *, timeout: float) -> Path:
@@ -242,15 +360,16 @@ def _resolve_git_root(repo_path: Path, arg: str, *, timeout: float) -> Path:
             f"could not resolve git dir from {arg}={raw!r}: {exc}") from exc
 
 
-def _stat_entry(path: Path) -> tuple[int, int, int, str]:
+def _stat_entry(path: Path) -> tuple[int, int, str]:
+    """`(mode, size, sha256)` — deliberately NOT mtime. See `_git_dir_inventory`."""
     try:
         st = path.stat()
     except (FileNotFoundError, PermissionError, OSError) as exc:
         raise WorktreeCheckFailed(f"could not stat {path}: {exc}") from exc
-    return (stat.S_IMODE(st.st_mode), st.st_size, st.st_mtime_ns, _content_hash(path))
+    return (stat.S_IMODE(st.st_mode), st.st_size, _content_hash(path))
 
 
-def _symlink_entry(path: Path) -> tuple[int, int, int, str]:
+def _symlink_entry(path: Path) -> tuple[int, int, str]:
     # A symlinked hook is executed by git exactly like a regular file at that
     # path (`ln -s /tmp/payload post-checkout`) — the earlier revision of
     # this guard skipped `path.is_symlink()` paths entirely, which made a
@@ -266,7 +385,10 @@ def _symlink_entry(path: Path) -> tuple[int, int, int, str]:
     except OSError as exc:
         raise WorktreeCheckFailed(f"could not read symlink {path}: {exc}") from exc
     digest = hashlib.sha256(target.encode("utf-8", "surrogateescape")).hexdigest()
-    return (stat.S_IMODE(st.st_mode), len(target), st.st_mtime_ns, digest)
+    # Mtime omitted for the same reason as `_stat_entry`: retargeting the link
+    # changes `digest`, and `chmod` changes the mode. Touching it changes
+    # neither, and changes nothing git will do.
+    return (stat.S_IMODE(st.st_mode), len(target), digest)
 
 
 def _iter_git_paths(
@@ -312,13 +434,13 @@ def _iter_git_paths(
 
 def _walk_git_root(
     root: Path, label: str, *, skip_dir_prefixes: frozenset[str] = frozenset()
-) -> dict[str, tuple[int, int, int, str]]:
-    entries: dict[str, tuple[int, int, int, str]] = {}
+) -> dict[str, tuple[int, int, str]]:
+    entries: dict[str, tuple[int, int, str]] = {}
     if not root.is_dir():
         return entries
     for path, is_link in sorted(_iter_git_paths(root, skip_dir_prefixes)):
         rel = path.relative_to(root).as_posix()
-        if _is_volatile_git_path(rel):
+        if _is_volatile_git_path(rel, label):
             continue
         if is_link:
             # Inventoried by link identity (mode + target), never by
@@ -331,20 +453,82 @@ def _walk_git_root(
     return entries
 
 
-def _git_dir_inventory(repo_path: Path, *, timeout: float) -> dict[str, tuple[int, int, int, str]]:
-    """Recursive inventory of the `.git` subtree: `(mode, size, mtime_ns,
-    sha256)` per path, covering both the per-worktree admin dir
+def _git_dir_inventory(repo_path: Path, *, timeout: float) -> dict[str, tuple[int, int, str]]:
+    """Recursive inventory of the `.git` subtree: `(mode, size, sha256)` per
+    path, covering both the per-worktree admin dir
     (`git rev-parse --absolute-git-dir`) and the shared common dir
     (`git rev-parse --git-common-dir`) — for a *linked* worktree these
     differ, and the hooks that actually fire live under the common dir
     (`push_hook.py:24-31`), not the admin dir alone. Mode is part of the
     tuple so a `chmod +x` on a byte-identical existing file (e.g. a
     `hooks/*.sample`) is still a detected delta.
+
+    THE ENTRY IDENTITY IS EXACTLY WHAT DETERMINES WHAT GIT WILL DO: content
+    and mode. `st_mtime_ns` was part of this tuple until 2026-08-25 and made
+    a BYTE-IDENTICAL rewrite read as a modification.
+
+    It is NOT true that mtime could never catch anything content+mode miss —
+    measured, it did catch a symlink->regular-file swap and a hardlink
+    replacement. The claim that survives adversarial measurement is narrower
+    and sufficient: mtime is ATTACKER-WRITABLE (`utimensat`, and
+    `os.utime(..., follow_symlinks=False)` restores an exact ns), so an
+    adversary defeats it for free. It was detection against accidents only,
+    at the price below.
+
+    THE PRICE, and the limit of what it establishes: completed review verdicts
+    were repeatedly discarded, each reported with a `.git/common/` path —
+    git's own bookkeeping, never a source file — and at least one task
+    exhausted `max_attempts` and escalated to a human as a result.
+
+    NO COUNT AND NO TASK IDS ARE GIVEN. Two other places in this repo once
+    carried them and disagreed: this docstring said three verdicts and named
+    one task, `orchestrator.py` said six tasks, and a commit message said
+    seven events across six different ones. All were true when written, none
+    is checkable from the shipped tree, and a reader could only find them
+    contradicting each other. The MECHANISM below is reproducible; that is
+    what belongs in permanent source.
+
+    Whether those particular writes left the content
+    unchanged is NOT established — this inventory stores hashes, not bytes
+    (`revert()` deliberately never touches `.git`-subtree paths, see its
+    docstring), so the before/after content of those incident writes was
+    never captured anywhere. What is established by reproduction is that
+    an identical-bytes rewrite is SUFFICIENT to produce exactly that report.
+
+    ATTRIBUTION — the residual, stated rather than papered over. This
+    inventory covers the common dir, which on a linked-worktree installation
+    is SHARED: the primary checkout, every concurrent task worktree and any
+    human working in the repo all write to the same files. Nothing here can
+    establish that a change found in the common dir was made by the reviewed
+    session rather than by one of those other writers. What the change above
+    establishes is narrower and is the whole of what it claims: a write that
+    does not alter content or mode is not reported at all, so the ordinary
+    case — a tool rewriting a file with the bytes it already had — no longer
+    discards a verdict. A genuine concurrent CONTENT change to the shared
+    git dir is still attributed to the reviewer, and still fails closed.
+    That direction is the safe one, and it is rare where the identical-bytes
+    rewrite was routine, but it is not fixed here and must not be described
+    as if it were.
+
+    TRANSIENT STATE — the second residual, and the one dropping mtime makes
+    sharper. `snapshot` and `compare` observe two ENDPOINTS; they never see the
+    trajectory between them. A payload written over an existing hook, FIRED,
+    and then restored to its exact bytes and mode executes with an empty delta.
+    Measured against this revision and against main: main happens to catch the
+    bytes-and-mode-restored case only because its identity tuple still carried
+    mtime, and it falls to the same attack the moment the attacker also covers
+    mtime. So mtime was never a defence — it was an accident that tripped the
+    careless version of this attack — and removing it is still right, because
+    mtime is attacker-writable and its false positives were destroying real
+    verdicts. But the accident IS gone, and this is where a reader would
+    otherwise have to rediscover that. Closing this class needs a different
+    instrument entirely (watching writes as they happen, not diffing two
+    snapshots); it is not attempted here.
     """
     repo_path = Path(repo_path)
     admin_dir = _resolve_git_root(repo_path, "--absolute-git-dir", timeout=timeout)
     common_dir = _resolve_git_root(repo_path, "--git-common-dir", timeout=timeout)
-    entries: dict[str, tuple[int, int, int, str]] = {}
+    entries: dict[str, tuple[int, int, str]] = {}
     entries.update(
         _walk_git_root(admin_dir, "admin", skip_dir_prefixes=_SKIPPED_GIT_DIR_PREFIXES))
     if common_dir != admin_dir:
@@ -394,7 +578,25 @@ def snapshot(repo_path: Path, *, timeout: float) -> Snapshot:
     for path, xy in _parse_porcelain_z(raw):
         entries[path] = f"{xy}:{_content_hash(repo_path / path)}"
     git_entries = _git_dir_inventory(repo_path, timeout=timeout)
-    return Snapshot(head=head, entries=entries, git_entries=git_entries)
+    common_head: str | None = None
+    admin_dir = _resolve_git_root(repo_path, "--absolute-git-dir", timeout=timeout)
+    common_dir = _resolve_git_root(repo_path, "--git-common-dir", timeout=timeout)
+    if common_dir != admin_dir:
+        try:
+            common_head = (common_dir / "HEAD").read_text(errors="replace")
+        except OSError:
+            common_head = None  # unreadable reads as "not a symref" -> fail closed
+    return Snapshot(head=head, entries=entries, git_entries=git_entries,
+                    common_head=common_head)
+
+
+#: One branch symref line, exactly — what `git checkout <branch>` writes.
+#: A raw sha (detached), an empty file, or any extra content does not match.
+_BRANCH_SYMREF = re.compile(r"ref: refs/heads/\S+\n?\Z")
+
+
+def _is_branch_symref(content: str | None) -> bool:
+    return content is not None and _BRANCH_SYMREF.fullmatch(content) is not None
 
 
 def _bucket(xy: str) -> str:
@@ -451,6 +653,17 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
         a = after.git_entries.get(path)
         if a == b:
             continue
+        if path == "common/HEAD" and a is not None and b is not None:
+            # SHAPE, not writer: an ordinary branch switch in the primary
+            # checkout rewrites the shared HEAD as one branch symref line to
+            # another, and nothing here can tell who wrote it. Only that
+            # shape is excused. A raw sha (detach), garbage, or a side this
+            # snapshot could not read stays a violation — see
+            # `_is_volatile_git_path`'s docstring for why the path is not
+            # simply skipped.
+            if (_is_branch_symref(before.common_head)
+                    and _is_branch_symref(after.common_head)):
+                continue
         display = f".git/{path}"
         if a is None:
             deleted.append(display)

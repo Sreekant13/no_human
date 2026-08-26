@@ -167,3 +167,53 @@ async def test_a_clean_worktree_still_returns_the_reviewers_verdict(
     assert not [e for e in events
                 if (e.get("kind") if isinstance(e, dict) else None)
                 == "reviewer_worktree_uncheckable"]
+
+
+async def test_the_integrity_verdict_reaches_production_carrying_its_paths(
+    store, tmp_path, monkeypatch,
+):
+    """The PRODUCTION wiring, which nothing asserted.
+
+    A sibling test asserts what `_integrity_failure_decision` RETURNS, calling
+    the helper directly. That leaves the call site untested: an independent
+    review replaced the call in `_run_reviewer` with an inline, counts-only
+    `ReviewDecision` and every then-existing reviewer test stayed GREEN
+    (no count given: a number here is uncheckable from the shipped tree and
+    this branch's own rule forbids those) — production would
+    silently lose the paths, which is the entire defect this branch exists to
+    fix. Extracting the helper moved the untested boundary up one level rather
+    than closing it.
+
+    So this drives the REAL `_run_reviewer` to the real call site and asserts
+    the path survives all the way into the returned verdict.
+    """
+    written = "src/no_human/core/orchestrator.py"
+
+    def _clean_revert(*a, **k):
+        return None
+
+    monkeypatch.setattr(rw, "compare", _dirty)
+    monkeypatch.setattr(rw, "revert", _clean_revert)
+
+    events = []
+    repo = _git_repo(tmp_path / "repo")
+    cfg = load_config(tmp_path / "config.yaml")
+    orch = Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None),
+                        event_sink=events.append)
+    orch.reviewer = _PassingReviewer()
+
+    decision = await orch._run_reviewer(_task(), repo_path=repo)
+
+    # The reviewer PASSED; the integrity failure must override it.
+    assert decision.passed is False, (
+        "a reviewer that wrote to the worktree it was judging had its PASS "
+        "returned as the verdict")
+    assert len(decision.checklist) == 1
+    item = decision.checklist[0]
+    assert item.label == "reviewer worktree integrity"
+    assert item.passed is False
+    assert written in item.evidence, (
+        f"the production call site produced a verdict WITHOUT the path it "
+        f"objected to — this is the counts-only regression, live: "
+        f"{item.evidence!r}")
+
