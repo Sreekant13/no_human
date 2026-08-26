@@ -140,6 +140,57 @@ def test_blocks_nh_approve_and_the_approve_api_in_every_mode():
             assert "approv" in d.reason.lower(), d.reason
 
 
+def test_peel_runners_consumes_envs_own_flags():
+    """`_peel_runners` (session_mark.py's companion fix, 2026-08-26): `env`
+    peels its OWN flags — `-u NAME`, `-uNAME`, `--unset=NAME`, `-i` /
+    `--ignore-environment` — as well as `VAR=value` assignments, before
+    handing back the real command. Unit-level, not routed through
+    `guard.evaluate`: `_strip_wrappers`'s recovery scan (exercised by
+    `test_a_wrapper_carrying_its_own_flags_is_still_recovered` below) already
+    finds a known binary name anywhere in `env`'s tail regardless of how its
+    flags parse, so the full pipeline was never observed to miss any of these
+    — this test is what actually pins `_peel_runners`'s own flag grammar,
+    for the day some OTHER call site feeds it a raw `env ...` argv without
+    that recovery scan in front of it."""
+    for argv, want in (
+        (["env", "-u", "NO_HUMAN_AGENT_SESSION", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+        (["env", "-uNO_HUMAN_AGENT_SESSION", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+        (["env", "--unset=NO_HUMAN_AGENT_SESSION", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+        (["env", "-i", "nh", "approve", "x"], ["nh", "approve", "x"]),
+        (["env", "--ignore-environment", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+        (["env", "-u", "A", "-u", "B", "FOO=1", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+        (["env", "-i", "PATH=/bin", "nh", "approve", "x"],
+         ["nh", "approve", "x"]),
+    ):
+        assert guard._peel_runners(list(argv)) == want, argv
+
+
+def test_env_flag_spellings_still_deny_approve_and_merge_stack():
+    """Full-pipeline companion to the unit test above: every `env <flags>`
+    spelling of `nh approve`/`nh merge-stack run` stays denied. (As noted
+    above, `_strip_wrappers`'s recovery already carried this before the
+    `_peel_runners` fix — this pins the observable behaviour, not the fix
+    alone.)"""
+    for readonly in (False, True):
+        for cmd in (
+            "env -u NO_HUMAN_AGENT_SESSION nh approve abc123",
+            "env -uNO_HUMAN_AGENT_SESSION nh approve abc123",
+            "env --unset=NO_HUMAN_AGENT_SESSION nh approve abc123",
+            "env -i NO_HUMAN_AGENT_SESSION=0 nh approve abc123",
+            "env -u NO_HUMAN_AGENT_SESSION nh merge-stack run --yes",
+            "env --ignore-environment nh merge-stack run --squash --yes",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd!r}"
+
+
 def test_blocks_the_other_spellings_of_the_same_act():
     """Round 2 of the same sweep, after a peer session named spellings the
     first fix missed. Every one of these was measured ALLOW against the first

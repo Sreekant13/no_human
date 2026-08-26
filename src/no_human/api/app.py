@@ -18,6 +18,7 @@ import copy
 import json
 import contextlib
 import os
+import posixpath
 import re
 import subprocess
 import threading
@@ -44,6 +45,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import __version__
+from ..agent.session_mark import AGENT_SESSION_HEADER, request_is_marked
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
@@ -382,6 +384,80 @@ async def _csp_header(request, call_next):
     csp = getattr(request.app.state, "csp", None) or _CSP
     response.headers.setdefault("Content-Security-Policy", csp)
     return response
+
+
+# The four gate-ending route suffixes — deliberately the same set
+# `guard.py`'s `_GATE_PATH` regex already names (`approve`, `approve-landed`,
+# `finish-review`, `shipped`), kept as a literal tuple here rather than
+# imported from `guard.py` so this module has no import-time dependency on
+# the CLI-hook module. `tests/test_gate_at_the_act.py` pins the two lists
+# against each other so they cannot silently drift apart.
+_GATE_ENDING_SUFFIXES = ("/approve", "/approve-landed", "/finish-review", "/shipped")
+
+
+def _is_gate_ending_path(path: str) -> bool:
+    """True for `/api/tasks/{id}/<gate-ending suffix>`. Interior repeated
+    slashes, a trailing slash, `.`/`..` segments and one level of
+    percent-encoding are normalized away first — the same class of
+    normalization `guard.py`'s lexical route check applies.
+
+    The two layers agree on every path Starlette actually routes to a
+    gate-ending handler. They diverge on two spellings that Starlette does
+    NOT route, so neither is a dodge: a doubled LEADING slash
+    (`//api/tasks/x/approve` — `posixpath.normpath` preserves it, so this
+    returns False where `guard.py` matches) and upper case
+    (`/api/tasks/x/APPROVE` — `guard.py`'s regex is IGNORECASE, this
+    comparison is not). Both reach the SPA catch-all instead of the approve
+    handler and answer 405, measured; they cannot end the gate, so the
+    stricter layer being the lexical one costs nothing here."""
+    from urllib.parse import unquote
+
+    normalized = posixpath.normpath(unquote(path))
+    if not normalized.startswith("/api/tasks/"):
+        return False
+    return normalized.endswith(_GATE_ENDING_SUFFIXES)
+
+
+@app.middleware("http")
+async def _refuse_marked_gate_acts(request, call_next):
+    """The act-level half of the human gate (session_mark.py), applied to
+    the HTTP surface: a gate-ending route refuses a request that carries the
+    agent-session mark — via `AGENT_SESSION_HEADER` (a marked CLI client
+    sends it, see `cli/api_client.py`) or via this server process's own env
+    mark — BEFORE the route handler runs, so no state mutates. Additive to
+    the CLI-side `_refuse_agent_gate_act` and to `guard.py`'s existing
+    lexical checks; this is the checkpoint that still catches a caller that
+    reaches the API directly rather than through the `nh` CLI at all.
+
+    Only POST is checked, because all four gate-ending routes are declared
+    POST-only — a non-POST request cannot perform the act, and no GET route
+    in this app matches `_is_gate_ending_path` at all (task detail is
+    `/api/tasks/{id}`, the diff is `/api/tasks/{id}/diff`). The method test
+    is what keeps the refusal off the OTHER traffic that does normalize onto
+    those paths: dropping it turns the CORS preflight `OPTIONS
+    /api/tasks/{id}/approve` into a 403 on a marked server (measured — the
+    board's approve button would then fail as an opaque CORS error instead
+    of the API's own JSON), and turns the SPA catch-all's 404 for a GET of
+    the same path into a gate refusal. `tests/test_gate_at_the_act.py`
+    (`test_non_post_methods_on_a_gate_path_are_not_gate_refused`,
+    `test_every_gate_ending_route_is_post_only`) pins both halves.
+    """
+    if request.method.upper() == "POST" and _is_gate_ending_path(request.url.path):
+        if request_is_marked(request.headers.get(AGENT_SESSION_HEADER)):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "gate_refused",
+                    "reason": (
+                        "this request carries the agent-session mark; "
+                        "gate-ending actions are operator-only "
+                        "(see docs/security.md)."
+                    ),
+                },
+            )
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------------- #

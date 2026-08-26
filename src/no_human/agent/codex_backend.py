@@ -134,6 +134,7 @@ from .backend import (
     BackendUnavailable,
     DEFAULT_CODEX_MODEL,
 )
+from .session_mark import mark_env
 
 #: Declared once, read by ``nh doctor``, the seam's tests, and anything that
 #: wants to know what it is talking to before it talks to it.
@@ -1045,6 +1046,11 @@ class CodexBackend:
         for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
                     "ANTHROPIC_AUTH_TOKEN"):
             env.pop(var, None)
+        # The agent-session mark (session_mark.py): stamped last, after the
+        # credential scrub, so it always survives it — the gate-ending act
+        # sites refuse a caller descended from this subprocess regardless of
+        # which auth_mode paid for the run.
+        env.update(mark_env("codex"))
         return env
 
     def _child_env_api_key(self) -> dict[str, str]:

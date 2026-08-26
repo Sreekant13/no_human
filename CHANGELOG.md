@@ -17,12 +17,47 @@ All notable changes to no_human. The format follows
 
 ### Security
 
+- **The human gate is now also enforced at the ACT, one layer behind the
+  lexical guard below — and this too is a cost-raising layer, not a closed
+  door.** `agent/session_mark.py` stamps every subprocess the two coding
+  backends launch (`ClaudeBackend._options()`, `CodexBackend._child_env()`)
+  with an env-var mark (`NO_HUMAN_AGENT_SESSION`, plus a `_KIND` for
+  diagnostics) that every descendant of that session inherits. The
+  gate-ending acts then refuse a caller carrying it: `nh approve` and
+  `nh merge-stack run` refuse before `_bootstrap` or the `Store` is touched,
+  and an HTTP middleware refuses `POST /api/tasks/<id>/approve`,
+  `/approve-landed`, `/finish-review` and `/shipped` when the request carries
+  the `X-No-Human-Agent-Session` header (a marked CLI client sends it) or the
+  server process is itself marked. Fail-closed: an unrecognized mark value
+  counts as marked.
+
+  **What shipped is a DROPPABLE mark that gate-ending acts refuse — not the
+  positive capability an earlier draft of this entry promised.** That draft
+  said the routes would "require something an agent session structurally
+  lacks"; the opposite polarity shipped, and stating it the old way would
+  claim a structural impossibility the code does not establish. What the
+  placement actually buys is (1) ONE choke point at the act instead of
+  chasing twelve spellings on the way to it, and (2) the only enforcement
+  that works at all on the Codex backend, where `codex exec` offers no
+  PreToolUse veto and the lexical rules can only run after the fact.
+  Two residuals, disclosed rather than implied away: an environment variable
+  can be DROPPED, so a session that both dodges the argv layer (e.g. a script
+  written by one tool call and run by the next) and unsets the var in the
+  same step is past both layers; and the HTTP check is honour-system, since
+  the local server cannot see a caller's environment — a marked caller that
+  omits the header is not refused by it. Four commit subjects on the branch
+  that shipped this say "so the spelling of the invocation stops mattering",
+  which is backwards — spelling decides whether the mark survives to the act.
+  Landed subjects cannot be corrected without rewriting history, so the
+  correction is recorded here and in `docs/security.md`.
+
 - **The obvious routes an agent session had to ending the human gate now cost
   it a denial — and this is a cost-raising layer, not a closed door.**
   The known gaps are listed below — deliberately without a count, because the
   count has gone stale twice: the review that would make it accurate always
-  happens after the commit that states it. The control that closes the door
-  has to live at the act itself and is tracked separately.
+  happens after the commit that states it. The check at the act itself —
+  shipped in the entry above — sits behind this one and is a better-placed
+  layer of the same kind, not the thing that closes the door.
   `nh approve` performs
   a real `git merge --squash` and pushes to the default branch, and
   `POST /api/tasks/<id>/approve` (plus `/approve-landed`, `/shipped` and
@@ -45,10 +80,13 @@ All notable changes to no_human. The format follows
   it can only report that it did not fire. They are
   disclosed rather than chased: eight rounds of adding the next shape produced
   a rule that still loses to shell grammar, which is the signal to stop. The
-  durable fix is a check at the ACT — `nh approve` refusing inside an agent
-  session, and the four gate-ending routes requiring something an agent
-  session structurally lacks — which makes every spelling moot in one place
-  and also covers the Codex backend, where no PreToolUse rule can act at all.
+  better-placed check is at the ACT — `nh approve`, `nh merge-stack run` and
+  the four gate-ending routes refusing a caller that carries the agent-session
+  mark, shipped in the entry above — which collapses the spellings into one
+  choke point and also covers the Codex backend, where no PreToolUse rule can
+  act at all. It refuses a DROPPABLE mark rather than requiring a capability
+  an agent session structurally lacks, so it raises the cost of these gaps
+  instead of making them unreachable.
   Two smaller asymmetries, same category: a python payload that merely PRINTS
   the route is denied where a node one is not, and an `awk`/`perl` one-liner
   containing `$` plus a word like `shipped` or `serve` is refused as
@@ -94,8 +132,8 @@ All notable changes to no_human. The format follows
 
   `docs/security.md` no longer publishes a closed list of exceptions. It says
   what this is: a layer that raises the cost of the obvious spellings, in front
-  of a control that has to live at the act itself. Seven rounds and six reviews
-  produced that sentence, and it is the honest one.
+  of a second, better-placed cost-raising layer at the act itself. Seven rounds
+  and six reviews produced that sentence, and it is the honest one.
 
 - **The forge-merge argv check (`_forge_invocations` in `agent/guard.py`) read
   `gh`/`glab` off the bare command and never recursed into a shell wrapper —

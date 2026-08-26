@@ -1758,7 +1758,11 @@ def test_subscription_mode_accepts_an_unrecognised_but_present_session(monkeypat
                         lambda cli_path=None: cx.CodexSessionStatus(True, "unknown"))
     env = cx.CodexBackend(auth_mode="subscription",
                           env={"PATH": "/bin"})._child_env()
-    assert env == {"PATH": "/bin"}
+    # `_child_env` also stamps the agent-session mark (session_mark.py) onto
+    # every Codex subprocess env now, so the accepted-session path returns
+    # PATH plus exactly the two mark vars — not a bare passthrough anymore.
+    from no_human.agent.session_mark import mark_env
+    assert env == {"PATH": "/bin", **mark_env("codex")}
 
 
 # --------------------------------------------------------------------------- #

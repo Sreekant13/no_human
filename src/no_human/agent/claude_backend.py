@@ -45,6 +45,7 @@ from claude_agent_sdk import (
 
 from . import guard
 from .backend import AgentEvent, AgentResult, BackendCapabilities
+from .session_mark import mark_env
 from .supervisor import SupervisorHook
 from .tool_result_cap import make_tool_result_cap_hook
 from .worker_context import describe_concurrency
@@ -672,6 +673,17 @@ class ClaudeBackend:
         if self.compact_window_tokens:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(self.compact_window_tokens))
         env.update(self.extra_env)
+        # The agent-session mark (session_mark.py): every subprocess this
+        # backend launches is stamped so the gate-ending act sites can refuse
+        # a caller descended from it, regardless of how that caller is
+        # invoked. Stamped last so it always wins over `extra_env`. Merges
+        # into the SDK's `env` (additive over the subprocess environment,
+        # per the comment above) — never into this process's `os.environ`.
+        env.update(mark_env("claude"))
+        # `env` is now never empty (the mark alone guarantees that), but the
+        # explicit check is kept rather than assigning unconditionally so a
+        # future edit that makes the mark optional does not silently start
+        # passing an empty dict where the SDK expects `None`.
         if env:
             kwargs["env"] = env
         if self.cli_path:

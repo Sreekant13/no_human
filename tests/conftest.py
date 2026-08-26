@@ -55,6 +55,23 @@ os.environ[DISABLE_ENV_VAR] = "1"
 
 
 @pytest.fixture(autouse=True)
+def _no_agent_mark(monkeypatch):
+    """Every test starts UNMARKED, regardless of what launched the suite
+    process itself (`session_mark.py`: a `no_human` coding backend stamps
+    its own subprocesses, and this repo's own dev/CI loop can itself run
+    inside one). Without this, a test asserting the "unmarked" behaviour of
+    `refuse_if_marked`/`request_is_marked` would pass or fail depending on
+    ambient state the test never controls — the same hazard `DISABLE_ENV_VAR`
+    above exists to close for the update check. Tests that want the "marked"
+    branch re-set the two vars explicitly via `monkeypatch.setenv`."""
+    from no_human.agent.session_mark import (
+        NO_HUMAN_AGENT_SESSION, NO_HUMAN_AGENT_SESSION_KIND,
+    )
+    monkeypatch.delenv(NO_HUMAN_AGENT_SESSION, raising=False)
+    monkeypatch.delenv(NO_HUMAN_AGENT_SESSION_KIND, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_backoffs(monkeypatch):
     from no_human.core.orchestrator import Orchestrator
     monkeypatch.setattr(Orchestrator, "PR_OPEN_RETRY_DELAY", 0)

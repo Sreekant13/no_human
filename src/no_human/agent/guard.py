@@ -1455,15 +1455,38 @@ def _decoded(tok: str) -> str:
 def _peel_runners(argv: list[str]) -> list[str]:
     """`uv run X`, `uvx X`, `poetry run X`, `env X`, `/usr/bin/env X` peeled to
     X. `_strip_wrappers` handles the bare-name wrappers; this also handles the
-    ones reached by an absolute path and the per-tool `run` subcommand."""
+    ones reached by an absolute path and the per-tool `run` subcommand.
+
+    `env` also peels its own flags — `-i`/`--ignore-environment` and
+    `-u NAME`/`-uNAME`/`--unset=NAME` — before the `VAR=value` assignments
+    and the real command. Those flags exist to STRIP env vars from the child
+    (session_mark.py's agent-session mark among them) before it runs; without
+    peeling them here, `env -u NO_HUMAN_AGENT_SESSION nh approve X` would
+    read as an opaque `env` invocation and the real `nh approve X` underneath
+    it would never reach the route/verb checks below. This peel is
+    permissive by design — it is a wrapper for FINDING the real command to
+    check, not itself a security boundary, so peeling one token too many
+    costs nothing."""
     for _ in range(4):
         if not argv:
             return argv
         name = PurePosixPath(argv[0]).name
         if name == "env":
             argv = argv[1:]
-            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
-                argv = argv[1:]
+            while argv:
+                tok = argv[0]
+                if tok in ("-i", "--ignore-environment"):
+                    argv = argv[1:]
+                elif tok == "-u" and len(argv) > 1:
+                    argv = argv[2:]
+                elif tok.startswith("-u") and tok != "-u":
+                    argv = argv[1:]
+                elif tok.startswith("--unset="):
+                    argv = argv[1:]
+                elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tok):
+                    argv = argv[1:]
+                else:
+                    break
             continue
         if name in {"uv", "poetry", "pdm", "hatch", "rye", "pipx"} and len(argv) > 1:
             argv = argv[2:] if argv[1] in {"run", "tool"} else argv[1:]

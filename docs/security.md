@@ -91,7 +91,7 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 **Read this first: no_human is not an offline tool, and this page does not claim
 to be an exhaustive list of its network traffic.** It cannot be one. The coder
 session is a Claude Agent SDK session built with **no tool restrictions** and
-`permission_mode="bypassPermissions"` (`agent/claude_backend.py:518`, `:543`) —
+`permission_mode="bypassPermissions"` (`agent/claude_backend.py:519`, `:544`) —
 no tool allowlist, no tool denylist, no per-call permission callback. It has
 Bash. Anything an agent decides to run — `curl`, `pip install`, `npm i`, a test
 suite that hits a staging API — leaves your machine, and nothing in no_human sits
@@ -135,7 +135,7 @@ named here.
   `git fetch origin` (`vcs/git.py:767`, `:797`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:2770`). This is *your* command, not the agent's — an agent
+  (`cli/commands.py:2793`). This is *your* command, not the agent's — an agent
   session's Bash is denied it for the spellings the rule models
   (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
   in both session modes; see §2 for the bound.
@@ -218,12 +218,70 @@ named here.
   `case...esac` gap already on record in `CHANGELOG.md` names `nh approve`,
   a different check, and disclosing it there does not cover this one.
 
-  **The control that does close the door is not this.** It is a check at the
-  act: `nh approve` refusing inside an agent session, and the four gate-ending
-  routes requiring something an agent session does not have. That check is
-  **not implemented today** — neither `nh approve` (`cli/commands.py:4597`)
-  nor the API's `approve_task` route (`api/app.py:1023`) tests for an agent
-  session — so nothing here should be read as telling you to rely on it.
+  **A check at the ACT sits behind this one. It is implemented, and it is a
+  BETTER-PLACED layer of the same kind — not a closed door.**
+  `agent/session_mark.py` stamps every subprocess the two coding backends
+  launch (`ClaudeBackend._options()`, `CodexBackend._child_env()`) with an
+  env-var mark that is inherited by every descendant of that session, no
+  matter how it is invoked. `nh approve` and `nh merge-stack run`
+  (`_refuse_agent_gate_act`, `cli/commands.py:4623`, `:2763`) refuse before
+  `_bootstrap` runs when the calling process carries that mark, and an HTTP
+  middleware in `api/app.py` (`_refuse_marked_gate_acts`, by `_csp_header`)
+  refuses
+  the four gate-ending routes — `/approve`, `/approve-landed`,
+  `/finish-review`, `/shipped` — whenever the request carries the mark header
+  (a marked CLI client sends one, see `cli/api_client.py`) or the server
+  process itself was launched inside an agent session. Both checks run
+  before any state mutates. This is additive to the lexical guard above, not
+  a replacement for it.
+
+  **What that placement actually buys, stated without overclaiming.** Two
+  things the argv layer cannot give, and nothing more:
+
+  1. **One choke point instead of twelve spellings.** The check is at the
+     act, not on the way to it, so an invocation the lexical rules never
+     modelled — a runtime-assembled command, an alias, a `PATH` shim, a
+     script written by one tool call and run by the next — arrives at the
+     same single refusal, *provided the mark is still in the environment*.
+     One place to get right instead of a list that went stale three times.
+  2. **It is the only layer that works at all on the Codex backend.**
+     `codex exec` offers no PreToolUse veto, so the lexical rules there can
+     only be evaluated on an already-executed call. The mark is stamped into
+     the child env and checked inside the act itself, which is before the
+     fact on every backend.
+
+  **The two residuals, so nobody reads the above as "closed".**
+
+  - **The mark travels in the environment, and an environment variable can
+    be dropped.** The argv layer denies `env -u NO_HUMAN_AGENT_SESSION nh
+    approve <id>` (`_peel_runners` recognises that spelling, see below), but
+    it cannot see the same two lines inside a script that one tool call
+    writes and the next runs by path — that is the disclosed gap two
+    paragraphs up. A session that dodges the argv layer *and* unsets the var
+    in the same step is past both layers. Script indirection defeats the
+    argv layer; unsetting an inherited variable is not hard once you are
+    past it.
+  - **The HTTP check is honour-system.** The local server cannot see a
+    caller's environment, so a marked caller is recognised only if it SENDS
+    `X-No-Human-Agent-Session` — which `cli/api_client.py` does and a raw
+    `POST` need not. A marked caller that talks HTTP without the header is
+    not refused by this check at all, unless the server process itself is
+    marked. The argv layer denies the obvious `curl`- and `gh`-driven
+    spellings of those routes, which is exactly the composition being
+    described: two cost-raising layers, not one closed door.
+
+  So, plainly: the act-level check RAISES THE COST of ending the gate, moves
+  the enforcement to the one place every spelling arrives at, and covers a
+  backend nothing else covers. It does not make the act impossible for a
+  determined session, and the spelling of the invocation has NOT stopped
+  mattering — it decides whether the mark survives to the act. (Four commit
+  subjects on the branch that shipped this say "so the spelling of the
+  invocation stops mattering". That is backwards; landed commit subjects
+  cannot be corrected without rewriting history, so the correction is
+  recorded here and in `CHANGELOG.md`.) The control that actually closes the
+  door is not in this repo: it is the human holding the merge button —
+  `nh approve` is an operator act, the agent never merges — and forge-side
+  branch protection making the human the only party who can land a PR.
 
   The paragraph overstated between 2026-08-12 and 2026-08-22, when `nh approve`
   gained a real `git merge --squash` and push while neither it nor the API

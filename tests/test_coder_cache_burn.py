@@ -32,11 +32,18 @@ from no_human.agent.backend import (
     make_backend,
 )
 from no_human.agent.claude_backend import AgentEvent, ClaudeBackend
+from no_human.agent.session_mark import mark_env
 from no_human.cli.commands import cli
 from no_human.core.db import Store
 from no_human.core.orchestrator import CODER_ROLE, BudgetAbort, Orchestrator
 from no_human.core.task import TaskStatus
 from no_human.notify.slack import SlackNotifier
+
+# Every `ClaudeBackend._options()` call now also stamps the agent-session mark
+# (`session_mark.mark_env`) — additive to whatever this module's own AC1
+# assertions check, so every exact `opts.env == {...}` comparison below must
+# include it alongside the compaction-window key(s) it actually pins.
+_MARK = mark_env("claude")
 
 from .test_cli_commands import _make_runner, _seed_attempt, _seed_task
 from .test_e2e_orchestrator import _config, store  # noqa: F401
@@ -49,7 +56,7 @@ from .test_e2e_orchestrator import _config, store  # noqa: F401
 def test_compact_window_reaches_sdk_options(tmp_path):
     backend = ClaudeBackend(model="claude-sonnet-4-6", compact_window_tokens=140_000)
     opts = backend._options(tmp_path, max_turns=5)
-    assert opts.env == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "140000"}
+    assert opts.env == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "140000", **_MARK}
 
 
 def test_no_window_means_no_env_override(tmp_path):
@@ -69,23 +76,24 @@ def test_only_the_coder_role_gets_the_window(tmp_path):
 
     coder = make_backend(model="m", config=cfg, role="coder")
     assert _window_env(coder, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456"
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456", **_MARK
     }
 
     reviewer = make_backend(model="m", config=cfg, role="reviewer")
-    assert _window_env(reviewer, tmp_path) == {}
+    assert _window_env(reviewer, tmp_path) == _MARK
 
     planner = make_backend(model="m", config=cfg, role="planner")
-    assert _window_env(planner, tmp_path) == {}
+    assert _window_env(planner, tmp_path) == _MARK
 
     readonly_coder = make_backend(model="m", config=cfg, role="coder", readonly=True)
-    assert _window_env(readonly_coder, tmp_path) == {}
+    assert _window_env(readonly_coder, tmp_path) == _MARK
 
 
 def test_default_window_applied_when_key_absent(tmp_path):
     backend = make_backend(model="m", config={}, role="coder")
     assert _window_env(backend, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS)
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS),
+        **_MARK,
     }
 
 
@@ -94,7 +102,8 @@ def test_invalid_window_does_not_reach_the_cli(tmp_path, bad):
     cfg = {"bounds": {"coder_compact_window_tokens": bad}}
     backend = make_backend(model="m", config=cfg, role="coder")
     assert _window_env(backend, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS)
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS),
+        **_MARK,
     }
 
 

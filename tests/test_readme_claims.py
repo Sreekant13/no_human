@@ -1744,17 +1744,19 @@ _LINE_CITATION_RE = re.compile(
 CITATION_TABLE = (
     # docs/security.md
     ("security.md", "guard.py:58", "guard.py", 'WRITE_TOOLS = {"Write"'),
-    ("security.md", "agent/claude_backend.py:518", "agent/claude_backend.py",
+    ("security.md", "agent/claude_backend.py:519", "agent/claude_backend.py",
      'permission_mode: str = "bypassPermissions"'),
-    ("security.md", ":543", "agent/claude_backend.py", "PreToolUse guard"),
+    ("security.md", ":544", "agent/claude_backend.py", "PreToolUse guard"),
     ("security.md", "vcs/pr_watcher.py:507-533", "vcs/pr_watcher.py",
      '"gh", "pr", "view"'),
     ("security.md", "vcs/git.py:767", "vcs/git.py", '"git", "fetch"'),
     ("security.md", ":797", "vcs/git.py", '["fetch", remote]'),
-    ("security.md", "cli/commands.py:2770", "cli/commands.py",
+    ("security.md", "cli/commands.py:2793", "cli/commands.py",
      '"gh", "pr", "merge"'),
-    ("security.md", "cli/commands.py:4597", "cli/commands.py", "def approve("),
-    ("security.md", "api/app.py:1023", "api/app.py", "async def approve_task("),
+    ("security.md", "cli/commands.py:4623", "cli/commands.py",
+     '_refuse_agent_gate_act("approve")'),
+    ("security.md", ":2763", "cli/commands.py",
+     '_refuse_agent_gate_act("merge_stack_run")'),
     ("security.md", "updates.py:44", "updates.py", "PYPI_JSON_URL"),
     ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
     ("security.md", "desktop/main.mjs:213", "desktop/main.mjs",
@@ -1792,10 +1794,10 @@ CITATION_TABLE = (
     ("security.md", "history/extractor.py:65-72", "history/extractor.py",
      "csrf_token"),
     # docs/eval.md
-    ("eval.md", "src/no_human/cli/commands.py:6753", "src/no_human/cli/commands.py",
+    ("eval.md", "src/no_human/cli/commands.py:6777", "src/no_human/cli/commands.py",
      '"--trials"'),
-    ("eval.md", ":7083", "src/no_human/cli/commands.py", "asyncio.gather"),
-    ("eval.md", ":6966", "src/no_human/cli/commands.py",
+    ("eval.md", ":7107", "src/no_human/cli/commands.py", "asyncio.gather"),
+    ("eval.md", ":6990", "src/no_human/cli/commands.py",
      "(sc.task_id, sc.trial)"),
     ("eval.md", "src/no_human/eval/northstar_card.py:443",
      "src/no_human/eval/northstar_card.py", "def pass_k_rate("),
@@ -1973,7 +1975,7 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4062" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4051 — this test is "
+        "the traceback no longer cites orchestrator.py:4062 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 

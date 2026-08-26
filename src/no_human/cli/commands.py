@@ -295,6 +295,28 @@ def _bootstrap(*, require_auth: bool = True):
     return config, report
 
 
+def _refuse_agent_gate_act(act: str) -> None:
+    """The act-level half of the human gate (session_mark.py): refuse `act`
+    outright if THIS process carries the agent-session mark, before any
+    other work — including `_bootstrap`'s config load or opening the
+    `Store` — happens. Additive to `guard.py`'s existing lexical PreToolUse
+    checks, which stay untouched; this is the checkpoint that still catches
+    a caller that dodges those by spelling the command differently.
+
+    Exit code 2 separates this from the exit 1 used for ordinary business
+    refusals ("no passing review yet"), but it is NOT unique to it: Click's
+    own UsageError also exits 2 (`nh approve` with no TASK_ID does). A caller
+    must key on the printed `refused: ... marked agent session`, not the code.
+    """
+    from ..agent.session_mark import GateRefused, refuse_if_marked
+
+    try:
+        refuse_if_marked(act)
+    except GateRefused as exc:
+        console.print(f"[bold red]refused:[/] {exc.reason}")
+        sys.exit(2)
+
+
 def _assert_backend_usable() -> None:
     """Refuse to start the server when the coding backend can't run a task.
 
@@ -2738,6 +2760,7 @@ def merge_stack_run(project, squash):
     """Merge the currently-ready PRs (parents merged) in topological order via
     `gh`. Stops at the first PR that isn't cleanly mergeable (e.g. needs a
     rebase) and reports it. Operator action — never run by the agent."""
+    _refuse_agent_gate_act("merge_stack_run")
     import subprocess
     from ..vcs.merge_order import MergeCycle, merge_order, ready_to_merge
     from ..vcs.pr_watcher import default_pr_merged, parse_pr_url
@@ -4597,6 +4620,7 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
 def approve(task_id, landed_sha, justification, base_branch):
     """Approve and merge — squash-lands the PR under the operator identity
     (the agent still never merges on its own)."""
+    _refuse_agent_gate_act("approve")
     config, _ = _bootstrap(require_auth=False)
 
     if landed_sha is not None:

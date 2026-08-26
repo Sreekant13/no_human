@@ -107,13 +107,13 @@ FROZEN_FUNCTION_CC = {
 # tree that actually contains the ratchet; growth from here fails again.
 FROZEN_FILE_LINES = {
     "core/orchestrator.py": 19354,
-    "cli/commands.py": 7773,
-    "api/app.py": 4956,
+    "cli/commands.py": 7783,
+    "api/app.py": 5032,
     "core/db.py": 4149,
     "config.py": 2888,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
-    "agent/guard.py": 2698,
+    "agent/guard.py": 2721,
     "core/scheduler.py": 2522,
 }
 

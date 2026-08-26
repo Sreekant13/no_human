@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from ..agent.session_mark import mark_headers
+
 DEFAULT_BASE_URL = "http://127.0.0.1:8420"
 
 # The grill stream can sit silent while the subagent greps a repo; the server
@@ -166,8 +168,15 @@ class NhClient:
         timeout: float = 15.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        # `mark_headers()` (session_mark.py) is empty for an ordinary operator
+        # shell — this process's env carries no agent-session mark — and adds
+        # exactly one header when the shell itself is running inside a marked
+        # session, so the server's gate middleware refuses `act("...",
+        # "approve")` the same as it refuses the CLI's own `nh approve`,
+        # regardless of which path the caller used to reach the gate.
         self._http = httpx.AsyncClient(
             base_url=self.base_url, transport=transport, timeout=timeout,
+            headers=mark_headers(),
         )
 
     async def __aenter__(self) -> NhClient:
