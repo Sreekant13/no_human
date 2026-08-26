@@ -16,12 +16,16 @@ reads (`Scheduler._run`) — arms the pool if it is still in the future.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
+import no_human.core.scheduler as scheduler_mod
 from no_human.core.db import Store
+from no_human.core.health import queue_health
 from no_human.core.scheduler import Scheduler
 from no_human.core.task import Task, TaskStatus
 
@@ -212,3 +216,139 @@ def test_park_quota_stamps_the_profile_on_the_blocker():
     from no_human.core.orchestrator import Orchestrator
     src = inspect.getsource(Orchestrator._park_quota)
     assert '"auth_profile": profile' in src
+
+
+# nh67: `recover_quota_cooldown` is the third writer of `_quota_cooldown_until`
+# (alongside `tick()`'s fleet-infra breaker trip and `_run()`'s per-task quota
+# park) and, pre-fix, the only one that left `_infra_cooldown_active` as it
+# found it. A fresh `Scheduler` always starts with the flag `False`, so the
+# bad interleaving never fires in production as the code stands today — but
+# nothing enforced it, so a caller (or a future refactor) that constructs a
+# `Scheduler`, runs a tick that trips the fleet breaker, and only THEN calls
+# `recover_quota_cooldown` (e.g. a reload/resync path) would arm a real quota
+# wall's clock while leaving the INFRA label on it — reporting the wall to
+# the operator as `paused_reason: "infra"`, with no profile, instead of the
+# quota wall it actually is.
+
+async def test_recovery_relabels_a_breaker_armed_pool_as_the_quota_wall_it_restores(
+        store, monkeypatch):
+    """Pre-fix this FAILS: the flag survives from the simulated breaker trip,
+    so `infra_cooldown_until` stays armed and `queue_health` reports
+    `paused_reason == "infra"` / `paused_profile is None` for what is, by the
+    DB's own record, a quota wall."""
+    monkeypatch.setattr(scheduler_mod, "active_auth_profile", lambda: "personal2")
+    now = datetime.now(timezone.utc)
+    await _pending(store, 1)
+    wall = now + timedelta(hours=3)
+    t = await _quota_park(store, wall)
+    t.blocker = {**t.blocker, "auth_profile": "personal2"}
+    await store.update_task_columns(t)
+    sched = Scheduler(store, _RecordingOrch, max_workers=1)
+    sched._infra_cooldown_active = True  # the breaker armed first
+
+    await sched.recover_quota_cooldown()
+
+    assert sched.quota_cooldown_until == wall
+    assert sched.infra_cooldown_until is None
+
+    h = await queue_health(store, max_workers=1,
+                            quota_cooldown_until=sched.quota_cooldown_until,
+                            infra_cooldown_until=sched.infra_cooldown_until)
+    assert h.paused is True
+    assert h.paused_reason == "quota"
+    assert h.paused_profile == "personal2"
+    assert h.paused_until == wall.isoformat()
+
+
+async def test_recovery_that_arms_nothing_leaves_a_live_infra_label_alone(store):
+    """Pins that the flag write sits on the branch that actually arms the
+    clock, not at the function's entry: a remembered park whose wall has
+    already passed arms nothing (existing behaviour, `test_a_passed_wall_arms_nothing`)
+    and must not clear a live breaker's label either — the mutation that
+    would otherwise pass the test above (moving the flag write to the top of
+    `recover_quota_cooldown`) breaks this one."""
+    now = datetime.now(timezone.utc)
+    await _quota_park(store, now - timedelta(minutes=5))
+    sched = Scheduler(store, _RecordingOrch, max_workers=1)
+    sched._infra_cooldown_active = True
+
+    recovered = await sched.recover_quota_cooldown()
+
+    assert recovered is None
+    assert sched._infra_cooldown_active is True
+
+
+def test_every_quota_cooldown_writer_also_writes_the_infra_label():
+    """Registry test, not an enumeration: a hardcoded list of "the three known
+    sites" would not catch a FOURTH writer added later without the flag —
+    which is exactly the shape of this defect (repo memory:
+    `enumerations-in-a-clear-list-reproduce-the-bug`). Instead this walks
+    every statement LIST in `scheduler.py` (a function body, an `if`/`for`/
+    `while`/`try` block's body/orelse/finalbody, an `except` handler's body)
+    and requires that any list containing an assignment to
+    `self._quota_cooldown_until` also contains, as a SIBLING statement in
+    that same list, an assignment to `self._infra_cooldown_active`. Sibling-
+    scope (not function-scope) is the right granularity: it would still catch
+    a new writer added inside a fresh `if` branch of a function that already
+    sets the flag elsewhere in its body.
+
+    Self-check: asserts at least 4 clock-assignment sites are found (`__init__`,
+    `tick()`'s breaker trip, `_run()`'s per-task park, and
+    `recover_quota_cooldown`'s recovery) — a scan that silently matched
+    nothing would be a green no-op (repo memory: `gates-must-fail-closed`).
+    """
+    _CLOCK_ATTR = "_quota_cooldown_until"
+    _FLAG_ATTR = "_infra_cooldown_active"
+
+    def _self_attrs_assigned(stmt) -> list[str]:
+        """Every `self.<attr>` name this statement assigns to (Assign,
+        possibly chained, or AnnAssign)."""
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign):
+            targets = [stmt.target]
+        else:
+            return []
+        attrs = []
+        for t in targets:
+            if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                    and t.value.id == "self"):
+                attrs.append(t.attr)
+        return attrs
+
+    def _iter_stmt_lists(node):
+        """Yield every statement list reachable from `node`: `body`/`orelse`/
+        `finalbody` on any node that has them, recursing into each statement
+        found (and into `try`'s `handlers`) — so a nested block is its OWN
+        list, never merged with its parent's."""
+        for field in ("body", "orelse", "finalbody"):
+            lst = getattr(node, field, None)
+            if isinstance(lst, list):
+                yield lst
+                for stmt in lst:
+                    yield from _iter_stmt_lists(stmt)
+        for handler in getattr(node, "handlers", None) or ():
+            yield from _iter_stmt_lists(handler)
+
+    src_path = Path(scheduler_mod.__file__)
+    tree = ast.parse(src_path.read_text())
+
+    offenders: list[tuple[int, str]] = []
+    clock_sites_found = 0
+    for stmts in _iter_stmt_lists(tree):
+        clock_lines = [s.lineno for s in stmts if _CLOCK_ATTR in _self_attrs_assigned(s)]
+        if not clock_lines:
+            continue
+        clock_sites_found += len(clock_lines)
+        has_flag_sibling = any(_FLAG_ATTR in _self_attrs_assigned(s) for s in stmts)
+        if not has_flag_sibling:
+            offenders.extend((line, f"{_CLOCK_ATTR} assigned without a sibling "
+                                     f"{_FLAG_ATTR} assignment") for line in clock_lines)
+
+    assert clock_sites_found >= 4, (
+        "expected to find at least the 4 known clock-assignment sites "
+        f"(__init__, tick(), _run(), recover_quota_cooldown()); found "
+        f"{clock_sites_found} — the scan itself may be vacuous")
+    assert offenders == [], (
+        f"{_CLOCK_ATTR} assigned without also assigning {_FLAG_ATTR} in the "
+        f"same statement list: {offenders}")

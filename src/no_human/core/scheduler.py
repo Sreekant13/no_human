@@ -702,6 +702,14 @@ class Scheduler:
         if self._quota_cooldown_until is not None and self._quota_cooldown_until >= newest:
             return newest
         self._quota_cooldown_until = newest
+        # One clock, two causes: what this restores is BY DEFINITION a
+        # remembered QUOTA wall (infra parks are skipped above via
+        # `blocker.get("infra")`), so the label must be re-set here, not
+        # inherited from whatever armed the clock before. Every writer of
+        # `_quota_cooldown_until` writes `_infra_cooldown_active` beside it —
+        # the invariant holds per-site, not by call ordering (a fresh
+        # Scheduler happening to have the flag False).
+        self._infra_cooldown_active = False
         whose = f"'{newest_profile}' profile" if newest_profile else "an unattributed park"
         self._on_event("quota_pause",
                        f"pool paused until {newest.isoformat()} (recovered from "
