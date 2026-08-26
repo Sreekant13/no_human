@@ -328,13 +328,27 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   // picker below offers nothing (not a guess) while it is in flight.
   const backendOptions = config?.coder_backends ?? [];
   const claudePinnedRoles = config?.claude_pinned_roles ?? [];
-  // Fail closed at compose time (never a silent fallback to claude): 'local'
-  // needs llm.local_base_url, exactly what agent.backend.make_backend checks
-  // before the first attempt — this just moves the same refusal earlier.
-  const localBackendUnconfigured =
-    backend === "local" && !String(config?.llm?.local_base_url || "").trim();
+  // `coder_backend_availability` is core.backend_settings.describe_backend's
+  // output for every SUPPORTED_BACKENDS entry — the SAME call
+  // core.runtime.assert_task_backend_usable makes that build_orchestrator
+  // runs before the first coder turn. Never a second frontend rule (the
+  // 'local'-only, base_url-truthiness-only check this replaced could
+  // disagree with the server — e.g. an unset OPENAI credential for 'codex'
+  // was invisible to it). Keyed by id so a lookup miss (older server, no
+  // field yet) degrades to "no opinion" rather than blocking everything.
+  const backendAvailability = new Map(
+    (config?.coder_backend_availability ?? []).map((o) => [o.id, o]),
+  );
+  const selectedBackendInfo = backend ? backendAvailability.get(backend) : undefined;
+  // Fail closed at compose time (never a silent fallback to claude), but
+  // only once the server has actually answered — an empty/missing field
+  // (older server, GET /api/config still in flight) must never block
+  // submit, since that would be blocking on ABSENT evidence, not a refusal.
+  const selectedBackendUnavailable = selectedBackendInfo
+    ? !selectedBackendInfo.available
+    : false;
   const canSubmit =
-    Boolean(title) && Boolean(hasRepo) && !prRefMissing && !localBackendUnconfigured && !busy;
+    Boolean(title) && Boolean(hasRepo) && !prRefMissing && !selectedBackendUnavailable && !busy;
   // With no projects, the free-text path IS the only input — a toggle there would
   // be a no-op button whose only effect is wiping what was typed.
   const loaded = projects !== undefined;
@@ -855,9 +869,13 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
                   (GET /api/config's coder_backends, sourced from
                   agent.backend.SUPPORTED_BACKENDS) — never a hardcoded list
                   here, so a backend added there shows up with no web change.
-                  Affects the coder ONLY: reviewer/planner/supervisor/utility/
-                  intake stay on Claude regardless of this choice (see the
-                  title/help text below and CLAUDE_PINNED_ROLES). */}
+                  A backend this install cannot run right now is disabled AT
+                  THE POINT OF CHOICE (coder_backend_availability, the same
+                  check core.runtime.assert_task_backend_usable runs), not
+                  just blocked at submit. Affects the coder ONLY: reviewer/
+                  planner/supervisor/utility/intake stay on Claude regardless
+                  of this choice (see the title/help text below and
+                  CLAUDE_PINNED_ROLES). */}
               {backendOptions.length > 0 && (
                 <SelectPill
                   onPanel
@@ -872,9 +890,20 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
                   }
                 >
                   <option value="">worker.backend (config default)</option>
-                  {backendOptions.map((b) => (
-                    <option key={b} value={b}>{b} (coder only)</option>
-                  ))}
+                  {backendOptions.map((b) => {
+                    const info = backendAvailability.get(b);
+                    const unavailable = info ? !info.available : false;
+                    return (
+                      <option
+                        key={b}
+                        value={b}
+                        disabled={unavailable}
+                        title={unavailable ? info.reason : undefined}
+                      >
+                        {b} (coder only){unavailable ? " — unavailable" : ""}
+                      </option>
+                    );
+                  })}
                 </SelectPill>
               )}
 
@@ -921,15 +950,14 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
             </p>
           )}
 
-          {localBackendUnconfigured && (
+          {selectedBackendUnavailable && (
             <p
               role="alert"
               className="mt-2 px-5 font-ui text-sm"
               style={{ color: "var(--red)" }}
             >
-              The 'local' coder backend needs llm.local_base_url set in
-              config.yaml before it can be chosen here — set it, or pick a
-              different backend.
+              {selectedBackendInfo.reason || `The '${backend}' coder backend is not available on this install.`}{" "}
+              Pick a different backend.
             </p>
           )}
 

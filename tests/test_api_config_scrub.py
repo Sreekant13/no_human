@@ -117,3 +117,49 @@ async def test_show_config_exposes_claude_pinned_roles_from_the_one_source_of_tr
     r = await client.get("/api/config")
     data = r.json()
     assert data["claude_pinned_roles"] == list(CLAUDE_PINNED_ROLES)
+
+
+@pytest.mark.asyncio
+async def test_show_config_exposes_coder_backend_availability_shape(client):
+    """`coder_backend_availability` must carry one `{id, available, reason}`
+    entry per `coder_backends` entry, in the same order — the task
+    composer's disabled/title logic indexes it by `id`, so a missing entry
+    or a shape drift would silently make an option un-greyable."""
+    from no_human.agent.backend import SUPPORTED_BACKENDS
+
+    r = await client.get("/api/config")
+    data = r.json()
+    availability = data["coder_backend_availability"]
+    assert [row["id"] for row in availability] == list(SUPPORTED_BACKENDS)
+    for row in availability:
+        assert set(row) == {"id", "available", "reason"}
+        assert isinstance(row["available"], bool)
+        assert isinstance(row["reason"], str)
+
+
+@pytest.mark.asyncio
+async def test_show_config_reports_local_unavailable_without_local_base_url(client):
+    """Acceptance criterion: 'with llm.local_base_url unset, selecting
+    local is refused with the reason the existing config check gives.' This
+    fixture's config carries no `llm.local_base_url` key at all, so the
+    reason must be the verbatim `assert_local_backend_mode` refusal, not a
+    frontend-invented message."""
+    r = await client.get("/api/config")
+    data = r.json()
+    local = next(row for row in data["coder_backend_availability"] if row["id"] == "local")
+    assert local["available"] is False
+    assert "llm.local_base_url is not set" in local["reason"]
+
+
+@pytest.mark.asyncio
+async def test_show_config_reports_local_available_once_base_url_is_set(client):
+    """The other half of the same criterion: with `llm.local_base_url` set
+    to a valid loopback URL, the same selection is accepted — same config
+    object, only the one key changed, proving the answer tracks the actual
+    config check rather than being hardcoded to 'local' = unavailable."""
+    app.state.config.data.setdefault("llm", {})["local_base_url"] = "http://localhost:8000"
+    r = await client.get("/api/config")
+    data = r.json()
+    local = next(row for row in data["coder_backend_availability"] if row["id"] == "local")
+    assert local["available"] is True
+    assert local["reason"] == ""

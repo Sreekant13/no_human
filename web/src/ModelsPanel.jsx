@@ -1,6 +1,118 @@
 import { useEffect, useState, useCallback } from "react";
-import { fetchModels, saveModels } from "./api.js";
+import { fetchModels, saveModels, fetchCoderBackend, saveCoderBackend } from "./api.js";
 import { modelsPanelView, pendingBody, resetBody, applyError } from "./modelsPanelView.js";
+import {
+  backendPanelView,
+  pendingBody as pendingBackendBody,
+  isSubmittable as backendIsSubmittable,
+  applyError as applyBackendError,
+} from "./backendPanelView.js";
+
+// Settings → Models pane's coder-backend row: the coder role's GLOBAL
+// default backend (claude | codex | local | any future SUPPORTED_BACKENDS
+// entry — the option list comes entirely from the GET /api/coder-backend
+// payload, never a hardcoded list here). Independent fetch/save cycle from
+// the five model-id rows below it, against GET/PUT /api/coder-backend, all
+// decision-making delegated to backendPanelView.js — this component only
+// renders what that module returns.
+function CoderBackendRow() {
+  const [payload, setPayload] = useState(undefined); // undefined = loading, null = unavailable
+  const [pending, setPending] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(() => {
+    fetchCoderBackend().then((p) => setPayload(p));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (payload === undefined) return <div className="settings-empty">Loading…</div>;
+
+  const view = backendPanelView(payload);
+  if (view.unavailable) {
+    return (
+      <div className="settings-empty">
+        Coder backend selection is unavailable — this server build does not
+        expose the coder-backend endpoint yet.
+      </div>
+    );
+  }
+
+  const selected = pending !== null ? pending : view.current;
+
+  function handleChange(value) {
+    setPending(value);
+    setError(null);
+  }
+
+  async function commit() {
+    const body = pendingBackendBody(payload, pending);
+    if (!body) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const refreshed = await saveCoderBackend(body);
+      setPayload(refreshed);
+      setPending(null);
+    } catch (e) {
+      const reverted = applyBackendError(e.message);
+      setPending(reverted.pending);
+      setError(reverted.error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dirty = pendingBackendBody(payload, pending);
+  const hasChanges = !!dirty;
+  // Belt-and-braces on top of the <option disabled> the <select> already
+  // renders: refuse to submit a pending value the SAME availability check
+  // (backendPanelView.js's isSubmittable, sourced from the payload's own
+  // per-option `available`) says this install cannot run right now.
+  const selectedSubmittable = pending === null || backendIsSubmittable(payload, pending);
+
+  return (
+    <div className="models-row coder-backend-row">
+      <label className="auth-label">
+        Coder backend
+        <select
+          className="new-task-select"
+          aria-label="Coder backend"
+          value={selected}
+          onChange={(e) => handleChange(e.target.value)}
+        >
+          {view.options.map((o) => (
+            <option key={o.id} value={o.id} disabled={o.disabled} title={o.reason || undefined}>
+              {o.label}{o.disabled ? ` — ${o.reason}` : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      <span className="models-default">
+        default: <code>{view.default}</code>
+      </span>
+      {view.showRestartBanner && (
+        <div className="nh-alarm auth-alarm" role="alert">
+          Restart required — the coder backend change is saved to{" "}
+          <code>config.yaml</code>, but the running server has not picked it
+          up (it never reloads its config mid-run). Restart with{" "}
+          <code>nh stop && nh start</code> to switch.
+        </div>
+      )}
+      {error && <div className="settings-error" role="alert">{error}</div>}
+      <div className="integration-actions">
+        <button
+          type="button"
+          className="btn btn-approve"
+          disabled={!hasChanges || saving || !selectedSubmittable}
+          onClick={commit}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 // Settings → Models (model picker part 3 of 3). One row per role (coder,
 // reviewer, planner, supervisor, utility), fed entirely by GET /api/models —
@@ -67,6 +179,8 @@ export default function ModelsPanel() {
       <div className="memory-header">
         <h3 className="memory-title"><span className="panel-title-text">Models</span></h3>
       </div>
+
+      <CoderBackendRow />
 
       {view.showRestartBanner && (
         <div className="nh-alarm auth-alarm" role="alert">

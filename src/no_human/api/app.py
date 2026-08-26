@@ -3542,16 +3542,29 @@ async def show_config(request: Request) -> dict[str, Any]:
       roles that stay on Claude no matter which coder backend is chosen, so
       the composer can say so instead of asserting it as a second literal
       that could drift from the one `make_backend` actually enforces.
+    * ``coder_backend_availability`` — one ``{"id", "available", "reason"}``
+      per entry in ``coder_backends``, from
+      ``core.backend_settings.describe_backend``: the SAME
+      ``core.runtime.assert_task_backend_usable`` preflight the orchestrator
+      runs before the first coder turn, never a frontend heuristic
+      re-deriving "does 'local' have a base_url" or "is codex logged in" on
+      its own — a duplicated rule here is exactly what could disagree with
+      the CLI/API's own refusal. The task composer greys out an option (and
+      shows this ``reason``) using this field instead.
 
-    Both are computed fresh on every call (not config data), so they can
-    never be "scrubbed" or otherwise altered by ``_scrub_secrets``.
+    All three are computed fresh on every call (not config data), so they
+    can never be "scrubbed" or otherwise altered by ``_scrub_secrets``.
     """
     cfg = request.app.state.config
     data = copy.deepcopy(cfg.data)
     scrubbed = _scrub_secrets(data)
     from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS
+    from ..core.backend_settings import describe_backend
     scrubbed["coder_backends"] = list(SUPPORTED_BACKENDS)
     scrubbed["claude_pinned_roles"] = list(CLAUDE_PINNED_ROLES)
+    scrubbed["coder_backend_availability"] = [
+        describe_backend(name, cfg.data) for name in SUPPORTED_BACKENDS
+    ]
     return scrubbed
 
 
@@ -3826,6 +3839,83 @@ async def api_set_config_models(request: Request) -> dict[str, Any]:
         await _mgr.broadcast({
             "type": "task_event",
             "task_id": model_settings.CONFIG_AUDIT_TASK_ID,
+            "event": event,
+        })
+    return payload
+
+
+@app.get("/api/coder-backend")
+async def api_get_coder_backend(request: Request) -> dict[str, Any]:
+    """Settings' coder-backend row: the current GLOBAL default
+    (``worker.backend``) plus, for every entry in
+    ``agent.backend.SUPPORTED_BACKENDS``, whether THIS install can run it
+    right now and why not if it can't.
+
+    Availability comes from ``core.backend_settings.describe_backend``,
+    which calls the exact same ``core.runtime.assert_task_backend_usable``
+    preflight the orchestrator itself runs before the first coder turn — so
+    a backend the board greys out here is the same one a per-task
+    ``--backend`` override would fail on, never a second, divorceable
+    opinion. ``restart_required`` mirrors ``/api/models``'s file-vs-process
+    comparison (``worker.backend`` is read at the same construction site,
+    ``core.runtime.build_orchestrator``, bound at server start).
+    """
+    from ..config import CONFIG_PATH
+    from ..core import backend_settings
+
+    _require_local_origin(request)
+    cfg = getattr(request.app.state, "config", None)
+    data = getattr(cfg, "data", None) or {}
+    return await asyncio.to_thread(backend_settings.backend_payload, data, CONFIG_PATH)
+
+
+@app.put("/api/config/coder-backend")
+async def api_set_coder_backend(request: Request) -> dict[str, Any]:
+    """Change the GLOBAL default coder backend (``worker.backend``).
+
+    A per-task ``--backend``/composer override (``task.config["backend"]``,
+    read by ``core.runtime.task_backend_override``) is untouched by this —
+    it only moves the default a task falls back to when it names none. The
+    body is parsed by hand, same as ``/api/config/models``, so a malformed
+    request gets one short operator-facing sentence. Validation and the
+    write both run through ``core.backend_settings.apply_backend_change`` —
+    the same function any future CLI twin would call, so the two can never
+    enforce different rules.
+
+    Deliberately does NOT reload ``request.app.state.config`` for the same
+    reason ``/api/config/models`` does not: the orchestrator reads
+    ``config.data`` per task, not per request, so a change here only takes
+    effect on the NEXT task (until a restart), and reloading here would make
+    ``restart_required`` lie the moment this handler returns.
+    """
+    from ..config import CONFIG_PATH, AuthError
+    from ..core import backend_settings
+
+    _require_local_origin(request, writing=True)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — never surface the raw body
+        raise HTTPException(422, "expected a JSON object") from None
+
+    cfg = getattr(request.app.state, "config", None)
+    running_data = getattr(cfg, "data", None) or {}
+    try:
+        payload, changes = await asyncio.to_thread(
+            backend_settings.apply_backend_change,
+            body,
+            running_cfg_data=running_data,
+            config_path=CONFIG_PATH,
+        )
+    except (backend_settings.BackendSettingsError, AuthError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    if changes:
+        store = _store(request)
+        event = backend_settings.backend_change_event(changes)
+        await store.save_events(backend_settings.CONFIG_AUDIT_TASK_ID, [event])
+        await _mgr.broadcast({
+            "type": "task_event",
+            "task_id": backend_settings.CONFIG_AUDIT_TASK_ID,
             "event": event,
         })
     return payload

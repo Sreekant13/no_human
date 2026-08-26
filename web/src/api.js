@@ -418,6 +418,27 @@ export async function fetchModels() {
 // key before writing any of them.
 export const saveModels = (body) => _put("/api/config/models", body);
 
+// Settings → Models pane's coder-backend row (core/backend_settings.py ::
+// backend_payload). Same degrade-to-null convention as fetchModels: an
+// older server without the endpoint, or the SPA catch-all answering with
+// index.html at 200, both fail `r.json()` and land here as null rather than
+// throwing into the render path.
+export async function fetchCoderBackend() {
+  try {
+    const r = await fetch(`${BASE}/api/coder-backend`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+// Write `{backend: <name>}` to worker.backend — the GLOBAL default coder
+// backend. `_put` throws Error(detail) verbatim on a 422 (an unsupported
+// name, or one this install cannot currently run — the same reason the
+// dropdown already greyed it out with, never a second message).
+export const saveCoderBackend = (body) => _put("/api/config/coder-backend", body);
+
 // C3-G3: the repos the operator knows (for the repo-understanding picker).
 export async function fetchRepos() {
   try {

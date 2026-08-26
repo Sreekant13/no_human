@@ -2704,6 +2704,108 @@ def set_model_ids(
     return resolved
 
 
+#: Same shape as ``_LLM_HEADER_RE`` above, for the top-level ``worker:``
+#: block — anchored at column 0 so a nested ``worker:`` under another section
+#: stays out of scope.
+_WORKER_HEADER_RE = re.compile(r"^worker:[ \t]*(#.*)?$")
+
+
+def _splice_worker_scalar(lines: list[str], key: str, value: str) -> None:
+    """``_splice_llm_scalar``'s twin for the top-level ``worker:`` block. Not
+    unified with it into one generic helper on purpose: the two headers
+    (``llm:`` / ``worker:``) are matched by separate compiled regexes, and
+    inlining a header-selector parameter into the hot ``set_model_ids`` path
+    was judged a larger blast radius than 20 duplicated lines here — see
+    ``set_worker_backend``, this function's only caller.
+    """
+    try:
+        start = next(i for i, ln in enumerate(lines) if _WORKER_HEADER_RE.match(ln.rstrip()))
+    except StopIteration:
+        lines.extend(["worker:", f"  {key}: {value}"])
+        return
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            end = i
+            break
+    for i in range(start + 1, end):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(f"{key}:"):
+            indent = lines[i][: len(lines[i]) - len(stripped)]
+            lines[i] = f"{indent}{key}: {value}"
+            break
+    else:
+        lines.insert(start + 1, f"  {key}: {value}")
+
+
+#: A bare backend name, as YAML would parse it back unquoted. Reuses the
+#: exact same shape as a model id (letters, digits, '.', '_', '-' only) — no
+#: quotes, no colons, no newlines, nothing that could inject YAML structure.
+_BACKEND_NAME_SHAPE_RE = _MODEL_ID_SHAPE_RE
+
+
+def set_worker_backend(backend: str, config_path: Path = CONFIG_PATH) -> str:
+    """Splice ``worker.backend`` into config.yaml, one atomic write,
+    preserving comments — the Settings-pane twin of ``set_model_ids``/
+    ``set_auth_profile``, for the coder-only global default backend
+    (``core.backend_settings.apply_backend_change`` is the only caller; the
+    catalog/availability validation happens there, BEFORE this is reached —
+    this function's own job is purely the text splice, the write-time safety
+    net, and refusing a name outside ``SUPPORTED_BACKENDS`` as a last-line
+    guard so a caller bug can never write an arbitrary string into
+    ``worker.backend``).
+
+    Every value is shape-validated before the file is ever touched, the
+    write is verified by re-loading the config afterward, and the original
+    file is restored on ANY failure — same discipline as ``set_model_ids``.
+    """
+    from .agent.backend import SUPPORTED_BACKENDS  # local: config.py stays
+
+    # free of a module-level import from agent/ (agent.backend already
+    # imports from config.py inside functions; this keeps the arrow
+    # one-directional at import time, same idiom set_model_ids uses for
+    # core.model_catalog).
+    backend = str(backend or "").strip().lower()
+    if backend not in SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"backend {backend!r} is not supported; must be one of "
+            f"{sorted(SUPPORTED_BACKENDS)!r}"
+        )
+    if not _BACKEND_NAME_SHAPE_RE.fullmatch(backend):
+        raise ValueError(
+            f"backend {backend!r} is not a bare name (letters, digits, '.', "
+            "'_', '-' only) — refusing to splice it into config.yaml."
+        )
+
+    load_config(config_path)  # materialize a default file if there is none
+    original = config_path.read_text()
+    lines = original.splitlines()
+    _splice_worker_scalar(lines, "backend", backend)
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(config_path, original, "set worker backend")
+
+    try:
+        resolved_cfg = load_config(config_path)
+    except Exception as exc:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set worker backend {backend!r}: {config_path} failed "
+            f"to reload after the edit ({exc}). The file has been restored."
+        ) from exc
+
+    resolved = resolved_cfg.data.get("worker", {}).get("backend")
+    if resolved != backend:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set worker backend: {config_path} resolved to "
+            f"{resolved!r} after the edit, not {backend!r}. The file has "
+            "been restored."
+        )
+    return backend
+
+
 #: Query-param names, matched case-insensitively as a substring, that mark a
 #: URL as carrying a credential. Covers `key`, `api_key`, `apikey`,
 #: `access_token`/`token`, `secret`, and `password` in one pass.
