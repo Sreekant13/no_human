@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..proc import hidden_console_kwargs
 from . import tamper_guard
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -32,14 +33,12 @@ log = logging.getLogger(__name__)
 # Windows branches below are reachable from a test on any host.
 _IS_WINDOWS = os.name == "nt"
 
-# `start_new_session` is POSIX-only. Windows has no session/process-group in
-# that sense; CREATE_NEW_PROCESS_GROUP is the nearest equivalent and is what
-# detaches the child from our console so a Ctrl-C to `nh` does not also hit it.
-_CREATE_NEW_PROCESS_GROUP = 0x00000200
-_NEW_GROUP_KWARGS: dict[str, object] = (
-    {"creationflags": _CREATE_NEW_PROCESS_GROUP} if _IS_WINDOWS
-    else {"start_new_session": True}
-)
+# POSIX: `start_new_session` puts the child in its own group so a timeout can
+# kill the whole tree. Windows: CREATE_NEW_PROCESS_GROUP is the nearest
+# equivalent (detaches from our console so a Ctrl-C to `nh` does not also hit
+# it) AND CREATE_NO_WINDOW so the pytest child spawns no visible console when
+# the desktop app launched nh without one. See no_human.proc.
+_NEW_GROUP_KWARGS: dict[str, object] = hidden_console_kwargs(new_group=True)
 
 
 def _kill_process_tree(proc: "subprocess.Popen") -> bool:

@@ -126,6 +126,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from ..config import CODEX_SUBSCRIPTION_SCRUB_VARS
+from ..proc import hidden_console_kwargs
 from . import guard
 from .backend import (
     AgentEvent,
@@ -254,6 +255,7 @@ def codex_exec_help(cli: str, *, resume: bool = False, timeout: float = 10.0) ->
         proc = subprocess.run(
             argv, capture_output=True, text=True,
             timeout=timeout, check=False,
+            **hidden_console_kwargs(),
         )
         combined = (proc.stdout or "") + (proc.stderr or "")
         text = combined if combined.strip() else None
@@ -278,6 +280,7 @@ def codex_version(cli: str, *, timeout: float = 10.0) -> str:
         proc = subprocess.run(
             [cli, "--version"], capture_output=True, text=True,
             timeout=timeout, check=False,
+            **hidden_console_kwargs(),
         )
         combined = ((proc.stdout or "") + (proc.stderr or "")).strip()
         if combined:
@@ -490,6 +493,7 @@ def codex_login_status(
         proc = subprocess.run(
             [cli, "login", "status"], capture_output=True, text=True,
             timeout=timeout_s, env=env,
+            **hidden_console_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         return CodexSessionStatus(present=False, via="none", detail=f"timed out: {exc}")
@@ -1507,6 +1511,7 @@ class CodexBackend:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STDOUT_LIMIT,
+            **hidden_console_kwargs(),
         )
         assert proc.stdin is not None and proc.stdout is not None
         try:

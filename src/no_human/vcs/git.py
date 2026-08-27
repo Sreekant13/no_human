@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from ..proc import hidden_console_kwargs
 from .outbound_scrub import scrub_outbound
 from .push_hook import install_pre_push_guard
 
@@ -175,7 +176,8 @@ class GitRepo:
         # subprocess.run site, and a helper parameter turns every call into
         # an unclassifiable `exec:git <dynamic>` (test_egress_allowlist).
         proc = subprocess.run(
-            cmd, cwd=self.path, capture_output=True, text=True
+            cmd, cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
         )
         if check:
             for backoff in _GIT_RETRY_BACKOFFS_S:
@@ -183,7 +185,8 @@ class GitRepo:
                     break
                 time.sleep(backoff)
                 proc = subprocess.run(
-                    cmd, cwd=self.path, capture_output=True, text=True
+                    cmd, cwd=self.path, capture_output=True, text=True,
+                    **hidden_console_kwargs(),
                 )
         if check and proc.returncode != 0:
             raise GitError(
@@ -209,7 +212,8 @@ class GitRepo:
             *args,
         ]
         proc = subprocess.run(
-            cmd, cwd=self.path, capture_output=True, text=True
+            cmd, cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
         )
         if check:
             # Same inline lock-contention retry as `_run` (see the note there).
@@ -218,7 +222,8 @@ class GitRepo:
                     break
                 time.sleep(backoff)
                 proc = subprocess.run(
-                    cmd, cwd=self.path, capture_output=True, text=True
+                    cmd, cwd=self.path, capture_output=True, text=True,
+                    **hidden_console_kwargs(),
                 )
         if check and proc.returncode != 0:
             raise GitError(
@@ -715,6 +720,7 @@ class GitRepo:
         proc = subprocess.run(
             ["git", "merge-base", "--is-ancestor", sha, descendant],
             cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
         )
         return proc.returncode == 0
 
@@ -751,6 +757,7 @@ class GitRepo:
         ls = subprocess.run(
             ["git", "ls-remote", remote, f"refs/heads/{branch}"],
             cwd=self.path, capture_output=True, text=True, timeout=timeout,
+            **hidden_console_kwargs(),
         )
         if ls.returncode != 0 or not ls.stdout.strip():
             return "unknown"
@@ -760,6 +767,7 @@ class GitRepo:
         have_obj = subprocess.run(
             ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
             cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
         )
         if have_obj.returncode != 0:
             private_ref = f"refs/no_human/push-check/{branch}"
@@ -767,12 +775,14 @@ class GitRepo:
                 ["git", "fetch", "--refmap=", remote,
                  f"+refs/heads/{branch}:{private_ref}"],
                 cwd=self.path, capture_output=True, text=True, timeout=timeout,
+                **hidden_console_kwargs(),
             )
             if fetched.returncode != 0:
                 return "unknown"
             have_obj = subprocess.run(
                 ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
                 cwd=self.path, capture_output=True, text=True,
+                **hidden_console_kwargs(),
             )
             if have_obj.returncode != 0:
                 return "unknown"
@@ -801,6 +811,7 @@ class GitRepo:
             subprocess.run(
                 ["git", *args],
                 cwd=self.path, capture_output=True, text=True, timeout=timeout,
+                **hidden_console_kwargs(),
             )
         except (subprocess.TimeoutExpired, OSError):
             pass  # best-effort; offline work must still function
