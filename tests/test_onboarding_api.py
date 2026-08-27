@@ -443,3 +443,27 @@ async def test_discover_refuses_a_conventional_root_that_leaves_home(
     body = r.json()
     assert body["repos"] == []
     assert body["roots_refused"], "a refused root must be reported, not silently dropped"
+
+
+async def test_docs_generate_returns_202_and_job_is_pollable(client, tmp_path):
+    repo = tmp_path / "wikirepo"
+    repo.mkdir()
+    r = await client.post("/api/onboarding/docs/generate", json={"repo_path": str(repo)})
+    assert r.status_code == 202 and "job_id" in r.json()
+    j = await client.get(f"/api/onboarding/docs/jobs/{r.json()['job_id']}")
+    assert j.status_code == 200 and j.json()["status"] in {"queued", "running", "done", "failed"}
+
+
+async def test_docs_detect_lists_existing_docs(client, tmp_path):
+    repo = tmp_path / "detectrepo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "README.md").write_text("# hi")
+    r = await client.get("/api/onboarding/docs/detect", params={"repo": str(repo)})
+    assert r.status_code == 200
+    found = r.json()["found"]
+    assert "README.md" in found and "docs" in found and "CONTRIBUTING.md" not in found
+
+
+async def test_docs_job_missing_is_404(client):
+    r = await client.get("/api/onboarding/docs/jobs/nope")
+    assert r.status_code == 404

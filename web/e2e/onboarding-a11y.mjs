@@ -1,8 +1,10 @@
 // a11y guard for the onboarding flow's icon-only remove buttons.
-// The "✕" remove controls (remove-project in the Projects step, remove-entry in
-// the Docs ListEditor) render only glyph content; without an accessible name a
-// screen reader announces nothing meaningful. This drives the real flow in a
-// browser and asserts each carries an aria-label. Mocked API, no :8420.
+// The "✕" remove-project control in the Projects step renders only glyph
+// content; without an accessible name a screen reader announces nothing
+// meaningful. This drives the real flow in a browser and asserts it carries an
+// aria-label. Mocked API, no :8420. (The Docs step's ListEditor and its
+// remove-entry ✕ were retired in B4; the walk now anchors on that step's
+// heading instead.)
 import { chromium } from "playwright";
 import http from "node:http";
 import fs from "node:fs";
@@ -67,17 +69,14 @@ check("remove-project button has a descriptive aria-label",
   await removeProj.isVisible().catch(() => false),
   `looked for aria-label "Remove project ${NAME}"`);
 
-// Docs step: ListEditor. Ensure 2+ entries so a remove ✕ renders, then check it.
+// Docs step: the free-text ListEditor is gone (B4). It now shows detected
+// README/docs chips + a background "Generate wiki" button per selected repo.
+// With no repos ticked (repos/detect mock returns []) it renders the empty
+// state; assert the step heading rendered so the walk is anchored here.
 await cont(); await page.waitForTimeout(300);
-const addAnother = page.getByRole("button", { name: /add another/i });
-check("reached the Docs step (ListEditor present)", await addAnother.isVisible().catch(() => false));
-await addAnother.click();
-await page.waitForTimeout(200);
-// Empty entries -> the fallback label "Remove this entry".
-const removeEntry = page.getByRole("button", { name: /^Remove this entry$/ });
-check("ListEditor remove button has an aria-label",
-  (await removeEntry.count()) >= 1,
-  `found ${await removeEntry.count()} labelled remove button(s)`);
+const docsHeading = page.getByRole("heading", { name: /Repo docs & wiki/i });
+check("reached the Docs step (wiki UI present)",
+  await docsHeading.isVisible().catch(() => false));
 
 check("no page errors during onboarding", errors.length === 0, errors[0] || "");
 

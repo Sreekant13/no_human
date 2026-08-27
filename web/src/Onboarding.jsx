@@ -2,9 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   detectRepos, discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
-  generateDocs, fetchIntegrationSetup, saveIntegrationSetup,
+  generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
   proveRepoSSE, confirmRepoProfile, fetchReadiness, saveTelemetryConsent,
 } from "./api.js";
+import { shouldPoll, nextJobState } from "./wikiJobs.js";
 import {
   TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT,
   CONSENT_YES_LABEL, CONSENT_NO_LABEL, submitConsent,
@@ -148,7 +149,6 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
   const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set, primary}]
   const [newProjName, setNewProjName] = useState("");
-  const [docs, setDocs] = useState([""]);
   const [history, setHistory] = useState(null);     // {available, transcripts}
   // The ANALYZE response. Separate from `history` (the extract probe) because
   // the result callout must describe the pass that actually ingested — see
@@ -159,7 +159,10 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   const [chosenRules, setChosenRules] = useState(new Set());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const [wikiGen, setWikiGen] = useState({});  // repoPath -> "busy"|{ok,files}|{error}
+  // Background wiki-generation jobs (B4): repoPath -> {jobId,status,error,files}.
+  // Polled every 2 s while queued|running; the result survives this unmount.
+  const [wikiJobs, setWikiJobs] = useState({});
+  const [detectedDocs, setDetectedDocs] = useState({});  // repoPath -> [names] | undefined (unfetched)
   const [integrations, setIntegrations] = useState(null);   // null=unloaded
   // Proving: path -> {status, lines[], elapsed, attempted, result, error}.
   // "unproven" is not a cosmetic state — a repo without a proven test command
@@ -259,6 +262,36 @@ export default function Onboarding({ onComplete, askTelemetry }) {
     }
     // deps intentionally partial (was: eslint-disable react-hooks/exhaustive-deps — plugin never loaded here)
   }, [step.key]);
+
+  // Docs step: detect each selected repo's README/docs/CONTRIBUTING once, so
+  // the wizard shows what the coder already reads rather than asking the user
+  // to re-type paths nobody read. Cheap existence checks, no generation.
+  useEffect(() => {
+    if (step.key !== "docs") return;
+    for (const rp of selectedRepos) {
+      if (detectedDocs[rp] !== undefined) continue;
+      detectDocs(rp)
+        .then((res) => setDetectedDocs((d) => ({ ...d, [rp]: res.found || [] })))
+        .catch(() => setDetectedDocs((d) => ({ ...d, [rp]: [] })));
+    }
+    // deps intentionally partial (detectedDocs read only to skip refetch)
+  }, [step.key, selectedRepos]);
+
+  // Poll running wiki jobs every 2 s until each reaches a terminal state. The
+  // interval is recreated whenever wikiJobs changes and torn down once nothing
+  // is in flight, so a done/failed job stops costing requests.
+  useEffect(() => {
+    const active = Object.entries(wikiJobs).filter(([, j]) => shouldPoll(j) && j.jobId);
+    if (active.length === 0) return;
+    const t = setInterval(() => {
+      active.forEach(([rp, j]) => {
+        getDocsJob(j.jobId)
+          .then((row) => setWikiJobs((s) => nextJobState(s, rp, row)))
+          .catch(() => { /* transient; retry next tick */ });
+      });
+    }, 2000);
+    return () => clearInterval(t);
+  }, [wikiJobs]);
 
   function setIntField(name, field, value) {
     setIntDraft((d) => ({ ...d, [name]: { ...(d[name] || {}), [field]: value } }));
@@ -505,7 +538,6 @@ export default function Onboarding({ onComplete, askTelemetry }) {
         // team stays null on the free tier — the upgrade onboarding owns it.
         team: null,
         repos: [...selectedRepos],
-        docs: docs.map((d) => d.trim()).filter(Boolean),
         ...(askTelemetry ? { telemetry_asked: c.telemetryAsked } : {}),
       });
       // Hand the ready repo up so the app can open the composer on it instead
@@ -792,37 +824,57 @@ export default function Onboarding({ onComplete, askTelemetry }) {
 
           {step.key === "docs" && (
             <Stagger>
-              <h2 className="ob-h2">Any docs the agents should read?</h2>
-              <p className="ob-sub">READMEs, ADRs, team handbooks — paths or URLs. Optional.</p>
-              <ListEditor items={docs} setItems={setDocs} placeholder="~/git/team/docs or https://…" />
-              {selectedRepos.size > 0 && (
-                <div style={{ marginTop: "1rem" }}>
-                  <h3 className="ob-h2" style={{ fontSize: "0.95rem" }}>Generate docs for your repos</h3>
-                  <p className="ob-sub">Auto-generate architecture, modules, and conventions wiki for each repo.</p>
+              <h2 className="ob-h2">Repo docs & wiki</h2>
+              <p className="ob-sub">The coder reads your <code>README</code> and <code>docs/</code> itself — the chips below are just what it found. Generating a wiki gives it a structured architecture / modules / conventions summary in <code>.no_human/wiki/</code>. It runs in the background, so you can continue.</p>
+              {selectedRepos.size === 0 ? (
+                <div className="ob-empty">Select one or more repositories on the previous step to see their docs here.</div>
+              ) : (
+                <div style={{ marginTop: "0.5rem" }}>
                   {[...selectedRepos].map((rp) => {
-                    const st = wikiGen[rp];
+                    const job = wikiJobs[rp];
+                    const found = detectedDocs[rp];
+                    let fileCount = 0;
+                    if (job && job.status === "done") {
+                      try { fileCount = JSON.parse(job.files || "[]").length; } catch { fileCount = 0; }
+                    }
                     return (
-                      <div key={rp} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                        <code style={{ fontSize: "0.8rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{rp.split("/").slice(-2).join("/")}</code>
-                        {st === "busy" ? (
-                          <span style={{ fontSize: "0.75rem", color: "var(--fg-dim)" }}>generating…</span>
-                        ) : st && st.ok ? (
-                          <span style={{ fontSize: "0.75rem", color: "var(--success)" }}>✓ {st.files?.length || 0} files</span>
-                        ) : st && st.error ? (
-                          <span style={{ fontSize: "0.75rem", color: "var(--danger)" }}>✗ {st.error}</span>
-                        ) : (
-                          <button className="ob-btn" style={{ padding: "0.2rem 0.6rem", fontSize: "0.75rem" }}
-                            disabled={busy}
-                            onClick={async () => {
-                              setWikiGen((g) => ({ ...g, [rp]: "busy" }));
-                              try {
-                                const res = await generateDocs(rp);
-                                setWikiGen((g) => ({ ...g, [rp]: res }));
-                              } catch (e) {
-                                setWikiGen((g) => ({ ...g, [rp]: { error: e.message } }));
-                              }
-                            }}>Generate</button>
-                        )}
+                      <div key={rp} style={{ marginBottom: "0.9rem" }}>
+                        <code style={{ fontSize: "0.85rem", fontWeight: 600 }}>{rp.split("/").slice(-2).join("/")}</code>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "0.35rem 0" }}>
+                          {found === undefined ? (
+                            <span className="ob-faint" style={{ fontSize: "0.75rem" }}>detecting…</span>
+                          ) : found.length === 0 ? (
+                            <span className="ob-faint" style={{ fontSize: "0.75rem" }}>no README / docs / CONTRIBUTING found</span>
+                          ) : (
+                            found.map((name) => (
+                              <span key={name} title="the coder reads this itself"
+                                style={{ fontSize: "0.72rem", padding: "0.1rem 0.5rem", border: "1px solid var(--border)", borderRadius: 999, color: "var(--fg-dim)" }}>{name}</span>
+                            ))
+                          )}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          {(!job || job.status === "failed") && (
+                            <button className="ob-btn" style={{ padding: "0.2rem 0.7rem", fontSize: "0.78rem" }}
+                              aria-label={`Generate wiki for ${repoName(rp)}`}
+                              onClick={async () => {
+                                try {
+                                  const res = await generateDocs(rp);   // {job_id}
+                                  setWikiJobs((s) => nextJobState(s, rp, res));
+                                } catch (e) {
+                                  setWikiJobs((s) => nextJobState(s, rp, { status: "failed", error: e.message }));
+                                }
+                              }}>Generate wiki</button>
+                          )}
+                          {job && (job.status === "queued" || job.status === "running") && (
+                            <span style={{ fontSize: "0.75rem", color: "var(--fg-dim)" }}>Generating in the background — you can continue</span>
+                          )}
+                          {job && job.status === "done" && (
+                            <span style={{ fontSize: "0.75rem", color: "var(--success)" }}>✓ Wiki written: {fileCount} files</span>
+                          )}
+                          {job && job.status === "failed" && (
+                            <span style={{ fontSize: "0.75rem", color: "var(--danger)" }}>✗ {job.error}</span>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -980,7 +1032,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                       <b>{projectDefs.length}{unbound.length ? ` · ${unbound.length} with no repos` : ""}</b>
                     </li>
                     <li><span>Repos</span><b>{counts.repos}</b></li>
-                    <li><span>Docs</span><b>{docs.filter((d) => d.trim()).length}</b></li>
+                    <li><span>Wiki generated</span><b>{Object.values(wikiJobs).filter((j) => j.status === "done").length}</b></li>
                     <li><span>Rules confirmed</span><b>{chosenRules.size}</b></li>
                     <li>
                       <span>Repos with a proven test command</span>
@@ -1303,27 +1355,6 @@ function Stagger({ children }) {
       {Array.isArray(children)
         ? children.map((c, idx) => <div key={idx} className="ob-rise" style={{ animationDelay: `${idx * 60}ms` }}>{c}</div>)
         : children}
-    </div>
-  );
-}
-
-function ListEditor({ items, setItems, placeholder }) {
-  return (
-    <div className="ob-listedit">
-      {items.map((v, idx) => (
-        <div className="ob-row" key={idx}>
-          <input
-            className="ob-input"
-            value={v}
-            placeholder={placeholder}
-            onChange={(e) => setItems(items.map((x, k) => (k === idx ? e.target.value : x)))}
-          />
-          {items.length > 1 && (
-            <button className="ob-btn-ghost" aria-label={v.trim() ? `Remove ${v.trim()}` : "Remove this entry"} onClick={() => setItems(items.filter((_, k) => k !== idx))}>✕</button>
-          )}
-        </div>
-      ))}
-      <button className="ob-btn-ghost ob-add" onClick={() => setItems([...items, ""])}>+ add another</button>
     </div>
   );
 }

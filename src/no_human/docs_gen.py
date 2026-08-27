@@ -21,7 +21,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
+_KEYS = ("architecture", "modules", "conventions")
+
+# The json_schema handed to the SDK so the model's answer arrives as a parsed
+# ResultMessage.structured_output instead of prose we must scrape.
+WIKI_SCHEMA = {
+    "type": "object",
+    "properties": {k: {"type": "string"} for k in _KEYS},
+    "additionalProperties": False,
+}
+
+# Fallback scraper: fenced ```json / ```JSON / bare ``` blocks. `.*?` + DOTALL
+# so a block spanning newlines is captured; the fence tag is optional.
+_FENCE = re.compile(r"```(?:json|JSON)?\s*\n(.*?)```", re.DOTALL)
 
 # Delimiters for the managed block in CLAUDE.md.
 _WIKI_BLOCK_START = "<!-- no_human:wiki -->"
@@ -45,7 +57,7 @@ class WikiResult:
     repo_path: str = ""
     files_written: list[str] = field(default_factory=list)
     commit_sha: str = ""
-    error: str = ""
+    error: str | None = None
     skipped: bool = False   # W3.6: HEAD unchanged since last wiki — no cost
 
 
@@ -120,15 +132,24 @@ class WikiGenerator:
             cwd=repo,
             max_turns=self.max_turns,
             effort="low",
+            output_format={"type": "json_schema", "schema": WIKI_SCHEMA},
         )
 
         text = result.final_text or ""
-        parsed = _parse_wiki_json(text)
+        # Structured output first (the SDK enforced the schema); fall back to
+        # scraping the prose only when the CLI produced none (older CLI, a run
+        # that never emitted a final structured message).
+        so = getattr(result, "structured_output", None)
+        if isinstance(so, dict) and any(k in so for k in _KEYS):
+            parsed = {k: str(v) for k, v in so.items() if k in _KEYS}
+        else:
+            parsed = _parse_wiki_json(text)
         if parsed is None:
+            excerpt = text[:300].replace("\n", " ")
             return WikiResult(
                 repo_path=str(repo),
                 commit_sha=commit_sha,
-                error="failed to parse wiki JSON from agent output",
+                error="failed to parse wiki JSON from agent output: " + excerpt,
             )
 
         written = _write_wiki_files(repo, parsed)
@@ -147,20 +168,27 @@ class WikiGenerator:
 
 
 def _parse_wiki_json(text: str) -> dict[str, str] | None:
-    """Extract the wiki JSON from agent output."""
-    blocks = _JSON_BLOCK.findall(text)
-    if not blocks:
-        return None
-    try:
-        data = json.loads(blocks[-1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Require at least one of the expected keys.
-    if not any(k in data for k in ("architecture", "modules", "conventions")):
-        return None
-    return data
+    """Extract the wiki JSON from agent output.
+
+    Accepts fenced ```json / ```JSON / bare ``` blocks and a bare top-level
+    object, and repairs invalid backslash escapes (``C:\\x``, ``\\d``) via
+    ``loads_lenient`` before giving up. The LAST valid candidate wins — the
+    final answer, not an example the model quoted earlier.
+    """
+    from .core.jsonparse import loads_lenient
+
+    candidates = _FENCE.findall(text) or []
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        candidates.append(stripped)
+    for block in reversed(candidates):
+        try:
+            data = loads_lenient(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and any(k in data for k in _KEYS):
+            return {k: str(v) for k, v in data.items() if k in _KEYS}
+    return None
 
 
 def _write_wiki_files(repo: Path, data: dict[str, str]) -> list[str]:

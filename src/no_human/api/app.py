@@ -141,6 +141,15 @@ async def lifespan(app: FastAPI):
     store = external_store or await Store(config.db_path).connect()
     app.state.store = store
     app.state.config = config
+    # Wiki jobs a previous process left queued/running are orphans now — fail
+    # them so the board shows the truth instead of a job stuck "running"
+    # forever (mirrors the scheduler's orphan recovery). Advisory: a failure
+    # here must not block startup.
+    try:
+        from ..wiki_jobs import resume_unfinished
+        await resume_unfinished(store)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wiki-job orphan recovery skipped: %s", exc)
     # CSP is computed once per app start from the loaded config: strict by
     # default, widened by exactly the PostHog hosts when the operator opted in.
     app.state.csp = _build_csp(config.data)
@@ -4851,36 +4860,71 @@ class DocsGenerateRequest(BaseModel):
     repo_path: str
 
 
-@app.post("/api/onboarding/docs/generate")
+@app.post("/api/onboarding/docs/generate", status_code=202)
 async def onboarding_docs_generate(
     body: DocsGenerateRequest, request: Request
 ) -> dict[str, Any]:
-    """Generate wiki docs for a repo via a bounded Agent SDK session."""
-    from ..docs_gen import WikiGenerator
-    from ..agent.claude_backend import ClaudeBackend
+    """Queue wiki generation as a background job; return 202 + the job id.
 
+    The generation is a bounded Agent SDK session that can take minutes. It runs
+    in a detached task so the wizard is not blocked and the result survives the
+    wizard unmounting; poll ``GET /api/onboarding/docs/jobs/{id}``. Backend
+    construction happens INSIDE the task so a config problem fails the job (which
+    the board shows) rather than 500ing this request.
+    """
+    from ..wiki_jobs import run_job
+    from ..core.db import _now
+
+    store = request.app.state.store
     config = request.app.state.config
-    backend = ClaudeBackend(
-        model=config.primary_model,
-        forbidden_paths=config["safety"]["forbidden_paths"],
-    )
-    gen = WikiGenerator(backend, max_turns=12)
-    result = await gen.generate(body.repo_path)
-    if result.error:
-        return {"ok": False, "error": result.error}
+    job_id = await store.create_wiki_job(body.repo_path)
 
-    # Persist wiki_commit to the profile if one exists.
-    from ..profile import ProjectProfile
-    profile = ProjectProfile.load(body.repo_path)
-    if profile and result.commit_sha:
-        profile.wiki_commit = result.commit_sha
-        profile.save()
+    async def _bg() -> None:
+        from ..docs_gen import WikiGenerator
+        from ..agent.claude_backend import ClaudeBackend
+        try:
+            backend = ClaudeBackend(
+                model=config.primary_model,
+                forbidden_paths=config["safety"]["forbidden_paths"],
+            )
+            gen = WikiGenerator(backend, max_turns=12)
+        except Exception as exc:  # noqa: BLE001 — bad config is a failed job, not a crash
+            await store.update_wiki_job(
+                job_id, status="failed",
+                error=f"backend init failed: {exc}", finished_at=_now())
+            return
+        await run_job(store, job_id, gen)
 
-    return {
-        "ok": True,
-        "files": result.files_written,
-        "commit_sha": result.commit_sha,
-    }
+    asyncio.create_task(_bg())
+    return {"job_id": job_id}
+
+
+@app.get("/api/onboarding/docs/jobs/{job_id}")
+async def onboarding_docs_job(job_id: str, request: Request) -> dict[str, Any]:
+    """Poll one wiki job."""
+    row = await request.app.state.store.get_wiki_job(job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such wiki job")
+    return row
+
+
+@app.get("/api/onboarding/docs/jobs")
+async def onboarding_docs_jobs(
+    request: Request, status: str | None = Query(default=None)
+) -> dict[str, Any]:
+    """List wiki jobs, newest first; optionally filtered by status."""
+    return {"jobs": await request.app.state.store.list_wiki_jobs(status=status)}
+
+
+@app.get("/api/onboarding/docs/detect")
+async def onboarding_docs_detect(repo: str) -> dict[str, Any]:
+    """The docs a coder already reads: README.md / docs/ / CONTRIBUTING.md, if
+    present. Informational chips for the wizard — no generation, no cost."""
+    from pathlib import Path
+    root = Path(repo).expanduser()
+    found = [name for name in ("README.md", "docs", "CONTRIBUTING.md")
+             if (root / name).exists()]
+    return {"repo": repo, "found": found}
 
 
 # --------------------------------------------------------------------------- #

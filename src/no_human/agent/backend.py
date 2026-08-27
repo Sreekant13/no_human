@@ -125,6 +125,10 @@ class AgentResult:
     # datum, not a comment: any surface that reports subagent spend can say
     # "N of M are floors" instead of presenting an undercount as a total.
     subagent_floored_count: int = 0
+    # The SDK ResultMessage.structured_output when the run was given an
+    # output_format (a json_schema); None otherwise. Lets a caller read the
+    # model's answer as a parsed dict instead of regex-scraping fenced JSON.
+    structured_output: Any = None
 
 
 @dataclass(frozen=True)

@@ -616,6 +616,7 @@ class ClaudeBackend:
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         on_compact: Callable[[str], None] | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -665,6 +666,12 @@ class ClaudeBackend:
             )
         if agents:
             kwargs["agents"] = agents
+        # A json_schema the CLI enforces on the final message, so the caller
+        # reads ResultMessage.structured_output instead of regex-scraping
+        # fenced JSON out of the prose. Only set when asked, so a run without
+        # it leaves the SDK's own default (None) — asserted by test_backend.
+        if output_format is not None:
+            kwargs["output_format"] = output_format
         # Additive: ClaudeAgentOptions.env merges into the subprocess
         # environment rather than replacing it, and this is a fresh options
         # object per call, so nothing here can leak across a reused backend
@@ -757,13 +764,15 @@ class ClaudeBackend:
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         on_compact: Callable[[str], None] | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
                                 supervisor_hook=supervisor_hook, lint_hook=lint_hook,
                                 skills=skills, thinking=thinking,
                                 max_thinking_tokens=max_thinking_tokens,
-                                agents=agents, on_compact=on_compact)
+                                agents=agents, on_compact=on_compact,
+                                output_format=output_format)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -1084,6 +1093,10 @@ class ClaudeBackend:
                             "subagent_cache_creation_tokens": sub_cc,
                             "subagent_count": sub_n,
                             "subagent_floored_count": sub_floored,
+                            # The parsed answer when the run was given an
+                            # output_format; None otherwise (older CLIs too).
+                            "structured_output": getattr(
+                                message, "structured_output", None),
                         },
                     )
         except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception on terminal errors
@@ -1160,6 +1173,7 @@ class ClaudeBackend:
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         on_compact: Callable[[str], None] | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Run to completion, retrying ONCE if the transport died, not the task.
 
@@ -1211,7 +1225,7 @@ class ClaudeBackend:
             on_event=on_event, supervisor_hook=supervisor_hook,
             lint_hook=lint_hook, skills=skills, thinking=thinking,
             max_thinking_tokens=max_thinking_tokens, agents=agents,
-            on_compact=on_compact,
+            on_compact=on_compact, output_format=output_format,
         )
         if not is_transport_failure(first):
             return first
@@ -1252,7 +1266,7 @@ class ClaudeBackend:
                 supervisor_hook=supervisor_hook, lint_hook=lint_hook,
                 skills=skills, thinking=thinking,
                 max_thinking_tokens=max_thinking_tokens, agents=agents,
-                on_compact=on_compact,
+                on_compact=on_compact, output_format=output_format,
             )
             _fold_spend(first, into=again)
             if not is_transport_failure(again):
@@ -1299,6 +1313,7 @@ class ClaudeBackend:
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         on_compact: Callable[[str], None] | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> AgentResult:
         """One session: consume the stream, keep the LAST result event."""
         final = AgentResult(
@@ -1309,7 +1324,7 @@ class ClaudeBackend:
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
             supervisor_hook=supervisor_hook, lint_hook=lint_hook, skills=skills,
             thinking=thinking, max_thinking_tokens=max_thinking_tokens,
-            agents=agents, on_compact=on_compact,
+            agents=agents, on_compact=on_compact, output_format=output_format,
         ):
             if on_event is not None:
                 on_event(event)
@@ -1341,6 +1356,7 @@ class ClaudeBackend:
                     subagent_count=int(m.get("subagent_count", 0)),
                     subagent_floored_count=int(
                         m.get("subagent_floored_count", 0)),
+                    structured_output=m.get("structured_output"),
                 )
         return final
 

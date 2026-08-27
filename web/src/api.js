@@ -598,6 +598,12 @@ async function _post(path, body) {
   return r.json();
 }
 
+async function _get(path) {
+  const r = await fetch(`${BASE}${path}`);
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `GET ${path} → ${r.status}`)); }
+  return r.json();
+}
+
 export async function fetchOnboardingStatus() {
   const r = await fetch(`${BASE}/api/onboarding/status`);
   if (!r.ok) throw new Error(`GET onboarding/status → ${r.status}`);
@@ -677,6 +683,8 @@ export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/a
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
+export const getDocsJob        = (id)        => _get(`/api/onboarding/docs/jobs/${encodeURIComponent(id)}`);
+export const detectDocs        = (repo)      => _get(`/api/onboarding/docs/detect?repo=${encodeURIComponent(repo)}`);
 
 // ── Integrations (status registry; secrets never returned) ──────────────────
 /**

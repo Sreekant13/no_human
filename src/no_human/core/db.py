@@ -4147,3 +4147,44 @@ class Store:
             "SELECT * FROM history_cache ORDER BY ingested_at DESC"
         )
         return [dict(r) for r in rows]
+
+    # ---- wiki generation jobs (migrations/0017) --------------------------- #
+
+    async def create_wiki_job(self, repo_path: str) -> str:
+        """Insert a queued wiki-generation job for *repo_path*; return its id."""
+        job_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO wiki_jobs (id, repo_path, status, created_at) "
+            "VALUES (?, ?, 'queued', ?)",
+            (job_id, repo_path, _now()),
+        )
+        await self.db.commit()
+        return job_id
+
+    async def get_wiki_job(self, job_id: str) -> dict[str, Any] | None:
+        row = await self._fetchone(
+            "SELECT * FROM wiki_jobs WHERE id = ?", (job_id,))
+        return dict(row) if row else None
+
+    async def update_wiki_job(self, job_id: str, **fields: Any) -> None:
+        """Update one job's mutable columns. Keys are whitelisted so only the
+        job's own columns can be written, never arbitrary SQL."""
+        allowed = {"status", "error", "files", "started_at", "finished_at"}
+        cols = [k for k in fields if k in allowed]
+        if not cols:
+            return
+        sql = "UPDATE wiki_jobs SET " + ", ".join(f"{c} = ?" for c in cols)
+        sql += " WHERE id = ?"
+        await self.db.execute(sql, [fields[c] for c in cols] + [job_id])
+        await self.db.commit()
+
+    async def list_wiki_jobs(self, status: str | None = None) -> list[dict[str, Any]]:
+        """All wiki jobs, newest first; optionally filtered by status."""
+        if status is None:
+            rows = await self._fetchall(
+                "SELECT * FROM wiki_jobs ORDER BY created_at DESC")
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM wiki_jobs WHERE status = ? ORDER BY created_at DESC",
+                (status,))
+        return [dict(r) for r in rows]

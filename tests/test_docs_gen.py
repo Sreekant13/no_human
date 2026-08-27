@@ -139,14 +139,18 @@ def test_upsert_wiki_block_three_runs_still_one_block():
 class FakeBackend:
     """Returns canned agent output for testing WikiGenerator."""
 
-    def __init__(self, output: str = ""):
-        self.output = output
+    def __init__(self, output: str = "", *, final_text: str | None = None,
+                 structured_output=None):
+        self.output = final_text if final_text is not None else output
+        self.structured_output = structured_output
         self.calls: list[dict] = []
 
-    async def run(self, prompt, *, cwd, max_turns, effort):
+    async def run(self, prompt, *, cwd, max_turns, effort, output_format=None):
         self.calls.append({"prompt": prompt, "cwd": str(cwd),
-                           "max_turns": max_turns, "effort": effort})
-        return SimpleNamespace(final_text=self.output)
+                           "max_turns": max_turns, "effort": effort,
+                           "output_format": output_format})
+        return SimpleNamespace(final_text=self.output,
+                               structured_output=self.structured_output)
 
 
 @pytest.fixture
@@ -167,7 +171,7 @@ def test_wiki_generator_success(fake_repo):
     backend = FakeBackend(output)
     gen = WikiGenerator(backend, max_turns=12)
     result = asyncio.run(gen.generate(fake_repo))
-    assert result.error == ""
+    assert result.error is None
     assert len(result.files_written) == 3
     assert (fake_repo / WIKI_DIR / "architecture.md").exists()
     assert (fake_repo / WIKI_DIR / "modules.md").exists()
@@ -254,3 +258,41 @@ async def test_wiki_full_generation_without_since_sha(tmp_path):
     assert res.skipped is False
     assert len(fake.calls) == 1
     assert "UPDATE" not in fake.calls[0]["prompt"]   # full-generation prompt
+
+
+# --------------------------------------------------------------------------- #
+# F2: structured-output-first, lenient fence/bare-object fallback, WHY errors  #
+# --------------------------------------------------------------------------- #
+
+from no_human import docs_gen as _docs_gen  # noqa: E402
+
+
+def test_parse_accepts_uppercase_fence():
+    assert _parse_wiki_json('```JSON\n{"architecture":"a"}\n```') == {"architecture": "a"}
+
+
+def test_parse_accepts_bare_fence_and_prose():
+    assert _parse_wiki_json('Here you go:\n```\n{"modules":"m"}\n```\nDone.') == {"modules": "m"}
+
+
+def test_parse_accepts_bare_object():
+    assert _parse_wiki_json('{"conventions":"c"}') == {"conventions": "c"}
+
+
+def test_parse_repairs_bad_escapes():
+    assert _parse_wiki_json('```json\n{"architecture":"path C:\\\\x \\d"}\n```')["architecture"].startswith("path")
+
+
+async def test_generate_prefers_structured_output(fake_repo):
+    fake_backend = FakeBackend(final_text="no json here",
+                               structured_output={"architecture": "A", "modules": "M", "conventions": "C"})
+    res = await WikiGenerator(fake_backend).generate(fake_repo)
+    assert res.error is None and len(res.files_written) == 3
+    assert fake_backend.calls[0]["output_format"]["schema"] == _docs_gen.WIKI_SCHEMA
+
+
+async def test_generate_error_carries_output_excerpt(fake_repo):
+    fake_backend = FakeBackend(final_text="I could not complete the analysis because the repo is huge",
+                               structured_output=None)
+    res = await WikiGenerator(fake_backend).generate(fake_repo)
+    assert res.error.startswith("failed to parse wiki JSON from agent output: I could not complete")

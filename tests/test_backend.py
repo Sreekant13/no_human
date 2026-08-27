@@ -523,3 +523,40 @@ def test_coder_options_unchanged_by_the_advisory_seam(tmp_path):
     assert opts.tools is None
     assert opts.system_prompt is None
     assert opts.setting_sources == ["project"]
+
+
+@pytest.fixture
+def fake_query(monkeypatch):
+    """Records the ClaudeAgentOptions query() was called with and yields one
+    ResultMessage the test can pre-load with `structured_output`."""
+    class _Recorder:
+        def __init__(self):
+            self.options = None
+            self.result_message = ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=1, session_id="s", result="ok",
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+
+        async def __call__(self, *, prompt, options):
+            self.options = options
+            yield self.result_message
+
+    rec = _Recorder()
+    monkeypatch.setattr(claude_backend, "query", rec)
+    return rec
+
+
+async def test_output_format_reaches_options_and_structured_output_is_returned(fake_query, tmp_path):
+    fake_query.result_message.structured_output = {"architecture": "x", "modules": "y", "conventions": "z"}
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    res = await backend.run("p", cwd=tmp_path, max_turns=2,
+                            output_format={"type": "json_schema", "schema": {"type": "object"}})
+    assert fake_query.options.output_format == {"type": "json_schema", "schema": {"type": "object"}}
+    assert res.structured_output == {"architecture": "x", "modules": "y", "conventions": "z"}
+
+
+async def test_no_output_format_leaves_option_unset(fake_query, tmp_path):
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    await backend.run("p", cwd=tmp_path, max_turns=2)
+    assert fake_query.options.output_format is None
