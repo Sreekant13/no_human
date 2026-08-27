@@ -1226,7 +1226,7 @@ async def approve_landed(
     task_id: str, body: LandedOverrideRequest, request: Request,
 ) -> dict[str, Any]:
     """The HUMAN landed-override affirmation: a human asserts (with required
-    justification) that a task's content landed at ``sha``, for any of three
+    justification) that a task's content landed at ``sha``, for any of four
     narrow shapes ``blockers/landed_override.py`` resolves and gates:
 
     - an ``awaiting_approval`` task where automated containment honestly
@@ -1240,7 +1240,12 @@ async def approve_landed(
       already has PR evidence (that pair goes through
       ``nh task restore-approval`` instead), or
     - a ``pending`` task that a human hand-lands before any coder attempt
-      ever dispatched — refused if it already has PR evidence, same as above.
+      ever dispatched — refused if it already has PR evidence, same as above, or
+    - a ``done`` task whose completion was real but whose event log carries
+      none of ``vcs.task_pr.DONE_EVIDENCE_KINDS`` (so ``nh doctor`` reports it
+      as an evidence gap forever) — refused if the task already carries one
+      of those kinds, has a pending cancellation request, or still has PR
+      evidence outstanding (same ``restore-approval`` pointer as above).
 
     See ``blockers/landed_override.py`` for the full contract; this endpoint
     only cheap-guards obviously-ineligible statuses and otherwise delegates
@@ -1249,23 +1254,30 @@ async def approve_landed(
     recorded base, and — narrowing to exactly itself when given — ``body.base``);
     the response's ``matched_branch`` names whichever one it matched.
 
-    This is deliberately additive and non-idempotent: a second call on the
-    same task 409s (the task is DONE), so a replay cannot append a duplicate
-    override event. It never merges, pushes, or touches git state — the
-    override is a recorded human assertion, not a merge action (constraint
-    #2: the agent never merges; there is nothing to merge here)."""
+    This is deliberately additive: a replay on an already-repaired task
+    reaches ``blockers/landed_override.py``'s own standing-evidence check
+    (the ``approved_landed_override`` event this endpoint just wrote is
+    itself one of ``DONE_EVIDENCE_KINDS``) and 400s from there rather than
+    409ing here, so a replay still cannot append a duplicate override event —
+    it is just refused one layer deeper than for the other three shapes,
+    because DONE is this shape's *starting* status, not only its ending one.
+    It never merges, pushes, or touches git state — the override is a
+    recorded human assertion, not a merge action (constraint #2: the agent
+    never merges; there is nothing to merge here)."""
     from ..blockers.landed_override import OverrideRefused, approve_landed_override
 
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status not in (
         TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED, TaskStatus.PENDING,
+        TaskStatus.DONE,
     ):
         raise HTTPException(
             status_code=409,
             detail=(
                 f"task is {task.status.value!r}, not awaiting_approval, "
-                "a pre-PR failed task, or a never-dispatched pending task"
+                "a pre-PR failed task, a never-dispatched pending task, or "
+                "a done task with no completion evidence on record"
             ),
         )
     try:

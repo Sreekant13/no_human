@@ -375,6 +375,52 @@ async def test_landed_override_row_reports_no_evidence_gap(tmp_path, store):
     assert any(other.id[:8] in g for g in d2.evidence_gaps), d2.evidence_gaps
 
 
+async def test_done_no_evidence_row_is_repairable_and_stops_being_a_gap(
+    tmp_path, store,
+):
+    """AC1 (doctor half), nh67: a DONE task from before the completion-
+    evidence mechanism existed (hand-landed, none of DONE_EVIDENCE_KINDS on
+    record) must stop being an evidence gap once `approve_landed_override`'s
+    `done_no_evidence` shape repairs it — proven via `diagnose(store)` itself,
+    not by asserting the event was written. Non-vacuity control: a second,
+    untouched DONE-no-evidence row is still reported after the repair."""
+    from no_human.blockers.landed_override import approve_landed_override
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("orig\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "initial")
+    landed_sha = _git_out(repo, "rev-parse", "main")
+
+    t1 = Task.new("hand-landed-1", repo_path=str(repo), kind="feature")
+    t1.context = {"base_branch": "main", "pr_branch": ""}
+    await store.create_task(t1)
+    await store.set_status(t1, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
+
+    t2 = Task.new("hand-landed-2", repo_path=str(repo), kind="feature")
+    t2.context = {"base_branch": "main", "pr_branch": ""}
+    await store.create_task(t2)
+    await store.set_status(t2, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
+
+    d1 = await diagnose(store)
+    assert any(t1.id[:8] in g for g in d1.evidence_gaps), d1.evidence_gaps
+    assert any(t2.id[:8] in g for g in d1.evidence_gaps), d1.evidence_gaps
+
+    await approve_landed_override(
+        store, t1, landed_sha,
+        "repairing a pre-mechanism hand-landing with no completion evidence")
+
+    d2 = await diagnose(store)
+    assert not any(t1.id[:8] in g for g in d2.evidence_gaps), d2.evidence_gaps
+    assert any(t2.id[:8] in g for g in d2.evidence_gaps), d2.evidence_gaps
+
+
 # --------------------------------------------------------------------------- #
 # Configured-but-unusable CI. Not a history check: this failure mode leaves no #
 # events at all, so no amount of event counting could ever have found it.      #

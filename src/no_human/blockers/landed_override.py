@@ -1,7 +1,7 @@
 """The human landed-override: an explicit human confirmation that completes
 a task whose content landed via a path automated containment cannot verify.
 
-Three eligible shapes, resolved by ``_resolve_shape``:
+Four eligible shapes, resolved by ``_resolve_shape``:
 
 - ``"awaiting_approval"`` — a supervising session's squash train that a later
   train car's classification-decision edits, or a union-resolved real source
@@ -51,6 +51,34 @@ Three eligible shapes, resolved by ``_resolve_shape``:
   review), not this one — and additionally on carrying no pending
   cancellation request (`Store.get_cancel_request`): a cancel racing a
   hand-land must not be silently dropped by the override.
+- ``"done_no_evidence"`` — a task whose status is already DONE (the
+  completion was real) but whose event log carries none of
+  `vcs.task_pr.DONE_EVIDENCE_KINDS`, so `nh doctor` reports it as an evidence
+  gap forever with no verb able to repair it — `nh approve --landed` refused
+  it outright because `_resolve_shape` accepted only AWAITING_APPROVAL or a
+  FAILED/PENDING task. Live incident: task 16f850ae's PR #230 was closed
+  UNMERGED (2026-08-11T22:27:32Z), its content was hand-landed on `main` as
+  commit 2a7495bf9 the same night, and `nh doctor` has reported the row as an
+  evidence gap ever since. This shape is gated on carrying NONE of
+  `DONE_EVIDENCE_KINDS` on record (`pr_open`, `approved_landed_override`,
+  `human_merged`, `approved_already_satisfied`) — a DONE task that already
+  has one of those kinds is refused, since re-asserting a landing over
+  evidence that already stands is exactly what this verb must never allow.
+  Because the `approved_landed_override` event this shape itself writes is
+  one of the kinds it checks for, the repair is self-sealing against replay:
+  the first call accepts, every later call on the same row refuses. Like
+  `failed_pre_pr` and `pending_never_ran`, this shape is ALSO gated on
+  carrying no PR evidence (`vcs.task_pr.task_has_pr_evidence`, broader than
+  `DONE_EVIDENCE_KINDS` — it additionally catches a draft PR recorded only in
+  `context["pr_draft_created"]`) and no pending cancellation request
+  (`Store.get_cancel_request`): a DONE row with a still-open PR is not the
+  no-evidence gap this shape repairs — landing it here would let
+  `close_task_prs_on_completion` close out a PR nobody ever merged, and a
+  cancel racing the hand-land must not be silently dropped by the override
+  either. Unlike the other three shapes, this one's completion write bypasses
+  `Store.set_status` entirely (see the dedicated comment at the call site) —
+  the row is already DONE, so nothing about `task.status` changes; only the
+  missing audit event is persisted.
 
 Single shared implementation for both the CLI (`nh approve --landed`) and the
 API (`POST /api/tasks/{id}/approve-landed`) — the exact validation and audit
@@ -150,7 +178,7 @@ from ..vcs.pr_watcher import (
     commit_is_ancestor, containment_residue, ref_tip_sha, refs_resolvable,
     resolve_default_branch, resolve_project_default_branch,
 )
-from ..vcs.task_pr import task_has_pr_evidence
+from ..vcs.task_pr import DONE_EVIDENCE_KINDS, task_has_pr_evidence
 from .pr_closeout import close_task_prs_on_completion
 
 LANDED_OVERRIDE_KIND = "approved_landed_override"
@@ -186,8 +214,26 @@ async def _resolve_shape(store: Any, task: Task) -> str:
     has no ``context["cancel_reason"]`` concept to begin with, since a human
     cancelling a PENDING task moves it straight to FAILED) and has no PENDING
     cancellation request either (``Store.get_cancel_request`` — the DB
-    column a live cancel races through before the status flip lands). Any
-    other status, or a FAILED/PENDING task that fails its evidence or cancel
+    column a live cancel races through before the status flip lands). A
+    ``DONE`` task is the ``"done_no_evidence"`` shape ONLY when it has no
+    PENDING cancellation request (``Store.get_cancel_request`` — the same
+    guard ``pending_never_ran`` uses; a cancel racing a hand-land must not be
+    silently dropped by the override here either), carries NONE of
+    ``DONE_EVIDENCE_KINDS`` on its event log, and carries no PR evidence
+    either (``task_has_pr_evidence`` — broader than ``DONE_EVIDENCE_KINDS``:
+    it also catches a draft PR recorded only in ``context["pr_draft_created"]``,
+    which is not itself a ``DONE_EVIDENCE_KINDS`` event kind — a DONE task
+    with a still-open, unclosed-out PR is not the no-evidence shape and must
+    not have its PR silently closed by ``close_task_prs_on_completion``). A
+    DONE task that already has one of ``DONE_EVIDENCE_KINDS`` on record
+    (``pr_open``, ``approved_landed_override``, ``human_merged``,
+    ``approved_already_satisfied``) is refused: re-asserting a landing over
+    evidence that already stands is exactly what this verb must never allow,
+    and it is what makes this shape self-sealing against replay (the event
+    this shape itself writes, ``approved_landed_override``, is one of the
+    kinds it checks for). Reading the event log fails CLOSED: an unreadable
+    log is refused, never silently treated as "no evidence". Any other
+    status, or a FAILED/PENDING/DONE task that fails its evidence or cancel
     gate, is refused.
     """
     if task.status is TaskStatus.AWAITING_APPROVAL:
@@ -222,9 +268,40 @@ async def _resolve_shape(store: Any, task: Task) -> str:
             )
         return "pending_never_ran"
 
+    if task.status is TaskStatus.DONE:
+        cancel_requested = await store.get_cancel_request(task.id)
+        if cancel_requested:
+            raise OverrideRefused(
+                "task has a pending cancellation request "
+                f"({cancel_requested!r}) — refusing"
+            )
+        try:
+            events = await store.list_events(task.id)
+        except Exception as exc:  # noqa: BLE001 — fail-closed, never a pass
+            raise OverrideRefused(
+                f"could not read this task's event log ({type(exc).__name__}) "
+                "— refusing (the no-evidence repair must fail closed)"
+            ) from exc
+        standing = sorted({e.get("kind") for e in events} & DONE_EVIDENCE_KINDS)
+        if standing:
+            raise OverrideRefused(
+                "task is already done with completion evidence on record "
+                f"({'/'.join(standing)}) — re-asserting a landing over "
+                "evidence that already stands is refused"
+            )
+        pr_url = await task_has_pr_evidence(store, task)
+        if pr_url:
+            raise OverrideRefused(
+                f"task has a PR ({pr_url}) that was never closed out — this "
+                "is not the no-evidence shape; use `nh task restore-approval` "
+                "then `nh approve --landed`"
+            )
+        return "done_no_evidence"
+
     raise OverrideRefused(
         f"task is {task.status.value!r}, not awaiting_approval, a pre-PR "
-        "failed task, or a never-dispatched pending task"
+        "failed task, a never-dispatched pending task, or a done task with "
+        "no completion evidence on record"
     )
 
 
@@ -418,8 +495,11 @@ async def approve_landed_override(
 
     1. ``task.status`` must resolve to an eligible shape (``_resolve_shape``):
        ``AWAITING_APPROVAL``, a ``FAILED`` task that was neither
-       human-cancelled nor ever opened a PR (the pre-PR shape), or a
-       ``PENDING`` task that never opened a PR (the never-ran shape).
+       human-cancelled nor ever opened a PR (the pre-PR shape), a
+       ``PENDING`` task that never opened a PR (the never-ran shape), or a
+       ``DONE`` task that carries none of ``vcs.task_pr.DONE_EVIDENCE_KINDS``
+       on its event log (the no-evidence shape — a DONE task that already
+       has one of those kinds is refused).
     2. ``justification`` must not be blank.
     3. ``sha`` must not be blank.
     4. ``task.repo_path`` must be recorded. A CANDIDATE branch list is then
@@ -663,6 +743,11 @@ async def approve_landed_override(
         text += " prior status: failed (no PR was ever opened)."
     elif shape == "pending_never_ran":
         text += " prior status: pending (no attempt ever ran)."
+    elif shape == "done_no_evidence":
+        text += (
+            " prior status: done (the completion was real; only its "
+            "evidence event was missing)."
+        )
     event = {
         "source": human,
         "kind": LANDED_OVERRIDE_KIND,
@@ -685,11 +770,24 @@ async def approve_landed_override(
     if residue_note is not None:
         event["residue_note"] = residue_note
 
-    moved = await store.set_status(
-        task, TaskStatus.DONE, validate=False, event=event)
-    if moved is None:
-        raise OverrideRefused(
-            "the store refused the transition — nothing was recorded")
+    if shape == "done_no_evidence":
+        # `Store.set_status` deliberately drops the event when
+        # `task.status is new_status` (the `already_there` guard in
+        # `core/db.py` — it exists so a second `set_status(DONE)` call never
+        # double-records a real completion). This task's row is ALREADY
+        # DONE, so routing through `set_status` here would silently swallow
+        # the very audit event this repair exists to write, leaving `nh
+        # doctor` flagging the row forever — the exact defect this shape
+        # fixes. Persist the event directly instead; the status column needs
+        # no write (the row is already correct). Do not "simplify" this back
+        # into the shared `set_status` call below.
+        await store.save_events(task.id, [event])
+    else:
+        moved = await store.set_status(
+            task, TaskStatus.DONE, validate=False, event=event)
+        if moved is None:
+            raise OverrideRefused(
+                "the store refused the transition — nothing was recorded")
     await close_task_prs_on_completion(
         store, task, completion_path=LANDED_OVERRIDE_KIND)
 

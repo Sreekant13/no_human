@@ -27,6 +27,7 @@ from no_human.blockers.landed_override import (
 )
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
+from no_human.vcs.task_pr import DONE_EVIDENCE_KINDS
 
 pytestmark = pytest.mark.usefixtures("isolated_env_file")
 
@@ -170,6 +171,17 @@ async def _seed_failed_pre_pr(
     return t
 
 
+async def _seed_done_with_evidence(store, repo_path, kind) -> Task:
+    """A DONE task that already carries *kind* (a member of
+    ``DONE_EVIDENCE_KINDS``) on its event log — the ``done_no_evidence``
+    shape must refuse these, since re-asserting a landing over evidence that
+    already stands is exactly what the shape must never allow."""
+    t = await _seed(store, repo_path, status=TaskStatus.DONE)
+    await store.save_events(
+        t.id, [{"source": "test", "kind": kind, "ts": time.time()}])
+    return t
+
+
 # --------------------------------------------------------------------------- #
 # approve_landed_override — the core, direct                                  #
 # --------------------------------------------------------------------------- #
@@ -230,7 +242,7 @@ async def test_refuses_empty_justification(tmp_path, store):
 
 
 @pytest.mark.parametrize(
-    "status", [TaskStatus.IMPLEMENTING, TaskStatus.DONE, TaskStatus.ESCALATED])
+    "status", [TaskStatus.IMPLEMENTING, TaskStatus.ESCALATED])
 async def test_refuses_task_not_awaiting_approval(tmp_path, store, status):
     repo = _make_repo(tmp_path)
     sha = _git_out(repo, "rev-parse", "HEAD")
@@ -655,7 +667,10 @@ async def test_api_approve_landed_refuses(tmp_path, store, client):
     )
     assert r.status_code == 409, r.text
 
-    # a repeated call (task now DONE) returns 409
+    # a repeated call: the task is now DONE, which the pre-check accepts
+    # (DONE is itself an eligible shape, `done_no_evidence`) — but the first
+    # call's own `approved_landed_override` event is standing evidence, so
+    # the resolver's own refusal fires and it's a 400, not a 409.
     t3 = await _seed(store, repo, pr_branch="")
     r = await client.post(
         f"/api/tasks/{t3.id}/approve-landed",
@@ -666,7 +681,7 @@ async def test_api_approve_landed_refuses(tmp_path, store, client):
         f"/api/tasks/{t3.id}/approve-landed",
         json={"sha": sha, "justification": "second call"},
     )
-    assert r.status_code == 409, r.text
+    assert r.status_code == 400, r.text
 
 
 async def test_api_approve_landed_completes_failed_pre_pr(tmp_path, store, client):
@@ -688,12 +703,15 @@ async def test_api_approve_landed_completes_failed_pre_pr(tmp_path, store, clien
     events = await store.list_events(t.id)
     assert any(e["kind"] == LANDED_OVERRIDE_KIND for e in events)
 
-    # replay cannot append a duplicate override event
+    # replay cannot append a duplicate override event — same mechanism as
+    # test_api_approve_landed_refuses's repeated-call case: the task is now
+    # DONE (an eligible pre-check shape), and the resolver's own
+    # standing-evidence refusal fires, so this is a 400, not a 409.
     r = await client.post(
         f"/api/tasks/{t.id}/approve-landed",
         json={"sha": landed_sha, "justification": "replay"},
     )
-    assert r.status_code == 409, r.text
+    assert r.status_code == 400, r.text
 
 
 async def test_approve_landed_endpoint_accepts_a_pending_task(
@@ -741,6 +759,36 @@ async def test_approve_landed_endpoint_refuses_a_pending_task_without_base(
 
     fresh = await store.get_task(t.id)
     assert fresh.status is TaskStatus.PENDING
+
+
+async def test_approve_landed_endpoint_accepts_a_done_no_evidence_task(
+    tmp_path, store, client,
+):
+    """API twin of the `done_no_evidence` shape (BLOCKING 1, independent
+    review of nh67): the CLI and API must not drift — the endpoint's
+    pre-check used to hard-code `(AWAITING_APPROVAL, FAILED, PENDING)`,
+    refusing a DONE task the CLI-side resolver correctly accepts, directly
+    contradicting this module's own "cannot drift" docstring claim."""
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    r = await client.post(
+        f"/api/tasks/{t.id}/approve-landed",
+        json={"sha": sha,
+              "justification": "repairing a pre-mechanism hand-landing"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["sha"] == sha
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    events = await store.list_events(t.id)
+    ev = [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND][0]
+    assert ev["shape"] == "done_no_evidence"
+    assert ev["prior_status"] == "done"
 
 
 # --------------------------------------------------------------------------- #
@@ -1341,3 +1389,172 @@ async def test_profile_configured_default_branch_beats_origin_head_probe(
 
     assert result["matched_branch"] == "release-line"
     assert result["base_source"] == "default_branch"
+
+
+# --------------------------------------------------------------------------- #
+# "done_no_evidence" shape — nh67: a DONE task from before the completion-   #
+# evidence mechanism existed (hand-landed, no DONE_EVIDENCE_KINDS event on  #
+# record) that `_resolve_shape` used to refuse outright, leaving `nh doctor`#
+# reporting it as an evidence gap forever with no verb able to repair it.   #
+# --------------------------------------------------------------------------- #
+
+async def test_done_task_with_no_evidence_is_accepted_and_records_override(
+    tmp_path, store,
+):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    result = await approve_landed_override(
+        store, t, sha,
+        "repairing a pre-mechanism hand-landing (task 16f850ae)")
+
+    assert result["shape"] == "done_no_evidence"
+    assert result["prior_status"] == "done"
+
+    events = await store.list_events(t.id)
+    override_events = [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+    assert len(override_events) == 1
+    ev = override_events[0]
+    assert ev["sha"] == sha
+    assert ev["justification"] == (
+        "repairing a pre-mechanism hand-landing (task 16f850ae)")
+    assert "HUMAN OVERRIDE" in ev["text"]
+    assert "prior status: done" in ev["text"]
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert fresh.context["landed_override_sha"] == sha
+
+
+@pytest.mark.parametrize("kind", sorted(DONE_EVIDENCE_KINDS))
+async def test_done_task_with_standing_evidence_is_refused(tmp_path, store, kind):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed_done_with_evidence(store, repo, kind)
+    before = await store.list_events(t.id)
+
+    with pytest.raises(OverrideRefused) as exc:
+        await approve_landed_override(store, t, sha, "asserting anyway")
+
+    assert kind in str(exc.value)
+    assert "evidence" in str(exc.value)
+    # No NEW event was appended (the seeded `kind` event may itself already
+    # be a LANDED_OVERRIDE_KIND event when kind == "approved_landed_override"
+    # — the refusal must add nothing on top of it, not merely leave zero).
+    after = await store.list_events(t.id)
+    assert after == before
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+
+
+async def test_second_override_on_the_repaired_row_is_refused(tmp_path, store):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    await approve_landed_override(store, t, sha, "first repair")
+
+    with pytest.raises(OverrideRefused):
+        await approve_landed_override(store, t, sha, "second repair attempt")
+
+    events = await store.list_events(t.id)
+    override_events = [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+    assert len(override_events) == 1
+
+
+async def test_done_shape_refuses_a_sha_that_is_not_an_ancestor(tmp_path, store):
+    repo = _repo_with_residue(tmp_path)
+    feature_sha = _git_out(repo, "rev-parse", "feature")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await approve_landed_override(store, t, feature_sha, "asserting anyway")
+
+    assert "main" in str(exc.value)
+    events = await store.list_events(t.id)
+    assert not [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+
+
+@pytest.mark.parametrize("because", ["", "   "])
+async def test_done_shape_refuses_blank_because(tmp_path, store, because):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await approve_landed_override(store, t, sha, because)
+
+    assert "justification must not be empty" in str(exc.value)
+    fresh = await store.get_task(t.id)
+    assert fresh.context.get("landed_override_sha") is None
+    events = await store.list_events(t.id)
+    assert not [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+
+
+async def test_done_shape_refuses_when_the_event_log_cannot_be_read(
+    tmp_path, store, monkeypatch,
+):
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+
+    async def _boom(task_id):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(store, "list_events", _boom)
+
+    with pytest.raises(OverrideRefused) as exc:
+        await approve_landed_override(store, t, sha, "asserting anyway")
+
+    assert "could not read" in str(exc.value)
+
+
+async def test_done_task_with_outstanding_pr_evidence_is_refused(tmp_path, store):
+    """MAJOR 1 (independent review of nh67): `DONE_EVIDENCE_KINDS` is an
+    event-KIND check only — it misses a draft PR recorded solely in
+    `context["pr_draft_created"]` (never itself a `DONE_EVIDENCE_KINDS`
+    event kind, per the live incident `task_pr.task_has_pr_evidence`'s own
+    docstring cites, 8c8b36b5). Without this guard, a DONE task with a
+    still-open, un-merged draft PR would get a landing stamped on it AND
+    have that PR closed out from under it by
+    `pr_closeout.close_task_prs_on_completion` — this must be refused
+    exactly like the FAILED/PENDING shapes refuse standing PR evidence,
+    pointing at `nh task restore-approval` instead."""
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+    await store.merge_context(
+        t.id, {"pr_draft_created": "https://example.com/pull/253"})
+    t = await store.get_task(t.id)
+
+    with pytest.raises(OverrideRefused, match="restore-approval") as exc:
+        await approve_landed_override(store, t, sha, "asserting anyway")
+
+    assert "pull/253" in str(exc.value)
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    events = await store.list_events(t.id)
+    assert not [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
+
+
+async def test_done_task_with_cancel_request_is_refused(tmp_path, store):
+    """MAJOR 2 (independent review of nh67): the DONE shape had no cancel
+    guard, unlike `failed_pre_pr` (`context["cancel_reason"]`) and
+    `pending_never_ran` (`Store.get_cancel_request`). A cancel racing a
+    hand-land must not be silently dropped by the override here either —
+    mirrors `test_pending_task_with_cancel_request_is_refused`."""
+    repo = _make_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    t = await _seed(store, repo, status=TaskStatus.DONE, pr_branch="")
+    await store.request_cancel(t.id, "no longer needed")
+
+    with pytest.raises(OverrideRefused, match="cancellation request"):
+        await approve_landed_override(store, t, sha, "asserting anyway")
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    events = await store.list_events(t.id)
+    assert not [e for e in events if e["kind"] == LANDED_OVERRIDE_KIND]
