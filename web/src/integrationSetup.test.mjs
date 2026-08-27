@@ -171,10 +171,11 @@ test("secretHint uses the server's note when there is one (Teams)", () => {
 
 test("the switch label names what it actually switches", () => {
   assert.equal(switchLabel(LINEAR, "Linear"), "Enable Linear");
-  // Slack's switch is `intake` (the Socket-Mode worker), NOT its
-  // notifications — calling it "Enable Slack" would promise the wrong thing.
+  // Slack's switch is `intake` (the Socket-Mode worker), which connects only —
+  // the mention-to-task handler isn't wired — so the label states what it does
+  // now and what's coming, without promising intake or "Enable Slack".
   const slack = { name: "slack", enable_field: "intake", fields: [], secrets: [] };
-  assert.equal(switchLabel(slack, "Slack"), "Enable Slack worker (connect only)");
+  assert.equal(switchLabel(slack, "Slack"), "Connect Slack — task intake coming soon");
   assert.equal(switchLabel({ enable_field: null }, "GitHub"), "");
   assert.equal(humanizeField("poll_interval"), "poll interval");
 });

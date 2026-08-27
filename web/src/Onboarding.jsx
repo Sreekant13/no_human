@@ -136,6 +136,9 @@ export default function Onboarding({ onComplete }) {
   const [proveCmd, setProveCmd] = useState({});   // path -> the human's corrected command
   const [readiness, setReadiness] = useState(null);
   const proveStreams = useRef({});
+  // Re-entry guard for advance() (M1) — a click while a profile-then-advance
+  // is mid-flight is ignored, without disabling Continue during the scan.
+  const advancing = useRef(false);
 
   // Editable draft of the integrations step: {name: {field: value}}. Seeded
   // from the server's spec (draftFrom) and diffed against it on save, so only
@@ -379,11 +382,37 @@ export default function Onboarding({ onComplete }) {
   async function onboardSelected() {
     await guard(async () => {
       for (const path of selectedRepos) {
+        // Skip repos already profiled — re-running (e.g. after adding one more
+        // repo, or from the M1 Continue-registers path) must never reset a
+        // repo the user has already proven back to just-profiled.
+        if (onboarded[path]) continue;
         setOnboarded((o) => ({ ...o, [path]: "busy" }));
         const res = await onboardRepo(path);
         setOnboarded((o) => ({ ...o, [path]: res }));
       }
     });
+  }
+
+  // M1: on the Repositories step, advancing IS registering. If repos are ticked
+  // but not yet profiled, profile them first so the server's registered-repo
+  // store (which the Launch summary reads) reflects them — "Continue" used to
+  // just next() and skip registration, so Launch reported "Repos 0" for a repo
+  // the user had clearly added. "Skip setup — open the board" stays the
+  // explicit no-profiling exit; every other step advances unchanged.
+  async function advance() {
+    // Re-entry guard (synchronous ref, not the wizard-wide `busy` flag — Continue
+    // must stay live during the background scan, per onboardingNav). Stops a
+    // double-click from profiling-then-advancing twice.
+    if (advancing.current) return;
+    advancing.current = true;
+    try {
+      if (step.key === "repos" && [...selectedRepos].some((p) => !onboarded[p])) {
+        await onboardSelected();
+      }
+      next();
+    } finally {
+      advancing.current = false;
+    }
   }
 
   // Abort any live prove stream when the wizard unmounts. The server-side run
@@ -611,6 +640,45 @@ export default function Onboarding({ onComplete }) {
     });
   }
 
+  // B1: the profile result line + Prove panel render for BOTH the recent-repo
+  // quick-add cards and the full-list rows. The repos a first-time user adds
+  // are the ones they work on — i.e. recently modified — i.e. the ones that
+  // render as cards; the card renderer never read onboarded[path]/proveState,
+  // so "Profile" changed a card by nothing and Launch pointed at a "Prove test
+  // command" button that only existed on the (30-days-untouched) list rows.
+  const profileStatus = (st) => {
+    if (st === "busy") return (
+      <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>
+    );
+    if (st && st !== "busy") return (
+      <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
+        {st.ecosystem || "unknown"}{st.test_cmd ? ` · ${st.test_cmd}` : ""}
+        {" · "}
+        {st.is_usable ? "proven & confirmed"
+          : st.test_proven ? "proven — confirm to use"
+          : "not proven yet"}
+      </span>
+    );
+    return null;
+  };
+  const proveBlock = (r) => {
+    const st = onboarded[r.path];
+    if (!st || st === "busy") return null;
+    return (
+      <ProvePanel
+        repoPath={r.path}
+        profile={st}
+        prove={proveState[r.path]}
+        editedCmd={proveCmd[r.path]}
+        onEditCmd={(v) => setProveCmd((c) => ({ ...c, [r.path]: v }))}
+        onProve={(cmd) => startProve(r.path, cmd)}
+        onStop={() => stopProve(r.path)}
+        onConfirm={() => confirmProved(r.path)}
+        busy={busy}
+      />
+    );
+  };
+
   return (
     <div className="ob-shell">
       <div className="ob-stage">
@@ -777,6 +845,11 @@ export default function Onboarding({ onComplete }) {
                                   onClick={() => toggleRepo(r.path)}>
                             {sel ? "Added ✓" : "Add"}
                           </button>
+                          {/* B1: once profiled, the card expands to show its
+                              profile result and the Prove panel — the same
+                              capability the list rows have. */}
+                          {profileStatus(onboarded[r.path])}
+                          {proveBlock(r)}
                         </div>
                       );
                     })}
@@ -791,7 +864,6 @@ export default function Onboarding({ onComplete }) {
                   : searchedPath ? `Searched ${searchedPath} — no git repositories there.` : "No repositories found. Search another folder above."}</div>}
                 {restRepos.map((r) => {
                   const st = onboarded[r.path];
-                  const pv = proveState[r.path];
                   return (
                     <div key={r.path} className="ob-repo-row ph-no-capture">
                     <label className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`}>
@@ -806,30 +878,9 @@ export default function Onboarding({ onComplete }) {
                       {ambiguousRepoNames.has(rowName(r)) && (
                         <span className="ob-repo-path">{r.path}</span>
                       )}
-                      {st === "busy" && <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>}
-                      {st && st !== "busy" && (
-                        <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
-                          {st.ecosystem || "unknown"}{st.test_cmd ? ` · ${st.test_cmd}` : ""}
-                          {" · "}
-                          {st.is_usable ? "proven & confirmed"
-                            : st.test_proven ? "proven — confirm to use"
-                            : "not proven yet"}
-                        </span>
-                      )}
+                      {profileStatus(st)}
                     </label>
-                    {st && st !== "busy" && (
-                      <ProvePanel
-                        repoPath={r.path}
-                        profile={st}
-                        prove={pv}
-                        editedCmd={proveCmd[r.path]}
-                        onEditCmd={(v) => setProveCmd((c) => ({ ...c, [r.path]: v }))}
-                        onProve={(cmd) => startProve(r.path, cmd)}
-                        onStop={() => stopProve(r.path)}
-                        onConfirm={() => confirmProved(r.path)}
-                        busy={busy}
-                      />
-                    )}
+                    {proveBlock(r)}
                     </div>
                   );
                 })}
@@ -839,9 +890,13 @@ export default function Onboarding({ onComplete }) {
               )}
               {selectedRepos.size > 0 && (
                 <div className="ob-row ob-minimal-row">
-                  {/* Profiling is the primary path forward — highlighted. */}
-                  <button className="ob-btn" disabled={busy} onClick={onboardSelected}>
-                    {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}
+                  {/* M1: Continue (the one primary) now profiles + advances, so
+                      this is a SECONDARY action — profile the selected repos
+                      HERE to see each result and prove its test command in-step
+                      before moving on. Kept as ghost so only Continue is a
+                      primary on the screen. */}
+                  <button className="ob-btn-ghost" disabled={busy} onClick={onboardSelected}>
+                    {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""} here`}
                   </button>
                   {/* Minimal path (spec §3 B1): a real user wanted to start after
                       one repo instead of six more steps. The server creates the
@@ -857,13 +912,18 @@ export default function Onboarding({ onComplete }) {
                   </div>
                 </div>
               )}
-              <p className="ob-note">
-                Profiling reads each repo's own declarations to find its install/test/lint
-                commands. Proving RUNS the test command here and shows you the output —
-                nothing is trusted until it exits clean. You can skip proving and come back
-                to it from the board, but until a repo is proven its tasks run with no test
-                command, so the review gate has no tests to execute.
-              </p>
+              {/* m2: this profiling/proving explainer is only actionable once a
+                  repo is selected — showing it before the user picks anything
+                  is a dense caveat about a feature they haven't reached. */}
+              {selectedRepos.size > 0 && (
+                <p className="ob-note">
+                  Profiling reads each repo's own declarations to find its install/test/lint
+                  commands. Proving RUNS the test command here and shows you the output —
+                  nothing is trusted until it exits clean. You can skip proving and come back
+                  to it from the board, but until a repo is proven its tasks run with no test
+                  command, so the review gate has no tests to execute.
+                </p>
+              )}
             </Stagger>
           )}
 
@@ -887,6 +947,15 @@ export default function Onboarding({ onComplete }) {
                          onKeyDown={(e) => e.key === "Enter" && addProject()} />
                   <button className="ob-btn-ghost" onClick={addProject} disabled={!newProjName.trim()}>+ Add project</button>
                 </div>
+                {/* M2: a typed-but-unadded name is easy to lose — the compose
+                    form pre-checks a repo and says "N selected", which reads as
+                    "ready", but a project only exists after + Add project.
+                    Continue discards the draft silently without this. */}
+                {newProjName.trim() && (
+                  <div className="ob-note" role="status" style={{ margin: '0.4rem 0 0' }}>
+                    “{newProjName.trim()}” isn’t added yet — click <strong>+ Add project</strong> to keep it. Continuing without it discards the draft.
+                  </div>
+                )}
                 <div className="ob-faint" style={{ margin: '0.5rem 0 0.25rem', fontSize: '0.8rem' }}>
                   Repos for this project <span className="ph-no-capture">({newProjRepos.size} selected)</span>
                 </div>
@@ -907,7 +976,11 @@ export default function Onboarding({ onComplete }) {
               {/* The created projects — a COMPACT list, never an expanded
                   checklist each. Name, its repo count, a default-repo picker when
                   it spans more than one, and a remove. */}
-              {projectDefs.length === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add them above or later in Settings.</div>}
+              {/* M2: don't say "No projects yet" while the user is mid-compose
+                  (a name typed, or repos pre-checked in the form above) — that
+                  juxtaposition read as "my project vanished". Show it only when
+                  the form is pristine. */}
+              {projectDefs.length === 0 && !newProjName.trim() && newProjRepos.size === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add one above or later in Settings.</div>}
               {projectDefs.map((pd, pi) => (
                 <div key={pd.name} className="ob-project-card ph-no-capture" style={{ marginBottom: '0.5rem' }}>
                   <div className="ob-project-head">
@@ -1056,7 +1129,11 @@ export default function Onboarding({ onComplete }) {
                 catalogs your <strong>skills</strong>, and distills the
                 corrections you keep repeating — so the Supervisor enforces them for you.
               </p>
-              <p className="ob-sub" style={{ opacity: 0.75, fontSize: "0.9em" }}>
+              {/* m7: the privacy scope+redaction sentence is the most
+                  reassuring copy in the flow — don't dim it below AA. Keep it
+                  slightly smaller (secondary), but at the muted token's full
+                  opacity, not 0.75 on top of it. */}
+              <p className="ob-sub" style={{ fontSize: "0.9em" }}>
                 Scope: conversations from the last <strong>30 days</strong> in {selectedRepos.size > 0
                   ? <><strong>{selectedRepos.size}</strong> selected repo{selectedRepos.size === 1 ? "" : "s"}</>
                   : <>every project on this machine (no repos selected)</>}.
@@ -1097,8 +1174,12 @@ export default function Onboarding({ onComplete }) {
                   Claude Code and simply has no history on this machine was told a
                   product they have never heard of was missing. The server's own
                   `detail` still rides along; it names the sources it looked in. */}
+              {/* M5: the server `detail` string leads with third-party IDE
+                  names ("no Windsurf IDE …") — a Claude Code user was told a
+                  product they've never heard of was missing. The headline
+                  already says everything a user needs; drop the detail. */}
               {scanPhase === "unavailable" && history && (
-                <div className="ob-callout">No past AI conversations or skills found on this machine — you can skip this and add rules later. <span className="ob-faint">({history.detail})</span></div>
+                <div className="ob-callout">No past AI conversations or skills found on this machine — you can skip this and add rules later.</div>
               )}
               {scanPhase === "done" && analysis && (
                 <div className="ob-callout ok">
@@ -1121,8 +1202,13 @@ export default function Onboarding({ onComplete }) {
 
           {step.key === "rules" && (
             <Stagger>
-              <h2 className="ob-h2">Review the rules we found</h2>
-              <p className="ob-sub">Nothing is ticked and nothing is active. Tick only the ones you want — confirmed rules become standing guidance the Supervisor enforces.</p>
+              {/* M6: the heading must not assert rules "we found" over an empty
+                  state — for a user with no AI history it read as a
+                  contradiction (and followed an equally-empty History step). */}
+              <h2 className="ob-h2">{proposals.length === 0 ? "No rules to review yet" : "Review the rules we found"}</h2>
+              <p className="ob-sub">{proposals.length === 0
+                ? "Rules are distilled from your AI history — there was none to learn from here. You can write rules anytime in Settings."
+                : "Nothing is ticked and nothing is active. Tick only the ones you want — confirmed rules become standing guidance the Supervisor enforces."}</p>
               {proposals.length === 0 ? (
                 <div className="ob-empty">No proposals — nothing extracted, or you skipped the scan. You can add rules anytime in Settings.</div>
               ) : (() => {
@@ -1268,7 +1354,7 @@ export default function Onboarding({ onComplete }) {
           )}
           <div className="ob-nav-spacer" />
           {i < STEPS.length - 1 ? (
-            <button className="ob-btn" onClick={next} disabled={forwardDisabled(navState) || continueBlocked}>Continue</button>
+            <button className="ob-btn" onClick={advance} disabled={forwardDisabled(navState) || continueBlocked}>Continue</button>
           ) : (
             // Onboarding used to end on an empty board. When a repo is actually
             // ready, end on the thing the whole setup was for.
@@ -1416,7 +1502,11 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField
   const verified = test && test.testing !== true
     ? test.healthy === true
     : (test && test.testing ? false : Boolean(spec.verified));
-  const ready = readiness(spec, { verified });
+  // M3: pass the draft `values` so the status chip reflects the just-ticked
+  // Enable immediately (flips "Off" → "On — needs settings"), instead of
+  // lagging the checkbox until Save. The Launch summary (setupSummary) still
+  // reads saved state, which is correct there.
+  const ready = readiness(spec, { verified, values });
   const enableField = spec.enable_field;
   // A mute switch that ships ON (e.g. teams) reads as effectively off until
   // the integration is configured — see effectiveEnabled(). Unchecking this

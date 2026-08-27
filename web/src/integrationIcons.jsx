@@ -43,6 +43,27 @@ const MARKS = {
       <path d="M9.2 10.4h6M9.2 13.6h4" />
     </g>
   ),
+  // Issue tracker — a task checklist. Linear had NO glyph and fell through to
+  // the plain-circle fallback (read as "broken/unfinished", m3). Generic
+  // category mark in the neutral app accent, NOT Linear's logo — same
+  // trademark reasoning as every other glyph here (see header + TRADEMARK.md).
+  // Distinct from jira's horizontal ticket so the two trackers don't collide.
+  linear: (c) => (
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.5 7h8M9.5 12h8M9.5 17h5" />
+      <path d="M4.6 6.3 5.5 7.2 7.1 5.5" />
+      <path d="M4.8 12h.01M4.8 17h.01" />
+    </g>
+  ),
+  // Work management — a board with columns. monday.com also had no glyph and
+  // hit the same broken-looking fallback (m3). Generic kanban-board mark, not
+  // monday.com's logo; distinct from the trackers and the CI pipeline.
+  monday: (c) => (
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3.6" y="4.8" width="16.8" height="14.4" rx="1.6" />
+      <path d="M9.2 4.8v14.4M14.8 4.8v14.4" />
+    </g>
+  ),
   // Version control — a branch.
   github: (c) => (
     <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">

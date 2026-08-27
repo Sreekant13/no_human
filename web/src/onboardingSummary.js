@@ -17,5 +17,6 @@ export function summaryRepoCounts(readiness) {
   }
   const total = Number(readiness.total) || 0;
   const usable = Number(readiness.usable) || 0;
-  return { repos: String(total), proven: `${usable} of ${total}`, total, usable };
+  // m6: "0 of 0" reads oddly when there are no repos yet — show "—" instead.
+  return { repos: String(total), proven: total ? `${usable} of ${total}` : "—", total, usable };
 }

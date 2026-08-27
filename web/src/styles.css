@@ -5188,7 +5188,9 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* Compact integration status rows in the onboarding wizard. */
 .ob-integrations { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 4px; }
 .ob-integration {
-  display: flex; align-items: center; gap: 10px;
+  /* m5: wrap on narrow widths so the enable label ("Enable Jira") isn't clipped
+     at the right edge on a ~390px screen instead of moving to a second line. */
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; row-gap: 6px;
   padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-md);
   background: var(--bg-card);
 }
@@ -5330,7 +5332,10 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-note em { color: var(--accent-500); font-style: normal; font-weight: 600; }
 
 /* Welcome — the three agents as role-colored cards */
-.ob-agents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 22px; }
+/* grid-auto-rows: 1fr equalizes every ROW to the tallest (m1): the Orchestrator
+   card's longer copy made row 2 visibly taller than row 1. Cards already stretch
+   within a row (align-items:stretch default); this evens the rows too. */
+.ob-agents { display: grid; grid-template-columns: repeat(3, 1fr); grid-auto-rows: 1fr; gap: 12px; margin-top: 22px; }
 @media (max-width: 767px) { .ob-agents { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 499px) { .ob-agents { grid-template-columns: 1fr; } }
 .ob-agent { background: var(--surface-1); border: 1px solid var(--border); border-top: 3px solid var(--a); border-radius: var(--r-lg); padding: 14px 14px 16px; }

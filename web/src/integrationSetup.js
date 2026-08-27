@@ -76,9 +76,10 @@ export function humanizeField(field) {
 export function switchLabel(spec, name) {
   if (!spec.enable_field) return "";
   if (spec.enable_field === "intake")
-    // Connect-only until the mention-to-task handler is wired in `nh serve` —
-    // see the comment above; the label must not promise intake.
-    return `Enable ${name} worker (connect only)`;
+    // Connect-only until the mention-to-task handler is wired in `nh serve`.
+    // "(connect only)" read as cryptic jargon (M4); say plainly what it does
+    // now and what is coming, without promising intake the code can't do yet.
+    return `Connect ${name} — task intake coming soon`;
   return spec.enable_field === "enabled"
     ? `Enable ${name}`
     : `Enable ${name} ${humanizeField(spec.enable_field)}`;
@@ -137,7 +138,9 @@ export function effectiveEnabled(spec, values) {
 export function readiness(spec, opts) {
   const missing = (spec.secrets || []).filter((s) => !s.set).map((s) => s.env_var);
   const verified = opts && opts.verified !== undefined ? opts.verified : Boolean(spec.verified);
-  if (spec.enable_field && !effectiveEnabled(spec)) {
+  // opts.values (the wizard draft) lets the chip reflect a just-ticked Enable
+  // before Save (M3); omitted (e.g. setupSummary), it falls back to saved state.
+  if (spec.enable_field && !effectiveEnabled(spec, opts && opts.values)) {
     return { state: "off", label: "Off", tone: "neutral", missing };
   }
   if (missing.length > 0) {

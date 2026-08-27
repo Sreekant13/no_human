@@ -79,11 +79,15 @@ async function runScenario(browser, { name, repos, readiness, tick, expectFix })
 
   check(`[${name}] Repos row = "${repos.length ? "1" : "0"}"`, reposValue === (readiness.total ? String(readiness.total) : "0"),
     `got "${reposValue}"`);
-  check(`[${name}] proven row = "${readiness.usable} of ${readiness.total}"`, provenValue === `${readiness.usable} of ${readiness.total}`,
+  // m6: with no registered repos the proven row is an em dash, not "0 of 0".
+  const expectedProven = readiness.total ? `${readiness.usable} of ${readiness.total}` : "—";
+  check(`[${name}] proven row = "${expectedProven}"`, provenValue === expectedProven,
     `got "${provenValue}"`);
-  check(`[${name}] both rows agree on the repo count`,
-    reposValue !== null && provenValue !== null && reposValue === provenValue.split(" of ")[1],
-    `Repos="${reposValue}" vs proven="${provenValue}"`);
+  if (readiness.total) {
+    check(`[${name}] both rows agree on the repo count`,
+      reposValue !== null && provenValue !== null && reposValue === provenValue.split(" of ")[1],
+      `Repos="${reposValue}" vs proven="${provenValue}"`);
+  }
   // Launch-card readiness rows (spec §3 B2): each unmet step shows a "Fix →"
   // that jumps to it. A repo-less run has a "Fix →" for Repositories; a ticked
   // run has none.

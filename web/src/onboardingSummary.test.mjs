@@ -17,10 +17,11 @@ test("one registered repo counts as 1 in both rows", () => {
   assert.equal(counts.proven, "0 of 1");
 });
 
-test("no registered repos reads 0 and 0 of 0", () => {
+test("no registered repos reads 0 and — (not '0 of 0')", () => {
+  // m6: "0 of 0" reads oddly when there are no repos yet — show an em dash.
   const counts = summaryRepoCounts({ total: 0, usable: 0 });
   assert.equal(counts.repos, "0");
-  assert.equal(counts.proven, "0 of 0");
+  assert.equal(counts.proven, "—");
 });
 
 test("both rows are derived from the same readiness object", () => {
@@ -44,5 +45,5 @@ test("in-flight readiness renders … in both rows", () => {
 test("missing/NaN total or usable coerce to 0 rather than propagating undefined", () => {
   const counts = summaryRepoCounts({});
   assert.equal(counts.repos, "0");
-  assert.equal(counts.proven, "0 of 0");
+  assert.equal(counts.proven, "—");   // m6: no repos ⇒ em dash, not "0 of 0"
 });

@@ -99,14 +99,19 @@ test("the step tells the user where credentials go, in the step copy itself", ()
   assert.match(STEP, /never taken here/i);
 });
 
-test("the readiness chip comes from the server's spec, not from the draft", () => {
-  // Otherwise the card would claim "Ready" for something that was typed but
-  // never written — the exact "Settings disagrees with reality" defect.
-  // C2: readiness now takes the verified flag (a passing live test / persisted
-  // last_verified_at) so "Ready" means the connection works, not that a value
-  // was typed. Still driven by the server spec, never the draft.
-  assert.match(CARD, /const ready = readiness\(spec, \{ verified \}\);/);
+test("the chip's on/off follows the draft, but 'Ready' still needs the server", () => {
+  // M3: the chip must AGREE with the just-ticked Enable checkbox — passing the
+  // draft `values` flips it "Off" → "On — needs settings" immediately instead
+  // of lagging until Save. The honesty guard is preserved because the draft
+  // only reaches effectiveEnabled (the on/off gate); "Ready" still requires
+  // `verified` (a passing live test / persisted last_verified_at), which is NOT
+  // in the draft — so a typed-but-unsaved value can never reach "Ready", the
+  // exact "Settings disagrees with reality" defect this test guards against.
+  assert.match(CARD, /const ready = readiness\(spec, \{ verified, values \}\);/);
   assert.match(CARD, /integration-chip tone-\$\{ready\.tone\}/);
+  // The verified flag is still a passing test / persisted verification, never
+  // "a value was typed".
+  assert.match(CARD, /test\.healthy === true/);
 });
 
 test("the Launch summary counts integrations from the server specs", () => {

@@ -121,8 +121,11 @@ test("the empty-history headline names the missing history, not a missing IDE", 
   assert.match(callout, /No past AI conversations or skills found on this machine/);
   assert.doesNotMatch(callout, /No running .*IDE detected/,
     "the headline must not claim a detection it did not make");
-  // The server's own detail still rides along — it names the sources it looked in.
-  assert.match(callout, /\{history\.detail\}/);
+  // M5: the server `detail` string leads with third-party IDE names ("no
+  // Windsurf IDE …"), so a Claude Code user was told an unknown product was
+  // missing. The headline says everything needed; the detail is NOT rendered.
+  assert.doesNotMatch(callout, /\{history\.detail\}/,
+    "the third-party-IDE detail must not be shown in the unavailable callout");
 });
 
 // ── the AI-history step names no product but Claude Code ───────────────────
