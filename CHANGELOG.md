@@ -6,6 +6,33 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-27
+
+Release range `70b880cf5..8a55a92d3` (134 commits since 0.1.4, each landed
+behind an independent fresh-context review). The themed entries below cover
+the major changes; the full per-commit record is the git range.
+
+### Fixed — reliability of the review loop and the coder backend
+
+- **The reviewer-worktree integrity guard no longer discards a completed
+  review verdict on a byte-identical rewrite of a shared `.git` file.** Its
+  file identity was `st_mtime_ns`-based, so ordinary bookkeeping in the shared
+  common dir read as "the reviewer wrote to the worktree it was judging" and
+  threw away the verdict — measured discarding 14+ verdicts across a day.
+  Identity is now content-hash based, and `common/HEAD` is adjudicated by
+  content shape (an ordinary branch switch is clean; a detach or garbage is a
+  violation).
+- **A denied read-only filesystem scan (`find`, `grep -r`) no longer
+  terminates the coder attempt.** Every `GuardDecision` denial site now
+  classifies its severity explicitly; a scan that only reads is hygiene
+  (non-terminating), while one that mutates or exfiltrates — a `find … -delete`,
+  a pipe into a writer, a redirect to a file — stays destructive.
+- **The Codex teardown is bounded on every await of its exit path**, so a
+  stranded reap can no longer hold a worker slot forever.
+- **`nh status` distinguishes a health probe that timed out from a server that
+  is down** — a brief stall no longer renders as a definitive "server not
+  running", while connection-refused stays definitive.
+
 - **Electron moves to 43.4.1**, clearing all 18 open Electron advisories (4
   high) against the desktop bundle: the app now ships Chromium 150 instead of
   the 38-line's Chromium. The jump goes to the current supported line rather
