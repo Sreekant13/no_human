@@ -18,13 +18,19 @@ This gate is complementary to the adversarial reviewer, not a replacement.
 
 Degradation is loud, never silent: no manifest → ``waived`` (the doctor
 counts waiver rate), broken harness → ``error`` (never a fail), and the
-whole gate sits behind ``repro_gate.mode`` (off | advisory | required).
+whole gate sits behind ``repro_gate.mode`` (off | advisory | required). A
+base-tree pytest run that COLLECTS ZERO tests (the declared file/id no
+longer exists at the merge base — the base moved under the ticket) is
+likewise ``error`` with a distinct "not found at base — re-anchor" reason,
+never the "already passes at base" verdict: zero collection is a
+selection/anchoring fact, not a test outcome (110655e5).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -162,6 +168,38 @@ def _pytest_python(repo_path: Path) -> str | None:
     return None
 
 
+def _run_pytest_proc(
+    tests: list[str], cwd: Path, env: dict, python: str,
+) -> tuple[int | None, str]:
+    """(returncode, tail_of_output). Never raises.
+
+    ``returncode`` is ``None`` when pytest could not even be launched or
+    could not load at all (missing interpreter, timeout, pytest not
+    importable) — an ENVIRONMENT failure indistinguishable from any exit
+    code, so the caller must treat it as "could not run" rather than infer
+    anything from it. Any other value is the real pytest exit code (0-5),
+    including 5 ("no tests collected"), which IS meaningful and is left for
+    the caller to classify (see :func:`_nothing_executed`)."""
+    try:
+        proc = subprocess.run(
+            [python, "-m", "pytest", "-x", "-q", "--no-header", *tests],
+            cwd=cwd, env=env, capture_output=True, text=True,
+            timeout=_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {_RUN_TIMEOUT}s"
+    except OSError as exc:
+        return None, f"could not run pytest: {exc}"
+    out = (proc.stdout + proc.stderr)[-2000:]
+    # The interpreter can't even load pytest (a bare system python3 fallback,
+    # or the frozen binary re-running the CLI). That is an environment failure,
+    # NOT a test verdict — treat as not-ran so the caller returns "error", never
+    # a false "fail".
+    if "No module named pytest" in out or "No module named 'pytest'" in out:
+        return None, out
+    return proc.returncode, out
+
+
 def _run_pytest(
     tests: list[str], cwd: Path, env: dict, python: str,
 ) -> tuple[bool, bool, str]:
@@ -173,28 +211,72 @@ def _run_pytest(
     (advisory) rather than "fail" (a real fails-before/passes-after verdict).
     ``python`` is resolved by :func:`_pytest_python` — ``sys.executable`` in a
     normal install, a real interpreter in a frozen build where ``sys.executable``
-    is the nh binary."""
-    try:
-        proc = subprocess.run(
-            [python, "-m", "pytest", "-x", "-q", "--no-header", *tests],
-            cwd=cwd, env=env, capture_output=True, text=True,
-            timeout=_RUN_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return False, False, f"timed out after {_RUN_TIMEOUT}s"
-    except OSError as exc:
-        return False, False, f"could not run pytest: {exc}"
-    out = (proc.stdout + proc.stderr)[-2000:]
-    # The interpreter can't even load pytest (a bare system python3 fallback,
-    # or the frozen binary re-running the CLI). That is an environment failure,
-    # NOT a test verdict — treat as not-ran so the caller returns "error", never
-    # a false "fail".
-    if "No module named pytest" in out or "No module named 'pytest'" in out:
+    is the nh binary.
+
+    A thin wrapper over :func:`_run_pytest_proc` — kept so this exact
+    3-tuple contract (used directly by callers in tests/test_repro_gate.py)
+    never changes."""
+    returncode, out = _run_pytest_proc(tests, cwd, env, python)
+    if returncode is None:
         return False, False, out
     # pytest exit 5 = "no tests collected" — an environment/selection problem,
     # not a test verdict. Anything that ran at least one test gives 0-4.
-    ran = proc.returncode != 5 and "no tests ran" not in out.lower()
-    return ran, proc.returncode == 0, out
+    ran = returncode != 5 and "no tests ran" not in out.lower()
+    return ran, returncode == 0, out
+
+
+_EXECUTED_RE = re.compile(r"\b\d+\s+(passed|failed|errors?|xpassed|xfailed)\b")
+
+
+def _nothing_executed(returncode: int, out: str) -> str | None:
+    """Why this pytest run executed NO test — or None when at least one ran.
+
+    Zero-collection is a SELECTION/anchoring fact, never a test verdict: an
+    exit-0 run that collected nothing is not "the tests pass" (110655e5 —
+    the declared repro file did not exist at the merge base, and the old
+    "ran, exit 0" reading booked it as a genuine pass-at-base and killed the
+    attempt with a misleading "already passes" reason). Checked in this
+    order because a run can match more than one signal (e.g. exit 5 also
+    lacks a "N passed" line). The final branch is a deliberately
+    return-code-agnostic catch-all: a module-level ``pytest.skip(...,
+    allow_module_level=True)`` guard invoked by node id exits **4** with
+    "ERROR: found no collectors ... / 1 skipped" (verified empirically —
+    it is not exit 0 as a naive reading of pytest's docs would suggest, and
+    it names no "not found"/"file or directory not found" text either), so
+    gating this on a specific returncode or error string misses it. The
+    final branch's actual, narrow signal: no ``N passed/failed/error(s)/
+    xpassed/xfailed`` COUNT line anywhere in the captured output. That
+    reliably separates the skip/deselect/zero-collection shapes above from a
+    genuine failure (exit 1, "1 failed") or a genuine collection error that
+    itself prints a one-line summary (exit 4, "1 error in 0.02s" — e.g. an
+    ImportError inside the declared test module) — those keep matching
+    ``_EXECUTED_RE`` and are therefore left as "something ran", falling
+    through unchanged to the pre-existing ok_before/ran_before handling.
+    That is a real, KNOWN blind spot, not a claim this function resolves
+    every zero-collection shape: it is a review-caught limit on what
+    "executed" means here, deliberately left alone rather than widened,
+    because a base-tree collection error is an existing, separately-scoped
+    ambiguity (main already reads it as a fails-before "pass", right or
+    wrong) that this ticket does not touch. Also out of reach in principle:
+    this is a TEXT match over output the base tree's own pytest config
+    controls — a base ``addopts = -s`` plus a conftest banner that itself
+    prints a fake "N passed" line can defeat it; there is no signal here
+    that is not, in the end, generated by the tree under judgment. Finally,
+    this classifies one WHOLE pytest run (all declared tests together), not
+    per-test: if a multi-test manifest has one test that genuinely executes
+    at base, its count line masks a *different* declared test in the same
+    run that collected zero — the existing "already pass at base" message
+    can still surface for that case. Narrowing to per-test attribution would
+    require parsing pytest's per-node result lines, which is out of scope
+    here."""
+    low = out.lower()
+    if returncode == 5 or "no tests ran" in low:
+        return "pytest collected no tests (exit 5)"
+    if "collected 0 items" in out:
+        return "pytest collected 0 items"
+    if not _EXECUTED_RE.search(out):
+        return "pytest exited without executing any test (all skipped/deselected/uncollectable)"
+    return None
 
 
 def _is_python_profile(profile: "ProjectProfile | None") -> bool:
@@ -318,7 +400,8 @@ def _run_test_cmd(
     ("command not found" / "not executable" — the shell's own signal that
     nothing ran, not a test verdict). pytest's exit-code-5 / 'no tests ran'
     conventions don't generalize across test runners, so we don't try to
-    guess collection state generically beyond that."""
+    guess collection state generically beyond that — the base-not-found
+    ("repro tests not found at base") classification is pytest-only."""
     try:
         proc = subprocess.run(
             [*argv, *tests], cwd=cwd, env=env, capture_output=True, text=True,
@@ -471,7 +554,30 @@ def run_repro_gate(
                 [str(worktree), str(worktree / "src"), env.get("PYTHONPATH", "")])}
         else:
             before_env = env
-        ran_before, ok_before, out_before = _run(target_files, worktree, before_env)
+        if python is not None:
+            rc_before, out_before = _run_pytest_proc(
+                target_files, worktree, before_env, python)
+            if rc_before is None:
+                ran_before, ok_before = False, False
+            else:
+                why = _nothing_executed(rc_before, out_before)
+                if why is not None:
+                    # {why} must lead — the orchestrator's repro_gate event
+                    # emits only reasons[0][:200], and base_ref (a 40-hex
+                    # sha) plus the joined test-id list can by themselves
+                    # exceed 200 chars, pushing the actual diagnosis (why
+                    # nothing executed) past the cut (review finding).
+                    return ReproResult("error", tests=tests, reasons=[
+                        "repro tests not found at base — the base moved "
+                        f"under this ticket; re-anchor the repro. Why: {why}. "
+                        f"At base ref {base_ref} the declared test(s) "
+                        f"({', '.join(tests)}) produced no pass/fail. "
+                        f"Re-point {MANIFEST} at test(s) that exist and "
+                        "fail at this base, or rebase the attempt onto "
+                        f"the current base.\n{out_before[-1000:]}"])
+                ran_before, ok_before = True, rc_before == 0
+        else:
+            ran_before, ok_before, out_before = _run(target_files, worktree, before_env)
         if not ran_before:
             return ReproResult("error", tests=tests, reasons=[
                 f"base-tree repro run could not execute:\n{out_before}"])

@@ -752,6 +752,158 @@ def test_normal_gate_is_byte_identical_to_resume_off(repo):
     )
 
 
+def test_base_run_that_executes_nothing_is_not_found_not_pass_at_base(repo):
+    """Task 110655e5 att12: the base moved and the declared repro test no
+    longer existed there. The old reading treated the base run's "nothing
+    executed" as a genuine pass-at-base and reported the misleading
+    `fails-before failed — ... already pass at base` verdict, killing a real
+    attempt. Reproduced here without needing real git history to delete a
+    file: a module-level ``pytest.skip(allow_module_level=True)`` guard on a
+    module that exists only in the attempt tree — the fails-before worktree
+    only ever gets a copy of the DECLARED test file (see `_test_files`), so
+    a helper module never committed to base is genuinely absent there too."""
+    (repo / "only_in_attempt.py").write_text("MARKER = True\n")
+    (repo / "test_repro.py").write_text(
+        "import importlib.util\n"
+        "import pytest\n"
+        "if importlib.util.find_spec('only_in_attempt') is None:\n"
+        "    pytest.skip('only in attempt tree', allow_module_level=True)\n"
+        "def test_add_fixed():\n"
+        "    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD")
+    assert r.verdict == "error"
+    assert r.verdict != "fail"
+    assert "repro tests not found at base" in r.reasons[0]
+    assert "the base moved under this ticket; re-anchor the repro" in r.reasons[0]
+    assert "already pass at base" not in r.reasons[0]
+    assert "already pass" not in r.reasons[0]
+
+
+def test_zero_collection_at_base_names_the_reanchor_guidance(repo):
+    """A second, differently-shaped zero-collection base run: the declared
+    node id's function is only DEFINED when a marker module is importable —
+    present in the attempt tree, absent at base — so pytest resolves the
+    node id at base to nothing (`ERROR: not found: ...`, "no tests ran",
+    exit 4) rather than skipping a found test (the sibling test above).
+    Both must reach the same distinct verdict and reason, never the old
+    generic `base-tree repro run could not execute`."""
+    (repo / "only_in_attempt.py").write_text("MARKER = True\n")
+    (repo / "test_repro.py").write_text(
+        "import importlib.util\n"
+        "if importlib.util.find_spec('only_in_attempt') is not None:\n"
+        "    def test_add_fixed():\n"
+        "        assert True\n"
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    r = run_repro_gate(repo, base)
+    assert r.verdict == "error"
+    assert "re-anchor" in r.reasons[0]
+    assert base in r.reasons[0]
+    assert "base-tree repro run could not execute" not in r.reasons[0]
+
+
+def test_exit0_skipif_at_base_is_not_found_not_pass_at_base(repo):
+    """The one base-run shape review found genuinely undertested: pytest
+    exits **0** having executed nothing — a function-level
+    ``@pytest.mark.skipif`` (not the module-level ``pytest.skip(...,
+    allow_module_level=True)`` used by the sibling tests above, which
+    actually exits 4). Empirically distinct and verified here directly:
+    ``python -m pytest test_repro.py::test_add_fixed`` on a skipif-guarded
+    test prints "1 skipped in 0.00s" and exits 0 — the exact shape an
+    ablation that special-cased "only classify when rc_before != 0" could
+    hide behind, since every other integration test in this file exercises
+    exit 4 or exit 5. Guarded on module importability exactly like the
+    sibling tests: the marker module exists only in the attempt tree (never
+    committed), so at base the guard is True (skip) and at tip it is False
+    (runs and passes)."""
+    (repo / "only_in_attempt.py").write_text("MARKER = True\n")
+    (repo / "test_repro.py").write_text(
+        "import importlib.util\n"
+        "import pytest\n"
+        "_available = importlib.util.find_spec('only_in_attempt') is not None\n"
+        "@pytest.mark.skipif(not _available, reason='only in attempt tree')\n"
+        "def test_add_fixed():\n"
+        "    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD")
+    assert r.verdict == "error"
+    assert r.verdict != "fail"
+    assert "repro tests not found at base" in r.reasons[0]
+    assert "the base moved under this ticket; re-anchor the repro" in r.reasons[0]
+    assert "already pass at base" not in r.reasons[0]
+    assert "already pass" not in r.reasons[0]
+
+
+@pytest.mark.parametrize("returncode,out,expect_none", [
+    (5, "no tests ran in 0.01s", False),
+    (0, "collected 0 items\nno tests ran in 0.00s", False),
+    (4, "ERROR: not found: test_x.py::test_y\nno tests ran in 0.00s", False),
+    (4, "ERROR: found no collectors for test_x.py::test_y\n1 skipped in 0.00s", False),
+    (0, "1 skipped in 0.01s", False),
+    (0, "1 passed in 0.02s", True),
+    (1, "1 failed in 0.02s", True),
+    (4, "ERROR: found no collectors for test_e.py::test_y\n1 error in 0.02s", True),
+])
+def test_nothing_executed_classifier(returncode, out, expect_none):
+    """Unit-level pin on `_nothing_executed`: every zero-collection shape
+    found empirically (exit 5, "collected 0 items", a not-found node id, a
+    module-level skip) returns a distinct non-None reason; a genuine pass,
+    fail, or collection ERROR (something really ran/was reported) returns
+    None so the existing pass/fail paths are left completely alone."""
+    why = repro_gate._nothing_executed(returncode, out)
+    assert (why is None) == expect_none
+
+
+def test_reanchor_phrase_survives_the_event_truncation(repo):
+    """The orchestrator's repro_gate event emits `reasons[0][:200]` — the
+    re-anchor guidance must lead the reason string, not trail past the cut."""
+    (repo / "only_in_attempt.py").write_text("MARKER = True\n")
+    (repo / "test_repro.py").write_text(
+        "import importlib.util\n"
+        "import pytest\n"
+        "if importlib.util.find_spec('only_in_attempt') is None:\n"
+        "    pytest.skip('only in attempt tree', allow_module_level=True)\n"
+        "def test_add_fixed():\n"
+        "    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD")
+    assert r.verdict == "error"
+    assert "repro tests not found at base" in r.reasons[0][:200]
+
+
+def test_genuine_pass_at_base_still_reads_fails_before_failed(repo):
+    """Negative control (AC2): a declared repro test that genuinely already
+    passes at base — no zero-collection involved anywhere — must still
+    produce the existing `fail` verdict and reason, completely untouched by
+    the new classifier."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD")
+    assert r.verdict == "fail"
+    assert r.reasons[0].startswith("fails-before failed")
+    assert "already pass at base ref" in r.reasons[0]
+    assert "not found at base" not in r.reasons[0]
+    assert "re-anchor" not in r.reasons[0]
+
+
+def test_genuine_pass_at_base_resume_shape_unchanged(repo):
+    """Same negative control under resume_shape=True: still the existing
+    `resume-shape: fails-before failed` prefix, never the new verdict."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD", resume_shape=True)
+    assert r.verdict == "fail"
+    assert r.resume_shape is True
+    assert r.reasons[0].startswith("resume-shape: fails-before failed")
+    assert "not found at base" not in r.reasons[0]
+
+
 def test_wrong_shaped_manifest_is_named_not_called_missing(tmp_path):
     """Task 89db42ea wrote a manifest keyed `repro_tests` (no `tests` list) and
     was told the file did not exist; the next attempt then redid 99 turns from
