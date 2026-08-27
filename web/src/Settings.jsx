@@ -138,10 +138,10 @@ function UpdatesPanel() {
   );
 }
 
-// Usage insights: the telemetry CONSENT toggle. Off by default; the server
-// owns the write (and mints the anonymous instance id on first enable). The
-// two-line description matches the published privacy policy exactly — do not
-// soften or embellish it here.
+// Usage insights: the telemetry CONSENT toggle. On by default (opt-out); the
+// server owns the write (and mints the anonymous instance id on first enable).
+// The two-line description matches the published privacy policy exactly — do
+// not soften or embellish it here.
 function UsageInsightsPanel() {
   const [enabled, setEnabled] = useState(null); // null = still loading
   const [busy, setBusy] = useState(false);
@@ -178,8 +178,8 @@ function UsageInsightsPanel() {
         <h3 className="memory-title"><span className="panel-title-text">Usage insights</span></h3>
       </div>
       <p className="font-ui text-sm text-text-muted">
-        Off by default. When on: anonymous usage events and masked recordings
-        of the app&apos;s own interface. Never your code.
+        On by default. When on: anonymous usage events and masked recordings
+        of the app&apos;s own interface. Never your code. Turn it off here.
       </p>
       <div className="mt-4 flex items-center gap-3">
         <button

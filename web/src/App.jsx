@@ -765,8 +765,9 @@ export default function App() {
     // can only mean a broken bridge, and an empty catch would bury it.
     window.nhDesktop?.setTheme?.(theme);
   }, [theme]);
-  // Opt-in usage telemetry + masked replay (telemetry.js): the config fetch
-  // decides consent; without it posthog-js is never even imported. Screen
+  // Opt-OUT usage telemetry + masked replay (telemetry.js): the config fetch
+  // decides consent (default on); without it posthog-js is never even
+  // imported. Screen
   // views report the lane NAME only (board/backlog/done/failed/stats/about).
   useEffect(() => {
     fetchConfig().then((cfg) => initTelemetry(cfg)).catch(() => {});

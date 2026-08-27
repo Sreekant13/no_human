@@ -144,8 +144,10 @@ export const repoName = (p) => (p || "").replace(/\/+$/, "").split("/").pop() ||
 
 export default function Onboarding({ onComplete, askTelemetry }) {
   const [i, setI] = useState(0);
-  // Default No — matches the product default (telemetry.enabled: False).
-  const [consent, setConsent] = useState(false);
+  // Default ON (opt-out) — matches the product default (telemetry.enabled: True).
+  // The user can still turn it off on the insights step; an explicit No is
+  // persisted (submitConsent), because the server default is now enabled.
+  const [consent, setConsent] = useState(true);
   const STEPS = useMemo(
     () => (askTelemetry ? [...BASE_STEPS, INSIGHTS_STEP] : BASE_STEPS),
     [askTelemetry]
@@ -1265,13 +1267,13 @@ export default function Onboarding({ onComplete, askTelemetry }) {
               <p className="ob-note">{TELEMETRY_CONSENT_SETTINGS_HINT}</p>
               <div className="ob-nav-spacer" />
               <div className="ob-row">
-                {/* No is the highlighted/default choice — ob-btn (primary),
-                    same convention as Continue below. Yes is ob-btn-ghost
-                    (secondary), same convention as Back. Static classes, not
-                    swapped on click: aria-pressed carries the live selection. */}
+                {/* Yes is the highlighted/default choice — ob-btn (primary),
+                    matching the opt-out default (insights ON). No is ob-btn-ghost
+                    (secondary), the visible way to turn it off. Static classes,
+                    not swapped on click: aria-pressed carries the live selection. */}
                 <button
                   type="button"
-                  className="ob-btn"
+                  className="ob-btn-ghost"
                   aria-pressed={consent === false}
                   onClick={() => setConsent(false)}
                 >
@@ -1279,7 +1281,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 </button>
                 <button
                   type="button"
-                  className="ob-btn-ghost"
+                  className="ob-btn"
                   aria-pressed={consent === true}
                   onClick={() => setConsent(true)}
                 >

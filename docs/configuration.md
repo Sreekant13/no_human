@@ -556,8 +556,8 @@ the exact contract.
 
 ## Usage insights: the complete event list
 
-`telemetry.enabled` (default `false`) turns on anonymous, opt-in usage
-telemetry (PostHog). This section is the complete, machine-checked list of
+`telemetry.enabled` (default `true`) turns on anonymous, opt-out usage
+telemetry (PostHog) — on unless the user turns it off in onboarding or Settings. This section is the complete, machine-checked list of
 what can ever be sent — two tests keep it that way:
 `tests/test_telemetry.py::test_every_server_event_kind_is_documented` /
 `test_documented_list_has_no_phantom_events` fail if the server's closed
@@ -604,8 +604,9 @@ list, which is why the list is enforced by tests rather than left to review.
 **Never sent, on either channel:** task titles, repo names, file paths,
 prompts/specs, diffs, or any credential/token.
 
-Telemetry defaults to **off** (`telemetry.enabled: false` in
-`config.DEFAULT_CONFIG`); nothing above is sent until an operator opts in.
+Telemetry defaults to **on** (`telemetry.enabled: true` in
+`config.DEFAULT_CONFIG`); everything above is sent unless the user opts out in
+the onboarding "Usage insights" step or Settings > Usage insights.
 
 ## Tests command
 

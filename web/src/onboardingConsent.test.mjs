@@ -13,32 +13,39 @@ import {
 } from "./onboardingConsent.js";
 
 // Onboarding never asked about telemetry, so the toggle sat buried in Settings
-// and no real install ever showed up in a replay. This is the one-time,
-// default-No consent step added after the existing 8 onboarding steps. No new
-// write path: `submitConsent` only ever calls the `saveTelemetryConsent` it is
-// handed (the existing PUT /api/telemetry/consent wrapper in api.js). As with
+// and no real install ever showed up in a replay. This is the one-time consent
+// step added after the existing 8 onboarding steps; usage insights default ON
+// (opt-out), so the toggle arrives pre-set to Yes and an explicit No is
+// persisted. No new write path: `submitConsent` only ever calls the
+// `saveTelemetryConsent` it is handed (the existing PUT /api/telemetry/consent
+// wrapper in api.js). As with
 // onboardingNav.test.mjs, `node --test` has no React renderer, so the decision
 // logic lives in this plain module and the JSX wiring is checked by reading
 // Onboarding.jsx's source text (the ruleTextFull.test.mjs idiom).
 
 // ── the decision logic ──────────────────────────────────────────────────────
 
-test("skip (never touched the buttons) persists asked and enables nothing", async () => {
+test("the step not shown (null) writes nothing and leaves asked true", async () => {
+  // null == the install was already asked before, so the insights step is not
+  // rendered — nothing to record, and never re-nag.
   let called = false;
   const saveTelemetryConsent = async () => { called = true; };
   const result = await submitConsent(null, { saveTelemetryConsent });
-  assert.equal(called, false, "skipping must never call the consent endpoint");
+  assert.equal(called, false, "a not-shown step must never call the consent endpoint");
   assert.equal(result.called, false);
   assert.equal(result.enabled, false);
-  assert.equal(result.telemetryAsked, true, "a skip still counts as asked — it must not re-nag");
+  assert.equal(result.telemetryAsked, true, "still counts as asked — it must not re-nag");
 });
 
-test("an explicit No persists asked and enables nothing", async () => {
-  let called = false;
-  const saveTelemetryConsent = async () => { called = true; };
+test("an explicit No persists the opt-out (default is now ON) and marks asked", async () => {
+  // Insights default ON: silence would leave telemetry enabled, so an explicit
+  // No MUST be written to the server as false.
+  const calls = [];
+  const saveTelemetryConsent = async (enabled) => { calls.push(enabled); };
   const result = await submitConsent(false, { saveTelemetryConsent });
-  assert.equal(called, false);
+  assert.deepEqual(calls, [false], "No must persist the opt-out via the existing wrapper");
   assert.equal(result.enabled, false);
+  assert.equal(result.called, true);
   assert.equal(result.telemetryAsked, true);
 });
 
@@ -146,11 +153,11 @@ test("the step renders only for an install that has never been asked", () => {
   );
 });
 
-test("No is the pre-selected default, matching the product's off-by-default telemetry", () => {
+test("Yes is the pre-selected default, matching the product's on-by-default (opt-out) telemetry", () => {
   assert.match(
     jsx,
-    /const \[consent, setConsent\] = useState\(false\)/,
-    "consent state must default to false (No)",
+    /const \[consent, setConsent\] = useState\(true\)/,
+    "consent state must default to true (Yes/on) — insights are opt-out",
   );
 });
 
@@ -170,17 +177,17 @@ test("the insights step prints the pinned copy and offers No / Yes", () => {
     "no pre-checked (or any) checkbox — this is a plain two-button choice",
   );
 
-  // No is the highlighted/default control (ob-btn, the primary-button class
-  // used elsewhere for Continue); Yes is the secondary ob-btn-ghost (used
-  // elsewhere for Back). Static per-role classes, not swapped on click, so
+  // Yes is now the highlighted/default control (ob-btn, the primary-button
+  // class used elsewhere for Continue), matching the opt-out default; No is the
+  // secondary ob-btn-ghost. Static per-role classes, not swapped on click, so
   // this assertion is reliable without a renderer.
   const noBtn = block.match(/<button[^>]*onClick=\{\(\) => setConsent\(false\)\}[^>]*>/s)
-    || block.match(/className="ob-btn"[\s\S]*?onClick=\{\(\) => setConsent\(false\)\}/);
+    || block.match(/className="ob-btn-ghost"[\s\S]*?onClick=\{\(\) => setConsent\(false\)\}/);
   assert.ok(noBtn, "No button must exist and set consent to false");
-  assert.match(block, /className="ob-btn"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(false\)\}/,
-    "No must carry the highlighted/default button class");
-  assert.match(block, /className="ob-btn-ghost"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(true\)\}/,
-    "Yes must carry the secondary button class, not the default one");
+  assert.match(block, /className="ob-btn"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(true\)\}/,
+    "Yes must carry the highlighted/default button class");
+  assert.match(block, /className="ob-btn-ghost"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(false\)\}/,
+    "No must carry the secondary button class, not the default one");
 
   assert.doesNotMatch(block, /autoFocus/, "neither button should steal focus into a nag");
 });

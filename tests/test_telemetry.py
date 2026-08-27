@@ -178,7 +178,8 @@ def test_default_endpoint_is_empty_so_no_cloud_identifier_ships():
     # (like team_brain.control_plane_url), and the shipped default is inert.
     from no_human.config import DEFAULT_CONFIG
     assert DEFAULT_CONFIG["telemetry"]["endpoint"] == ""
-    assert DEFAULT_CONFIG["telemetry"]["enabled"] is False
+    # Usage insights default ON (opt-out) as of the 2026-08-27 operator flip.
+    assert DEFAULT_CONFIG["telemetry"]["enabled"] is True
 
 
 def test_duration_bucketing():
@@ -572,5 +573,7 @@ def test_documented_list_has_no_phantom_events():
     )
 
 
-def test_telemetry_stays_off_by_default():
-    assert DEFAULT_CONFIG["telemetry"]["enabled"] is False
+def test_telemetry_defaults_on_opt_out():
+    # Operator flip 2026-08-27: usage insights are opt-OUT — enabled by default,
+    # turned off from the onboarding step or Settings > Usage insights.
+    assert DEFAULT_CONFIG["telemetry"]["enabled"] is True

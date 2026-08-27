@@ -19,22 +19,26 @@ export function shouldAskTelemetry(status) {
   return !(status && status.telemetry_asked);
 }
 
-/** yes | no | skip → what the launch must do. `answer` is `true`, `false`,
- *  or null/undefined (the user never touched the buttons = skip = No). */
+/** yes | no | not-shown → what the launch must do. `answer` is `true`, `false`,
+ *  or null/undefined (the step was not shown — an install already asked before).
+ *  Usage insights now default ON (opt-out), so BOTH a Yes and an explicit No are
+ *  persisted: the server default is enabled, and staying silent on a No would
+ *  leave telemetry on. Only the not-shown case writes nothing. */
 export async function submitConsent(answer, { saveTelemetryConsent, onError } = {}) {
-  if (answer !== true) return { enabled: false, called: false, telemetryAsked: true };
+  if (answer === null || answer === undefined)
+    return { enabled: false, called: false, telemetryAsked: true };
   try {
-    await saveTelemetryConsent(true);
-    return { enabled: true, called: true, telemetryAsked: true };
+    await saveTelemetryConsent(answer === true);
+    return { enabled: answer === true, called: true, telemetryAsked: true };
   } catch (err) {
     if (onError) onError(err);
     // A telemetry failure must never block the launch (AC5) — but it must
     // ALSO never be recorded as "asked". If it were, shouldAskTelemetry()
-    // would return false forever: the user said Yes, the write failed (a
+    // would return false forever: the user made a choice, the write failed (a
     // possibly-transient fault), and they would never get another chance to
-    // opt in. Leaving telemetryAsked false here means onboarding_complete's
+    // set it. Leaving telemetryAsked false here means onboarding_complete's
     // sticky patch (app.py) omits the key entirely, so the next launch asks
-    // again instead of silently losing the Yes.
+    // again instead of silently losing the choice.
     return { enabled: false, called: true, error: true, telemetryAsked: false };
   }
 }

@@ -282,9 +282,11 @@ def test_call_sites_use_constants_not_literals():
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_consent_off_records_nothing_on_disk(client, monkeypatch, tmp_path):
-    """Real `record` (no monkeypatch), consent off by default. Does not
-    re-test `record`'s internals — tests/test_telemetry.py owns those."""
+async def test_no_endpoint_records_nothing_on_disk(client, monkeypatch, tmp_path):
+    """Real `record` (no monkeypatch): consent now defaults ON, but the default
+    `endpoint` is empty, and `record` no-ops unless enabled AND endpoint set —
+    so nothing hits disk. Does not re-test `record`'s internals — tests/
+    test_telemetry.py owns those."""
     monkeypatch.setenv("HOME", str(tmp_path))
     r = await client.post("/api/tasks", json={
         "title": "Fix it", "source": "jira", "external_id": "NO-3",

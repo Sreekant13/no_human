@@ -1,4 +1,4 @@
-// Opt-in usage telemetry + masked session replay (PostHog), default OFF.
+// Opt-OUT usage telemetry + masked session replay (PostHog), default ON.
 //
 // The privacy contract this file enforces, matching the published policy:
 //  - CONSENT FIRST: without `telemetry.enabled` AND a publishable client

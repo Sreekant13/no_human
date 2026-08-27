@@ -28,7 +28,7 @@ test("the section list covers Projects, Rules, Skills, Learnings, Integrations, 
   // The name used to claim "exactly" while only checking presence, so adding a
   // section quietly made the title a lie. Both directions are asserted now:
   // every expected label is there, and the list holds nothing else.
-  // "Usage insights" is the opt-in telemetry consent panel (telemetry.js).
+  // "Usage insights" is the opt-out telemetry consent panel (telemetry.js).
   // "Models" is the model-picker pane (part 3 of 3): one row per role, fed by
   // GET /api/models — see modelsPanelView.test.mjs.
   const expected = ["Projects", "Rules", "Skills", "Learnings", "Integrations",

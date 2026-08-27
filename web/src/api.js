@@ -342,7 +342,7 @@ export async function fetchConfig() {
   return r.json();
 }
 
-// Settings > Usage insights (opt-in telemetry) consent toggle. The server
+// Settings > Usage insights (opt-out telemetry) consent toggle. The server
 // persists `telemetry.enabled` and mints the anonymous instance id on first
 // enable — the browser only ever sends the boolean.
 export const saveTelemetryConsent = (enabled) =>

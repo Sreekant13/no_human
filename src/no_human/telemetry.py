@@ -1,7 +1,10 @@
-"""Anonymous, opt-in usage telemetry (server-side events).
+"""Anonymous, opt-out usage telemetry (server-side events).
 
-Default OFF (`telemetry.enabled: false` — consent). When enabled, a CLOSED
-allowlist of event kinds is buffered to ``~/.no_human/telemetry-queue.jsonl``
+Default ON (`telemetry.enabled: true` — consent, turned off in onboarding or
+Settings). Note server-side events ALSO require a configured `endpoint`, which
+ships empty, so this queue stays inert until an endpoint is set even with
+consent on. When enabled AND endpointed, a CLOSED allowlist of event kinds is
+buffered to ``~/.no_human/telemetry-queue.jsonl``
 and flushed in small batches by a daemon thread to the first-party ingestion
 endpoint. Everything is fail-open: a dead endpoint, a full disk or a malformed
 queue line can never break a task run — the only exception `record` raises on

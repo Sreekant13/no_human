@@ -2118,12 +2118,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retention_days": 90,
     },
     "telemetry": {
-        # Opt-in usage telemetry + masked session replay. CONSENT, default
-        # OFF — nothing is recorded or sent until the operator flips this in
-        # Settings > Usage insights (or config.yaml). The published privacy
-        # posture: anonymous usage events and masked recordings of the app's
-        # OWN interface — never code, prompts, titles, paths or tokens.
-        "enabled": False,
+        # Opt-OUT usage telemetry + masked session replay. CONSENT, default
+        # ON — usage events and masked recordings are sent unless the user turns
+        # this OFF in the onboarding "Usage insights" step, Settings > Usage
+        # insights, or config.yaml. The published privacy posture: anonymous
+        # usage events and masked recordings of the app's OWN interface — never
+        # code, prompts, titles, paths or tokens.
+        "enabled": True,
         # PostHog *publishable* client token (phc_…). Publishable by design —
         # it can only ingest events, never read data — which is why it is
         # allowed to live in config defaults at all. The field is named
