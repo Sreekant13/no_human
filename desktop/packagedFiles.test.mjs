@@ -145,6 +145,31 @@ test("both shell pages declare a language (WCAG 3.1.1)", () => {
 const builderConfig = await import("./electron-builder.config.cjs")
   .then((m) => m.default ?? m);
 
+test("the linux .deb declares libgbm1 and libasound2 (Electron DT_NEEDED, not pulled by GTK)", () => {
+  // electron-builder's DEFAULT deb.depends omits two libraries the Electron
+  // binary hard-links: libgbm1 (Mesa GBM) and libasound2 (ALSA). GTK pulls
+  // neither, so without declaring them `apt install ./no_human.deb` on a clean
+  // machine leaves them out and the app dies at load — `libasound.so.2: cannot
+  // open shared object file` (measured 2026-08-27 on fresh Ubuntu 24.04). This
+  // pins the fix so a future edit that drops back to the default (or forgets one)
+  // goes red in CI rather than only on a clean-machine install.
+  // `deb` is a TOP-LEVEL target-options key, not nested under `linux`
+  // (electron-builder rejects the nested form — the build fails schema
+  // validation, which is how the first draft of this fix was caught).
+  const depends = builderConfig.deb?.depends;
+  assert.ok(Array.isArray(depends) && depends.length > 0,
+    "deb.depends must be an explicit array (the default omits libgbm1/libasound2)");
+  assert.ok(depends.includes("libgbm1"),
+    "deb.depends must include libgbm1 — the Electron binary DT_NEEDs it and GTK does not pull it");
+  // ALSA must be the REAL package, not the bare virtual name. On Ubuntu 24.04 the
+  // real package is libasound2t64 and `libasound2` is virtual-only — a bare
+  // `libasound2` was satisfied by a stub lacking snd_device_name_get_hint and the
+  // app still crashed. Require an entry naming libasound2t64 (the alternative
+  // `libasound2t64 | libasound2` keeps 22.04 and older working).
+  assert.ok(depends.some((d) => d.includes("libasound2t64")),
+    "deb.depends must name libasound2t64 (real 24.04 ALSA package), not bare virtual libasound2");
+});
+
 test("package.json holds no `build` key — electron-builder must never find a shadow config", () => {
   // THE TRAP, and why the key is called `nhPackagedFiles`.
   //

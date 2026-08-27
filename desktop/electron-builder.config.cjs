@@ -329,6 +329,30 @@ module.exports = {
   mac,
   win,
   linux,
+  // .deb runtime dependencies — a TOP-LEVEL target-options key (electron-builder
+  // rejects `deb` nested under `linux`). electron-builder's DEFAULT deb.depends
+  // (FpmTarget.js) is the first nine below; it omits two libraries the Electron
+  // binary hard-links (DT_NEEDED, not dlopen): libgbm1 (Mesa GBM) and libasound2
+  // (ALSA). libgtk-3-0 pulls neither, so on a clean machine `apt install
+  // ./no_human.deb` leaves them out and the app dies at load with
+  // `libasound.so.2: cannot open shared object file` (measured 2026-08-27 on a
+  // fresh Ubuntu 24.04 box; readelf -d confirmed both as NEEDED). Setting
+  // `depends` REPLACES the default, so the nine are respelled and the two
+  // appended. ALSA is declared `libasound2t64 | libasound2`, NOT bare
+  // `libasound2`: on Ubuntu 24.04 (the t64 transition) the real package is
+  // `libasound2t64` and `libasound2` exists only as a virtual name — a bare
+  // `libasound2` Depends was satisfied by a stub provider that lacks
+  // snd_device_name_get_hint@ALSA_0.9, so the app still died at launch (measured
+  // 2026-08-27, clean 24.04 box). The alternative pulls the REAL package:
+  // libasound2t64 on 24.04+, libasound2 on 22.04 and older. Guarded by
+  // desktop/packagedFiles.test.mjs.
+  deb: {
+    depends: [
+      "libgtk-3-0", "libnotify4", "libnss3", "libxss1", "libxtst6",
+      "xdg-utils", "libatspi2.0-0", "libuuid1", "libsecret-1-0",
+      "libgbm1", "libasound2t64 | libasound2",
+    ],
+  },
   // Darwin-only by construction: adhocSeal returns immediately unless
   // electronPlatformName is "darwin". Windows needs NO afterPack equivalent —
   // the macOS hook exists to repair a signature electron-builder INVALIDATES by
