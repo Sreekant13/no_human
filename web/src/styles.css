@@ -5319,6 +5319,8 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
 .ob-brand span { font-family: var(--font-ui); font-size: 30px; font-weight: 800; letter-spacing: -0.02em; color: var(--text-hi); }
 .ob-h1 { font-family: var(--font-ui); font-weight: 800; font-size: 40px; line-height: 1.05; letter-spacing: -0.03em; color: var(--text-hi); margin-bottom: 14px; }
+/* Second slogan sentence — secondary weight/size, same words (BINDING copy). */
+.ob-h1-sub { display: block; margin-top: 8px; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; color: var(--text-body); }
 .ob-h2 { font-family: var(--font-ui); font-weight: 800; font-size: 27px; line-height: 1.15; letter-spacing: -0.02em; color: var(--text-hi); margin-bottom: 8px; }
 .ob-lede { font-family: var(--font-ui); font-size: 16px; line-height: 1.6; color: var(--text-body); max-width: 56ch; }
 .ob-lede em { color: var(--accent-500); font-style: normal; font-weight: 600; }

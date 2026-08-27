@@ -82,10 +82,10 @@ test("the intro paragraph carries the operator's 2026-08-09 copy, and does NOT c
     /read-only/i,
     "the .ob-lede must NOT call investigations read-only — they are not, and this claim was retracted 2026-07-29",
   );
-  // The thesis line. "10× in parallel" was removed 2026-08-01 (unmeasured
-  // ambition), and the cost clause was removed 2026-08-09 by the operator's
-  // explicit rewrite of the headline.
-  assert.match(jsx, /Stop hand-holding one chat\. Give it a ticket, review the finished PR</);
+  // The headline is now the BINDING slogan (PRODUCT.md), verbatim and
+  // do-not-reword: two sentences, the second set as a secondary line.
+  assert.match(jsx, /From ticket to reviewed pull request\./);
+  assert.match(jsx, /Free and open-source, on your machine\./);
   assert.doesNotMatch(
     jsx,
     /10×|10x in parallel/i,

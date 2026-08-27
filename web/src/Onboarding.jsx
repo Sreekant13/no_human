@@ -691,7 +691,12 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                   `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
                   reset near the top of styles.css. If that reset is ever narrowed, this
                   headline needs an explicit margin-top. */}
-              <h2 className="ob-h1">Stop hand-holding one chat. Give it a ticket, review the finished PR</h2>
+              {/* BINDING slogan, do-not-reword (PRODUCT.md). Two sentences, verbatim;
+                  the second is set smaller/secondary but the words are unchanged. */}
+              <h2 className="ob-h1">
+                From ticket to reviewed pull request.
+                <span className="ob-h1-sub">Free and open-source, on your machine.</span>
+              </h2>
               <p className="ob-lede">
                 no_human fields an <em>entire team of specialized agents at once</em>. Each
                 one is carried from intake to an open PR on its own: no babysitting, no
