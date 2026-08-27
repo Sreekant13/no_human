@@ -37,7 +37,18 @@ await page.route("**/api/**", (route) => {
   const u = route.request().url();
   const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
   if (u.includes("/api/onboarding/status")) return j({ completed: false });
-  if (u.includes("/api/onboarding/repos/detect")) return j({ repos: [] });
+  if (u.includes("/api/repos/discover")) {
+    const now = Math.floor(Date.now() / 1000);
+    return j({
+      repos: [
+        { path: "/Users/me/git/alpha-svc", name: "alpha-svc", is_git: true, branch: "main", dirty: false, dirty_scan: "complete", ecosystem: "python", mtime: now - 3600 },
+        { path: "/Users/me/git/beta-web", name: "beta-web", is_git: true, branch: "main", dirty: false, dirty_scan: "complete", ecosystem: "node", mtime: now - 7200 },
+      ],
+      roots_scanned: ["/Users/me/git"], roots: ["/Users/me/git"],
+      roots_missing: [], roots_refused: [], refused: [], home_direct: 0,
+      total_found: 2, limit: 200, capped: false, walk_truncated: false, note: "", elapsed_ms: 3,
+    });
+  }
   if (u.includes("/api/tasks")) return j([]);
   return j({});
 });
@@ -45,6 +56,28 @@ await page.goto("http://127.0.0.1:4640/", { waitUntil: "networkidle" });
 await page.waitForTimeout(400);
 
 const cont = () => page.getByRole("button", { name: /^Continue$/ }).click();
+
+// Repos step: the recently-worked-on cards each carry an icon-ish "Add" button
+// whose only text is "Add". Without an accessible name naming the repo, a
+// screen reader announces "Add" three times with no way to tell them apart.
+// Walk to the repos step and assert every Add button names its repo.
+for (let hop = 0; hop < 6; hop++) {
+  if (await page.getByRole("heading", { name: /Which repositories do you work on/i })
+      .isVisible().catch(() => false)) break;
+  await cont(); await page.waitForTimeout(250);
+}
+await page.waitForTimeout(300);
+const addButtons = page.getByRole("button", { name: /^(Add|Remove) / });
+const addCount = await addButtons.count();
+check("recently-worked-on cards rendered with Add buttons", addCount >= 2, `saw ${addCount}`);
+let namedOk = addCount >= 2;
+for (const name of ["alpha-svc", "beta-web"]) {
+  const named = page.getByRole("button", { name: `Add ${name}` });
+  const ok = await named.isVisible().catch(() => false);
+  if (!ok) namedOk = false;
+}
+check("every Add button has an accessible name \"Add <repo name>\"", namedOk,
+  `expected "Add alpha-svc" and "Add beta-web"`);
 
 // Walk Continues until the Projects step's heading renders (bounded): the
 // suite used to hardcode 3 Continues for a welcome->team->repos->projects

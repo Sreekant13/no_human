@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  detectRepos, discoverRepos, onboardRepo, extractHistory, analyzeHistory,
+  discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
   generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
   proveRepoSSE, confirmRepoProfile, fetchReadiness, saveTelemetryConsent,
@@ -10,7 +10,8 @@ import {
   TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT,
   CONSENT_YES_LABEL, CONSENT_NO_LABEL, submitConsent,
 } from "./onboardingConsent.js";
-import { repoBadges, discoveryMessage, fromDetectedRepo, ambiguousNames, rowName } from "./discoveredRepos.js";
+import { repoBadges, discoveryMessage, ambiguousNames, rowName } from "./discoveredRepos.js";
+import { splitRecent, relativeMtime, debounce } from "./repoRecency.js";
 import { LegionLogo } from "./Logo.jsx";
 import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
@@ -196,6 +197,10 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   // anywhere - basenames that collide get their full path shown so the user
   // can tell which checkout they are selecting.
   const ambiguousRepoNames = ambiguousNames(detected);
+  // Recently-modified repos float to the top of the step as quick-add cards;
+  // the rest keep the newest-first order the server already sorted them into.
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  const { recent: recentRepos, rest: restRepos } = splitRecent(detected, nowEpoch);
   const next = () => setI((n) => Math.min(n + 1, STEPS.length - 1));
   const back = () => setI((n) => Math.max(n - 1, 0));
   // Everything the nav predicates in onboardingNav.js need. Kept as one object so
@@ -232,6 +237,23 @@ export default function Onboarding({ onComplete, askTelemetry }) {
     setBusy(true); setErr(null);
     try { await fn(); } catch (e) { setErr(e.message); } finally { setBusy(false); }
   }
+
+  // Scan ONE folder the user typed. The single scanner refuses a root outside
+  // home server-side, and the response already carries roots_scanned/note/etc.
+  // for this one root, so it replaces the whole discovery state directly — no
+  // hand-built roots_scanned like the retired detect path needed.
+  async function scanFolder(r) {
+    if (!r || !r.trim()) return;
+    await guard(async () => {
+      const res = await discoverRepos({ root: r.trim() });
+      setDetected(res.repos || []);
+      setDiscovery(res);
+    });
+  }
+  // Typing a folder scans it (400 ms after the last keystroke) instead of
+  // making the user reach for "Search". "Search" stays as the explicit trigger.
+  const debouncedScan = useMemo(() => debounce((r) => scanFolder(r), 400), []);
+  useEffect(() => () => debouncedScan.cancel(), [debouncedScan]);
 
   // Phase 3a: preload history scan on mount — kick off _gather_history early
   // so results are ready by the time the user reaches the history step.
@@ -670,33 +692,46 @@ export default function Onboarding({ onComplete, askTelemetry }) {
               </div>
               {manualScan && (
                 <div className="ob-row">
-                  <PathInput value={root} onChange={setRoot} placeholder="folder to search, e.g. ~/work" />
+                  {/* Typing a folder scans it (debounced); "Search" is the
+                      explicit trigger for the impatient. Both go through the one
+                      scanner, which refuses a root outside home server-side. */}
+                  <PathInput value={root}
+                             onChange={(v) => { setRoot(v); debouncedScan(v); }}
+                             placeholder="folder to search, e.g. ~/work" />
                   <button className="ob-btn-ghost" disabled={busy || !root.trim()}
-                          onClick={() => guard(async () => {
-                            // The older bounded scan: one caller-named root,
-                            // kept as the escape hatch for clones that live
-                            // outside the conventional locations.
-                            const res = await detectRepos(root);
-                            const rows = (res.repos || []).map(fromDetectedRepo);
-                            setDetected(rows);
-                            setDiscovery({
-                              ...(discovery || {}), roots_scanned: [res.root],
-                              roots_missing: [], roots_refused: [],
-                              // A manual single-root scan is its own complete
-                              // answer; carrying the auto-scan's truncation
-                              // flag over would warn about a search that is
-                              // no longer on screen.
-                              walk_truncated: false,
-                              repos: rows, capped: false, note: "",
-                            });
-                          })}>
+                          onClick={() => { debouncedScan.cancel(); scanFolder(root); }}>
                     Search
                   </button>
                 </div>
               )}
+              {recentRepos.length > 0 && (
+                <>
+                  <p className="ob-recent-label">Recently worked on</p>
+                  <div className="ob-repo-cards ph-no-capture">
+                    {recentRepos.map((r) => {
+                      const sel = selectedRepos.has(r.path);
+                      return (
+                        <div key={r.path} className={`ob-repo-card${sel ? " sel" : ""}`}>
+                          <div className="ob-repo-card-name">{r.name}</div>
+                          <div className="ob-repo-card-path">{r.path}</div>
+                          <div className="ob-repo-card-meta">{relativeMtime(r.mtime, nowEpoch)}</div>
+                          {/* Same handler as the checkbox below: Add just ticks
+                              the repo. aria-label carries the repo name so a
+                              screen reader announces which one. */}
+                          <button type="button" className="ob-repo-card-add"
+                                  aria-label={`${sel ? "Remove" : "Add"} ${r.name}`}
+                                  onClick={() => toggleRepo(r.path)}>
+                            {sel ? "Added ✓" : "Add"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
               <div className="ob-repolist ph-no-capture">
                 {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Looking for your repositories…</> : "No repositories found. Search another folder above."}</div>}
-                {detected.map((r) => {
+                {restRepos.map((r) => {
                   const st = onboarded[r.path];
                   const pv = proveState[r.path];
                   return (

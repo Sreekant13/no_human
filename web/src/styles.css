@@ -5398,6 +5398,52 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-repo-status { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
 .ob-repo-status.ok { color: var(--state-done); }
 
+/* Recently-worked-on repos: a quick-add grid above the full list, so a user
+   with dozens of clones reaches the one they were just in without scrolling.
+   Tokens only — no new colours; the accent/border/surface tokens are the same
+   ones the checkbox rows use. */
+.ob-recent-label {
+  font-family: var(--font-ui); font-size: 12px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-dim); margin: 4px 0 8px;
+}
+.ob-repo-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: var(--sp-2); margin-bottom: var(--sp-4);
+}
+.ob-repo-card {
+  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  gap: 2px var(--sp-3); padding: 10px 12px;
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  transition: border-color var(--dur-fast), background var(--dur-fast);
+}
+.ob-repo-card:hover { border-color: var(--border-hi); }
+.ob-repo-card.sel {
+  border-color: var(--accent-700);
+  background: color-mix(in oklab, var(--accent-500) 8%, var(--surface-1));
+}
+.ob-repo-card-name {
+  grid-column: 1; font-family: var(--font-ui); font-weight: 500; color: var(--text-hi);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ob-repo-card-path {
+  grid-column: 1; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ob-repo-card-meta {
+  grid-column: 1; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+}
+.ob-repo-card-add {
+  grid-column: 2; grid-row: 1 / 4; align-self: center;
+  font-family: var(--font-ui); font-size: 12px; color: var(--accent-300);
+  background: transparent; border: 1px solid var(--border-hi); border-radius: var(--r-pill);
+  padding: 4px 13px; cursor: pointer;
+  transition: border-color var(--dur-fast), color var(--dur-fast);
+}
+.ob-repo-card-add:hover { border-color: var(--accent-700); color: var(--text-hi); }
+.ob-repo-card-add:focus-visible { outline: 2px solid var(--accent-500); outline-offset: 2px; }
+
 /* project cards (onboarding) */
 .ob-project-card {
   background: var(--surface-1); border: 1px solid var(--border);
