@@ -204,16 +204,21 @@ test("the picker states, in the UI, that the choice affects the coder only", () 
   assert.match(composerJsx, /always run on Claude/);
 });
 
-test("choosing 'local' with llm.local_base_url unset is refused at COMPOSE TIME, naming the missing key", () => {
-  // Fail closed: mirrors agent.backend.make_backend's own local-config check,
-  // just moved earlier — to the picker, before task creation — never a silent
-  // fallback to claude.
+test("a backend the server reports UNAVAILABLE is refused at COMPOSE TIME, showing the server's reason", () => {
+  // Fail closed at compose time (never a silent fallback to claude), driven by
+  // the SERVER's per-backend availability — `backendAvailability` built from
+  // GET /api/config — not a client-side re-implementation of make_backend's
+  // config check. That is why the local-without-base_url case (and every other
+  // unrunnable backend) is refused here: the server marks it available:false
+  // with a reason. Fail-closed only once the server has answered, never on an
+  // absent/in-flight field (that would block on missing evidence).
   assert.match(composerJsx,
-    /localBackendUnconfigured\s*=\s*\n?\s*backend === "local" && !String\(config\?\.llm\?\.local_base_url \|\| ""\)\.trim\(\)/);
+    /selectedBackendUnavailable\s*=\s*selectedBackendInfo\s*\n?\s*\?\s*!selectedBackendInfo\.available/);
   // It must block submission, not just warn.
-  assert.match(composerJsx, /!localBackendUnconfigured && !busy/);
-  // The refusal message must name the actual missing config key.
-  assert.match(composerJsx, /llm\.local_base_url/);
+  assert.match(composerJsx, /!selectedBackendUnavailable && !busy/);
+  // The refusal surfaces the server's own reason (which names the missing key),
+  // rather than the board re-deriving and hardcoding it.
+  assert.match(composerJsx, /selectedBackendInfo\.reason/);
 });
 
 test("an untouched backend control behaves exactly as before the picker existed", () => {
