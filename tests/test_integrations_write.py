@@ -192,7 +192,11 @@ def test_integration_fields_reports_set_booleans(tmp_path):
     by_name = {f["name"]: f for f in fields}
     assert by_name["site"]["set"] is True
     assert by_name["api_token"]["set"] is False  # never set in this test
-    assert all(set(f) == {"name", "label", "secret", "set"} for f in fields)
+    # help/help_url join the descriptor (integrations/help.py catalogue) so the
+    # wizard and Settings say the same thing about each field; the shape guard
+    # tracks the real keys — test_integrations_help asserts they carry content.
+    assert all(set(f) == {"name", "label", "secret", "set", "help", "help_url"}
+               for f in fields)
 
 
 # --------------------------------------------------------------------------- #
