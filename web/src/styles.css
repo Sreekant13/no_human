@@ -5260,7 +5260,13 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* stepper */
 .ob-stepper { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 0 4px; }
-.ob-step { display: inline-flex; align-items: center; gap: 7px; opacity: 0.5; transition: opacity var(--dur-base) var(--ease-standard); }
+/* A button since spec §3 B2 (jump to any step). Reset the UA button chrome so it
+   still reads as the old text+dot indicator, and make it clearly clickable. */
+.ob-step { display: inline-flex; align-items: center; gap: 7px; opacity: 0.5; transition: opacity var(--dur-base) var(--ease-standard);
+  background: none; border: 0; padding: 2px 4px; margin: 0; cursor: pointer; border-radius: 6px; font: inherit; }
+.ob-step:hover:not(:disabled) { opacity: 0.85; }
+.ob-step:disabled { cursor: default; }
+.ob-step:focus-visible { outline: 2px solid var(--accent-500); outline-offset: 2px; }
 .ob-step.current, .ob-step.done { opacity: 1; }
 .ob-step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border-hi); transition: background var(--dur-base); }
 .ob-step.current .ob-step-dot { background: var(--accent-500); box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-500) 22%, transparent); }
@@ -6454,3 +6460,32 @@ textarea:disabled {
 .nh-about-block h2 { font-size: 15px; color: var(--text-hi); margin: 0 0 8px; }
 .nh-about-block p { margin: 0 0 10px; line-height: 1.6; }
 .nh-about-block code { color: var(--text-hi); }
+
+/* Finish-setup card (spec §3 B1): the minimal path's deferred steps on the board. */
+.finish-setup-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 0 0 14px;
+}
+.finish-setup-card h3 { font-size: 14px; color: var(--text-hi); margin: 0 0 4px; }
+.finish-setup-lede { font-size: 12.5px; color: var(--text); margin: 0 0 10px; }
+.finish-setup-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.finish-setup-list li { display: flex; align-items: center; gap: 8px; }
+.finish-setup-open {
+  flex: 1; text-align: left; background: var(--surface-2); border: 1px solid var(--border);
+  color: var(--text-hi); border-radius: 8px; padding: 8px 10px; font-size: 13px; cursor: pointer;
+}
+.finish-setup-open:hover { background: var(--surface-3); border-color: var(--border-hi); }
+.finish-setup-done {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 8px 12px; font-size: 12.5px; cursor: pointer;
+}
+.finish-setup-done:hover { border-color: var(--border-hi); color: var(--text-hi); }
+
+/* Launch-card readiness rows (spec §3 B2): each unmet step + a jump-to-fix. */
+.ob-readiness { list-style: none; margin: 0.6rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ob-readiness li { display: flex; align-items: center; gap: 10px; }
+.ob-readiness-msg { flex: 1; font-size: 12.5px; color: var(--red); }
+.ob-readiness-fix { flex: 0 0 auto; }

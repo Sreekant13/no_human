@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, fetchConfig, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, fetchConfig, grillStep, grillStepSSE, fetchDeferred, markDeferredDone } from "./api.js";
+import FinishSetupCard from "./FinishSetupCard.jsx";
 import { initTelemetry, captureScreen } from "./telemetry.js";
 import Board from "./Board.jsx";
 import Backlog from "./Backlog.jsx";
@@ -719,6 +720,12 @@ export default function App() {
   // Settings is an overlay dialog (Claude macOS desktop app model), not a
   // routed page — it can open on top of whatever page is showing.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Which Settings pane to open on — set when a Finish-setup item is clicked so
+  // the overlay lands on the matching pane; null means "wherever it last was".
+  const [settingsTab, setSettingsTab] = useState(null);
+  // The onboarding steps deferred by the minimal path (spec §3 B1). The board's
+  // FinishSetupCard renders them; empty once every step is done.
+  const [deferred, setDeferred] = useState([]);
   const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
@@ -802,6 +809,13 @@ export default function App() {
       .then((s) => { setOnboardStatus(s); setOnboarded(!!s.completed); })
       .catch(() => { setOnboardStatus(null); setOnboarded(true); });
   }, []);
+
+  // The minimal-path deferred steps for the Finish-setup card. Fetched once the
+  // board is showing; an empty list simply renders no card.
+  useEffect(() => {
+    if (onboarded !== true) return;
+    fetchDeferred().then((r) => setDeferred(r.deferred || [])).catch(() => {});
+  }, [onboarded]);
 
   // initial load
   useEffect(() => {
@@ -1217,6 +1231,13 @@ export default function App() {
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
+        {page === "board" && deferred.length > 0 && (
+          <FinishSetupCard
+            deferred={deferred}
+            onNavigate={({ tab }) => { setSettingsTab(tab); setSettingsOpen(true); }}
+            onDone={(step) => markDeferredDone(step).then((r) => setDeferred(r.deferred || [])).catch(() => {})}
+          />
+        )}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
         {page === "backlog" && (
           <Backlog
@@ -1268,7 +1289,7 @@ export default function App() {
           onStopQueue={stopQueue}
         />
       )}
-      {settingsOpen && <SettingsOverlay onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsOverlay initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(null); }} />}
     </div>
   );
 }

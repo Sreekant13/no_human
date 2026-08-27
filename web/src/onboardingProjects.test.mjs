@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import {
   newProjectDef, toggleProjectRepo, setPrimaryRepo, dropRepoEverywhere,
   unboundProjects, unboundProjectsMessage, projectPayload,
+  projectsBlockContinue, launchReadiness,
 } from "./onboardingProjects.js";
 
 // BUG (first external DMG tester): finished onboarding, landed on a board
@@ -242,10 +243,55 @@ test("the projects empty state does not claim a gate the nav does not enforce", 
     "the empty state must say what is true: nothing here is required");
 });
 
-test("nothing gates the projects step, so the copy above stays true", () => {
-  // If a future change DOES gate this step, this assertion fails and points at
-  // the copy that would then have to change back.
-  assert.doesNotMatch(onboarding, /projectDefs\.length === 0[^)]*\}\s*\/>\s*$/m);
-  assert.match(onboarding, /disabled=\{forwardDisabled\(navState\)\}>Continue<\/button>/,
-    "Continue must still be the tested predicate alone, with no per-step gate");
+test("the ONLY thing that gates Continue on this step is a project with zero repos", () => {
+  // spec §3 B2 added the one legitimate gate: a project that EXISTS with no repos
+  // cannot be created (finish() refuses it), so Continue is blocked until it is
+  // fixed on the step that shows it. What must NEVER come back is the "no
+  // projects" gate that dead-ended repo-less users — projectsBlockContinue fires
+  // only on the zero-repo-project case, and the empty-state copy stays optional.
+  assert.match(onboarding,
+    /const continueBlocked = projectsBlockMsg !== null;/,
+    "the gate must be the tested predicate, not an inline count");
+  assert.match(onboarding,
+    /const projectsBlockMsg = step\.key === "projects" \? projectsBlockContinue\(projectDefs\) : null;/,
+    "the block message must come from projectsBlockContinue, which fires only on a repo-less project");
+  assert.match(onboarding, /disabled=\{forwardDisabled\(navState\) \|\| continueBlocked\}>Continue<\/button>/,
+    "Continue delegates to forwardDisabled AND the projects gate — never a raw count");
+  assert.doesNotMatch(onboarding, /projectDefs\.length === 0[^)]*disabled/,
+    "a bare 'no projects' gate must never return — it dead-ends repo-less users");
+});
+
+// ── validate at the step + launch readiness (spec §3 B2) ────────────────────
+
+test("Continue is blocked while a project has zero repos, and only then", () => {
+  assert.match(projectsBlockContinue([{ name: "Kika", repos: [] }]), /Kika.*no repos/);
+  assert.equal(projectsBlockContinue([{ name: "K", repos: ["/r"] }]), null);
+  assert.equal(projectsBlockContinue([]), null, "no projects is a valid, non-blocking state");
+});
+
+test("projectsBlockContinue reads Set-shaped repos too (the wizard's live state)", () => {
+  assert.match(projectsBlockContinue([{ name: "Kika", repos: new Set() }]), /Kika.*no repos/);
+  assert.equal(projectsBlockContinue([{ name: "K", repos: new Set(["/r"]) }]), null);
+});
+
+test("launch readiness lists each failing step with a jump index", () => {
+  const rows = launchReadiness({ projects: [{ name: "Kika", repos: [] }], selectedRepos: new Set(["/r"]), deferred: [] });
+  assert.deepEqual(rows.filter((r) => !r.ok).map((r) => r.jumpTo), [2]);
+});
+
+test("launch readiness is all-clear when repos are picked and no project is empty", () => {
+  const rows = launchReadiness({ projects: [{ name: "K", repos: ["/r"] }], selectedRepos: new Set(["/r"]), deferred: [] });
+  assert.deepEqual(rows.filter((r) => !r.ok), []);
+});
+
+test("a deferred step is optional and drops out of the readiness list", () => {
+  const rows = launchReadiness({ projects: [], selectedRepos: new Set(), deferred: ["repos"] });
+  assert.equal(rows.some((r) => r.step === "repos"), false);
+});
+
+test("the Launch card renders launchReadiness rows with a Fix button that jumps", () => {
+  assert.match(onboarding, /launchReadiness\(\{ projects: projectDefs, selectedRepos, deferred: \[\] \}\)/,
+    "the Launch card must source its readiness from the tested helper");
+  assert.match(onboarding, /onClick=\{\(\) => setI\(r\.jumpTo\)\}>Fix →<\/button>/,
+    "each unmet step must offer a Fix that jumps to it, not prose telling the user to go Back");
 });

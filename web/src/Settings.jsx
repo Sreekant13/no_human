@@ -334,8 +334,12 @@ function AuthPanel() {
 // left section list and the section's panel content on the right — not a
 // routed page. Mirrors the SlideOver focus/Escape pattern (SlideOver.jsx),
 // so it behaves like the app's other modal surfaces.
-export default function SettingsOverlay({ onClose }) {
-  const [section, setSection] = useState("projects");
+export default function SettingsOverlay({ onClose, initialTab }) {
+  // A Finish-setup deep link (App passes initialTab) opens the overlay on the
+  // matching pane. An unknown tab (e.g. "docs"/"history", which have no pane of
+  // their own yet) falls back to Projects rather than a blank content area.
+  const [section, setSection] = useState(
+    SECTIONS.some((s) => s.key === initialTab) ? initialTab : "projects");
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
   const triggerRef = useRef(null);

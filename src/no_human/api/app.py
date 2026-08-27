@@ -4278,6 +4278,15 @@ class OnboardingCompleteRequest(BaseModel):
     repos: list[str] = []
     docs: list[str] = []
     telemetry_asked: bool = False
+    # Minimal path (spec §3 B1): finish after picking one repo. The server
+    # creates a project named after the repo and records the skipped steps as
+    # deferred so the board's Finish-setup card can carry them.
+    minimal: bool = False
+    repo_path: str | None = None
+
+
+# The steps the minimal path skips, in the order the Finish-setup card lists them.
+DEFERRED_STEPS = ["docs", "integrations", "history", "rules"]
 
 
 def _read_onboarding(config) -> dict[str, Any]:
@@ -4776,12 +4785,55 @@ async def onboarding_complete(
         "repos": body.repos,
         "docs": body.docs,
     }
+    # Minimal path: finish after one repo. Create the project server-side (the
+    # frontend cannot build a repo-less project this way) and record the steps
+    # the user skipped so the board can offer them.
+    if body.minimal:
+        if not body.repo_path:
+            raise HTTPException(400, "minimal completion requires repo_path")
+        await _ensure_project_for_repo(_store(request), body.repo_path)
+        patch["deferred"] = list(DEFERRED_STEPS)
+        patch["repos"] = [str(Path(body.repo_path).expanduser().resolve())]
     # Sticky: once asked, never un-asked — a re-run of the wizard (via
     # onboarding/reset) must not resurrect the telemetry question.
     if body.telemetry_asked or prior.get("telemetry_asked"):
         patch["telemetry_asked"] = True
     ob = _persist_onboarding(config, patch)
     return {"ok": True, "onboarding": ob}
+
+
+async def _ensure_project_for_repo(store: Store, repo_path: str) -> None:
+    """Create a project named after the repo bound to it, unless one already
+    binds that repo. Reuses the same Project.new + store.create_project path as
+    the POST /api/projects endpoint (api_create_project)."""
+    resolved = str(Path(repo_path).expanduser().resolve())
+    existing = await store.list_projects()
+    if any(resolved in p.repo_paths for p in existing):
+        return
+    from ..project_model import Project
+    name = Path(resolved).name
+    proj = Project.new(name=name, repo_paths=[resolved], primary_repo=resolved)
+    try:
+        await store.create_project(proj)
+    except Exception as exc:  # noqa: BLE001
+        # A name collision (a different repo already owns this basename) is not
+        # fatal to onboarding — the user still gets to the board.
+        if "UNIQUE" not in str(exc):
+            raise
+
+
+@app.get("/api/onboarding/deferred")
+async def onboarding_deferred(request: Request) -> dict[str, Any]:
+    ob = _read_onboarding(request.app.state.config)
+    return {"deferred": list(ob.get("deferred") or [])}
+
+
+@app.post("/api/onboarding/deferred/{step}/done")
+async def onboarding_deferred_done(step: str, request: Request) -> dict[str, Any]:
+    config = request.app.state.config
+    remaining = [s for s in (_read_onboarding(config).get("deferred") or []) if s != step]
+    ob = _persist_onboarding(config, {"deferred": remaining})
+    return {"deferred": list(ob.get("deferred") or [])}
 
 
 @app.post("/api/onboarding/reset")

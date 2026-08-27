@@ -49,3 +49,25 @@ export function backDisabledReason({ index, lastIndex, busy }) {
     ? "Finishing setup — this last step can't be interrupted."
     : "";
 }
+
+// ── clickable step indicator (spec §3 B2) ────────────────────────────────────
+// A real user asked to jump between steps instead of clicking Back six times.
+// No step gates any other, so any step is reachable from any step — the only
+// thing that must not be interrupted is the terminal launch (busy on the last
+// step), and `busy` already covers that.
+
+/** True when clicking a step to jump to it is allowed. Every step is reachable;
+ *  the one exception is while an awaited call is in flight (`busy`), where a jump
+ *  would race the wizard's own state — matching the Back/Continue lock. */
+export function canJumpTo({ from, to, busy }) {
+  return !busy;
+}
+
+/** The accessible name for a step button: its title, its 1-based position, and
+ *  whether it is where you are, done, or still ahead. `total` is STEPS.length,
+ *  passed from the wizard so the label can say "of N". */
+export function stepButtonLabel(step, idx, current, total) {
+  const state = idx === current ? "current" : idx < current ? "completed" : "not started";
+  const of = total ? ` of ${total}` : "";
+  return `${step.title}, step ${idx + 1}${of}, ${state}`;
+}

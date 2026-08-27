@@ -366,6 +366,32 @@ async def test_the_ask_is_sticky_across_reset_and_re_complete(client, tmp_path):
     assert s.json()["telemetry_asked"] is True
 
 
+@pytest.fixture
+def tmp_repo(tmp_path):
+    return _seed_repo(tmp_path / "myrepo")
+
+
+@pytest.mark.asyncio
+async def test_minimal_complete_creates_project_named_after_repo_and_defers_rest(client, tmp_repo):
+    r = await client.post("/api/onboarding/complete", json={"completed": True, "minimal": True, "repo_path": str(tmp_repo)})
+    assert r.status_code == 200
+    projects = (await client.get("/api/projects")).json()
+    assert any(p["name"] == tmp_repo.name and str(tmp_repo) in p["repo_paths"] for p in projects)
+    assert (await client.get("/api/onboarding/deferred")).json()["deferred"] == ["docs", "integrations", "history", "rules"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_step_done_removes_it(client, tmp_repo):
+    await client.post("/api/onboarding/complete", json={"completed": True, "minimal": True, "repo_path": str(tmp_repo)})
+    await client.post("/api/onboarding/deferred/docs/done")
+    assert "docs" not in (await client.get("/api/onboarding/deferred")).json()["deferred"]
+
+
+@pytest.mark.asyncio
+async def test_minimal_without_repo_is_400(client):
+    assert (await client.post("/api/onboarding/complete", json={"completed": True, "minimal": True})).status_code == 400
+
+
 # --------------------------------------------------------------------------- #
 # GET /api/repos/discover — the typed-path replacement. The endpoint is bound  #
 # to the process's home, so these tests relocate HOME onto tmp_path rather     #

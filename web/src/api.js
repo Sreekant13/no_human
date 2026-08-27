@@ -687,6 +687,9 @@ export const extractHistory    = ()        => _post("/api/onboarding/history/ext
 export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/analyze", { days });
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
+// Minimal path (spec §3 B1): the deferred steps carried on the board's Finish-setup card.
+export const fetchDeferred     = ()        => _get("/api/onboarding/deferred");
+export const markDeferredDone  = (step)    => _post(`/api/onboarding/deferred/${encodeURIComponent(step)}/done`, {});
 export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
 export const getDocsJob        = (id)        => _get(`/api/onboarding/docs/jobs/${encodeURIComponent(id)}`);
 export const detectDocs        = (repo)      => _get(`/api/onboarding/docs/detect?repo=${encodeURIComponent(repo)}`);

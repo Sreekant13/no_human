@@ -79,6 +79,12 @@ for (const name of ["alpha-svc", "beta-web"]) {
 check("every Add button has an accessible name \"Add <repo name>\"", namedOk,
   `expected "Add alpha-svc" and "Add beta-web"`);
 
+// Tick a repo before moving on: a project seeded with no repos now blocks
+// Continue (spec §3 B2 validate-at-the-step), which would otherwise trap this
+// walk on the Projects step. Ticking one keeps the added project non-empty.
+await page.getByRole("button", { name: "Add alpha-svc" }).click();
+await page.waitForTimeout(150);
+
 // Walk Continues until the Projects step's heading renders (bounded): the
 // suite used to hardcode 3 Continues for a welcome->team->repos->projects
 // order, and the step list has changed shape once already (the team step is

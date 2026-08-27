@@ -87,6 +87,40 @@ export function unboundProjectsMessage(names) {
       `back to Projects and tick at least one repo for each, or remove them.`;
 }
 
+/** How many repos a definition binds, whether `repos` is a Set (the wizard's
+ *  live state) or a plain array (a server project shape). */
+function repoCount(pd) {
+  const r = pd && pd.repos;
+  if (!r) return 0;
+  return typeof r.size === "number" ? r.size : (r.length || 0);
+}
+
+/** The message that must block Continue on the Projects step (spec §3 B2), or
+ *  null when nothing blocks. Fires ONLY when a project EXISTS with zero repos —
+ *  the exact "Kika has no repos" case. NOT when there are no projects at all: a
+ *  repo-less run has nothing to tick, and the old gate that fired there
+ *  dead-ended those users (see the design note in Onboarding.jsx). Reuses
+ *  unboundProjectsMessage so the wording matches finish()'s refusal. */
+export function projectsBlockContinue(projects) {
+  const names = (projects || []).filter((p) => repoCount(p) === 0).map((p) => p.name);
+  return names.length ? unboundProjectsMessage(names) : null;
+}
+
+/** The Launch card's per-step readiness (spec §3 B2): one row per hard
+ *  requirement, each with the step index to jump to when it is unmet. A step
+ *  the user deferred (minimal path) is optional and omitted. */
+export function launchReadiness({ projects, selectedRepos, deferred = [] }) {
+  const repos = selectedRepos && typeof selectedRepos.size === "number"
+    ? selectedRepos.size : (selectedRepos ? selectedRepos.length : 0);
+  const rows = [
+    { step: "repos", jumpTo: 1, ok: repos > 0,
+      message: repos > 0 ? "" : "Pick at least one repository." },
+    { step: "projects", jumpTo: 2, ok: projectsBlockContinue(projects) === null,
+      message: projectsBlockContinue(projects) || "" },
+  ];
+  return rows.filter((r) => !deferred.includes(r.step));
+}
+
 /** The POST /api/projects body for one definition. `primary_repo` is always a
  *  repo the project binds; it is never omitted, so the server never has to fall
  *  back to "whichever one came first". */

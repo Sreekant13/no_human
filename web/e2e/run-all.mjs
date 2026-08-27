@@ -35,6 +35,8 @@ const SUITES = [
   ["onboarding a11y", "onboarding-a11y.mjs"],
   ["onboarding consent step", "onboarding-consent-step.mjs"],
   ["onboarding summary counts", "onboarding-summary-counts.mjs"],
+  ["onboarding minimal path", "onboarding-minimal-path.mjs"],
+  ["onboarding step nav", "onboarding-step-nav.mjs"],
   ["settings a11y", "settings-a11y.mjs"],
   ["settings account", "settings-account.mjs"],
   ["models pane", "models-pane.mjs"],

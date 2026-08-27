@@ -19,12 +19,16 @@ import {
   draftFrom, changedValues, listToText, readiness, setupSummary, secretHint,
   switchLabel, effectiveEnabled,
 } from "./integrationSetup.js";
-import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
+import {
+  backDisabled, backDisabledReason, forwardDisabled, canJumpTo, stepButtonLabel,
+} from "./onboardingNav.js";
+import { canStartMinimal } from "./onboardingMinimal.js";
 import { scanSummary } from "./onboardingHistory.js";
 import { summaryRepoCounts } from "./onboardingSummary.js";
 import {
   newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
   dropRepoEverywhere, unboundProjects, unboundProjectsMessage, projectPayload,
+  projectsBlockContinue, launchReadiness,
 } from "./onboardingProjects.js";
 
 // "Building your validator agent" — a T-800-style head that assembles itself
@@ -150,6 +154,10 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
   const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set, primary}]
   const [newProjName, setNewProjName] = useState("");
+  // Which project's "Pick repos" checklist is open (spec §3 B2). The picker lists
+  // ALL discovered repos, not only the ones ticked on the repos step, so a
+  // project with zero repos can be fixed here instead of dead-ending.
+  const [pickReposFor, setPickReposFor] = useState(null);
   const [history, setHistory] = useState(null);     // {available, transcripts}
   // The ANALYZE response. Separate from `history` (the extract probe) because
   // the result callout must describe the pass that actually ingested — see
@@ -206,6 +214,13 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   // Everything the nav predicates in onboardingNav.js need. Kept as one object so
   // the Back/Continue/launch controls cannot drift apart.
   const navState = { index: i, lastIndex: STEPS.length - 1, busy };
+  // The Projects step is the ONE place Continue is gated (spec §3 B2) — not
+  // because projects are required (they are not; see the empty-state note) but
+  // because a project that EXISTS with zero repos cannot be created and finish()
+  // would refuse it at the end. Caught on the step that shows it, not six clicks
+  // later. projectsBlockContinue fires ONLY on that case, never on "no projects".
+  const projectsBlockMsg = step.key === "projects" ? projectsBlockContinue(projectDefs) : null;
+  const continueBlocked = projectsBlockMsg !== null;
 
   // Advancing a step swaps the whole card underneath the user, and nothing moved focus
   // with it. Measured on the pre-change build, not assumed: the Continue button lives in
@@ -220,6 +235,20 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   // while the card's entire contents change. Moving focus into the card, labelled
   // "Step N of 9: <title>", announces the change once and puts the next Tab inside it.
   const cardRef = useRef(null);
+  // Roving-tabindex targets for the clickable step buttons (spec §3 B2): only the
+  // current step is tabbable; ArrowLeft/ArrowRight move focus between the rest.
+  const stepRefs = useRef([]);
+  function onStepKeyDown(e) {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    e.preventDefault();
+    // Move relative to the button that HAS focus, not the wizard's current step —
+    // roving focus walks the row, it doesn't teleport back to the active step.
+    const focused = stepRefs.current.indexOf(document.activeElement);
+    const from = focused === -1 ? i : focused;
+    const delta = e.key === "ArrowRight" ? 1 : -1;
+    const to = Math.min(STEPS.length - 1, Math.max(0, from + delta));
+    stepRefs.current[to]?.focus();
+  }
   // Compare the previous index rather than a "have we mounted" flag: <StrictMode>
   // (main.jsx) double-invokes effects on mount with refs preserved, so a boolean reads
   // as already-mounted on the second pass and steals focus on first paint in dev.
@@ -531,6 +560,21 @@ export default function Onboarding({ onComplete, askTelemetry }) {
     setProjectDefs(projectDefs.filter((_, i) => i !== projIdx));
   }
 
+  // The minimal path (spec §3 B1): end onboarding right after the Repositories
+  // step. The server creates a project named after the repo and records the
+  // remaining steps as deferred (POST with minimal:true) — so nothing is
+  // half-created here, and the board's FinishSetupCard picks up the rest.
+  async function startMinimal() {
+    await guard(async () => {
+      const repo_path = [...selectedRepos][0];
+      if (!repo_path) return;
+      await completeOnboarding({ completed: true, minimal: true, repo_path });
+      // Land on the board with the Finish-setup card (spec §3 B1) rather than
+      // popping the composer — the deferred steps are the point of this path.
+      onComplete({});
+    });
+  }
+
   async function finish() {
     await guard(async () => {
       // A project that binds no repo used to be dropped here silently, while
@@ -576,25 +620,28 @@ export default function Onboarding({ onComplete, askTelemetry }) {
             steps — the step headings are h2. Visually hidden: the visible headline is the
             step's own. */}
         <h1 className="sr-only">Set up no_human</h1>
-        <div className="ob-stepper" role="list" aria-label="Setup progress">
+        {/* Clickable step indicator (spec §3 B2): each step is a button that jumps
+            straight to that step — a real user asked not to click Back six times.
+            No step gates another (onboardingNav.js), so the only lock is `busy`
+            (the terminal launch). Roving tabIndex: only the current step is
+            tabbable; ArrowLeft/ArrowRight move focus. aria-current still marks
+            where you are; stepButtonLabel carries the state a screen reader needs. */}
+        <div className="ob-stepper" role="list" aria-label="Setup progress" onKeyDown={onStepKeyDown}>
           {STEPS.map((s, idx) => (
-            <div
-              key={s.key}
-              role="listitem"
-              // Position and state were carried only by colour and opacity, which say
-              // nothing to a screen reader. aria-current marks where you are; the
-              // hidden suffix says whether a step is finished or still ahead.
-              aria-current={idx === i ? "step" : undefined}
-              className={`ob-step${idx === i ? " current" : ""}${idx < i ? " done" : ""}`}
-            >
-              <span className="ob-step-dot" />
-              <span className="ob-step-label">{s.title}</span>
-              {/* Only the states aria-current does NOT already convey. Saying
-                  "(current step)" here too would make the current item announce its
-                  state twice. */}
-              {idx !== i && (
-                <span className="sr-only">{idx < i ? " (completed)" : " (not started)"}</span>
-              )}
+            <div key={s.key} role="listitem">
+              <button
+                type="button"
+                ref={(el) => { stepRefs.current[idx] = el; }}
+                aria-current={idx === i ? "step" : undefined}
+                aria-label={stepButtonLabel(s, idx, i, STEPS.length)}
+                tabIndex={idx === i ? 0 : -1}
+                disabled={!canJumpTo({ from: i, to: idx, busy })}
+                className={`ob-step${idx === i ? " current" : ""}${idx < i ? " done" : ""}`}
+                onClick={() => { if (canJumpTo({ from: i, to: idx, busy })) setI(idx); }}
+              >
+                <span className="ob-step-dot" />
+                <span className="ob-step-label">{s.title}</span>
+              </button>
             </div>
           ))}
         </div>
@@ -780,9 +827,17 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 <p className="ob-note">{discoveryMessage(discovery)}</p>
               )}
               {selectedRepos.size > 0 && (
-                <button className="ob-btn" disabled={busy} onClick={onboardSelected}>
-                  {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}
-                </button>
+                <div className="ob-row">
+                  <button className="ob-btn-ghost" disabled={busy} onClick={onboardSelected}>
+                    {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}
+                  </button>
+                  {/* Minimal path (spec §3 B1): a real user wanted to start after
+                      one repo instead of six more steps. The server creates the
+                      project and defers the rest; the board carries them. */}
+                  <button className="ob-btn ob-btn-go" disabled={busy || !canStartMinimal({ selectedRepos })} onClick={startMinimal}>
+                    {busy ? "Starting…" : "Start with this repo"}
+                  </button>
+                </div>
               )}
               <p className="ob-note">
                 Profiling reads each repo's own declarations to find its install/test/lint
@@ -816,16 +871,23 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                   <div className="ob-project-head">
                     <strong className="ph-no-capture">{pd.name}</strong>
                     <span className="ob-faint">{pd.repos.size} repo{pd.repos.size !== 1 ? "s" : ""}</span>
-                    <button className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }} aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
+                    {/* Pick repos over ALL discovered repos (spec §3 B2), not just
+                        the ones ticked on the repos step — a repo-less project has
+                        nothing to tick otherwise, which is the Kika dead-end. */}
+                    <button type="button" className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }}
+                            aria-expanded={pickReposFor === pi} onClick={() => setPickReposFor(pickReposFor === pi ? null : pi)}>Pick repos</button>
+                    <button className="ob-btn-ghost" style={{ fontSize: '0.75rem' }} aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
                   </div>
-                  <div className="ob-repolist ph-no-capture" style={{ maxHeight: '140px' }}>
-                    {[...selectedRepos].map((rp) => (
-                      <label key={rp} className={`ob-repo${pd.repos.has(rp) ? " sel" : ""}`} style={{ padding: '0.25rem 0.5rem' }}>
-                        <input type="checkbox" checked={pd.repos.has(rp)} onChange={() => toggleProjectRepo(pi, rp)} />
-                        <span className="ob-repo-name">{rp.split("/").pop()}</span>
-                      </label>
-                    ))}
-                  </div>
+                  {(pickReposFor === pi || pd.repos.size === 0) && (
+                    <div className="ob-repolist ph-no-capture" style={{ maxHeight: '140px' }}>
+                      {Array.from(new Set([...detected.map((r) => r.path), ...pd.repos])).map((rp) => (
+                        <label key={rp} className={`ob-repo${pd.repos.has(rp) ? " sel" : ""}`} style={{ padding: '0.25rem 0.5rem' }}>
+                          <input type="checkbox" checked={pd.repos.has(rp)} onChange={() => toggleProjectRepo(pi, rp)} />
+                          <span className="ob-repo-name">{rp.split("/").pop()}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
                   {/* Said here, next to the empty tick-list that causes it, and
                       again as a refusal at launch. The wizard used to print
                       "Projects 1" on the summary and create none. */}
@@ -853,6 +915,12 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                   )}
                 </div>
               ))}
+              {/* The refusal that disables Continue, said on this step rather than
+                  only at launch (spec §3 B2). Fires only for a project that exists
+                  with zero repos — never for "no projects", which is a valid state. */}
+              {projectsBlockMsg && (
+                <div className="ob-empty" role="status" style={{ marginTop: '0.6rem' }}>{projectsBlockMsg}</div>
+              )}
               <p className="ob-note">You can add or edit projects later in Settings. Repos not assigned to any project can still be used via the "other" option when creating a task.</p>
             </Stagger>
           )}
@@ -1104,6 +1172,24 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                   {" "}{readiness.needs_proving.length === 1 ? "has no" : "have no"} proven test command — the board will show you.
                 </p>
               )}
+              {/* Per-step readiness with a "Fix →" that jumps straight to the
+                  unmet step (spec §3 B2) — instead of the old "go Back to
+                  Repositories" prose that made the user count steps. */}
+              {(() => {
+                const rows = launchReadiness({ projects: projectDefs, selectedRepos, deferred: [] });
+                const unmet = rows.filter((r) => !r.ok);
+                if (!unmet.length) return null;
+                return (
+                  <ul className="ob-readiness">
+                    {unmet.map((r) => (
+                      <li key={r.step}>
+                        <span className="ob-readiness-msg">{r.message}</span>
+                        <button type="button" className="ob-btn-ghost ob-readiness-fix" onClick={() => setI(r.jumpTo)}>Fix →</button>
+                      </li>
+                    ))}
+                  </ul>
+                );
+              })()}
               <p className="ob-note">You can change any of this later in Settings.</p>
             </Stagger>
           )}
@@ -1158,7 +1244,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
           )}
           <div className="ob-nav-spacer" />
           {i < STEPS.length - 1 ? (
-            <button className="ob-btn" onClick={next} disabled={forwardDisabled(navState)}>Continue</button>
+            <button className="ob-btn" onClick={next} disabled={forwardDisabled(navState) || continueBlocked}>Continue</button>
           ) : (
             // Onboarding used to end on an empty board. When a repo is actually
             // ready, end on the thing the whole setup was for.

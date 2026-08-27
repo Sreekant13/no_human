@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
+import { backDisabled, backDisabledReason, forwardDisabled, canJumpTo, stepButtonLabel } from "./onboardingNav.js";
 
 // BUG (first external DMG tester): "the back button doesn't work" on the repos
 // step of onboarding.
@@ -85,6 +85,24 @@ test("the launch button keeps its lock while launching (unchanged behaviour)", (
   assert.equal(forwardDisabled({ index: LAST, lastIndex: LAST, busy: false }), false);
 });
 
+// ── clickable step indicator (spec §3 B2) ──────────────────────────────────
+
+test("any step is reachable from any other — no step gates another", () => {
+  assert.equal(canJumpTo({ from: 6, to: 1, busy: false }), true);
+  assert.equal(canJumpTo({ from: 0, to: LAST, busy: false }), true);
+});
+
+test("a jump is refused only while an awaited call is in flight", () => {
+  assert.equal(canJumpTo({ from: 6, to: 1, busy: true }), false);
+});
+
+test("the step button's accessible name carries title, position and state", () => {
+  const step = { key: "projects", title: "Projects" };
+  assert.equal(stepButtonLabel(step, 2, 0, 8), "Projects, step 3 of 8, not started");
+  assert.equal(stepButtonLabel(step, 2, 2, 8), "Projects, step 3 of 8, current");
+  assert.equal(stepButtonLabel(step, 2, 5, 8), "Projects, step 3 of 8, completed");
+});
+
 // ── the wiring: the predicates are what the buttons actually use ────────────
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -102,6 +120,17 @@ test("the wizard's STEPS list really has lastIndex 7, so these cases are the rea
   const steps = [...src.matchAll(/\{ key: "\w+",\s+title:/g)];
   assert.equal(steps.length - 1, LAST,
     "STEPS changed length — update LAST in this test so the launch case still tests the LAST step");
+});
+
+test("the step indicator renders BUTTONS that jump via setI, gated on canJumpTo", () => {
+  // Regression guard: the indicator was <div>s that only reflected state. spec §3
+  // B2 makes each a real button so a user can jump instead of clicking Back.
+  assert.match(src, /className=\{`ob-step[\s\S]*?onClick=\{\(\) => \{ if \(canJumpTo\(/,
+    "each step must be a button whose onClick jumps only when canJumpTo allows it");
+  assert.match(src, /aria-label=\{stepButtonLabel\(s, idx, i, STEPS\.length\)\}/,
+    "the button's accessible name must come from the tested label helper");
+  assert.match(src, /onKeyDown=\{onStepKeyDown\}/,
+    "the stepper must handle ArrowLeft/ArrowRight for roving focus");
 });
 
 test("Back's disabled rule comes from backDisabled, not from a raw `busy`", () => {
@@ -130,9 +159,13 @@ test("the explanation is RENDERED, not only a title= nobody can see", () => {
 });
 
 test("both forward controls delegate to forwardDisabled", () => {
-  const uses = [...NAV.matchAll(/disabled=\{forwardDisabled\(navState\)\}/g)];
-  assert.equal(uses.length, 2,
-    "Continue and the final launch button must both use the tested predicate");
+  // The launch button uses forwardDisabled alone; Continue additionally carries
+  // the Projects-step gate (spec §3 B2: `|| continueBlocked`) — but it still
+  // delegates to the tested predicate, never to a raw `busy`.
+  assert.match(NAV, /disabled=\{forwardDisabled\(navState\)\}>\s*\n?\s*\{busy \? "Launching…"/,
+    "the terminal launch button uses forwardDisabled alone");
+  assert.match(NAV, /disabled=\{forwardDisabled\(navState\) \|\| continueBlocked\}>Continue<\/button>/,
+    "Continue delegates to forwardDisabled and the tested projects gate");
   assert.doesNotMatch(NAV, /onClick=\{next\} disabled=\{busy\}/,
     "Continue must not be gated on the wizard-wide busy flag either");
 });

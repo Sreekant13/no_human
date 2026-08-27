@@ -1,0 +1,105 @@
+// Minimal onboarding path (spec §3 B1): tick one repo → "Start with this repo"
+// → the board shows a Finish-setup card carrying the four deferred steps, and
+// each "Done" removes its step. Mocked API, no :8420.
+import { chromium } from "playwright";
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+
+const DIST = new URL("../dist", import.meta.url).pathname;
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+const srv = http.createServer((q, r) => {
+  const u = q.url.split("?")[0];
+  let f = path.join(DIST, u === "/" ? "index.html" : u);
+  if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(DIST, "index.html");
+  r.writeHead(200, { "Content-Type": MIME[path.extname(f)] || "application/octet-stream" });
+  r.end(fs.readFileSync(f));
+});
+await new Promise((r) => srv.listen(4641, r));
+
+const failures = [];
+const check = (n, ok, d = "") => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${n}${d ? "  — " + d : ""}`);
+  if (!ok) failures.push(n);
+};
+
+const browser = await chromium.launch();
+const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+const page = await ctx.newPage();
+const errors = [];
+page.on("pageerror", (e) => errors.push(e.message));
+
+const hits = new Set();
+let deferred = ["docs", "integrations", "history", "rules"];
+await page.route("**/api/**", (route) => {
+  const req = route.request();
+  const u = req.url();
+  const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+  if (u.includes("/api/onboarding/status")) return j({ completed: false });
+  if (u.includes("/api/repos/discover")) {
+    const now = Math.floor(Date.now() / 1000);
+    return j({
+      repos: [
+        { path: "/Users/me/git/alpha-svc", name: "alpha-svc", is_git: true, branch: "main", dirty: false, dirty_scan: "complete", ecosystem: "python", mtime: now - 3600 },
+      ],
+      roots_scanned: ["/Users/me/git"], roots: ["/Users/me/git"],
+      roots_missing: [], roots_refused: [], refused: [], home_direct: 0,
+      total_found: 1, limit: 200, capped: false, walk_truncated: false, note: "", elapsed_ms: 3,
+    });
+  }
+  if (u.includes("/api/onboarding/complete")) { hits.add("complete"); return j({ ok: true, onboarding: { completed: true, deferred } }); }
+  if (u.includes("/api/onboarding/deferred/") && u.endsWith("/done")) {
+    const step = u.split("/api/onboarding/deferred/")[1].replace("/done", "");
+    hits.add(`done:${step}`);
+    deferred = deferred.filter((s) => s !== step);
+    return j({ deferred });
+  }
+  if (u.includes("/api/onboarding/deferred")) return j({ deferred });
+  if (u.includes("/api/tasks")) return j([]);
+  return j({});
+});
+await page.goto("http://127.0.0.1:4641/", { waitUntil: "networkidle" });
+await page.waitForTimeout(400);
+
+const cont = () => page.getByRole("button", { name: /^Continue$/ }).click();
+
+// Walk to the repos step.
+for (let hop = 0; hop < 6; hop++) {
+  if (await page.getByRole("heading", { name: /Which repositories do you work on/i })
+      .isVisible().catch(() => false)) break;
+  await cont(); await page.waitForTimeout(200);
+}
+await page.getByRole("button", { name: "Add alpha-svc" }).click();
+await page.waitForTimeout(200);
+
+const startBtn = page.getByRole("button", { name: /^Start with this repo$/ });
+check("'Start with this repo' appears once a repo is ticked",
+  await startBtn.isVisible().catch(() => false));
+await startBtn.click();
+await page.waitForTimeout(500);
+
+check("POST /api/onboarding/complete was called", hits.has("complete"));
+
+// The board now shows the Finish-setup card with the four deferred items.
+const card = page.getByText(/Finish setup — optional\. Each item opens in Settings\./);
+check("Finish-setup card rendered on the board",
+  await card.isVisible().catch(() => false));
+
+const openButtons = () => page.locator(".finish-setup-open");
+const before = await openButtons().count();
+check("card lists the four deferred items", before === 4, `saw ${before}`);
+
+// "Done" on the first item (docs) removes it and calls the API.
+await page.locator(".finish-setup-done").first().click();
+await page.waitForTimeout(300);
+check("clicking Done posted /deferred/docs/done", hits.has("done:docs"));
+const after = await openButtons().count();
+check("the dismissed item disappeared", after === 3, `saw ${after}`);
+
+check("no page errors during the minimal path", errors.length === 0, errors[0] || "");
+
+await ctx.close();
+await browser.close();
+srv.close();
+console.log(failures.length ? `\n${failures.length} FAILURE(S)` : "\nALL CHECKS PASSED");
+process.exit(failures.length ? 1 : 0);

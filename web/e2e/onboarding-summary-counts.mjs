@@ -36,7 +36,7 @@ async function rowValue(page, label) {
   return li.locator("b").innerText();
 }
 
-async function runScenario(browser, { name, repos, readiness, tick }) {
+async function runScenario(browser, { name, repos, readiness, tick, expectFix }) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await ctx.newPage();
   const errors = [];
@@ -84,6 +84,18 @@ async function runScenario(browser, { name, repos, readiness, tick }) {
   check(`[${name}] both rows agree on the repo count`,
     reposValue !== null && provenValue !== null && reposValue === provenValue.split(" of ")[1],
     `Repos="${reposValue}" vs proven="${provenValue}"`);
+  // Launch-card readiness rows (spec §3 B2): each unmet step shows a "Fix →"
+  // that jumps to it. A repo-less run has a "Fix →" for Repositories; a ticked
+  // run has none.
+  const fixButtons = page.getByRole("button", { name: /^Fix →$/ });
+  const fixCount = await fixButtons.count();
+  check(`[${name}] readiness Fix rows = ${expectFix}`, fixCount === expectFix, `saw ${fixCount}`);
+  if (expectFix > 0) {
+    await fixButtons.first().click();
+    await page.waitForTimeout(200);
+    check(`[${name}] Fix → jumped to the Repositories step`,
+      await page.getByRole("heading", { name: /Which repositories do you work on/i }).isVisible().catch(() => false));
+  }
   check(`[${name}] no page errors`, errors.length === 0, errors[0] || "");
 
   await ctx.close();
@@ -97,6 +109,7 @@ await runScenario(browser, {
   repos: [ONE_REPO],
   readiness: { total: 1, usable: 0, first_usable: null, needs_proving: [ONE_REPO.path] },
   tick: true,
+  expectFix: 0,
 });
 
 // Scenario 2 (the regression itself): repo persisted server-side (readiness
@@ -108,6 +121,7 @@ await runScenario(browser, {
   repos: [ONE_REPO],
   readiness: { total: 1, usable: 0, first_usable: null, needs_proving: [ONE_REPO.path] },
   tick: false,
+  expectFix: 1,
 });
 
 // Scenario 3: zero-repo control.
@@ -116,6 +130,7 @@ await runScenario(browser, {
   repos: [],
   readiness: { total: 0, usable: 0, first_usable: null, needs_proving: [] },
   tick: false,
+  expectFix: 1,
 });
 
 await browser.close();
