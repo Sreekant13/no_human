@@ -230,6 +230,9 @@ jobs:
             --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs \
             --deselect tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees
 
+      - name: Context files under load limits
+        run: python scripts/check_context_files.py --claude CLAUDE.md
+
   web:
     name: Web board
     runs-on: ubuntu-latest
