@@ -247,7 +247,7 @@ Divergence only where an OS convention forces it. Everything else is shared.
 | 4 | The graceful stop escalates immediately on an OS liveness check | **[verified]** an un-forced `taskkill` CANNOT terminate a console process: Windows answers *"This process can only be terminated forcefully (with /F option)"*. There is no grace period actually elapsing, so waiting the caller's 10s grace would add a 10-second hang to every quit and still send exactly the same `/F` |
 | 5 | The escalation trigger is a liveness probe, not the message text | `taskkill` exits **128** for BOTH "not found" and "could not terminate" **[verified]**, so the exit code cannot distinguish them, and the message is localised — a German or Japanese Windows would defeat any text match. `process.kill(pid, 0)` is language-independent **[verified]** |
 | 6 | `resolveNhBin` reads `env.PATH` instead of spawning `where.exe` | The macOS login-shell trick exists because a GUI app inherits launchd's PATH and genuinely cannot see the user's. A Windows GUI process DOES inherit the user PATH, so there is nothing to recover — and reading `env` is deterministic and unit-testable, which `where.exe` (which consults the live process PATH, ignoring the injected `env`) could not be |
-| 7 | `spawn(..., { windowsHide: true })` | `nh` is a console-subsystem binary and `detached` gives a detached child its own console, so without this a black console window appears beside the app and stays for the server's whole life |
+| 7 | `spawn(..., spawnOptionsFor(process.platform))` — win32 gets `{ detached: false, windowsHide: true }` | Covers **nh's OWN console only**. `nh` is a console-subsystem binary; on win32 `detached: true` mapped to `DETACHED_PROCESS`, which makes Windows IGNORE `CREATE_NO_WINDOW` (what `windowsHide` sets) — nh then had no console and every console-subsystem grandchild (`claude.exe`, `git.exe`) got its own visible one. Dropping `detached` on win32 lets `windowsHide` apply and the hidden console is inherited. This row's earlier claim — that `windowsHide` alone hid the console — was the defect; see `desktop/server.mjs` `spawnOptionsFor`. The grandchild-console count is a separate check that requires a running task: **§5.4** (NOT YET RUN on Windows) |
 | 8 | `.ico` and `.icns` are both DERIVED, neither committed | Both are build outputs of `packaging/derive-icons.mjs`, generated at package time from `web/public/nh-mark-512.png` (the brief's `mark-dark` PNGs are **not in this repo** — verified, no file matching `mark-dark*` exists anywhere in the tree). `.icns` needs `sips`/`iconutil`, so it's macOS-only; `.ico` is dependency-free Node and runs on every platform. `packaging/make-win-icon.ps1` (deriving `.ico` from `.icns`) still exists as a Windows-native fallback for a box with no Node, but is superseded as the actual build path |
 | 9 | Neither icon is git-tracked any more | `.gitignore` ignores `desktop/build/*` with no carve-out for either icon (the earlier `icon.icns` force-add is gone). `electron-builder.config.cjs` refuses to load (`process.exit(1)`) if a fresh icon isn't already on disk, so a build that skipped derivation fails loudly instead of silently shipping Electron's stock atom icon |
 | 10 | Install directory is `no-human-desktop`, not `no_human` | electron-builder derives the per-user install directory from package `name`, while `productName` drives the app and registry display name. Cosmetic, recorded so it is not mistaken for a mis-install. The registry entry reads `no_human 0.1.0` |
@@ -606,6 +606,31 @@ liveness, it does not fabricate activity. Advisories never affect the exit code.
 | `tasklist` after quit | `INFO: No tasks are running which match the specified criteria.` for both images |
 | Uninstall (`/S`) | install dir removed, registry entry removed, Start Menu shortcut removed |
 | User data | `~/.no_human` **preserved** — correct; an uninstall must not delete the operator's config and task history |
+
+**Grandchild consoles while a task runs — the step the table above never
+exercised.** The rows above start the server and quit; they never add a task, so
+the console-subsystem *grandchildren* nh spawns (`claude.exe`, `codex.exe`,
+`git.exe`) were never on screen when the count was taken. That gap is exactly
+where two real users saw "multiple empty claude terminals on top of other
+screens". The verification is:
+
+1. Launch the app **from Explorer** (double-click the shortcut), NOT from a
+   terminal — a terminal-launched `nh` lends its own console to every child and
+   masks the bug.
+2. Add a task and let it reach the coder/reviewer stage so `claude.exe` (or
+   `codex.exe`) is actually running.
+3. While it runs: `tasklist /v | findstr /i "claude codex cmd"`.
+4. Count the **visible** console windows on screen: **expected 0**. Before this
+   fix (`detached: true` on win32, which makes Windows ignore `CREATE_NO_WINDOW`)
+   there was **one empty `claude.exe` console per coder/reviewer session**, plus
+   a brief flash from the SDK's `claude -v` probe.
+
+**NOT YET RUN.** This step gates the 0.1.6 Windows walk and has not been executed
+on a Windows machine. The fix rests on the libuv + Microsoft mechanism (see
+`docs/superpowers/plans/2026-08-26-windows-console-popups-root-cause.md`) and on
+the unit tests in `desktop/server.test.mjs` / `tests/test_proc.py`; the decisive
+console-count repro above is what actually establishes the pop-ups are gone, and
+until it runs the fix is "mechanism-verified", not "confirmed on Windows".
 
 ### 5.5 Signing and SmartScreen — stated honestly
 
