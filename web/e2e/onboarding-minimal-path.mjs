@@ -1,4 +1,4 @@
-// Minimal onboarding path (spec §3 B1): tick one repo → "Start with this repo"
+// Minimal onboarding path (spec §3 B1): tick one repo → "Skip setup — open the board"
 // → the board shows a Finish-setup card carrying the four deferred steps, and
 // each "Done" removes its step. Mocked API, no :8420.
 import { chromium } from "playwright";
@@ -72,8 +72,8 @@ for (let hop = 0; hop < 6; hop++) {
 await page.getByRole("button", { name: "Add alpha-svc" }).click();
 await page.waitForTimeout(200);
 
-const startBtn = page.getByRole("button", { name: /^Start with this repo$/ });
-check("'Start with this repo' appears once a repo is ticked",
+const startBtn = page.getByRole("button", { name: /^Skip setup — open the board$/ });
+check("'Skip setup — open the board' appears once a repo is ticked",
   await startBtn.isVisible().catch(() => false));
 await startBtn.click();
 await page.waitForTimeout(500);

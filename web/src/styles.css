@@ -5392,6 +5392,11 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .ob-input:focus { border-color: var(--accent-500); box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent-500) 22%, transparent); }
 .ob-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+/* Minimal-path footer: primary "Profile" beside a secondary "Skip setup"
+   button that stacks its own one-line hint underneath. */
+.ob-minimal-row { align-items: flex-start; }
+.ob-minimal-skip { display: flex; flex-direction: column; gap: 4px; }
+.ob-minimal-hint { margin-top: 0; }
 .ob-row .ob-input { flex: 1; }
 .ob-listedit { display: flex; flex-direction: column; gap: 4px; }
 .ob-add { align-self: flex-start; margin-top: 4px; }

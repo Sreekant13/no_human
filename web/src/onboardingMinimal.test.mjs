@@ -27,9 +27,12 @@ test("deferred items keep the server's order and drop unknown keys", () => {
 // ── wiring ──────────────────────────────────────────────────────────────────
 const here = fileURLToPath(new URL(".", import.meta.url));
 
-test("the repos step footer really offers 'Start with this repo', gated on canStartMinimal", () => {
+test("the repos step footer offers a self-explanatory skip-setup button, gated on canStartMinimal", () => {
   const src = readFileSync(here + "Onboarding.jsx", "utf8");
-  assert.match(src, /Start with this repo/);
+  // Copy must say it ENDS setup now — the old "Start with this repo" gave no
+  // hint that it finished onboarding and confused a real user.
+  assert.match(src, /Skip setup — open the board/);
+  assert.match(src, /add integrations, docs &amp; rules later from Settings/);
   assert.match(src, /canStartMinimal\(/);
 });
 

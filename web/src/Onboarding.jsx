@@ -871,16 +871,23 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 <p className="ob-note">{discoveryMessage(discovery)}</p>
               )}
               {selectedRepos.size > 0 && (
-                <div className="ob-row">
-                  <button className="ob-btn-ghost" disabled={busy} onClick={onboardSelected}>
+                <div className="ob-row ob-minimal-row">
+                  {/* Profiling is the primary path forward — highlighted. */}
+                  <button className="ob-btn" disabled={busy} onClick={onboardSelected}>
                     {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}
                   </button>
                   {/* Minimal path (spec §3 B1): a real user wanted to start after
                       one repo instead of six more steps. The server creates the
-                      project and defers the rest; the board carries them. */}
-                  <button className="ob-btn ob-btn-go" disabled={busy || !canStartMinimal({ selectedRepos })} onClick={startMinimal}>
-                    {busy ? "Starting…" : "Start with this repo"}
-                  </button>
+                      project and defers the rest; the board carries them. Kept
+                      visually SECONDARY (ghost) with copy that says it ENDS setup
+                      now — the old "Start with this repo" gave no such hint and
+                      read as a mystery that finished onboarding. */}
+                  <div className="ob-minimal-skip">
+                    <button className="ob-btn-ghost" disabled={busy || !canStartMinimal({ selectedRepos })} onClick={startMinimal}>
+                      {busy ? "Starting…" : "Skip setup — open the board"}
+                    </button>
+                    <span className="ob-note ob-minimal-hint">Uses this repo; add integrations, docs &amp; rules later from Settings.</span>
+                  </div>
                 </div>
               )}
               <p className="ob-note">
