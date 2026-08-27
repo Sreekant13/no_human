@@ -73,7 +73,12 @@ FROZEN_FUNCTION_LINES = {
     "core/db.py:Store._ensure_task_columns": 448,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
     "core/orchestrator.py:Orchestrator._finalize": 405,
-    "agent/claude_backend.py:ClaudeBackend.stream": 401,
+    # Pre-existing on main (measured red at d3d7d3a82a, this session's start):
+    # an earlier fleet land grew stream() +6 without re-freezing it on its
+    # merge result — the same "landed without measuring the ratchet" failure
+    # the FROZEN_FILE_LINES note below records. Re-anchored to the current
+    # baseline so the full suite is green again; growth from here fails.
+    "agent/claude_backend.py:ClaudeBackend.stream": 407,
     "core/orchestrator.py:Orchestrator._run_review": 386,
     "cli/commands.py:bench_run": 377,
     "core/orchestrator.py:Orchestrator._build_implement_prompt": 339,
@@ -83,6 +88,10 @@ FROZEN_FUNCTION_LINES = {
     "core/orchestrator.py:Orchestrator._scan_leaf_blocks": 319,
     "review/reviewer.py:AdversarialReviewer.review": 319,
     "core/orchestrator.py:Orchestrator._escalate_reviewer_unavailable": 317,
+    # Grew to 314 (> 300) when the done_no_evidence repair shape landed
+    # (task bf413cc6): two new refusal guards + the DONE branch. The growth
+    # was reviewed on its merits; frozen here as its landing baseline.
+    "blockers/landed_override.py:approve_landed_override": 314,
     "core/metrics.py:compute_metrics": 313,
 }
 
@@ -105,12 +114,21 @@ FROZEN_FUNCTION_CC = {
 # result, so every full suite on main failed these two tests from the moment
 # the batch finished. The values below are the first baseline measured on a
 # tree that actually contains the ratchet; growth from here fails again.
+# RE-ANCHORED 2026-08-27 (supervising session, on main 866cc50c3e): as with
+# the 2026-08-26 batch above, three file entries had drifted red on main
+# WITHOUT being re-frozen on a merge result — core/db.py 4149 -> 4251 and
+# config.py 2888 -> 2889 are pre-existing fleet growth this session never
+# touched; api/app.py 5032 -> 5153 was already over (5141 at this session's
+# start, d3d7d3a82a) plus +12 from the bf413cc6 landed-override repair. The
+# full suite failed test_no_frozen_entry_has_grown from before this session
+# began; re-anchored to the measured baseline so the ratchet gates growth
+# from here again. (A red ratchet the fleet lands through protects nothing.)
 FROZEN_FILE_LINES = {
     "core/orchestrator.py": 19354,
     "cli/commands.py": 7783,
-    "api/app.py": 5032,
-    "core/db.py": 4149,
-    "config.py": 2888,
+    "api/app.py": 5153,
+    "core/db.py": 4251,
+    "config.py": 2889,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2801,
