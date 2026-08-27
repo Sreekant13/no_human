@@ -26,11 +26,7 @@ import { chromium } from "playwright";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import {
-  TELEMETRY_CONSENT_QUESTION,
-  CONSENT_YES_LABEL,
-  CONSENT_NO_LABEL,
-} from "../src/onboardingConsent.js";
+import { TELEMETRY_CONSENT_QUESTION } from "../src/onboardingConsent.js";
 
 const DIST = new URL("../dist", import.meta.url).pathname;
 
@@ -100,68 +96,50 @@ const cont = async (page) => {
 
 const browser = await chromium.launch();
 
-// --- Scenario A: never asked -------------------------------------------
-{
-  const { ctx, page } = await newPage(browser, { completed: false, telemetry_asked: false });
+// The usage-insights CONSENT step was REMOVED (operator, 2026-08-26): telemetry
+// is on by default and never asked about. So NO onboarding-status payload may
+// ever produce a "usage insights" rail entry, and the rail is always the fixed
+// 8 base steps — this suite proves the step is gone in the real built bundle.
+const STATUSES = [
+  ["never asked",              { completed: false, telemetry_asked: false }],
+  ["telemetry_asked absent",   { completed: false }],
+  ["already asked",            { completed: false, telemetry_asked: true }],
+];
+
+for (const [name, status] of STATUSES) {
+  const { ctx, page } = await newPage(browser, status);
   const labels = await railLabels(page);
-  check("consent step is offered when the install has never been asked", labels.includes("usage insights"),
+  check(`[${name}] no "usage insights" step in the rail`, !labels.includes("usage insights"),
     `rail labels: ${JSON.stringify(labels)}`);
-  check("[A] rail entry count = BASE_STEPS + 1 (9)", labels.length === BASE_STEPS_COUNT + 1,
+  check(`[${name}] rail entry count = BASE_STEPS (8)`, labels.length === BASE_STEPS_COUNT,
     `got ${labels.length}`);
   await ctx.close();
 }
 
-// --- Scenario A': telemetry_asked key absent entirely (old server) -----
-{
-  const { ctx, page } = await newPage(browser, { completed: false });
-  const labels = await railLabels(page);
-  check("consent step is offered when telemetry_asked is absent entirely", labels.includes("usage insights"),
-    `rail labels: ${JSON.stringify(labels)}`);
-  await ctx.close();
-}
-
-// --- Scenario A question/buttons: walk to the insights step ------------
+// The consent question/heading must appear nowhere in a full walk, and the walk
+// must still reach Launch (a vacuous "never seen" from a walk that died early
+// would be a false pass — so we assert BOTH, in the same walk).
 {
   const { ctx, page } = await newPage(browser, { completed: false, telemetry_asked: false });
-  let reached = false;
-  for (let hop = 0; hop < 12; hop++) {
-    if (await page.getByRole("heading", { name: /^Usage insights$/i }).isVisible().catch(() => false)) {
-      reached = true;
-      break;
-    }
-    await cont(page);
-  }
-  // exact:true — "No" is a case-insensitive SUBSTRING match by default, and
-  // also matches the unrelated "Enter no_human" launch button.
-  check("the consent question and both answer buttons render on the insights step",
-    reached &&
-      (await page.getByText(TELEMETRY_CONSENT_QUESTION).isVisible().catch(() => false)) &&
-      (await page.getByRole("button", { name: CONSENT_NO_LABEL, exact: true }).isVisible().catch(() => false)) &&
-      (await page.getByRole("button", { name: CONSENT_YES_LABEL, exact: true }).isVisible().catch(() => false)),
-    reached ? "" : "never reached the Usage insights step within 12 Continues");
-  await ctx.close();
-}
-
-// --- Scenario B: already asked ------------------------------------------
-{
-  const { ctx, page } = await newPage(browser, { completed: false, telemetry_asked: true });
-  const labels = await railLabels(page);
-  check("consent step is NOT offered once telemetry_asked is true", !labels.includes("usage insights"),
-    `rail labels: ${JSON.stringify(labels)}`);
-  check("[B] rail entry count = BASE_STEPS (8)", labels.length === BASE_STEPS_COUNT, `got ${labels.length}`);
-
-  // Vacuous-pass guard: "insights never seen" must not be true merely
-  // because the walk died at step 2 — prove it actually reaches Launch.
+  let sawInsights = false;
   let reachedLaunch = false;
   for (let hop = 0; hop < 12; hop++) {
+    if (await page.getByRole("heading", { name: /^Usage insights$/i }).isVisible().catch(() => false)) {
+      sawInsights = true;
+    }
     if (await page.getByText("Repos with a proven test command").isVisible().catch(() => false)) {
       reachedLaunch = true;
       break;
     }
     await cont(page);
   }
-  check("the already-asked walk still reaches Launch", reachedLaunch,
+  check("the walk reaches Launch (so the 'no insights' result is not vacuous)", reachedLaunch,
     reachedLaunch ? "" : "walk died before reaching the Launch/summary step");
+  check("the Usage insights consent step is never shown during a full walk", !sawInsights,
+    sawInsights ? "the removed consent step reappeared" : "");
+  // The consent copy string must not appear on any step either.
+  check("the consent question text is absent from the wizard",
+    !(await page.getByText(TELEMETRY_CONSENT_QUESTION).isVisible().catch(() => false)));
   await ctx.close();
 }
 

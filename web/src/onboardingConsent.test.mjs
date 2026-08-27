@@ -118,131 +118,64 @@ test("no dark patterns in the button copy", () => {
   assert.doesNotMatch(CONSENT_YES_LABEL, /accept|agree|allow all/i);
 });
 
-// ── the wiring: Onboarding.jsx actually renders this, once, after Launch ───
+// ── the wiring: the consent STEP is REMOVED from the wizard (2026-08-26) ────
+// Telemetry is on by default and no longer asked about. The onboardingConsent.js
+// MODULE is retained — its copy constants are the byte-identical twin of
+// config.py's, pinned by tests/test_telemetry.py, and the privacy policy still
+// names usage insights — but Onboarding.jsx must render no step, ask no consent,
+// and mention usage insights nowhere. These tests guard that the step stays out.
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const jsx = readFileSync(here + "Onboarding.jsx", "utf8");
 const api = readFileSync(here + "api.js", "utf8");
 
-test("the insights step is appended after the existing 8 steps, not spliced in", () => {
+test("the 8 base steps are untouched and nothing is appended after summary", () => {
   const base = jsx.match(/const BASE_STEPS = \[([\s\S]*?)\n\];/);
-  assert.ok(base, "the original 8-step list must still exist, untouched, as its own array");
+  assert.ok(base, "the original 8-step list must still exist as its own array");
   const keys = [...base[1].matchAll(/key: "(\w+)"/g)].map((m) => m[1]);
   assert.deepEqual(
     keys,
     ["welcome", "repos", "projects", "docs", "integrations", "history", "rules", "summary"],
     "the existing 8 steps must not be reordered or renamed",
   );
+  assert.match(jsx, /const STEPS = BASE_STEPS;/,
+    "STEPS must be exactly BASE_STEPS — no conditional insights append");
+  assert.doesNotMatch(jsx, /INSIGHTS_STEP/, "the INSIGHTS_STEP literal must be gone");
+});
+
+test("Onboarding takes no askTelemetry prop and holds no consent state", () => {
   assert.match(
     jsx,
-    /const INSIGHTS_STEP = \{[^}]*key: "insights"[^}]*\}/,
-    "a distinct insights step must be defined",
+    /export default function Onboarding\(\{ onComplete \}\)/,
+    "Onboarding must take only onComplete — the askTelemetry gate is gone",
   );
-  assert.match(
-    jsx,
-    /askTelemetry \? \[\.\.\.BASE_STEPS, INSIGHTS_STEP\] : BASE_STEPS/,
-    "insights must be appended after the 8, and only conditionally on askTelemetry",
-  );
+  assert.doesNotMatch(jsx, /const \[consent, setConsent\]/,
+    "the consent state belonged to the removed step and must not remain");
 });
 
-test("the step renders only for an install that has never been asked", () => {
-  assert.match(
-    jsx,
-    /export default function Onboarding\(\{ onComplete, askTelemetry \}\)/,
-    "the decision must come from a prop, not be recomputed inside the component",
-  );
+test("no usage-insights step or copy is rendered anywhere in the wizard", () => {
+  assert.doesNotMatch(jsx, /step\.key === "insights"/, "no insights step block may render");
+  assert.doesNotMatch(jsx, /Usage insights/, "the wizard UI must not mention Usage insights");
+  assert.doesNotMatch(jsx, /TELEMETRY_CONSENT_QUESTION/, "the consent question must not be printed");
+  assert.doesNotMatch(jsx, /CONSENT_YES_LABEL|CONSENT_NO_LABEL/, "the Yes/No consent buttons must be gone");
 });
 
-test("Yes is the pre-selected default, matching the product's on-by-default (opt-out) telemetry", () => {
-  assert.match(
-    jsx,
-    /const \[consent, setConsent\] = useState\(true\)/,
-    "consent state must default to true (Yes/on) — insights are opt-out",
-  );
-});
-
-test("the insights step prints the pinned copy and offers No / Yes", () => {
-  const start = jsx.indexOf('{step.key === "insights" &&');
-  assert.ok(start > 0, "the insights step block must exist");
-  const end = jsx.indexOf("{err &&", start);
-  assert.ok(end > start, "could not bound the insights step");
-  const block = jsx.slice(start, end);
-
-  assert.match(block, /\{TELEMETRY_CONSENT_QUESTION\}/, "must print the pinned question, not inline text");
-  assert.match(block, /\{TELEMETRY_CONSENT_SETTINGS_HINT\}/, "must print the pinned settings hint, not inline text");
-
-  assert.doesNotMatch(
-    block,
-    /type="checkbox"/,
-    "no pre-checked (or any) checkbox — this is a plain two-button choice",
-  );
-
-  // Yes is now the highlighted/default control (ob-btn, the primary-button
-  // class used elsewhere for Continue), matching the opt-out default; No is the
-  // secondary ob-btn-ghost. Static per-role classes, not swapped on click, so
-  // this assertion is reliable without a renderer.
-  const noBtn = block.match(/<button[^>]*onClick=\{\(\) => setConsent\(false\)\}[^>]*>/s)
-    || block.match(/className="ob-btn-ghost"[\s\S]*?onClick=\{\(\) => setConsent\(false\)\}/);
-  assert.ok(noBtn, "No button must exist and set consent to false");
-  assert.match(block, /className="ob-btn"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(true\)\}/,
-    "Yes must carry the highlighted/default button class");
-  assert.match(block, /className="ob-btn-ghost"[\s\S]{0,80}?onClick=\{\(\) => setConsent\(false\)\}/,
-    "No must carry the secondary button class, not the default one");
-
-  assert.doesNotMatch(block, /autoFocus/, "neither button should steal focus into a nag");
-});
-
-test("no new CSS classes were introduced for the step", () => {
-  const start = jsx.indexOf('{step.key === "insights" &&');
-  const end = jsx.indexOf("{err &&", start);
-  const block = jsx.slice(start, end);
-  const classNames = [...block.matchAll(/className="([^"]+)"/g)].map((m) => m[1]);
-  for (const c of classNames) {
-    for (const cls of c.split(" ")) {
-      assert.match(
-        cls,
-        /^ob-(btn|btn-ghost|h2|note|row|nav-spacer)$/,
-        `unexpected new class "${cls}" — reuse the wizard's existing classes only`,
-      );
-    }
-  }
-});
-
-test("the wizard reuses api.js's consent call — no new write path", () => {
-  assert.match(jsx, /saveTelemetryConsent/, "must import the existing wrapper");
-  assert.doesNotMatch(
-    jsx,
-    /fetch\(.*telemetry\/consent/,
-    "must not talk to the endpoint directly, bypassing api.js",
-  );
+test("the wizard no longer imports or calls the consent write path", () => {
+  assert.doesNotMatch(jsx, /submitConsent/, "the removed step's submitConsent call must be gone");
+  assert.doesNotMatch(jsx, /saveTelemetryConsent/, "the wizard must not call the consent wrapper anymore");
+  // The endpoint itself is untouched — still defined once in api.js for the
+  // retained Settings-side / hosted uses, never duplicated.
   const hits = [...api.matchAll(/\/api\/telemetry\/consent/g)];
-  assert.equal(hits.length, 1, "api.js must still define the endpoint exactly once — no new path added");
+  assert.equal(hits.length, 1, "api.js must still define the consent endpoint exactly once");
 });
 
-test("a telemetry failure cannot block completeOnboarding", () => {
+test("finish() completes onboarding without a telemetry_asked field", () => {
   const start = jsx.indexOf("async function finish()");
   assert.ok(start > 0);
   const end = jsx.indexOf("\n  }\n", start);
   const body = jsx.slice(start, end);
-  const consentIdx = body.indexOf("submitConsent(");
-  const completeIdx = body.indexOf("completeOnboarding(");
-  assert.ok(consentIdx > 0 && completeIdx > consentIdx,
-    "consent must be resolved (success or swallowed failure) before completeOnboarding runs");
-  // submitConsent's own contract (proven above) is that it never throws — a
-  // rejected saveTelemetryConsent is caught internally and still resolves.
-  // So the only thing this call site needs to get right is NOT wrapping the
-  // await in a try/catch that could re-throw past it.
-  assert.doesNotMatch(
-    body.slice(consentIdx - 40, consentIdx),
-    /try\s*\{\s*$/,
-    "finish() must not re-wrap submitConsent in a try that could re-throw its result",
-  );
-});
-
-test("completeOnboarding only carries telemetry_asked when the step actually ran", () => {
-  assert.match(
-    jsx,
-    /\.\.\.\(askTelemetry \? \{ telemetry_asked: c\.telemetryAsked \} : \{\}\)/,
-    "an already-asked install must not resend telemetry_asked and re-trigger persistence",
-  );
+  assert.match(body, /completeOnboarding\(/, "finish() must still complete onboarding");
+  assert.doesNotMatch(body, /telemetry_asked/,
+    "no telemetry_asked is written — the wizard never asks, so it never records an answer");
+  assert.doesNotMatch(body, /submitConsent/, "finish() must not resolve any consent");
 });

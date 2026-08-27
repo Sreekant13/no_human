@@ -24,15 +24,16 @@ test("the Config section is gone: no ConfigPanel, no config entry in the section
   assert.doesNotMatch(settingsJsx, /label:\s*["']Config["']/);
 });
 
-test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Usage insights, Updates", () => {
+test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Updates", () => {
   // The name used to claim "exactly" while only checking presence, so adding a
   // section quietly made the title a lie. Both directions are asserted now:
   // every expected label is there, and the list holds nothing else.
-  // "Usage insights" is the opt-out telemetry consent panel (telemetry.js).
+  // "Usage insights" was REMOVED from the nav (operator, 2026-08-26): telemetry
+  // is on by default and no longer surfaced in the UI, so the pane is gone.
   // "Models" is the model-picker pane (part 3 of 3): one row per role, fed by
   // GET /api/models — see modelsPanelView.test.mjs.
   const expected = ["Projects", "Rules", "Skills", "Learnings", "Integrations",
-                    "Models", "Account", "Usage insights", "Updates"];
+                    "Models", "Account", "Updates"];
   for (const label of expected) {
     assert.match(settingsJsx, new RegExp(`label:\\s*["']${label}["']`), `missing section: ${label}`);
   }

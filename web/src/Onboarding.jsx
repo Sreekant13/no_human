@@ -4,13 +4,9 @@ import {
   confirmRules, completeOnboarding, suggestPaths, createProject,
   generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
   testIntegration,
-  proveRepoSSE, confirmRepoProfile, fetchReadiness, saveTelemetryConsent,
+  proveRepoSSE, confirmRepoProfile, fetchReadiness,
 } from "./api.js";
 import { shouldPoll, nextJobState } from "./wikiJobs.js";
-import {
-  TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT,
-  CONSENT_YES_LABEL, CONSENT_NO_LABEL, submitConsent,
-} from "./onboardingConsent.js";
 import { repoBadges, discoveryMessage, ambiguousNames, rowName } from "./discoveredRepos.js";
 import { optionValue } from "./pathSuggest.js";
 import { splitRecent, relativeMtime, debounce } from "./repoRecency.js";
@@ -133,25 +129,17 @@ const BASE_STEPS = [
   { key: "summary",  title: "Launch" },
 ];
 
-// Appended after "summary" only for an install that has never been asked
-// (Onboarding's `askTelemetry` prop) — see onboardingConsent.js for why the
-// decision logic lives outside this component. Property order is swapped
-// (title before key) so this literal does not join the STEPS count that
-// onboardingNav.test.mjs pins against BASE_STEPS's fixed 8 entries.
-const INSIGHTS_STEP = { title: "Usage insights", key: "insights" };
-
+// Telemetry ships ON by default and is no longer asked about in onboarding —
+// the operator's 2026-08-26 decision removed the consent step entirely
+// (telemetry.enabled ships True; it is inert without an endpoint, and the
+// endpoint ships empty, so nothing leaves the machine). There is therefore no
+// consent step, no consent state, and no telemetry mention in this wizard's UI.
+// The privacy-policy/docs mention stays; only the UI mention goes.
 export const repoName = (p) => (p || "").replace(/\/+$/, "").split("/").pop() || p;
 
-export default function Onboarding({ onComplete, askTelemetry }) {
+export default function Onboarding({ onComplete }) {
   const [i, setI] = useState(0);
-  // Default ON (opt-out) — matches the product default (telemetry.enabled: True).
-  // The user can still turn it off on the insights step; an explicit No is
-  // persisted (submitConsent), because the server default is now enabled.
-  const [consent, setConsent] = useState(true);
-  const STEPS = useMemo(
-    () => (askTelemetry ? [...BASE_STEPS, INSIGHTS_STEP] : BASE_STEPS),
-    [askTelemetry]
-  );
+  const STEPS = BASE_STEPS;
   const [root, setRoot] = useState("");
   // The folder a manual "Search another folder" run actually scanned, so the
   // empty/searching state can name it ("" = the initial home+roots auto-scan).
@@ -626,17 +614,10 @@ export default function Onboarding({ onComplete, askTelemetry }) {
           if (!e.message.includes("already exists")) throw e;
         }
       }
-      // A telemetry failure must never block the launch — submitConsent
-      // swallows it and still reports the step as asked.
-      const c = await submitConsent(askTelemetry ? consent : null, {
-        saveTelemetryConsent,
-        onError: (e) => setErr(String(e?.message ?? e)),
-      });
       await completeOnboarding({
         // team stays null on the free tier — the upgrade onboarding owns it.
         team: null,
         repos: [...selectedRepos],
-        ...(askTelemetry ? { telemetry_asked: c.telemetryAsked } : {}),
       });
       // Hand the ready repo up so the app can open the composer on it instead
       // of dropping the user onto an empty board.
@@ -1264,37 +1245,6 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 );
               })()}
               <p className="ob-note">You can change any of this later in Settings.</p>
-            </Stagger>
-          )}
-
-          {step.key === "insights" && (
-            <Stagger>
-              <h2 className="ob-h2">Usage insights</h2>
-              <p className="ob-note">{TELEMETRY_CONSENT_QUESTION}</p>
-              <p className="ob-note">{TELEMETRY_CONSENT_SETTINGS_HINT}</p>
-              <div className="ob-nav-spacer" />
-              <div className="ob-row">
-                {/* Yes is the highlighted/default choice — ob-btn (primary),
-                    matching the opt-out default (insights ON). No is ob-btn-ghost
-                    (secondary), the visible way to turn it off. Static classes,
-                    not swapped on click: aria-pressed carries the live selection. */}
-                <button
-                  type="button"
-                  className="ob-btn-ghost"
-                  aria-pressed={consent === false}
-                  onClick={() => setConsent(false)}
-                >
-                  {CONSENT_NO_LABEL}
-                </button>
-                <button
-                  type="button"
-                  className="ob-btn"
-                  aria-pressed={consent === true}
-                  onClick={() => setConsent(true)}
-                >
-                  {CONSENT_YES_LABEL}
-                </button>
-              </div>
             </Stagger>
           )}
 

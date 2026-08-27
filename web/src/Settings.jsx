@@ -39,9 +39,11 @@ const SECTIONS = [
   { key: "integrations", label: "Integrations" },
   { key: "models",    label: "Models" },
   { key: "account",   label: "Account" },
-  { key: "insights",  label: "Usage insights" },
   { key: "updates",   label: "Updates" },
 ];
+// Usage insights (telemetry) is ON by default and no longer surfaced in the UI
+// (operator decision, 2026-08-26): the consent pane was dropped from the nav so
+// nothing here mentions it. UsageInsightsPanel is kept below but unrendered.
 
 // The Updates panel. All of the decision-making lives in updateNotice.js so it
 // can be tested without a renderer; this component only renders the result and
@@ -497,7 +499,6 @@ export default function SettingsOverlay({ onClose, initialTab }) {
             {section === "integrations" && <IntegrationsPanel />}
             {section === "models"      && <ModelsPanel />}
             {section === "account"     && <AuthPanel />}
-            {section === "insights"    && <UsageInsightsPanel />}
             {section === "updates"     && <UpdatesPanel />}
           </div>
         </div>

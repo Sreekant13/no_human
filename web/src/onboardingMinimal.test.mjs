@@ -24,7 +24,7 @@ test("deferred items name the settings pane", () => {
 test("every deferred item resolves to a real Settings pane", () => {
   // The four steps the minimal path can defer. None may keep a tab that
   // Settings.jsx has no pane for, or the deep-link falls back to Projects.
-  const PANES = new Set(["projects", "rules", "skills", "learnings", "integrations", "models", "account", "insights", "updates"]);
+  const PANES = new Set(["projects", "rules", "skills", "learnings", "integrations", "models", "account", "updates"]);
   for (const it of deferredItems(["docs", "integrations", "history", "rules"])) {
     assert.ok(PANES.has(it.tab), `${it.key} → ${it.tab} is not a Settings pane`);
   }
