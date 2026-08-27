@@ -375,6 +375,18 @@ export function classifyBackendFailure(text) {
  * kill target — the pidfile belongs to the operator and is never consulted
  * for killing (design rule from the plan; an attached server is not ours).
  */
+// Windows: `detached` maps to DETACHED_PROCESS, and Windows IGNORES
+// CREATE_NO_WINDOW (what windowsHide sets) when DETACHED_PROCESS is present.
+// nh.exe then has no console at all, and every console-subsystem grandchild —
+// claude.exe, codex.exe, git.exe, npm — is allocated a fresh VISIBLE console.
+// Real users saw "multiple empty claude terminals on top of other screens".
+// Not detached + windowsHide gives nh one hidden console that all descendants
+// inherit. stopServer never relied on a group on Windows (it walks the tree
+// with taskkill /T — see stopServer/windowsStopTree), so nothing is lost.
+export function spawnOptionsFor(platform) {
+  return { detached: platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] };
+}
+
 export async function ensureServer({
   origin = DEFAULT_ORIGIN,
   // Widened from 20000: a cold start of the PyInstaller-frozen `nh` was measured
@@ -417,15 +429,12 @@ export async function ensureServer({
   // `node --test`), and a referenced pipe would otherwise keep the event loop
   // alive waiting on it.
   const capture = makeOutputCapture();
-  const child = spawn(bin, nhArgs, {
-    env: spawnEnv, detached: true, stdio: ["ignore", "pipe", "pipe"],
-    // Windows only, and ignored elsewhere. `nh` is a CONSOLE-subsystem binary,
-    // and `detached` on Windows gives a detached child its own console — so
-    // without this a black console window appears beside the app on every
-    // launch and stays for the server's whole life. It does not affect what is
-    // captured: stdout/stderr are piped above, not written to that console.
-    windowsHide: true,
-  });
+  // `nh` is a CONSOLE-subsystem binary. Per-platform spawn options (detached +
+  // windowsHide) come from spawnOptionsFor: POSIX keeps its own process group so
+  // stopServer can take the workers down; win32 drops detached so windowsHide's
+  // CREATE_NO_WINDOW is honoured and no console appears. windowsHide does not
+  // affect capture — stdout/stderr are piped above, not written to any console.
+  const child = spawn(bin, nhArgs, { env: spawnEnv, ...spawnOptionsFor(process.platform) });
   child.unref();
   for (const stream of [child.stdout, child.stderr]) {
     if (!stream) continue;

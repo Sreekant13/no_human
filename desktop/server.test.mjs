@@ -7,7 +7,7 @@ import test from "node:test";
 
 import {
   classifyBackendFailure, configuredPort, isAppOrigin, makeOutputCapture,
-  probe, tailDetail, waitForServer,
+  probe, spawnOptionsFor, tailDetail, waitForServer,
 } from "./server.mjs";
 
 function serve(handler) {
@@ -406,6 +406,14 @@ test("taskkillArgs: /T always, /F only for SIGKILL", () => {
     "the graceful form must still take the TREE, or workers outlive the app");
   // The pid is stringified — execFile rejects a number argument outright.
   assert.equal(typeof taskkillArgs(1234, "SIGKILL").at(-1), "string");
+});
+
+test("win32 spawn is NOT detached: DETACHED_PROCESS makes Windows ignore CREATE_NO_WINDOW, so every console grandchild (claude.exe, git.exe) would get its own visible empty console", () => {
+  const win = spawnOptionsFor("win32");
+  assert.equal(win.detached, false);
+  assert.equal(win.windowsHide, true);
+  const posix = spawnOptionsFor("darwin");
+  assert.equal(posix.detached, true, "POSIX keeps the process group — stopServer kills the group");
 });
 
 test("ensureServer: the spawned server inherits the widened PATH",
