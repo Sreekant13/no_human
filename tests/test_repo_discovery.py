@@ -69,6 +69,44 @@ def _by_name(result) -> dict[str, dict]:
     return {r["name"]: r for r in result["repos"]}
 
 
+@pytest.fixture
+def fake_home(tmp_path):
+    home = tmp_path / "home"
+    (home / "git").mkdir(parents=True)
+    return home
+
+
+# --------------------------------------------------------------------------- #
+# Home is a depth-1 root; rows carry mtime; root= scans one folder             #
+# --------------------------------------------------------------------------- #
+
+def test_repos_directly_under_home_are_found(fake_home):
+    _fake_repo(fake_home / "ai-realtime")   # HEAD is the evidence _is_repo needs
+    out = discover_repos(home=fake_home)
+    assert any(r["path"].endswith("ai-realtime") for r in out["repos"]) and out["home_direct"] == 1
+def test_rows_carry_mtime_and_sort_newest_first(fake_home):
+    old, new = fake_home / "git" / "old", fake_home / "git" / "new"
+    for p in (old, new): (p / ".git").mkdir(parents=True); (p / ".git" / "HEAD").write_text("ref")
+    os.utime(old / ".git" / "HEAD", (1_000, 1_000)); os.utime(new / ".git" / "HEAD", (2_000, 2_000))
+    names = [r["name"] for r in discover_repos(home=fake_home)["repos"]]
+    assert names.index("new") < names.index("old")
+def test_root_param_scans_only_that_root(fake_home):
+    _fake_repo(fake_home / "git" / "a"); _fake_repo(fake_home / "elsewhere" / "b")
+    out = discover_repos(home=fake_home, root=str(fake_home / "elsewhere"))
+    assert [r["name"] for r in out["repos"]] == ["b"] and out["roots"] == [str(fake_home / "elsewhere")]
+def test_root_outside_home_is_refused(fake_home, tmp_path):
+    out = discover_repos(home=fake_home, root=str(tmp_path / "x"))
+    assert out["repos"] == [] and out["refused"]
+def test_home_scan_never_enters_protected_dirs(fake_home, monkeypatch):
+    touched = []
+    real = Path.iterdir
+    def spy(self): touched.append(str(self)); return real(self)
+    monkeypatch.setattr(Path, "iterdir", spy)
+    (fake_home / "Documents" / "secret" / ".git").mkdir(parents=True)
+    discover_repos(home=fake_home)
+    assert not any(t.endswith("/Documents") or "/Documents/" in t for t in touched)
+
+
 # --------------------------------------------------------------------------- #
 # Roots                                                                        #
 # --------------------------------------------------------------------------- #
@@ -349,9 +387,13 @@ def test_an_uncapped_result_says_so(tmp_path):
     assert res["limit"] == DEFAULT_MAX_RESULTS
 
 
-def test_results_are_sorted_by_name_for_a_stable_list(tmp_path):
+def test_results_are_sorted_by_name_when_mtime_ties(tmp_path):
+    # The primary sort key is mtime desc; name.lower() is the tiebreaker. Pin
+    # every .git/HEAD to the same mtime so this exercises the tiebreaker, which
+    # keeps the list stable when recency does not separate the repos.
     for n in ("zeta", "alpha", "Mid"):
         _fake_repo(tmp_path / "git" / n)
+        os.utime(tmp_path / "git" / n / ".git" / "HEAD", (5_000, 5_000))
     names = [r["name"] for r in discover_repos(home=tmp_path)["repos"]]
     assert names == ["alpha", "Mid", "zeta"]
 

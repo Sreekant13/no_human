@@ -65,6 +65,15 @@ DEFAULT_MAX_DEPTH = 3
 #: response carries a note instead of quietly dropping the tail.
 DEFAULT_MAX_RESULTS = 200
 
+#: Direct children of ``home`` the home-root scan never enters. These are the
+#: macOS TCC-guarded folders (Documents/Desktop/Downloads and the media dirs) —
+#: stat-ing ``.git`` inside them is what raised the "wants to access" prompt
+#: during setup — plus ``Library``, which holds no repos worth the walk. Home is
+#: a depth-1 root precisely so a user whose repos sit directly under ``~`` is
+#: found without descending into any of these.
+PROTECTED_HOME_DIRS = ("Desktop", "Documents", "Downloads", "Library",
+                       "Pictures", "Movies", "Music")
+
 #: Never entered. Hidden directories are skipped by name as well, so ``.venv``
 #: and ``.tox`` are covered twice over — the explicit names document intent.
 EXCLUDED_DIRS = frozenset({
@@ -288,6 +297,28 @@ def _head_info(repo: Path) -> tuple[str, bool]:
     return "", False
 
 
+def _mtime(repo: Path) -> float | None:
+    """Recency of a repo, read off git's own metadata — no subprocess.
+
+    The newest mtime among ``.git/HEAD``, ``.git/index`` and ``.git/FETCH_HEAD``
+    that exist: HEAD moves on commit/checkout, index on ``git add``, FETCH_HEAD
+    on fetch/pull, so the max tracks "last touched" better than any one alone.
+    None when the repo has no readable git dir — those rows sort last.
+    """
+    gd = _git_dir(repo)
+    if gd is None:
+        return None
+    times: list[float] = []
+    for name in ("HEAD", "index", "FETCH_HEAD"):
+        p = gd / name
+        try:
+            if p.exists():
+                times.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times) if times else None
+
+
 def _git_status(repo: Path, untracked: str, timeout: float) -> str | None:
     """``git status --porcelain`` output, or None when it could not be read.
 
@@ -334,6 +365,7 @@ def _describe_cheap(repo: Path, deadline: float) -> dict[str, Any]:
         "dirty": False,
         "dirty_scan": "not-a-repo",
         "ecosystem": _quick_ecosystem(repo),
+        "mtime": _mtime(repo) if is_git else None,
     }
     if not is_git:
         return row
@@ -378,12 +410,17 @@ def _untracked_pass(rows: list[dict[str, Any]], deadline: float) -> None:
 
 
 def _walk(root: Path, home: Path, max_depth: int, ceiling: int,
-          found: list[Path], deadline: float) -> bool:
+          found: list[Path], deadline: float,
+          skip: frozenset[str] = frozenset()) -> bool:
     """Collect candidate project directories under ``root``, depth-bounded.
 
     Returns True if the wall-clock ``deadline`` cut the walk short — the caller
     reports that rather than passing a truncated list off as a complete one.
     Whatever was found before the cut is kept.
+
+    ``skip`` names are never entered — used for the home root, whose direct
+    children include the macOS TCC-guarded dirs (:data:`PROTECTED_HOME_DIRS`)
+    that must not be stat-ed at all.
     """
     truncated = False
 
@@ -415,7 +452,7 @@ def _walk(root: Path, home: Path, max_depth: int, ceiling: int,
                 is_link = e.is_symlink()
             except OSError:
                 continue
-            if e.name.startswith(".") or e.name in EXCLUDED_DIRS:
+            if e.name.startswith(".") or e.name in EXCLUDED_DIRS or e.name in skip:
                 continue
             child = Path(e.path)
             if is_link:
@@ -439,14 +476,26 @@ def discover_repos(
     extra_roots: Iterable[str] | None = None,
     max_depth: int = DEFAULT_MAX_DEPTH,
     max_results: int = DEFAULT_MAX_RESULTS,
+    root: str | None = None,
 ) -> dict[str, Any]:
     """Scan the conventional clone roots and return a pickable repository list.
 
     Returns a JSON-ready dict: ``repos`` (path/name/is_git/branch/dirty/
-    detached/ecosystem), the roots actually scanned, missing and refused, the
-    cap state, ``walk_truncated`` (the walk ran out of wall clock, so some
-    folders were never reached), a human-readable ``note`` covering both of
-    those, and ``elapsed_ms``.
+    detached/ecosystem/``mtime``), the roots actually scanned, missing and
+    refused, the cap state, ``walk_truncated`` (the walk ran out of wall clock,
+    so some folders were never reached), a human-readable ``note`` covering both
+    of those, ``home_direct`` (repos found directly under ``home``) and
+    ``elapsed_ms``. Rows sort newest-first by ``mtime`` (None last), then name.
+
+    ``home`` itself is a depth-1 root — the common case of repos cloned straight
+    under ``~`` — scanned without descending into :data:`PROTECTED_HOME_DIRS`
+    (the macOS TCC-guarded folders) so setup never triggers an access prompt.
+
+    ``root``: when given, ONLY that single folder is scanned (still at
+    ``max_depth`` and under the same containment check as ``extra_roots`` — a
+    ``root`` resolving outside ``home`` is refused, not scanned), and the
+    conventional/home roots are skipped. This is the "type a folder to scan it"
+    path.
 
     It does not raise on anything it merely cannot read. An unreadable
     directory, a dead symlink or a root that vanished mid-scan is skipped and
@@ -460,50 +509,15 @@ def discover_repos(
     missing: list[str] = []
     refused: list[str] = []
 
-    candidate_roots: list[Path] = []
-    # Case-sensitive filesystems (Linux) keep ``~/code`` and ``~/Code`` apart;
-    # APFS and NTFS fold them, which is why the list above only ever needed one
-    # spelling. Measured on a real Ubuntu 24.04 desktop (2026-08-18): a user's
-    # ``~/code/calc`` was invisible to the scan. So every on-disk case variant
-    # of a conventional name is a root, and the canonical spelling stands in
-    # only when no variant exists (so ``roots_missing`` still names it).
-    # On a folding filesystem the variants collapse to one real directory, and
-    # ``seen`` keeps it from being scanned twice.
-    try:
-        by_fold: dict[str, list[Path]] = {}
-        for entry in home_path.iterdir():
-            try:
-                if entry.is_dir():
-                    by_fold.setdefault(entry.name.lower(), []).append(entry)
-            except OSError:
-                continue
-    except OSError:
-        by_fold = {}
-    seen: set[Path] = set()
-    for name in CONVENTIONAL_ROOTS:
-        for root in sorted(by_fold.get(name.lower()) or [home_path / name]):
-            # The conventional roots were the ONE path built without this
-            # check, and `~/Code -> /Volumes/BigDisk/code` is an ordinary
-            # setup - so the walk left home through the front door while
-            # refusing every side entrance. Report the link, not just its
-            # target: "/Volumes/BigDisk" on its own does not tell the user
-            # which of their folders did it.
-            target = _resolved(root)
-            if target in seen:
-                continue
-            seen.add(target)
-            if target != root and not _is_within(target, home_path):
-                refused.append(f"{root} -> {target}")
-                continue
-            candidate_roots.append(root)
+    def _contain(text: str) -> Path | None:
+        """Resolve a caller-supplied root and refuse it if it escapes ``home``.
 
-    for raw in extra_roots or []:
-        if not str(raw).strip():
-            continue
-        # "~" means the home this scan is bound to, not the process's home.
-        # Anything else would let a configured "~/work" reach outside the
-        # boundary every other line of this function is defending.
-        text = str(raw).strip()
+        ``~``/``~/`` mean the home this scan is bound to, not the process's
+        home — anything else would let configured text reach outside the
+        boundary every other line here defends. Returns None (and records the
+        refusal) for a root that resolves outside ``home``.
+        """
+        text = text.strip()
         if text == "~":
             p = home_path
         elif text.startswith("~/"):
@@ -513,23 +527,87 @@ def discover_repos(
         p = _resolved(p)
         if not _is_within(p, home_path):
             refused.append(str(p))
-            continue
-        if p not in candidate_roots:
-            candidate_roots.append(p)
+            return None
+        return p
+
+    protected = frozenset(PROTECTED_HOME_DIRS)
+    # (root, depth, skip-names, report-in-roots_scanned).
+    walk_specs: list[tuple[Path, int, frozenset[str], bool]] = []
+
+    if root is not None:
+        # "Type a folder to scan it": ONLY that root, still contained in home,
+        # conventional and home roots skipped.
+        p = _contain(str(root))
+        if p is not None:
+            walk_specs.append((p, max_depth, frozenset(), True))
+    else:
+        candidate_roots: list[Path] = []
+        # Case-sensitive filesystems (Linux) keep ``~/code`` and ``~/Code``
+        # apart; APFS and NTFS fold them, which is why the list above only ever
+        # needed one spelling. Measured on a real Ubuntu 24.04 desktop
+        # (2026-08-18): a user's ``~/code/calc`` was invisible to the scan. So
+        # every on-disk case variant of a conventional name is a root, and the
+        # canonical spelling stands in only when no variant exists (so
+        # ``roots_missing`` still names it). On a folding filesystem the variants
+        # collapse to one real directory, and ``seen`` keeps it from being
+        # scanned twice.
+        try:
+            by_fold: dict[str, list[Path]] = {}
+            for entry in home_path.iterdir():
+                try:
+                    if entry.is_dir():
+                        by_fold.setdefault(entry.name.lower(), []).append(entry)
+                except OSError:
+                    continue
+        except OSError:
+            by_fold = {}
+        seen: set[Path] = set()
+        for name in CONVENTIONAL_ROOTS:
+            for cr in sorted(by_fold.get(name.lower()) or [home_path / name]):
+                # The conventional roots were the ONE path built without this
+                # check, and `~/Code -> /Volumes/BigDisk/code` is an ordinary
+                # setup - so the walk left home through the front door while
+                # refusing every side entrance. Report the link, not just its
+                # target: "/Volumes/BigDisk" on its own does not tell the user
+                # which of their folders did it.
+                target = _resolved(cr)
+                if target in seen:
+                    continue
+                seen.add(target)
+                if target != cr and not _is_within(target, home_path):
+                    refused.append(f"{cr} -> {target}")
+                    continue
+                candidate_roots.append(cr)
+
+        for raw in extra_roots or []:
+            if not str(raw).strip():
+                continue
+            p = _contain(str(raw))
+            if p is not None and p not in candidate_roots:
+                candidate_roots.append(p)
+
+        walk_specs = [(cr, max_depth, frozenset(), True) for cr in candidate_roots]
+        # Home itself is a depth-1 root — repos cloned straight under ~, the
+        # case a user with dozens of them saw zero results for. Not reported in
+        # ``roots_scanned`` (``home_direct`` carries the count); its protected
+        # children are never entered, so setup raises no macOS access prompt.
+        walk_specs.append((home_path, 1, protected, False))
 
     ceiling = max(max_results * 5, 1000)
     found: list[Path] = []
     walk_deadline = time.monotonic() + WALK_BUDGET_S
     walk_truncated = False
-    for root in candidate_roots:
+    for wroot, wdepth, wskip, wreport in walk_specs:
         if time.monotonic() >= walk_deadline:
             walk_truncated = True
             break
-        if not _is_dir(root):
-            missing.append(str(root))
+        if not _is_dir(wroot):
+            if wreport:
+                missing.append(str(wroot))
             continue
-        scanned.append(str(root))
-        if _walk(root, home_path, max_depth, ceiling, found, walk_deadline):
+        if wreport:
+            scanned.append(str(wroot))
+        if _walk(wroot, home_path, wdepth, ceiling, found, walk_deadline, wskip):
             walk_truncated = True
 
     # Dedupe on the RESOLVED path: `Projects/alias -> Projects/plain` is one
@@ -541,7 +619,13 @@ def discover_repos(
         prev = by_real.get(key)
         if prev is None or (prev != key and p == key):
             by_real[key] = p
-    unique = sorted(by_real.values(), key=lambda p: (p.name.lower(), str(p)))
+    # Newest first: a user opens the picker to reach the repo they were just in,
+    # not the alphabetically-first one. mtime is None for non-git rows (they
+    # sort last); name.lower() then path break ties for a stable list.
+    mtimes = {p: _mtime(p) for p in by_real.values()}
+    unique = sorted(by_real.values(),
+                    key=lambda p: (-(mtimes[p] or 0), p.name.lower(), str(p)))
+    home_direct = sum(1 for p in unique if p.parent == home_path)
     total = len(unique)
     capped = total > max_results
     shown = unique[:max_results]
@@ -570,6 +654,11 @@ def discover_repos(
         "roots_scanned": scanned,
         "roots_missing": missing,
         "roots_refused": refused,
+        # Short aliases the wizard reads (the sub-heading lists the roots it
+        # scanned, and a refused root becomes an inline warning).
+        "roots": scanned,
+        "refused": refused,
+        "home_direct": home_direct,
         "total_found": total,
         "limit": max_results,
         "capped": capped,
