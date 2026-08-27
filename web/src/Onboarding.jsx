@@ -744,11 +744,14 @@ export default function Onboarding({ onComplete, askTelemetry }) {
             <Stagger>
               <h2 className="ob-h2">Which repositories do you work on?</h2>
               <p className="ob-sub">
+                {/* Home is ALWAYS searched at depth 1 (that is how repos directly
+                    under $HOME are found — carried by discovery.home_direct, never
+                    in roots_scanned), so say so: a user with repos under $HOME saw
+                    only "…/git" and thought home was skipped. Name the roots, don't
+                    count them — a count once read as "broken page" (wrong directory). */}
                 {discovery?.roots_scanned?.length
-                  // Name the roots, don't count them — a count once read as
-                  // "broken page" when the real story was "wrong directory".
-                  ? `Found by searching ${discovery.roots_scanned.join(", ")}.`
-                  : "Searching the usual places people keep their clones."}
+                  ? `Searched your home folder and ${discovery.roots_scanned.join(", ")}.`
+                  : "Searched your home folder and the usual clone roots (~/git, ~/code, …)."}
               </p>
               <div className="ob-row">
                 <button className="ob-btn-ghost" disabled={busy}
