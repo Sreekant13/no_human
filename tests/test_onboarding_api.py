@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import types
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -48,29 +49,80 @@ async def test_status_initially_incomplete(client):
 
 
 @pytest.mark.asyncio
-async def test_detect_repos_bounded(client, tmp_path):
-    # Two repos at different depths + a non-repo dir.
-    (tmp_path / "proj-a" / ".git").mkdir(parents=True)
-    (tmp_path / "proj-a" / "package.json").write_text('{"scripts":{"test":"x"}}')
-    (tmp_path / "nested" / "proj-b" / ".git").mkdir(parents=True)
-    (tmp_path / "nested" / "proj-b" / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
-    (tmp_path / "not-a-repo").mkdir()
+async def test_discover_root_param_bounded(client, tmp_path, monkeypatch):
+    """The typed-a-folder path: ``?root=`` scans ONLY that folder and still
+    obeys ``max_results``. Replaces the retired POST /repos/detect scan."""
+    home = tmp_path / "home"
+    for i in range(6):
+        _seed_repo(home / "scan" / f"r{i}")
+    _seed_repo(home / "other" / "elsewhere")   # a repo under a DIFFERENT root
+    monkeypatch.setenv("HOME", str(home))
 
-    r = await client.post("/api/onboarding/repos/detect", json={"root": str(tmp_path)})
-    assert r.status_code == 200
-    repos = r.json()["repos"]
-    names = {x["name"]: x["ecosystem"] for x in repos}
-    assert "proj-a" in names and names["proj-a"] == "node"
-    assert "proj-b" in names and names["proj-b"] == "python"
-    assert "not-a-repo" not in names
+    r = await client.get("/api/repos/discover",
+                         params={"root": str(home / "scan"), "limit": 2})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["repos"]) == 2
+    assert body["capped"] is True and body["total_found"] == 6
+    # Only the named root is scanned — the repo under home/other is never seen.
+    assert body["roots"] == [str(home / "scan")]
 
 
 @pytest.mark.asyncio
-async def test_detect_missing_root(client, tmp_path):
-    r = await client.post("/api/onboarding/repos/detect", json={"root": str(tmp_path / "nope")})
+async def test_discover_root_missing_is_refused(client, tmp_path, monkeypatch):
+    """A ``?root=`` that resolves outside the home this endpoint is bound to is
+    refused, not scanned — the same containment the extra roots get."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_repo(tmp_path / "outside" / "secret")
+    monkeypatch.setenv("HOME", str(home))
+
+    r = await client.get("/api/repos/discover",
+                         params={"root": str(tmp_path / "outside")})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["repos"] == [] and body["refused"]
+
+
+@pytest.mark.asyncio
+async def test_detect_route_is_gone(client, tmp_path):
+    """The second, unbounded, alphabetical scanner is retired: the POST handler
+    no longer exists, so the request falls through to the SPA catch-all
+    (``GET /{path:path}``) and answers 405 Method Not Allowed — the same "gone"
+    signal the approve-gate paths rely on (app.py, "reach the SPA catch-all
+    ... and answer 405"). It is emphatically NOT a 200 with a repo list.
+    """
+    r = await client.post("/api/onboarding/repos/detect", json={"root": str(tmp_path)})
+    assert r.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_suggest_never_stats_git_under_home(client, tmp_path, monkeypatch):
+    """The macOS-TCC fix: /fs/suggest used to stat ``<dir>/.git`` on every
+    listed folder to badge it "git repo", and doing that inside Documents/
+    Desktop is what raised the "wants to access" prompt DURING setup. The
+    rewrite lists names via iterdir only — no ``.git`` stat at all — and never
+    lists the protected dirs when the base is home.
+    """
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    (home / "myrepo" / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    seen: list[str] = []
+    real = Path.exists
+    def spy(self):
+        seen.append(str(self))
+        return real(self)
+    monkeypatch.setattr(Path, "exists", spy)
+
+    r = await client.get("/api/fs/suggest", params={"path": str(home) + "/"})
     assert r.status_code == 200
-    assert r.json()["repos"] == []
-    assert "not a directory" in r.json()["error"]
+    names = {s["name"] for s in r.json()["suggestions"]}
+    assert "myrepo" in names
+    assert "Documents" not in names, "protected home dirs must not be listed"
+    assert not any(s.endswith("/.git") for s in seen), \
+        f"suggest must not stat any .git under home: {[s for s in seen if s.endswith('/.git')]}"
 
 
 @pytest.mark.asyncio

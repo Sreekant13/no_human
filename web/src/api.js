@@ -609,17 +609,22 @@ export async function fetchOnboardingStatus() {
   if (!r.ok) throw new Error(`GET onboarding/status → ${r.status}`);
   return r.json();
 }
-export const detectRepos       = (root)    => _post("/api/onboarding/repos/detect", { root });
-
-// Auto-discovery over the conventional clone roots. No body and no root
-// parameter by design (see the endpoint's docstring): the scan is bound to the
-// user's home, so a plain GET is the whole request.
-export const discoverRepos = async (limit) => {
-  const qs = limit ? `?limit=${encodeURIComponent(limit)}` : "";
-  const r = await fetch(`${BASE}/api/repos/discover${qs}`);
+// Auto-discovery over home + the conventional clone roots. `root` scans just
+// that one folder (still refused server-side if it escapes home); `limit` caps
+// the rows. Both optional — a plain `discoverRepos()` is the default scan.
+export const discoverRepos = async ({ root, limit } = {}) => {
+  const qs = new URLSearchParams();
+  if (limit) qs.set("limit", limit);
+  if (root)  qs.set("root", root);
+  const q = qs.toString();
+  const r = await fetch(`${BASE}/api/repos/discover${q ? `?${q}` : ""}`);
   if (!r.ok) throw new Error(`GET repos/discover → ${r.status}`);
   return r.json();
 };
+
+// The old single-root POST /repos/detect was retired (it 404s now); this is a
+// thin shim over the one scanner so callers passing a folder path keep working.
+export const detectRepos       = (root)    => discoverRepos({ root });
 
 export const onboardRepo       = (repo_path) => _post("/api/onboarding/repos/onboard", { repo_path });
 

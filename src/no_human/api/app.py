@@ -4251,9 +4251,6 @@ async def linear_issue_detail_endpoint(key: str, request: Request) -> TrackerIss
 # about EVIDENCE, not about unblocking anyone.                                 #
 # --------------------------------------------------------------------------- #
 
-class RepoDetectRequest(BaseModel):
-    root: str | None = None  # defaults to ~/git
-
 class RepoOnboardRequest(BaseModel):
     repo_path: str
 
@@ -4309,47 +4306,20 @@ def _persist_onboarding(config, patch: dict[str, Any]) -> dict[str, Any]:
     return ob
 
 
-def _find_git_repos(root: Path, *, max_depth: int = 7, limit: int = 500) -> list[Path]:
-    """Bounded scan for git repos under `root` (don't descend into a repo, cap
-    depth + count so a huge tree can't hang the request)."""
-    found: list[Path] = []
-
-    def walk(d: Path, depth: int) -> None:
-        if depth > max_depth or len(found) >= limit:
-            return
-        if (d / ".git").exists():
-            found.append(d)
-            return  # a repo is a leaf — don't descend
-        try:
-            entries = sorted(p for p in d.iterdir() if p.is_dir())
-        except OSError:
-            return
-        for e in entries:
-            if e.name.startswith("."):
-                continue
-            walk(e, depth + 1)
-
-    walk(root, 0)
-    return found
-
-
-def _quick_ecosystem(repo: Path) -> str:
-    if (repo / "package.json").exists():
-        return "node"
-    if (repo / "uv.lock").exists() or (repo / "pyproject.toml").exists():
-        return "python"
-    if (repo / "pom.xml").exists():
-        return "maven"
-    if (repo / "go.mod").exists():
-        return "go"
-    return ""
-
-
 @app.get("/api/fs/suggest")
 async def fs_suggest(path: str = "") -> dict[str, Any]:
     """Directory autocomplete for path inputs. Given a partial path, return up to
-    20 matching sub-directories (absolute, ~-expanded), flagging git repos. Used
-    by the onboarding repo/docs inputs to autofill as the user types."""
+    20 matching sub-directories (absolute, ~-expanded). Used by the onboarding
+    and composer repo/docs inputs to autofill as the user types.
+
+    It lists NAMES via ``iterdir`` only and never stats ``<dir>/.git``: doing
+    that inside ``~/Documents`` or ``~/Desktop`` is what raised the macOS "wants
+    to access" prompt during setup. For the same reason, when the base directory
+    IS the user's home, the TCC-guarded folders (:data:`PROTECTED_HOME_DIRS`)
+    are not offered at all — a repo does not live in Downloads.
+    """
+    from ..repo_discovery import PROTECTED_HOME_DIRS
+
     raw = (path or "").strip() or "~"
     expanded = Path(raw).expanduser()
     # If the user is mid-typing a segment (no trailing slash and the path isn't a
@@ -4358,15 +4328,15 @@ async def fs_suggest(path: str = "") -> dict[str, Any]:
         base, prefix = expanded, ""
     else:
         base, prefix = expanded.parent, expanded.name.lower()
+    hidden = set(PROTECTED_HOME_DIRS) if base == Path.home() else set()
     out: list[dict[str, Any]] = []
     try:
         for p in sorted(base.iterdir()):
-            if not p.is_dir() or p.name.startswith("."):
+            if not p.is_dir() or p.name.startswith(".") or p.name in hidden:
                 continue
             if prefix and not p.name.lower().startswith(prefix):
                 continue
-            out.append({"path": str(p), "name": p.name,
-                        "is_repo": (p / ".git").exists()})
+            out.append({"path": str(p), "name": p.name})
             if len(out) >= 20:
                 break
     except OSError:
@@ -4378,15 +4348,18 @@ async def fs_suggest(path: str = "") -> dict[str, Any]:
 async def discover_repositories(
     request: Request,
     limit: int | None = Query(default=None, ge=1, le=1000),
+    root: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Find the user's repositories so onboarding and the composer can offer a
     list instead of demanding a typed path.
 
-    There is deliberately no caller-supplied root: the scan is bound to the
-    process's own home directory plus whatever the operator put in
-    ``onboarding.extra_scan_roots``. A root parameter would turn a localhost
-    convenience endpoint into an arbitrary-filesystem scanner, and the typed
-    path field (which stays) already covers "somewhere else".
+    The default scan is bound to the process's own home directory (home itself
+    plus the conventional clone roots) and whatever the operator put in
+    ``onboarding.extra_scan_roots``. ``root`` is NOT an arbitrary-filesystem
+    escape hatch: :func:`discover_repos` refuses any ``root`` that resolves
+    outside home, exactly as it does for the configured extra roots. It is the
+    "type a folder to scan just that folder" path that replaced the old,
+    unbounded ``POST /api/onboarding/repos/detect`` scanner.
     """
     from ..repo_discovery import DEFAULT_MAX_RESULTS, discover_repos
 
@@ -4398,6 +4371,7 @@ async def discover_repositories(
         discover_repos,
         extra_roots=list(extra),
         max_results=limit if limit is not None else DEFAULT_MAX_RESULTS,
+        root=root,
     )
 
 
@@ -4405,23 +4379,6 @@ async def discover_repositories(
 async def onboarding_status(request: Request) -> dict[str, Any]:
     ob = _read_onboarding(request.app.state.config)
     return {"completed": bool(ob.get("completed")), **ob}
-
-
-@app.post("/api/onboarding/repos/detect")
-async def onboarding_detect_repos(
-    body: RepoDetectRequest, request: Request
-) -> dict[str, Any]:
-    root = Path(body.root).expanduser() if body.root else Path.home() / "git"
-    if not root.is_dir():
-        return {"root": str(root), "repos": [], "error": f"{root} is not a directory"}
-    repos = await asyncio.to_thread(_find_git_repos, root)
-    return {
-        "root": str(root),
-        "repos": [
-            {"path": str(p), "name": p.name, "ecosystem": _quick_ecosystem(p)}
-            for p in repos
-        ],
-    }
 
 
 @app.post("/api/onboarding/repos/onboard")
