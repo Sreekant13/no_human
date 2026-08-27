@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { suggestPaths } from "./api.js";
+import { optionValue } from "./pathSuggest.js";
 
 // Directory autocomplete over GET /api/fs/suggest, shared by Settings' add-repo
 // and scan-root fields and the composer's free-text repository input. Options
@@ -29,8 +30,11 @@ export default function PathInput({
         {...rest}
       />
       <datalist id={listId} className="ph-no-capture">
+        {/* Value must match the typed text or the native datalist hides it
+            (a ~/-relative input never matches an absolute path). is_repo was
+            removed from /api/fs/suggest — every entry is a folder. */}
         {opts.map((o) => (
-          <option key={o.path} value={o.path}>{o.is_repo ? "git repo" : "folder"}</option>
+          <option key={o.path} value={optionValue(value, o.name)}>folder</option>
         ))}
       </datalist>
     </>

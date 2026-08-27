@@ -12,6 +12,7 @@ import {
   CONSENT_YES_LABEL, CONSENT_NO_LABEL, submitConsent,
 } from "./onboardingConsent.js";
 import { repoBadges, discoveryMessage, ambiguousNames, rowName } from "./discoveredRepos.js";
+import { optionValue } from "./pathSuggest.js";
 import { splitRecent, relativeMtime, debounce } from "./repoRecency.js";
 import { LegionLogo } from "./Logo.jsx";
 import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
@@ -102,10 +103,12 @@ function PathInput({ value, onChange, placeholder, autoFocus }) {
         onChange={(e) => onChange(e.target.value)}
       />
       <datalist id={listId} className="ph-no-capture">
+        {/* The option VALUE must match what the user is typing or the native
+            datalist never surfaces it (a ~/-relative input can't match an
+            absolute path). Rebuild it in the input's shape. is_repo was removed
+            from /api/fs/suggest, so every entry is just a folder. */}
         {opts.map((o) => (
-          <option key={o.path} value={o.path}>
-            {o.is_repo ? "git repo" : "folder"}
-          </option>
+          <option key={o.path} value={optionValue(value, o.name)}>folder</option>
         ))}
       </datalist>
     </>
