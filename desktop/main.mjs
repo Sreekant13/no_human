@@ -38,6 +38,24 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ORIGIN = process.env.NH_ORIGIN || DEFAULT_ORIGIN;
 
+// The spawn window ensureServer waits for the port before giving up (defaults to
+// server.mjs's own 30s when unset). NH_SPAWN_TIMEOUT_MS is a TEST seam only — it
+// lets a test reproduce a spawn-timeout in ~1s instead of the real 30, so the
+// non-latching re-probe below can be exercised without a 30s hang. Unset in
+// production, so the shipped app uses server.mjs's measured default unchanged.
+const SPAWN_TIMEOUT_MS = process.env.NH_SPAWN_TIMEOUT_MS
+  ? Number(process.env.NH_SPAWN_TIMEOUT_MS) : undefined;
+
+// The non-latching re-probe's window and cadence (main.mjs part of the
+// first-launch race fix). After a spawn-timeout error page is shown, keep
+// probing for this long: a slow post-install boot can run well past the 30s
+// spawn window (AV scan of the 44MB bundle + cold disk), and this is the extra
+// tail that still flips it to the board on its own. NH_LATE_POLL_MS overrides
+// the window for tests; the cadence matches waitForServer's own 500ms.
+const LATE_POLL_MS = process.env.NH_LATE_POLL_MS
+  ? Number(process.env.NH_LATE_POLL_MS) : 40000;
+const LATE_POLL_INTERVAL_MS = 500;
+
 let win = null;
 // The ensure result lives in `lifecycle` (below) — ONE owner, because keeping a
 // second copy here is how a spawned child got overwritten and orphaned.
@@ -532,6 +550,7 @@ async function _loadBoardOrError(w, current) {
   // reported success over a server holding the old credential.
   const result = await ensureServer({
     origin: ORIGIN,
+    spawnTimeoutMs: SPAWN_TIMEOUT_MS,   // undefined → server.mjs's measured default
     onSpawn: (child) => rememberChild(child),
   });
   if (!current()) return;             // superseded while we waited
@@ -541,6 +560,64 @@ async function _loadBoardOrError(w, current) {
     return;
   }
   await showError(w, lifecycle.state.reason, lifecycle.state.detail);
+  // A plain spawn-timeout is the ONE failure that self-heals: ensureServer
+  // deliberately leaves the slow-booting child alive ("may still be about to win
+  // the port"), so keep probing in the background and swap the board in the
+  // moment it answers — instead of latching this error page until the user
+  // clicks Retry. Every OTHER reason is a real, non-self-healing failure
+  // (spawn-error / backend-cli-missing / backend-not-logged-in / backend-exited /
+  // nh-not-found / stop-failed), so those are NOT polled: the error page is the
+  // final word. Not awaited — the error page is already painted and the nav must
+  // complete; the poll carries `current()` so it stands down the instant the
+  // user navigates away (credential screen, Retry).
+  if (lifecycle.state.reason === "spawn-timeout") {
+    pollForLateServer(w, current).catch((err) =>
+      console.error("late-server re-probe failed:", (err && err.message) || err));
+  }
+}
+
+/**
+ * After a spawn-timeout error page, re-probe the SAME origin on a bounded window
+ * and load the board the first time it answers. This is the non-latching half of
+ * the first-launch race fix: the child ensureServer left running may be a slow
+ * boot (measured ~17.4s cold; a post-install AV scan pushes it past the 30s
+ * spawn window), and without this the user sits on an error page for a server
+ * that is seconds from ready.
+ *
+ * It obeys the SAME supersession contract as _loadBoardOrError: `current()`
+ * going false (Retry, or the credential screen opening over the board) or the
+ * window being torn down stops the poll WITHOUT painting over whatever replaced
+ * it — the guard is re-checked after every await, because both can happen while
+ * a probe or a load is in flight. Deps are injectable so the flap/teardown/
+ * timeout paths are unit-testable without a real server (see
+ * mainLatePoll.test.mjs); production uses the module defaults.
+ */
+export async function pollForLateServer(w, current, {
+  probeOrigin = () => probe(ORIGIN),
+  loadBoard = showBoard,
+  windowMs = LATE_POLL_MS,
+  intervalMs = LATE_POLL_INTERVAL_MS,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const deadline = Date.now() + windowMs;
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    // Superseded or torn down while we slept: stand down. Painting now would
+    // clobber the screen the user moved to (e.g. the credential screen).
+    if (!current() || w.isDestroyed()) return;
+    if ((await probeOrigin()) !== "up") continue;
+    // Re-check across the probe await — the user may have navigated away in it.
+    if (!current() || w.isDestroyed()) return;
+    // Keep the spawned child (ownership is what makes it stoppable at quit);
+    // correct only the stale "failed (spawn-timeout)" status. See stateOnProbeUp.
+    lifecycle.state = stateOnProbeUp(lifecycle.state);
+    // A load can still fail if the port flapped down between probe and load —
+    // showBoard renders load-failed rather than blanking, and we keep probing so
+    // a genuine late boot is not abandoned on a single flap. A supersession
+    // during the load returns false too, so re-check the guard before looping.
+    if (await loadBoard(w)) return;
+    if (!current() || w.isDestroyed()) return;
+  }
 }
 
 const SETUP_FILE = path.join(__dirname, "token.html");

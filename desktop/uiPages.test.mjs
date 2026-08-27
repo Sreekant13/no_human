@@ -78,6 +78,17 @@ test("error.html routes each reason to the right guidance", () => {
     "a developer was not shown the developer copy");
   assert.ok(!probe.errPackaged.steps.includes("steps-dev"),
     "a friend on a DMG was told to run `uv tool install` from a git checkout");
+  // A plain spawn-timeout is a slow boot, not a credential fault: it gets the
+  // honest "still trying to connect" copy in BOTH audiences, never the
+  // steps-packaged accusation nor the developer's terminal instructions.
+  for (const t of [probe.errTimeout, probe.errTimeoutDev]) {
+    assert.ok(t.steps.includes("steps-timeout"),
+      "spawn-timeout must show the non-accusatory 'taking longer' block");
+    assert.ok(!t.steps.includes("steps-packaged"),
+      "spawn-timeout must NOT accuse the credential — the server is merely booting");
+    assert.ok(!t.steps.includes("steps-dev"),
+      "spawn-timeout is a slow boot, not 'start it in a terminal'");
+  }
 });
 
 test("the token link hides only when nh itself is missing", () => {

@@ -77,8 +77,15 @@ app.whenReady().then(async () => {
     };
     out.errStopFailed = await errAt({ reason: "stop-failed", packaged: "1" });
     out.errNotFound   = await errAt({ reason: "nh-not-found", packaged: "1" });
-    out.errPackaged   = await errAt({ reason: "spawn-timeout", packaged: "1" });
-    out.errDev        = await errAt({ reason: "spawn-timeout", packaged: "0" });
+    // A GENERIC reason (not one of the classified cases) exercises the
+    // packaged/dev split. load-failed, not spawn-timeout: the latter now has its
+    // own steps-timeout block (a slow boot is not a credential fault).
+    out.errPackaged   = await errAt({ reason: "load-failed", packaged: "1" });
+    out.errDev        = await errAt({ reason: "load-failed", packaged: "0" });
+    // spawn-timeout gets its own honest "still trying to connect" copy — never
+    // the credential-accusing steps-packaged — in BOTH packaged and dev.
+    out.errTimeout    = await errAt({ reason: "spawn-timeout", packaged: "1" });
+    out.errTimeoutDev = await errAt({ reason: "spawn-timeout", packaged: "0" });
 
     // The version the preload hands the board, measured through the SAME
     // sandboxed preload the packaged app runs (Electron sandboxes a preload by

@@ -13,7 +13,7 @@ import test from "node:test";
 import fs from "node:fs";
 import vm from "node:vm";
 
-const IDS = ["steps-packaged", "steps-stopfailed", "steps-dev",
+const IDS = ["steps-packaged", "steps-stopfailed", "steps-dev", "steps-timeout",
   "steps-cli-missing", "steps-not-logged-in", "token-link", "retry-status",
   "detail-text", "detail-body"];
 
@@ -82,12 +82,39 @@ test("error.html: no detail param means the detail block stays hidden", () => {
   assert.equal(els.get("detail-text").hidden, true);
 });
 
+// --- spawn-timeout: a slow boot, never a credential accusation -------------
+
+test("error.html: reason=spawn-timeout shows the honest 'taking longer' block, not the credential copy", () => {
+  // The bug: a plain spawn-timeout fell through to steps-packaged, whose copy
+  // says the server "refuses to start without a working Claude credential" — a
+  // false accusation for a server that is merely booting slowly.
+  const els = route("?reason=spawn-timeout&packaged=1");
+  assert.equal(els.get("steps-timeout").hidden, false,
+    "the non-accusatory 'still trying to connect' block must be shown");
+  assert.equal(els.get("steps-packaged").hidden, true,
+    "the credential-accusing packaged copy must NOT show for a plain timeout");
+  assert.equal(els.get("steps-cli-missing").hidden, true);
+  assert.equal(els.get("steps-not-logged-in").hidden, true);
+});
+
+test("error.html: spawn-timeout is the same slow-boot story for a developer, not steps-dev", () => {
+  // The shell spawns the server in dev too, so a timeout there is the same slow
+  // boot — the honest 'taking longer' block, not "start it in a terminal".
+  const els = route("?reason=spawn-timeout&packaged=0");
+  assert.equal(els.get("steps-timeout").hidden, false);
+  assert.equal(els.get("steps-dev").hidden, true);
+  assert.equal(els.get("steps-packaged").hidden, true);
+});
+
 // --- existing behaviours must survive untouched ---------------------------
 
 test("error.html: existing reasons still route to their own copy", () => {
   assert.equal(route("?reason=stop-failed&packaged=1").get("steps-stopfailed").hidden, false);
-  assert.equal(route("?reason=spawn-timeout&packaged=0").get("steps-dev").hidden, false);
-  assert.equal(route("?reason=spawn-timeout&packaged=1").get("steps-packaged").hidden, false);
+  // A GENERIC reason (not one of the classified cases) still falls through to
+  // the dev/packaged split — exercised here with load-failed, since spawn-timeout
+  // now has its own block above.
+  assert.equal(route("?reason=load-failed&packaged=0").get("steps-dev").hidden, false);
+  assert.equal(route("?reason=load-failed&packaged=1").get("steps-packaged").hidden, false);
 });
 
 test("error.html: the token-reentry link still hides only for nh-not-found", () => {

@@ -377,7 +377,14 @@ export function classifyBackendFailure(text) {
  */
 export async function ensureServer({
   origin = DEFAULT_ORIGIN,
-  spawnTimeoutMs = 20000,
+  // Widened from 20000: a cold start of the PyInstaller-frozen `nh` was measured
+  // at ~17.4s (first /api/tasks 200 at 17,448ms), leaving only ~2.5s of headroom
+  // under the old 20s window — and a post-install launch (AV scanning the 44MB
+  // bundle, cold disk) routinely spends that headroom and times out on a server
+  // that WAS about to come up. 30s restores real margin over the measured boot.
+  // main.mjs's non-latching background re-probe is the backstop for the boot
+  // that is slower still; this just stops the common case from ever seeing it.
+  spawnTimeoutMs = 30000,
   env = process.env,
   nhArgs = ["start", "--no-open"],
   fallbackPaths = DEFAULT_NH_PATHS,

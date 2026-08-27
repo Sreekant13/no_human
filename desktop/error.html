@@ -63,6 +63,17 @@
     below to replace your saved credential if it may be wrong — the server
     refuses to start without a working Claude credential.
   </p>
+  <!-- spawn-timeout is NOT a credential problem: the bundled server DID start
+       and is simply booting slowly (measured cold start ~17.4s; a post-install
+       AV scan of the bundle pushes it past the spawn window). Accusing the
+       credential here is the misleading copy this fix removes. main.mjs keeps
+       re-probing in the background and swaps in the board on its own the moment
+       the server answers, so this page is transient — the wording says so. -->
+  <p class="steps" id="steps-timeout" hidden>
+    The bundled server is taking longer than usual to start — still trying to
+    connect… It should appear on its own once it finishes booting; you can also
+    Retry if you’d rather not wait.
+  </p>
   <!-- stop-failed is neither audience's story: a server IS running and would
        not stop, so "start it in a terminal" and "the bundled server didn't
        start" are both wrong. -->
@@ -116,9 +127,15 @@
     // classifyBackendFailure in server.mjs) get their own remediation ahead of
     // the generic packaged/dev/stop-failed copy — installing a CLI or minting a
     // token has nothing to do with either of those stories.
+    // spawn-timeout is a slow boot, not a credential fault, and it is the same
+    // story for a packaged user and a developer (the shell spawned the server in
+    // both) — so it takes its own non-accusatory block ahead of the dev/packaged
+    // split, never steps-packaged's "refuses to start without a working
+    // credential" copy.
     const which = reason === "backend-cli-missing" ? "steps-cli-missing"
       : reason === "backend-not-logged-in" ? "steps-not-logged-in"
       : reason === "stop-failed" ? "steps-stopfailed"
+      : reason === "spawn-timeout" ? "steps-timeout"
       : (dev ? "steps-dev" : "steps-packaged");
     document.getElementById(which).hidden = false;
     // The actual captured tail of nh start's own output, when there is one —
