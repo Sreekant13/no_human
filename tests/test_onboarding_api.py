@@ -238,6 +238,39 @@ async def test_history_analyze_returns_valid_shape(client):
 
 
 @pytest.mark.asyncio
+async def test_analyze_response_proposals_carry_project(client, monkeypatch):
+    """Every proposal in the analyze response names the project it came from,
+    so the web step can group them by whether they are in the selected repos.
+    The scan is fed a single real correction rooted at a known cwd; the analyzer
+    stamps its project from that cwd and the handler surfaces it."""
+    import sys
+    # `no_human.api.app` the NAME resolves to the FastAPI instance (the package
+    # re-exports it), so reach the module object through sys.modules to patch it.
+    app_module = sys.modules["no_human.api.app"]
+    from no_human.history.extractor import Transcript, Message
+
+    seeded = Transcript(
+        cascade_id="cc:seed", title="Fix login", created="2026-07-01",
+        cwd="/Users/u/mine",
+        messages=[Message(role="user",
+                          content="never commit the lockfile", step_type="user")],
+    )
+
+    async def fake_gather(days, repo_paths=None):
+        return [seeded], {"claude_code": 1}
+
+    monkeypatch.setattr(app_module, "_gather_history", fake_gather)
+
+    r = await client.post("/api/onboarding/history/analyze",
+                          json={"days": 30, "repo_paths": ["/Users/u/mine"]})
+    assert r.status_code == 200
+    proposals = r.json()["proposals"]
+    assert proposals, "the seeded correction should produce at least one proposal"
+    assert all("project" in p for p in proposals)
+    assert any(p["project"] == "/Users/u/mine" for p in proposals)
+
+
+@pytest.mark.asyncio
 async def test_confirm_rules_activates_proposal(client, store):
     # Seed an unconfirmed proposal, then confirm it via the onboarding endpoint.
     mem_id = await store.add_memory(

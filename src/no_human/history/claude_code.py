@@ -202,12 +202,30 @@ def _parse_session(
     )
 
 
+def _cwd_under(cwd: str, repo_paths: list[str]) -> bool:
+    """True if ``cwd`` sits inside one of ``repo_paths`` on a real path
+    boundary — NOT a string prefix. ``/Users/u/mine-other`` is a sibling of
+    ``/Users/u/mine``, not inside it, so it must not be kept when ``mine`` is
+    selected. Equality counts (a session run at the repo root)."""
+    if not cwd:
+        return False
+    c = Path(cwd)
+    for repo in repo_paths:
+        if not repo:
+            continue
+        r = Path(repo)
+        if c == r or r in c.parents:
+            return True
+    return False
+
+
 def extract_claude_code_transcripts(
     *,
     days: int = 30,
     limit: int = 80,
     roots: list[Path] | tuple[Path, ...] | None = None,
     min_user_msgs: int = 2,
+    repo_paths: list[str] | None = None,
 ) -> list[Transcript]:
     """Read recent Claude Code sessions into Transcripts.
 
@@ -218,7 +236,13 @@ def extract_claude_code_transcripts(
     pytest tmp repos, anything under a temp root — see _MACHINE_DIR_MARKERS).
     ``min_user_msgs`` is the substance floor: the learning pipeline keeps the
     historical >=2 (needs a correction to learn from); the benchmark corpus
-    passes 1 (a one-shot request is still a real task)."""
+    passes 1 (a one-shot request is still a real task).
+
+    ``repo_paths`` scopes the scan to the repos the user selected: a transcript
+    is kept only if its session ``cwd`` is under one of them (real path
+    boundary, not string prefix). None/empty keeps everything — the unchanged
+    default. This exists because a repo-focused onboarding was ingesting
+    transcripts from EVERY project on the machine (noise + privacy)."""
     bases = [Path(r) for r in (roots if roots is not None else DEFAULT_ROOTS)]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
     files: list[tuple[Path, str]] = []
@@ -243,8 +267,11 @@ def extract_claude_code_transcripts(
     out: list[Transcript] = []
     for f, label in files[:limit]:
         tr = _parse_session(f, source=label, min_user_msgs=min_user_msgs)
-        if tr is not None:
-            out.append(tr)
+        if tr is None:
+            continue
+        if repo_paths and not _cwd_under(tr.cwd, repo_paths):
+            continue  # outside the selected repos — not this onboarding's history
+        out.append(tr)
     log.info("Claude Code: %d transcripts from %d recent session files "
              "across %d roots", len(out), min(len(files), limit), len(bases))
     return out

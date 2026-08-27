@@ -251,6 +251,41 @@ def test_cli_json_out_is_pure_json(roots, monkeypatch):
     assert len(data) == 1 and data[0]["source"] == "cc:enterprise"
 
 
+def _lines_in(cwd: str) -> list[str]:
+    """A minimal real session (>=2 user messages) rooted at ``cwd``."""
+    return [
+        _line("user", "Fix the flaky login test", ts="2026-07-01T10:00:00.000Z",
+              cwd=cwd),
+        _line("assistant", "Looking.", ts="2026-07-01T10:00:30.000Z",
+              usage=USAGE_2, cwd=cwd),
+        _line("user", "No — revert that part", ts="2026-07-01T10:05:00.000Z",
+              cwd=cwd),
+    ]
+
+
+def test_repo_paths_filters_transcripts_by_cwd_boundary(roots):
+    """repo_paths keeps only transcripts whose cwd is under a selected repo,
+    on a real path boundary — a prefix collision (mine-other vs mine) is NOT
+    kept — and None/[] keep everything (the unchanged default)."""
+    ent, _ = roots
+    _write_session(ent, "-Users-u-mine-sub", "in", _lines_in("/Users/u/mine/sub"))
+    _write_session(ent, "-Users-u-mine", "exact", _lines_in("/Users/u/mine"))
+    _write_session(ent, "-Users-u-other", "out", _lines_in("/Users/u/other"))
+    # Prefix collision: shares the string prefix but is a sibling directory.
+    _write_session(ent, "-Users-u-mine-other", "sib",
+                   _lines_in("/Users/u/mine-other"))
+
+    scoped = extract_claude_code_transcripts(
+        days=36500, roots=[ent], repo_paths=["/Users/u/mine"])
+    assert sorted(t.cwd for t in scoped) == ["/Users/u/mine", "/Users/u/mine/sub"]
+
+    # None and [] both mean "keep all" — the pre-existing behaviour.
+    assert len(extract_claude_code_transcripts(
+        days=36500, roots=[ent], repo_paths=None)) == 4
+    assert len(extract_claude_code_transcripts(
+        days=36500, roots=[ent], repo_paths=[])) == 4
+
+
 def test_windsurf_transcript_defaults_stay_compatible():
     """New Transcript fields must default safely for the Windsurf path."""  # term-ok: real IDE name
     from no_human.history.extractor import Transcript

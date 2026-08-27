@@ -137,6 +137,10 @@ class TranscriptIngester:
                     "content": f.content, "importance": f.importance,
                     "source_transcript": f.source_transcript,
                     "source_message": f.source_message,
+                    # The repo the conversation happened in (empty = unscoped).
+                    # The onboarding web step groups proposals by this so it can
+                    # separate the selected repos from other projects (spec §3 B5).
+                    "project": f.project or "",
                 })
             else:
                 result.duplicates += 1

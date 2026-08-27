@@ -4269,6 +4269,9 @@ class RepoConfirmRequest(BaseModel):
 
 class HistoryAnalyzeRequest(BaseModel):
     days: int = 30
+    # Scope the scan to the repos the user selected (spec §3 B5). Empty = every
+    # project on the machine, the pre-B5 behaviour a non-scoped caller keeps.
+    repo_paths: list[str] = []
 
 class ConfirmRulesRequest(BaseModel):
     ids: list[str] = []
@@ -4633,10 +4636,15 @@ async def onboarding_confirm_repo(
     return {"ok": True, **_profile_readiness(prof)}
 
 
-async def _gather_history(days: int) -> tuple[list, dict[str, int]]:
+async def _gather_history(
+    days: int, repo_paths: list[str] | None = None,
+) -> tuple[list, dict[str, int]]:
     """Combine conversation history from every available source: the IDE
     transcript extractor (best-effort — needs a running IDE) AND Claude Code
-    (read from disk, always available). Returns (transcripts, per-source counts)."""
+    (read from disk, always available). Returns (transcripts, per-source counts).
+
+    ``repo_paths`` scopes the Claude Code scan to the selected repos (spec §3
+    B5) — None/empty keeps every project, as before."""
     from ..history.extractor import extract_transcripts, IDENotRunningError
     from ..history.claude_code import extract_claude_code_transcripts
 
@@ -4652,7 +4660,8 @@ async def _gather_history(days: int) -> tuple[list, dict[str, int]]:
         log.warning("Windsurf extract failed: %s", exc)  # term-ok: real IDE name
         sources["windsurf"] = 0  # term-ok: internal source tag names the real IDE
     try:
-        cc = await asyncio.to_thread(extract_claude_code_transcripts, days=days)
+        cc = await asyncio.to_thread(
+            extract_claude_code_transcripts, days=days, repo_paths=repo_paths)
         transcripts += cc
         sources["claude_code"] = len(cc)
     except Exception as exc:  # noqa: BLE001
@@ -4689,7 +4698,7 @@ async def onboarding_history_analyze(
     until confirmed — preserving the learning-queue invariant."""
     store = _store(request)
     from ..history.ingester import TranscriptIngester
-    transcripts, sources = await _gather_history(body.days)
+    transcripts, sources = await _gather_history(body.days, body.repo_paths)
     messages = sum(len(t.messages) for t in transcripts)
 
     # Build an LLM-distillation pass so proposed rules are GENERAL, durable
@@ -4735,8 +4744,11 @@ async def onboarding_history_analyze(
         )
         if mid:
             skills_added += 1
+            # Skills are machine-wide, not repo-scoped: empty project, so the
+            # web step groups them as in-scope rather than under "other".
             proposals.append({"id": mid, "category": "skill", "title": s.name,
-                              "content": s.description or s.name, "importance": "med"})
+                              "content": s.description or s.name,
+                              "importance": "med", "project": ""})
 
     # NOTHING IS PRE-SELECTED. A real user was shown their own home address and
     # phone number already TICKED for confirmation as standing guidance — one
