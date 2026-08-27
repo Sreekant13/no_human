@@ -7,6 +7,8 @@ import { testResultView } from "./integrationTestResult.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { secretState, fieldSecretLabel } from "./integrationSecret.js";
+import FieldHint from "./FieldHint.jsx";
+import { hintId as fieldHintId } from "./fieldHelp.js";
 
 // Settings → Integrations. One card per integration: brand mark, kind, live
 // status chip, a Configure form generated from the integration's `fields`
@@ -24,14 +26,6 @@ import { secretState, fieldSecretLabel } from "./integrationSecret.js";
 // promised an active CI backend for a form that pinned nothing — the panel
 // said the gate was on and every PR went out ungated.
 const CI_AUTOPIN = new Set(["github", "gitlab", "jenkins", "circleci"]);
-
-// Plain-language help for field names that read as internal jargon on their
-// own — everything else is covered by its label.
-const FIELD_HELP = {
-  project_slug: "Your CircleCI project slug: <vcs>/<org>/<repo>, e.g. gh/your-org/your-repo.",
-  jql: "Optional JQL query to filter which issues sync in — leave blank for the default.",
-  job: "The Jenkins job path, e.g. folder/job-name.",
-};
 
 export default function IntegrationsPanel() {
   const [items, setItems] = useState([]);
@@ -305,7 +299,7 @@ function IntegrationConfigForm({
           onSubmit={(e) => { e.preventDefault(); onSubmit(); }}>
       {fields.map((f) => {
         const inputId = `cfg-${integration.name}-${f.name}`;
-        const hintId = FIELD_HELP[f.name] ? `${inputId}-hint` : null;
+        const hintId = f.help ? fieldHintId(integration.name, f.name) : null;
         const errorId = fieldErrors[f.name] ? `${inputId}-error` : null;
         const describedBy = [hintId, errorId].filter(Boolean).join(" ") || undefined;
         return (
@@ -331,7 +325,7 @@ function IntegrationConfigForm({
               aria-invalid={fieldErrors[f.name] ? "true" : undefined}
               aria-describedby={describedBy}
             />
-            {FIELD_HELP[f.name] && <div className="ntm-hint" id={hintId}>{FIELD_HELP[f.name]}</div>}
+            {f.help && <FieldHint id={hintId} text={f.help} url={f.help_url} />}
             {fieldErrors[f.name] && (
               <div className="integration-field-error" id={errorId}>{fieldErrors[f.name]}</div>
             )}

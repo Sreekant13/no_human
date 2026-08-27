@@ -97,6 +97,12 @@ class FieldSpec:
     secret: bool
     env_var: str | None = None
     config_path: str | None = None
+    # Where-to-find-it help; the source of truth is integrations/help.py, and
+    # the emitting functions below fill these from `help_for` so the wizard and
+    # Settings render the same catalogue. Defaults keep every existing
+    # FieldSpec() call site unchanged.
+    help: str = ""
+    help_url: str = ""
 
 
 # github/gitlab/jenkins/circleci are STATUS VIEWS over the single shared `ci.*`
@@ -179,6 +185,13 @@ FIELD_SPECS: dict[str, list[FieldSpec]] = {
         FieldSpec("webhook_url", "Webhook URL", True, config_path="notifications.teams_webhook_url"),
     ],
 }
+
+
+class RepoNotRegistered(ValueError):
+    """Raised when `default_repo` names a path that is not a registered repo
+    profile. A subclass of ValueError so existing `except ValueError` sites
+    still catch it, but distinct so the API can map it to 400 (a bad value)
+    rather than 422 (a malformed/credential field)."""
 
 
 def _sect(config: dict, key: str) -> dict:
@@ -685,11 +698,16 @@ def _field_is_set(spec: FieldSpec, config: dict) -> bool:
 
 def integration_fields(name: str, config: dict) -> list[dict[str, Any]]:
     """The field descriptors for one integration's settings form — never a
-    secret VALUE, only whether each field currently ``set``."""
-    return [
-        {"name": s.name, "label": s.label, "secret": s.secret, "set": _field_is_set(s, config)}
-        for s in FIELD_SPECS.get(name, [])
-    ]
+    secret VALUE, only whether each field currently ``set``. ``help``/``help_url``
+    come from the shared catalogue (integrations/help.py) so Settings and the
+    wizard say the same thing about each field."""
+    from .help import help_for
+    out = []
+    for s in FIELD_SPECS.get(name, []):
+        text, url = help_for(name, s.name)
+        out.append({"name": s.name, "label": s.label, "secret": s.secret,
+                    "set": _field_is_set(s, config), "help": text, "help_url": url})
+    return out
 
 
 def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationStatus:
@@ -958,19 +976,33 @@ def _setup_label(name: str, field: str) -> str:
     registry already describes this field (so the wizard and Settings say the
     same thing — "Site URL", "JQL filter", not "Site" and "Jql"), else a
     generated one, so a field no registry knows about still reads."""
+    # `default_repo` is a plain config string, so it would otherwise humanize
+    # to "Default repo" — a real user could not tell that meant "where the
+    # coder runs a pulled-in ticket". Name it for what it does.
+    if field == "default_repo":
+        return "Run tasks in repo"
     for spec in FIELD_SPECS.get(name, []):
         if spec.name == field and not spec.secret:
             return spec.label
     return _humanize(field)
 
 
-def _setup_fields(name: str, defaults: dict, current: dict) -> list[dict[str, Any]]:
+def _setup_fields(name: str, defaults: dict, current: dict,
+                  repos: list[str] | None = None) -> list[dict[str, Any]]:
     """The non-secret, renderable settings of one integration block.
 
     Kinds are derived from the DEFAULT's type: bool → a checkbox, str → a text
     box, list-of-str → a comma list. Anything else (None, nested dict, mixed
     list) is skipped rather than guessed at — a field the wizard cannot render
-    honestly must not be rendered at all."""
+    honestly must not be rendered at all.
+
+    ``default_repo`` is the one exception: it is a ``repo_select`` — a dropdown
+    over ``repos`` (the operator's registered repo profiles) rather than free
+    text, so a pulled-in ticket can only ever name a repo no_human actually
+    knows. ``repos`` is threaded in from the API (the store owns profiles);
+    ``None`` means "caller had no list", which renders an empty select."""
+    from .help import help_for
+
     out: list[dict[str, Any]] = []
     for key, default in defaults.items():
         try:
@@ -978,7 +1010,10 @@ def _setup_fields(name: str, defaults: dict, current: dict) -> list[dict[str, An
         except ValueError:
             continue  # a credential, or not writable — never offered
         value = current.get(key, default)
-        if isinstance(default, bool):
+        options = None
+        if key == "default_repo":
+            kind, value, options = "repo_select", str(value or ""), list(repos or [])
+        elif isinstance(default, bool):
             kind, value = "bool", bool(value)
         elif isinstance(default, str):
             kind, value = "text", str(value or "")
@@ -987,12 +1022,16 @@ def _setup_fields(name: str, defaults: dict, current: dict) -> list[dict[str, An
             value = [str(x) for x in (value if isinstance(value, list) else default)]
         else:
             continue
-        out.append({"name": key, "label": _setup_label(name, key),
-                    "kind": kind, "value": value})
+        text, url = help_for(name, key)
+        field = {"name": key, "label": _setup_label(name, key),
+                 "kind": kind, "value": value, "help": text, "help_url": url}
+        if options is not None:
+            field["options"] = options
+        out.append(field)
     return out
 
 
-def setup_specs(config: dict) -> list[dict[str, Any]]:
+def setup_specs(config: dict, repos: list[str] | None = None) -> list[dict[str, Any]]:
     """Everything the onboarding step needs to render itself, discovered from
     ``DEFAULT_CONFIG["integrations"]``.
 
@@ -1021,8 +1060,14 @@ def setup_specs(config: dict) -> list[dict[str, Any]]:
             "enabled": enable_state(config, name),
             "enable_default": enable_default(name),
             "configured": status.configured,
+            # A green "Ready" mark requires a live connection test to have
+            # PASSED — not merely that a key was typed. `verified` is the
+            # persisted record of that pass (integrations.<name>.last_verified_at,
+            # written by `mark_verified`); the wizard also flips it true on an
+            # in-session passing test. See web/src/integrationSetup.js readiness.
+            "verified": bool(current.get("last_verified_at")),
             "detail": status.detail,
-            "fields": _setup_fields(name, defaults, current),
+            "fields": _setup_fields(name, defaults, current, repos),
             "secrets": [{"env_var": v, "set": bool(set_map.get(v, False))} for v in env_vars],
             "secret_note": SETUP_SECRET_NOTE.get(name, ""),
         })
@@ -1077,13 +1122,22 @@ def _assert_setup_values_usable(name: str, values: dict[str, Any]) -> None:
             )
 
 
-def apply_setup(name: str, values: dict[str, Any]) -> dict[str, Any]:
+def apply_setup(name: str, values: dict[str, Any],
+                repos: list[str] | None = None) -> dict[str, Any]:
     """Persist one integration's NON-SECRET settings to config.yaml and return
     its refreshed spec entry.
 
     Every field is validated through :func:`assert_config_safe_field` and
     coerced BEFORE anything is written, so a rejected field leaves config.yaml
-    byte-for-byte untouched rather than half-written."""
+    byte-for-byte untouched rather than half-written.
+
+    ``default_repo`` is additionally checked for membership in ``repos`` (the
+    operator's registered repo profiles): a non-empty value that is not one of
+    them raises :class:`RepoNotRegistered` (→ 400), so a pulled-in ticket can
+    never be routed to a repo no_human does not know. An empty value (clearing
+    the field) is always allowed. ``repos=None`` means the caller did not
+    supply the list, so membership is not enforced (used by unit tests / any
+    non-API caller)."""
     from .. import config as _config_mod
     from ..config import DEFAULT_CONFIG
 
@@ -1099,13 +1153,53 @@ def apply_setup(name: str, values: dict[str, Any]) -> dict[str, Any]:
         updates[f"integrations.{name}.{field}"] = coerced[field]
     _assert_setup_values_usable(name, coerced)
 
+    chosen = coerced.get("default_repo")
+    if repos is not None and chosen and chosen not in repos:
+        raise RepoNotRegistered(
+            f"{chosen!r} is not a registered repo. Add it first (Onboarding → "
+            f"Repositories), then choose it here.")
+
     if updates:
         _write_config_values(_config_mod.CONFIG_PATH, updates)
     refreshed = _config_mod.load_config(_config_mod.CONFIG_PATH)
-    for spec in setup_specs(refreshed.data):
+    for spec in setup_specs(refreshed.data, repos):
         if spec["name"] == name:
             return spec
     raise ValueError(f"unknown integration: {name!r}")  # pragma: no cover
+
+
+def mark_verified(name: str) -> str | None:
+    """Record that *name* passed a live connection test, by writing
+    ``integrations.<name>.last_verified_at`` (UTC ISO-8601) to config.yaml, and
+    return that timestamp.
+
+    Returns ``None`` — writing nothing — for a name that has no
+    ``integrations.<name>`` config block (github/gitlab/jenkins/circleci are
+    ``ci.*`` views: there is nowhere to persist the flag and nothing that reads
+    one, so a write would only litter config.yaml with an inert block).
+
+    Returns ``None`` — writing nothing — ALSO for a VIEW-ONLY integration
+    (:data:`VIEW_ONLY_CHECKS`: slack/teams). Their `_check_*` only confirm a
+    webhook string is present; they do NOT deliver anything, so a healthy result
+    is "saved", not "verified". Letting it earn a green "Ready" is exactly the
+    "green means a key was typed, not that it works" lie C2 exists to remove.
+
+    This is the ONLY thing a passing test persists; it never touches a
+    credential."""
+    from datetime import datetime, timezone
+
+    from .. import config as _config_mod
+    from ..config import DEFAULT_CONFIG
+
+    if name in VIEW_ONLY_CHECKS:
+        return None
+    block = (DEFAULT_CONFIG.get("integrations") or {}).get(name)
+    if not isinstance(block, dict):
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _write_config_values(_config_mod.CONFIG_PATH,
+                         {f"integrations.{name}.last_verified_at": ts})
+    return ts
 
 
 # --------------------------------------------------------------------------- #
@@ -1344,6 +1438,104 @@ async def _check_circleci(config: dict) -> IntegrationStatus:
     return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
 
 
+async def _unconfigured_or_ambient(base: IntegrationStatus, name: str) -> IntegrationStatus:
+    """The unconfigured branch shared by the real VCS probes: an unconfigured
+    github/gitlab that is nonetheless ambiently authenticated reports
+    ``status="ambient"``/``healthy=None`` (agreeing with
+    `list_integrations_with_ambient` and the /test endpoint contract), never a
+    flat 'not configured'. ``ambient_available`` can shell out, so it is
+    offloaded off the event loop."""
+    if await asyncio.to_thread(ambient_available, name):
+        return replace(base, healthy=None, detail=_AMBIENT_DETAIL, status="ambient")
+    return replace(base, healthy=False, detail="not configured")
+
+
+async def _check_github(config: dict) -> IntegrationStatus:
+    """Real GitHub probe: the token authenticates AND the configured repo is
+    reachable. FAIL-CLOSED — a transport error is 'not verified', never green."""
+    base = _github_status(config)
+    if not base.configured:
+        return await _unconfigured_or_ambient(base, "github")
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        return replace(base, healthy=False,
+                       detail="GITHUB_TOKEN not set in ~/.no_human/.env")
+    ci = _sect(config, "ci")
+    project = str(ci.get("project") or "")
+    hostname = str(ci.get("hostname") or "")
+    api = "https://api.github.com" if not hostname else f"https://{hostname}/api/v3"
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json"}
+    try:
+        u = await _http_get(f"{api}/user", headers=headers, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 — a health check never raises
+        return replace(base, healthy=False, detail=f"not verified: {type(exc).__name__}")
+    if u.status_code != 200:
+        return replace(base, healthy=False, detail=f"HTTP {u.status_code}")
+    login = ""
+    try:
+        login = (u.json() or {}).get("login", "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        r = await _http_get(f"{api}/repos/{project}", headers=headers, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001
+        return replace(base, healthy=False, detail=f"not verified: {type(exc).__name__}")
+    if r.status_code != 200:
+        return replace(base, healthy=False,
+                       detail=f"repo {project} not found (HTTP {r.status_code})")
+    who = f"connected as {login}" if login else "connected"
+    return replace(base, healthy=True, detail=f"{who} · repo {project} found")
+
+
+async def _check_gitlab(config: dict) -> IntegrationStatus:
+    """Real GitLab probe: GITLAB_TOKEN authenticates against the project's host.
+    FAIL-CLOSED on any transport error."""
+    base = _gitlab_status(config)
+    if not base.configured:
+        return await _unconfigured_or_ambient(base, "gitlab")
+    token = os.environ.get("GITLAB_TOKEN")
+    if not token:
+        return replace(base, healthy=False,
+                       detail="GITLAB_TOKEN not set in ~/.no_human/.env")
+    hostname = str(_sect(config, "ci").get("hostname") or "") or "gitlab.com"
+    try:
+        r = await _http_get(f"https://{hostname}/api/v4/user",
+                            headers={"PRIVATE-TOKEN": token}, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001
+        return replace(base, healthy=False, detail=f"not verified: {type(exc).__name__}")
+    if r.status_code != 200:
+        return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
+    who = ""
+    try:
+        who = (r.json() or {}).get("username", "")
+    except Exception:  # noqa: BLE001
+        pass
+    return replace(base, healthy=True,
+                   detail=f"connected as {who}" if who else "connected")
+
+
+async def _check_jenkins(config: dict) -> IntegrationStatus:
+    """Real Jenkins probe: basic auth against the controller's ``/api/json``.
+    FAIL-CLOSED on any transport error. Jenkins has no ambient-CLI concept."""
+    base = _jenkins_status(config)
+    if not base.configured:
+        return replace(base, healthy=False, detail="not configured")
+    user = os.environ.get("JENKINS_USER")
+    token = os.environ.get("JENKINS_API_TOKEN")
+    if not (user and token):
+        return replace(base, healthy=False,
+                       detail="JENKINS_USER / JENKINS_API_TOKEN not set in ~/.no_human/.env")
+    base_url = str(_sect(config, "ci").get("base_url") or "https://build.example.com").rstrip("/")
+    try:
+        r = await _http_get(f"{base_url}/api/json", auth=(user, token), timeout=10.0)
+    except Exception as exc:  # noqa: BLE001
+        return replace(base, healthy=False, detail=f"not verified: {type(exc).__name__}")
+    if r.status_code != 200:
+        return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
+    return replace(base, healthy=True, detail=f"connected to {base_url}")
+
+
 async def _check_view(status_fn, name: str, config: dict) -> IntegrationStatus:
     """github/gitlab/jenkins/slack are status views — 'healthy' mirrors
     'configured'; the live connection is exercised by the CI backend / webhook
@@ -1370,11 +1562,21 @@ _CHECKERS = {
     "monday": _check_monday,
     "teams": _check_teams,
     "circleci": _check_circleci,
-    "github": lambda c: _check_view(_github_status, "github", c),
-    "gitlab": lambda c: _check_view(_gitlab_status, "gitlab", c),
-    "jenkins": lambda c: _check_view(_jenkins_status, "jenkins", c),
+    "github": _check_github,
+    "gitlab": _check_gitlab,
+    "jenkins": _check_jenkins,
+    # Slack stays a view: a webhook cannot be probed without POSTing a message,
+    # so the live verification happens at the notifier at run time. github /
+    # gitlab / jenkins now have real fail-closed probes above.
     "slack": lambda c: _check_view(_slack_status, "slack", c),
 }
+
+#: Integrations whose ``_check_*`` only confirm a webhook string is PRESENT —
+#: they cannot deliver anything without POSTing a message, which their terms
+#: forbid a health check from doing. A healthy result from one of these is
+#: "saved", never "verified", so `mark_verified` refuses them: they must not
+#: earn a green "Ready" on config-presence alone (see `mark_verified`).
+VIEW_ONLY_CHECKS = frozenset({"slack", "teams"})
 
 
 async def test_integration(name: str, config: dict) -> IntegrationStatus:
@@ -1392,5 +1594,5 @@ __all__ = [
     "ambient_available", "list_integrations_with_ambient",
     "SETUP_SECRET_ENV", "SETUP_SECRET_NOTE", "assert_config_safe_field",
     "is_credential_name", "enable_field", "enable_default", "enable_state",
-    "setup_specs", "apply_setup",
+    "setup_specs", "apply_setup", "mark_verified", "RepoNotRegistered",
 ]

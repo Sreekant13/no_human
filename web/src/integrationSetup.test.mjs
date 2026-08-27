@@ -112,17 +112,46 @@ test("readiness names the missing env var instead of claiming it works", () => {
 test("readiness distinguishes 'credential set but settings blank' from ready", () => {
   const keyed = { ...LINEAR, enabled: true, secrets: [{ env_var: "LINEAR_API_KEY", set: true }] };
   assert.equal(readiness(keyed).state, "incomplete");
-  assert.equal(readiness({ ...keyed, configured: true }).state, "ready");
+  // Configured is no longer enough for "ready": a green mark means a live test
+  // passed, not that a key was typed. Until then it is "Saved — not verified".
+  assert.equal(readiness({ ...keyed, configured: true }).state, "saved-unverified");
+  assert.equal(readiness({ ...keyed, configured: true }, { verified: true }).state, "ready");
+});
+
+test("readiness is 'Saved — not verified' (warn) until a connection test passes", () => {
+  const configured = { ...LINEAR, enabled: true, configured: true,
+    secrets: [{ env_var: "LINEAR_API_KEY", set: true }] };
+  const unverified = readiness(configured, { verified: false });
+  assert.equal(unverified.state, "saved-unverified");
+  assert.equal(unverified.label, "Saved — not verified");
+  assert.equal(unverified.tone, "warn");
+  const verified = readiness(configured, { verified: true });
+  assert.equal(verified.state, "ready");
+  assert.equal(verified.label, "Ready");
+  assert.equal(verified.tone, "ok");
+});
+
+test("readiness reads the server's persisted verified flag when no opt is passed", () => {
+  const configured = { ...LINEAR, enabled: true, configured: true,
+    secrets: [{ env_var: "LINEAR_API_KEY", set: true }] };
+  // spec.verified (from integrations.<name>.last_verified_at) counts as a pass.
+  assert.equal(readiness({ ...configured, verified: true }).state, "ready");
+  assert.equal(readiness({ ...configured, verified: false }).state, "saved-unverified");
 });
 
 test("an integration with no switch is never reported off", () => {
-  const noSwitch = { ...TEAMS, enable_field: null, enabled: null, configured: true };
+  const noSwitch = { ...TEAMS, enable_field: null, enabled: null, configured: true, verified: true };
   assert.equal(readiness(noSwitch).state, "ready");
+  // Without a passing test it is saved-unverified, still never "off".
+  assert.equal(readiness({ ...noSwitch, verified: false }).state, "saved-unverified");
 });
 
 test("setupSummary counts what is on and what is actually ready", () => {
-  const ready = { ...TEAMS, configured: true };
+  const ready = { ...TEAMS, configured: true, verified: true };
   assert.deepEqual(setupSummary([LINEAR, ready]), { total: 2, on: 1, ready: 1 });
+  // A configured-but-unverified integration is on, but not yet ready.
+  assert.deepEqual(setupSummary([LINEAR, { ...TEAMS, configured: true }]),
+                   { total: 2, on: 1, ready: 0 });
   assert.deepEqual(setupSummary([]), { total: 0, on: 0, ready: 0 });
 });
 

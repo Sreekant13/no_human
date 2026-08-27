@@ -2058,6 +2058,20 @@ async def list_profiles(request: Request) -> list[dict[str, Any]]:
     return out
 
 
+async def _registered_repo_paths(request: Request) -> list[str]:
+    """The operator's registered repo profiles, as the option list for the
+    integrations "Run tasks in repo" select and its server-side membership
+    check. Onboarded profiles ONLY (never task repo_paths) — a pulled-in ticket
+    must run in a repo the operator deliberately set up, not any path a task
+    once referenced. Empty (never raises) when the table does not exist yet."""
+    store = _store(request)
+    try:
+        rows = await store.list_profiles()
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        return []
+    return [rp for r in rows if (rp := (r.get("repo_path") or ""))]
+
+
 async def _known_repo_paths(store) -> set[str]:
     """Every repo the operator already knows: onboarded profiles + any repo a
     task references. This set is the allow-list for /api/repo — it is why the
@@ -3717,7 +3731,8 @@ async def integration_setup_specs(request: Request) -> dict[str, Any]:
     value, and never a field the wizard is allowed to write a secret into."""
     from ..integrations import setup_specs
     cfg = request.app.state.config
-    return {"integrations": setup_specs(cfg.data)}
+    repos = await _registered_repo_paths(request)
+    return {"integrations": setup_specs(cfg.data, repos)}
 
 
 @app.put("/api/integrations/{name}/setup")
@@ -3731,11 +3746,15 @@ async def save_integration_setup(
     and refuses (422) any field that reads as a credential, so the wizard can
     never put a token in a world-readable file. Same local-origin guard as
     every other config write."""
-    from ..integrations import apply_setup
+    from ..integrations import RepoNotRegistered, apply_setup
 
     _require_local_origin(request, writing=True)
+    repos = await _registered_repo_paths(request)
     try:
-        spec = await asyncio.to_thread(apply_setup, name, dict(body.values))
+        spec = await asyncio.to_thread(apply_setup, name, dict(body.values), repos)
+    except RepoNotRegistered as exc:
+        # A bad VALUE (default_repo names no registered repo) — 400, not 422.
+        raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
         # Unknown integration/field and "that's a credential" are both the
         # caller's mistake; 422 carries the message the UI shows verbatim.
@@ -3756,6 +3775,14 @@ async def test_integration_endpoint(name: str, request: Request) -> dict[str, An
         FIELD_SPECS,
         test_integration as run_integration_test,
     )
+
+    # This route is NOT a no-op read: it loads .env secrets, fires authenticated
+    # OUTBOUND calls with the operator's stored tokens, and (on a pass) writes
+    # config.yaml via mark_verified. The app runs allow_origins=["*"]
+    # unauthenticated, so — exactly like /setup and /config — it MUST refuse a
+    # cross-origin caller, or a page the operator merely visits could drive a
+    # probe with their token and read back the VCS username/project in `detail`.
+    _require_local_origin(request, writing=True)
 
     # Load this integration's secret(s) from ~/.no_human/.env into the process
     # env BEFORE the health check. Without this the button could only
@@ -3778,6 +3805,18 @@ async def test_integration_endpoint(name: str, request: Request) -> dict[str, An
         status = await run_integration_test(name, cfg.data)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+    # A PASSING test is the one thing that earns a green "Ready": persist
+    # integrations.<name>.last_verified_at so the wizard shows Ready across
+    # reloads, not just in this session. mark_verified writes nothing for a
+    # ci.* view (github/gitlab/jenkins/circleci) — see its docstring — and never
+    # touches a credential.
+    if status.healthy is True:
+        from ..integrations import mark_verified
+
+        if await asyncio.to_thread(mark_verified, name):
+            from ..config import CONFIG_PATH, load_config
+            request.app.state.config.data = load_config(CONFIG_PATH).data
     return asdict(status)
 
 

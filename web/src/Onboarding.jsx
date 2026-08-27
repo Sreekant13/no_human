@@ -3,6 +3,7 @@ import {
   discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
   generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
+  testIntegration,
   proveRepoSSE, confirmRepoProfile, fetchReadiness, saveTelemetryConsent,
 } from "./api.js";
 import { shouldPoll, nextJobState } from "./wikiJobs.js";
@@ -15,6 +16,8 @@ import { splitRecent, relativeMtime, debounce } from "./repoRecency.js";
 import { LegionLogo } from "./Logo.jsx";
 import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
+import FieldHint from "./FieldHint.jsx";
+import { hintId as fieldHintId } from "./fieldHelp.js";
 import {
   draftFrom, changedValues, listToText, readiness, setupSummary, secretHint,
   switchLabel, effectiveEnabled,
@@ -191,6 +194,11 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   const [intSaving, setIntSaving] = useState(null);   // integration name
   const [intSaved, setIntSaved] = useState(null);     // integration name
   const [intError, setIntError] = useState({});       // name -> message
+  // Post-save live-test result: name -> {testing} | {healthy: bool, detail}.
+  // "Ready" (green) is shown ONLY when healthy === true here (or the server's
+  // persisted spec.verified) — a saved key that has not passed a test reads
+  // "Saved — not verified". See integrationSetup.js readiness.
+  const [intTest, setIntTest] = useState({});
 
   const step = STEPS[i];
   // The repo to offer a first task in: the server's readiness answer, never a
@@ -363,6 +371,18 @@ export default function Onboarding({ onComplete, askTelemetry }) {
       setIntegrations((all) => (all || []).map((s) => (s.name === spec.name ? refreshed : s)));
       setIntDraft((d) => ({ ...d, [spec.name]: draftFrom([refreshed])[spec.name] }));
       setIntSaved(spec.name);
+      // A saved key is not a working connection: run the live test so "Ready"
+      // means a test passed, not that a value was typed (fail-closed — a probe
+      // that cannot reach the network reports not-healthy, never green).
+      setIntTest((t) => ({ ...t, [spec.name]: { testing: true } }));
+      try {
+        const res = await testIntegration(spec.name);
+        setIntTest((t) => ({ ...t, [spec.name]:
+          { healthy: res.healthy === true, detail: res.detail || "" } }));
+      } catch (te) {
+        setIntTest((t) => ({ ...t, [spec.name]:
+          { healthy: false, detail: te.message || "test failed" } }));
+      }
     } catch (e) {
       setIntError((er) => ({ ...er, [spec.name]: e.message }));
     } finally {
@@ -993,6 +1013,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
             <Stagger>
               <h2 className="ob-h2">Connect your tools <span className="ob-faint">(optional)</span></h2>
               <p className="ob-sub">Turn on the ones you use and fill in their settings — this writes straight to your config. <strong>Keys and tokens are never taken here:</strong> each card names the <code>~/.no_human/.env</code> variable its credential belongs in, because config.yaml is world-readable. You can skip this and keep going.</p>
+              <p className="ob-note">GitHub, GitLab and CI are configured per repository from its profile — there is nothing to enter for them here.</p>
               {integrations === null ? (
                 <div className="ob-empty">Checking integrations…</div>
               ) : integrations.length === 0 ? (
@@ -1007,6 +1028,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                       saving={intSaving === spec.name}
                       saved={intSaved === spec.name}
                       error={intError[spec.name]}
+                      test={intTest[spec.name]}
                       onField={setIntField}
                       onSave={() => saveIntegration(spec)}
                     />
@@ -1407,9 +1429,15 @@ export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
 // The credential rule is structural, not a convention: there is no branch
 // that renders an input for a secret, because the API never describes one.
 // Credentials are stated as env-var NAMES via secretHint().
-function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSave }) {
+function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField, onSave }) {
   const values = draft[spec.name] || {};
-  const ready = readiness(spec);
+  // Verified this session (a passing /test) OR persisted on the server
+  // (spec.verified from integrations.<name>.last_verified_at). Fail-closed:
+  // while a test is in flight, or after a failing one, it is NOT verified.
+  const verified = test && test.testing !== true
+    ? test.healthy === true
+    : (test && test.testing ? false : Boolean(spec.verified));
+  const ready = readiness(spec, { verified });
   const enableField = spec.enable_field;
   // A mute switch that ships ON (e.g. teams) reads as effectively off until
   // the integration is configured — see effectiveEnabled(). Unchecking this
@@ -1446,30 +1474,53 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSa
             <div className="ob-integration-fields">
               {settings.map((f) => {
                 const id = `ob-int-${spec.name}-${f.name}`;
+                const hId = f.help ? fieldHintId(spec.name, f.name) : null;
                 if (f.kind === "bool") {
                   return (
                     <label className="ob-integration-check" key={f.name} htmlFor={id}>
                       <input id={id} type="checkbox"
                              checked={values[f.name] === true}
+                             aria-describedby={hId || undefined}
                              onChange={(e) => onField(spec.name, f.name, e.target.checked)} />
                       <span>{f.label}</span>
+                      {f.help && <FieldHint id={hId} text={f.help} url={f.help_url} />}
                     </label>
                   );
                 }
                 return (
                   <div className="ob-integration-field" key={f.name}>
                     <label className="ob-integration-label" htmlFor={id}>{f.label}</label>
-                    <input
-                      id={id}
-                      className="ob-input"
-                      type="text"
-                      spellCheck={false}
-                      // No password input exists on this card by construction:
-                      // the API never advertises a credential field here.
-                      autoComplete="off"
-                      value={f.kind === "list" ? listToText(values[f.name]) : (values[f.name] ?? "")}
-                      onChange={(e) => onField(spec.name, f.name, e.target.value)}
-                    />
+                    {f.kind === "repo_select" ? (
+                      // "Run tasks in repo": a dropdown over the operator's
+                      // registered repo profiles, so a pulled-in ticket can only
+                      // ever name a repo no_human knows (validated server-side).
+                      <select
+                        id={id}
+                        className="ob-input"
+                        aria-describedby={hId || undefined}
+                        value={values[f.name] ?? ""}
+                        onChange={(e) => onField(spec.name, f.name, e.target.value)}
+                      >
+                        <option value="">— none —</option>
+                        {(f.options || []).map((opt) => (
+                          <option key={opt} value={opt}>{opt}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        id={id}
+                        className="ob-input"
+                        type="text"
+                        spellCheck={false}
+                        // No password input exists on this card by construction:
+                        // the API never advertises a credential field here.
+                        autoComplete="off"
+                        aria-describedby={hId || undefined}
+                        value={f.kind === "list" ? listToText(values[f.name]) : (values[f.name] ?? "")}
+                        onChange={(e) => onField(spec.name, f.name, e.target.value)}
+                      />
+                    )}
+                    {f.help && <FieldHint id={hId} text={f.help} url={f.help_url} />}
                   </div>
                 );
               })}
@@ -1487,6 +1538,15 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSa
             {saved && !error && <span className="ob-integration-ok">✓ Saved to config.yaml</span>}
             {error && <span className="ob-integration-err">Couldn't save — {error}</span>}
           </div>
+          {test && test.testing && (
+            <p className="ob-integration-testing">Testing connection…</p>
+          )}
+          {test && test.testing !== true && (
+            <p className={test.healthy ? "ob-integration-ok" : "ob-integration-err"}>
+              {test.healthy ? "✓ Connected" : "✗ Not verified"}
+              {test.detail ? ` — ${test.detail}` : ""}
+            </p>
+          )}
         </div>
       )}
     </div>

@@ -110,12 +110,21 @@ export function effectiveEnabled(spec, values) {
 // The honest state line for one integration — the whole point of the step is
 // that this cannot say "Configured" while nothing runs.
 //
-// Four states, in the order they are decided:
-//   off        — its own switch is effectively off (see effectiveEnabled)
-//   needs-key  — switched on, but a credential it needs is not in .env yet
-//   incomplete — switched on and credentialled, but its settings are blank
-//   ready      — on, credentialled and configured
+// Five states, in the order they are decided:
+//   off              — its own switch is effectively off (see effectiveEnabled)
+//   needs-key        — switched on, but a credential it needs is not in .env yet
+//   incomplete       — switched on and credentialled, but its settings are blank
+//   saved-unverified — on, credentialled and configured, but NO connection test
+//                      has passed yet — the whole point of this change: a green
+//                      mark must mean a live test passed, not that a key was typed
+//   ready            — configured AND a live /test passed (this session) or a
+//                      persisted last_verified_at (spec.verified)
 // An integration with no switch (enable_field null) is never "off".
+//
+// `verified` comes from opts.verified when the caller passes it (a passing
+// /test in this session), else the server's persisted spec.verified
+// (integrations.<name>.last_verified_at). It defaults to false — fail-closed:
+// unknown verification status is NOT a pass.
 //
 // KNOWN IMPRECISION, in the safe direction. `configured` is the registry's own
 // predicate for the integration as a whole, which for Slack means "a notify
@@ -125,8 +134,9 @@ export function effectiveEnabled(spec, values) {
 // readiness; it can never report ready for something that is not, which is the
 // direction that matters when the whole point of this step is to stop the UI
 // claiming an integration is live while nothing runs.
-export function readiness(spec) {
+export function readiness(spec, opts) {
   const missing = (spec.secrets || []).filter((s) => !s.set).map((s) => s.env_var);
+  const verified = opts && opts.verified !== undefined ? opts.verified : Boolean(spec.verified);
   if (spec.enable_field && !effectiveEnabled(spec)) {
     return { state: "off", label: "Off", tone: "neutral", missing };
   }
@@ -138,6 +148,9 @@ export function readiness(spec) {
   }
   if (!spec.configured) {
     return { state: "incomplete", label: "On — needs settings", tone: "warn", missing };
+  }
+  if (!verified) {
+    return { state: "saved-unverified", label: "Saved — not verified", tone: "warn", missing };
   }
   return { state: "ready", label: "Ready", tone: "ok", missing };
 }

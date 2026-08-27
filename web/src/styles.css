@@ -5239,6 +5239,20 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-integration-actions { display: flex; align-items: center; gap: 10px; }
 .ob-integration-ok { font-size: 12px; font-weight: 600; color: var(--green); }
 .ob-integration-err { font-size: 12px; color: var(--red); }
+.ob-integration-testing { font-size: 12px; color: var(--text-muted); margin: 4px 0 0; }
+
+/* FieldHint — the "ⓘ How to find this" per-field help toggle, shared by the
+   onboarding wizard and Settings → Integrations (static hint, no tooltip lib). */
+.field-hint-wrap { margin-top: 4px; }
+.field-hint-toggle {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font-size: 12px; color: var(--text-muted); text-decoration: underline;
+}
+.field-hint-toggle:hover { color: var(--text-dim); }
+.field-hint {
+  margin: 4px 0 0; font-size: 12px; color: var(--text-dim); line-height: 1.4;
+}
+.field-hint a { color: var(--blue); }
 
 /* ── ONBOARDING WIZARD — premium first-run (Warm Editorial) ──────────────── */
 .ob-shell {

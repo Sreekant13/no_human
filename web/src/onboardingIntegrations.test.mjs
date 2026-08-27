@@ -88,7 +88,10 @@ test("the step tells the user where credentials go, in the step copy itself", ()
 test("the readiness chip comes from the server's spec, not from the draft", () => {
   // Otherwise the card would claim "Ready" for something that was typed but
   // never written — the exact "Settings disagrees with reality" defect.
-  assert.match(CARD, /const ready = readiness\(spec\);/);
+  // C2: readiness now takes the verified flag (a passing live test / persisted
+  // last_verified_at) so "Ready" means the connection works, not that a value
+  // was typed. Still driven by the server spec, never the draft.
+  assert.match(CARD, /const ready = readiness\(spec, \{ verified \}\);/);
   assert.match(CARD, /integration-chip tone-\$\{ready\.tone\}/);
 });
 
@@ -118,4 +121,17 @@ test("every class the card uses has a rule in styles.css", () => {
   for (const c of used) {
     assert.ok(new RegExp(`\\.${c}[\\s,.:{]`).test(css), `.${c} has no rule in styles.css`);
   }
+});
+
+test("default_repo renders as a select over registered repos, not free text (C3)", () => {
+  // "Run tasks in repo" must be a dropdown over the operator's registered
+  // profiles — a pulled-in ticket can only ever name a repo no_human knows.
+  assert.match(CARD, /f\.kind === "repo_select"/);
+  assert.match(CARD, /\(f\.options \|\| \[\]\)\.map\(\(opt\)/);
+  assert.match(CARD, /<select/);
+});
+
+test("the Integrations step explains that GitHub/GitLab/CI come from the repo profile (C3)", () => {
+  assert.match(STEP, /configured per repository from its profile/);
+  assert.match(STEP, /GitHub, GitLab and CI/);
 });

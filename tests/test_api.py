@@ -2298,7 +2298,8 @@ async def test_integrations_list_never_leaks_the_slack_webhook(client, mock_ambi
 
 @pytest.mark.asyncio
 async def test_integration_test_endpoint_unconfigured_jira(client):
-    r = await client.post("/api/integrations/jira/test")
+    r = await client.post("/api/integrations/jira/test",
+                          headers={"Origin": "http://127.0.0.1:8420"})
     assert r.status_code == 200
     body = r.json()
     assert body["name"] == "jira"
@@ -2308,7 +2309,8 @@ async def test_integration_test_endpoint_unconfigured_jira(client):
 
 @pytest.mark.asyncio
 async def test_integration_test_endpoint_unknown_name_404(client):
-    r = await client.post("/api/integrations/mystery/test")
+    r = await client.post("/api/integrations/mystery/test",
+                          headers={"Origin": "http://127.0.0.1:8420"})
     assert r.status_code == 404
 
 
@@ -2611,7 +2613,8 @@ async def test_integration_test_endpoint_reports_ambient_not_unconfigured(
     ticket exists to remove.
     """
     monkeypatch.setitem(mock_ambient_probes._AMBIENT_PROBES, "github", lambda: True)
-    r = await client.post("/api/integrations/github/test")
+    r = await client.post("/api/integrations/github/test",
+                          headers={"Origin": "http://127.0.0.1:8420"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "ambient", body

@@ -522,7 +522,8 @@ async def test_test_connection_loads_token_from_env_not_only_serve(client, tmp_p
 
     monkeypatch.setattr(integ, "_http_get", _fake_get)
 
-    r = await client.post("/api/integrations/jira/test")
+    r = await client.post("/api/integrations/jira/test",
+                          headers={"Origin": "http://127.0.0.1:8420"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["healthy"] is True, body

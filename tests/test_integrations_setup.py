@@ -572,3 +572,271 @@ async def test_list_integrations_endpoint_reports_enabled(client):
     by_name = {s["name"]: s for s in r.json()["integrations"]}
     assert by_name["linear"]["enabled"] is True
     assert by_name["github"]["enabled"] is None
+
+
+# --------------------------------------------------------------------------- #
+# C2.1 — REAL, fail-closed probes for github / gitlab / jenkins.               #
+#                                                                              #
+# No respx in deps, so `httpx.AsyncClient` is monkeypatched to one built on    #
+# `httpx.MockTransport(handler)`: the per-test handler maps a request to a     #
+# response WITHOUT any real network, and can raise `httpx.ConnectError` to     #
+# exercise the fail-closed path (a probe that cannot reach the network is      #
+# NEVER healthy).                                                              #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def mock_http(monkeypatch):
+    """Install a request handler that every `httpx.AsyncClient` in reg's probes
+    routes through — no socket is ever opened. Returns the installer."""
+    import httpx
+
+    def install(handler):
+        real = httpx.AsyncClient
+        transport = httpx.MockTransport(handler)
+
+        def factory(*args, **kwargs):
+            kwargs.setdefault("transport", transport)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+    return install
+
+
+_GH_CFG = {"ci": {"enabled": True, "backend": "github_actions", "project": "o/r"}}
+
+
+async def test_github_probe_healthy_on_200_user_and_repo(mock_http, monkeypatch):
+    import httpx
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-should-not-leak")
+
+    def handler(request):
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "amit"})
+        if request.url.path == "/repos/o/r":
+            return httpx.Response(200, json={"full_name": "o/r"})
+        return httpx.Response(404)
+
+    mock_http(handler)
+    s = await reg.test_integration("github", _GH_CFG)
+    assert s.healthy is True, s.detail
+    assert "connected as amit" in s.detail
+    assert "o/r" in s.detail
+    assert "gh-should-not-leak" not in s.detail  # never echoed
+
+
+async def test_github_probe_401_is_unhealthy(mock_http, monkeypatch):
+    import httpx
+    monkeypatch.setenv("GITHUB_TOKEN", "bad")
+
+    def handler(request):
+        return httpx.Response(401, json={"message": "Bad credentials"})
+
+    mock_http(handler)
+    s = await reg.test_integration("github", _GH_CFG)
+    assert s.healthy is False
+    assert "401" in s.detail
+
+
+async def test_network_error_is_not_verified(mock_http, monkeypatch):
+    # FAIL-CLOSED: a probe that cannot reach the network is NOT healthy, and
+    # says so — never a green from a request that never completed.
+    import httpx
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+
+    def handler(request):
+        raise httpx.ConnectError("no route to host")
+
+    mock_http(handler)
+    s = await reg.test_integration("github", _GH_CFG)
+    assert s.healthy is False
+    assert "not verified" in s.detail
+    assert "ConnectError" in s.detail
+
+
+async def test_linear_wrong_team_key_lists_available(mock_http, monkeypatch):
+    # The key authenticates, but the configured team_key names no team — the
+    # detail must NAME the teams this key can actually see, so the operator can
+    # fix the setting instead of guessing.
+    import json as _json
+    import httpx
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+
+    def handler(request):
+        q = _json.loads(request.content).get("query", "")
+        if "teams" in q:
+            return httpx.Response(200, json={"data": {"teams": {"nodes": [
+                {"key": "ENG"}, {"key": "OPS"}]}}})
+        return httpx.Response(200, json={"data": {"viewer": {"id": "u", "name": "Dana"}}})
+
+    mock_http(handler)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ABC"}}})
+    assert s.healthy is False
+    assert "ABC" in s.detail
+    assert "ENG" in s.detail and "OPS" in s.detail
+
+
+async def test_gitlab_probe_healthy_on_200_user(mock_http, monkeypatch):
+    import httpx
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-x")
+
+    def handler(request):
+        if request.url.path == "/api/v4/user":
+            return httpx.Response(200, json={"username": "amit"})
+        return httpx.Response(404)
+
+    mock_http(handler)
+    cfg = {"ci": {"enabled": True, "backend": "gitlab", "project": "g/p",
+                  "hostname": "gitlab.com"}}
+    s = await reg.test_integration("gitlab", cfg)
+    assert s.healthy is True, s.detail
+    assert "amit" in s.detail
+
+
+async def test_jenkins_probe_healthy_on_200_and_fails_closed(mock_http, monkeypatch):
+    import httpx
+    monkeypatch.setenv("JENKINS_USER", "amit")
+    monkeypatch.setenv("JENKINS_API_TOKEN", "jk-tok")
+
+    def handler(request):
+        if request.url.path.endswith("/api/json"):
+            return httpx.Response(200, json={"mode": "NORMAL"})
+        return httpx.Response(404)
+
+    mock_http(handler)
+    cfg = {"ci": {"enabled": True, "backend": "jenkins", "job": "job/build",
+                  "base_url": "https://ci.example.com"}}
+    s = await reg.test_integration("jenkins", cfg)
+    assert s.healthy is True, s.detail
+    assert "jk-tok" not in s.detail
+
+    # And fail-closed on a transport error.
+    def boom(request):
+        raise httpx.ConnectTimeout("slow")
+
+    mock_http(boom)
+    s2 = await reg.test_integration("jenkins", cfg)
+    assert s2.healthy is False
+    assert "not verified" in s2.detail
+
+
+# --------------------------------------------------------------------------- #
+# C2.2 — "Ready" only after a passing test: setup_specs carries a `verified`   #
+# flag from integrations.<name>.last_verified_at, and mark_verified persists   #
+# it on a passing /test.                                                       #
+# --------------------------------------------------------------------------- #
+
+def test_setup_specs_report_verified_from_last_verified_at():
+    cfg = {"integrations": {"linear": {"team_key": "ENG",
+                                       "last_verified_at": "2026-08-27T00:00:00Z"}}}
+    specs = {s["name"]: s for s in reg.setup_specs(cfg)}
+    assert specs["linear"]["verified"] is True
+    # An integration that has never passed a test is not verified.
+    assert specs["jira"]["verified"] is False
+
+
+def test_mark_verified_persists_for_a_tracker_and_refuses_a_ci_view():
+    ts = reg.mark_verified("linear")
+    assert ts
+    cfg = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert cfg["integrations"]["linear"]["last_verified_at"] == ts
+    specs = {s["name"]: s for s in reg.setup_specs(cfg)}
+    assert specs["linear"]["verified"] is True
+    # github/gitlab/jenkins/circleci are ci.* views with no integrations block,
+    # so there is nowhere to persist a verified flag and nothing reads one.
+    assert reg.mark_verified("github") is None
+    cfg2 = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert "github" not in (cfg2.get("integrations") or {})
+    # slack/teams DO have config blocks, but their check is view-only (a webhook
+    # present, never delivered), so a healthy result is "saved", not "verified":
+    # mark_verified refuses them too, so they can never earn a green "Ready".
+    assert reg.mark_verified("slack") is None
+    assert reg.mark_verified("teams") is None
+    cfg3 = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert "last_verified_at" not in (cfg3["integrations"].get("slack") or {})
+    assert "last_verified_at" not in (cfg3["integrations"].get("teams") or {})
+
+
+# --------------------------------------------------------------------------- #
+# C3 — "Run tasks in repo": default_repo is a select over the operator's       #
+# registered repo profiles, validated server-side to be one of them.           #
+# --------------------------------------------------------------------------- #
+
+def test_default_repo_is_a_repo_select_over_registered_profiles():
+    repos = ["/repos/proj1", "/repos/proj2"]
+    specs = {s["name"]: s for s in reg.setup_specs({"integrations": {"linear": {}}},
+                                                    repos=repos)}
+    fields = {f["name"]: f for f in specs["linear"]["fields"]}
+    assert fields["default_repo"]["kind"] == "repo_select"
+    assert fields["default_repo"]["options"] == repos
+    assert fields["default_repo"]["label"] == "Run tasks in repo"
+
+
+def test_apply_setup_refuses_an_unregistered_default_repo():
+    with pytest.raises(reg.RepoNotRegistered):
+        reg.apply_setup("linear", {"default_repo": "/not/registered"},
+                        repos=["/repos/proj"])
+    # A registered path is accepted, and clearing the field ("") is always fine.
+    reg.apply_setup("linear", {"default_repo": "/repos/proj"}, repos=["/repos/proj"])
+    reg.apply_setup("linear", {"default_repo": ""}, repos=["/repos/proj"])
+    cfg = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert cfg["integrations"]["linear"]["default_repo"] == ""
+
+
+@pytest.mark.asyncio
+async def test_put_setup_unregistered_default_repo_is_400(client):
+    # No profiles registered → any non-empty default_repo is unregistered.
+    r = await client.put("/api/integrations/linear/setup",
+                         json={"values": {"default_repo": "/nope"}})
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_put_setup_accepts_a_registered_default_repo(client, store):
+    from no_human.profile import ProjectProfile
+    await store.upsert_profile(ProjectProfile(repo_path="/repos/proj", ecosystem="node"))
+    r = await client.put("/api/integrations/linear/setup",
+                         json={"values": {"default_repo": "/repos/proj"}})
+    assert r.status_code == 200, r.text
+    fields = {f["name"]: f for f in r.json()["fields"]}
+    assert fields["default_repo"]["value"] == "/repos/proj"
+    assert fields["default_repo"]["options"] == ["/repos/proj"]
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes                                                                 #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_test_endpoint_refuses_a_cross_origin_call(client):
+    # CSRF: POST /test loads .env secrets, fires authenticated OUTBOUND calls
+    # with the operator's tokens, and writes config.yaml on a pass. The app runs
+    # allow_origins=["*"] unauthenticated, so — like every sibling write route —
+    # it must refuse a cross-origin caller, or a page the operator merely visits
+    # could drive a probe with their token and read back the VCS user/project.
+    r = await client.post("/api/integrations/github/test",
+                          headers={"Origin": "https://evil.example.com"})
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_slack_view_check_healthy_never_earns_verified(client):
+    # slack's check is view-only: it reports healthy when a webhook string is
+    # present, without delivering anything. That must NOT flip it to a green
+    # "Ready" — last_verified_at is never written, so setup_specs.verified stays
+    # False. (The same holds for teams; slack is the representative case.)
+    import yaml
+    nh_config.CONFIG_PATH.write_text(yaml.safe_dump(
+        {"notifications": {"slack_webhook_url": "https://hooks.slack.com/services/T/B/x"}}))
+    app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
+
+    r = await client.post("/api/integrations/slack/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["healthy"] is True   # the view-check reports healthy...
+
+    # ...but that is config-presence, not a delivery test — no verified flag.
+    specs = {s["name"]: s
+             for s in reg.setup_specs(nh_config.load_config(nh_config.CONFIG_PATH).data)}
+    assert specs["slack"]["verified"] is False
+    cfg = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert "last_verified_at" not in (cfg["integrations"].get("slack") or {})

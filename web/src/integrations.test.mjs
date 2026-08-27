@@ -127,9 +127,12 @@ test("the CI auto-pin note uses plain, active-voice copy", () => {
     "the visible note text must not contain raw config keys like ci.backend/ci.enabled");
 });
 
-test("a helper hint exists for jargon field names, e.g. the CircleCI project slug", () => {
-  assert.match(src, /project_slug:\s*"/);
-  assert.match(src, /FIELD_HELP\[f\.name\]/);
+test("field help is the shared FieldHint driven by the server's help catalogue, not a hardcoded map", () => {
+  // The old inline FIELD_HELP is gone; help text/URL now come from f.help /
+  // f.help_url (integrations/help.py) and render through one FieldHint.
+  assert.doesNotMatch(src, /const FIELD_HELP =/);
+  assert.match(src, /import FieldHint from "\.\/FieldHint\.jsx"/);
+  assert.match(src, /<FieldHint id=\{hintId\} text=\{f\.help\} url=\{f\.help_url\} \/>/);
 });
 
 test("Save is disabled while saving, on validation errors, or with nothing dirty to send", () => {
@@ -167,7 +170,7 @@ test("inputs wire aria-invalid and aria-describedby to their helper/error elemen
   assert.match(src, /aria-invalid=\{fieldErrors\[f\.name\]\s*\?\s*"true"\s*:\s*undefined\}/);
   assert.match(src, /aria-describedby=\{describedBy\}/);
   // The ids it points at are actually rendered on the hint/error elements.
-  assert.match(src, /const hintId = FIELD_HELP\[f\.name\]\s*\?\s*`\$\{inputId\}-hint`\s*:\s*null/);
+  assert.match(src, /const hintId = f\.help \? fieldHintId\(integration\.name, f\.name\) : null/);
   assert.match(src, /const errorId = fieldErrors\[f\.name\]\s*\?\s*`\$\{inputId\}-error`\s*:\s*null/);
   assert.match(src, /id=\{hintId\}/);
   assert.match(src, /id=\{errorId\}/);
