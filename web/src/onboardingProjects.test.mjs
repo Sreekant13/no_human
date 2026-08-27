@@ -169,8 +169,14 @@ test("re-ticking into an empty project makes that repo the default", () => {
 // ── the wizard actually uses all of it ─────────────────────────────────────
 
 test("Onboarding.jsx builds new project defs through newProjectDef", () => {
-  assert.match(onboarding, /newProjectDef\(name, selectedRepos\)/,
-    "addProject must seed from the onboarded repos");
+  // F8: one project at a time — addProject binds the repos the user ticked FOR
+  // THAT project in the add form (newProjRepos), not every selected repo and not
+  // nothing. The picker is seeded from selectedRepos when the step opens, so the
+  // common "one project, all my repos" case is still a single Add.
+  assert.match(onboarding, /newProjectDef\(name, newProjRepos\)/,
+    "addProject must bind the add form's chosen repos");
+  assert.match(onboarding, /setNewProjRepos\(new Set\(selectedRepos\)\)/,
+    "the add form's repo picker must seed/reset from the repos selected on the repos step");
   assert.doesNotMatch(onboarding, /repos:\s*new Set\(\)/,
     "the empty-by-construction default is the root cause and must not return");
 });

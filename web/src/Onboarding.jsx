@@ -153,10 +153,12 @@ export default function Onboarding({ onComplete }) {
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
   const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set, primary}]
   const [newProjName, setNewProjName] = useState("");
-  // Which project's "Pick repos" checklist is open (spec §3 B2). The picker lists
-  // ALL discovered repos, not only the ones ticked on the repos step, so a
-  // project with zero repos can be fixed here instead of dead-ending.
-  const [pickReposFor, setPickReposFor] = useState(null);
+  // The repos ticked in the ADD-project form for the project being composed now
+  // (F8 redesign). One project is created at a time: you name it, pick ITS repos
+  // here, then Add drops it into the created-projects list below and this form
+  // resets. Seeded from the repos selected on the repos step when the step opens,
+  // so the common "one project, all my repos" case is one click.
+  const [newProjRepos, setNewProjRepos] = useState(() => new Set());
   const [history, setHistory] = useState(null);     // {available, transcripts}
   // The ANALYZE response. Separate from `history` (the extract probe) because
   // the result callout must describe the pass that actually ingested — see
@@ -315,6 +317,12 @@ export default function Onboarding({ onComplete }) {
           setIntDraft(draftFrom(specs));
         })
         .catch(() => setIntegrations([]));
+    }
+    // Entering Projects with the add form pristine seeds its repo picker with
+    // the repos selected on the repos step — the "one project, all my repos"
+    // path is then a single Add, and the picker still lets you narrow it.
+    if (step.key === "projects" && !newProjName.trim()) {
+      setNewProjRepos(new Set(selectedRepos));
     }
     // deps intentionally partial (was: eslint-disable react-hooks/exhaustive-deps — plugin never loaded here)
   }, [step.key]);
@@ -555,15 +563,26 @@ export default function Onboarding({ onComplete }) {
     });
   }
 
+  // Tick/untick a repo for the project being composed in the add form.
+  function toggleNewProjRepo(repoPath) {
+    setNewProjRepos((s) => {
+      const n = new Set(s);
+      n.has(repoPath) ? n.delete(repoPath) : n.add(repoPath);
+      return n;
+    });
+  }
+
+  // Add ONE project at a time (F8): it takes the name AND the repos ticked in
+  // the form (newProjRepos), lands in the created-projects list, and the form
+  // resets to a fresh copy of the selected repos for the next one. A definition
+  // is bound to exactly the repos the user chose FOR IT — not to every repo, and
+  // not to nothing (the silent-discard bug; see onboardingProjects.js).
   function addProject() {
     const name = newProjName.trim();
     if (!name || projectDefs.some((p) => p.name === name)) return;
-    // Seeded with the repos onboarded on the previous step, not with nothing:
-    // an empty-by-construction definition is what the wizard then discarded in
-    // silence (see onboardingProjects.js). The seeding is visible — the boxes
-    // are ticked and the header counts them — so it can be undone.
-    setProjectDefs([...projectDefs, newProjectDef(name, selectedRepos)]);
+    setProjectDefs([...projectDefs, newProjectDef(name, newProjRepos)]);
     setNewProjName("");
+    setNewProjRepos(new Set(selectedRepos));
   }
 
   function toggleProjectRepo(projIdx, repoPath) {
@@ -881,69 +900,80 @@ export default function Onboarding({ onComplete }) {
             </Stagger>
           )}
 
-          {step.key === "projects" && (
+          {step.key === "projects" && (() => {
+            // The repos the add form offers: the ones picked on the repos step
+            // (the natural scope), falling back to every discovered repo when the
+            // user selected none — so a repo-less run is never a dead-end.
+            const pickerRepos = selectedRepos.size ? [...selectedRepos] : detected.map((r) => r.path);
+            return (
             <Stagger>
               <h2 className="ob-h2">Group repos into projects</h2>
-              <p className="ob-sub">A project is a named unit of work — it can span multiple repos. When you create a task, you pick a project.</p>
-              <div className="ob-row" style={{ marginBottom: '0.75rem' }}>
-                <input className="ob-input" value={newProjName} placeholder="Project name, e.g. checkout-api" onChange={(e) => setNewProjName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addProject()} />
-                <button className="ob-btn-ghost" onClick={addProject} disabled={!newProjName.trim()}>+ Add project</button>
+              <p className="ob-sub">A project is a named unit of work — it can span multiple repos. When you create a task, you pick a project. Add one at a time: name it, pick its repos, then Add.</p>
+
+              {/* ONE add form (F8): name + this project's repos, then Add. Each
+                  Add drops the project into the list below and clears the form —
+                  no more one-full-repo-checklist-per-project. */}
+              <div className="ob-project-card ph-no-capture" style={{ marginBottom: '0.9rem' }}>
+                <div className="ob-row">
+                  <input className="ob-input" value={newProjName} placeholder="Project name, e.g. checkout-api"
+                         onChange={(e) => setNewProjName(e.target.value)}
+                         onKeyDown={(e) => e.key === "Enter" && addProject()} />
+                  <button className="ob-btn-ghost" onClick={addProject} disabled={!newProjName.trim()}>+ Add project</button>
+                </div>
+                <div className="ob-faint" style={{ margin: '0.5rem 0 0.25rem', fontSize: '0.8rem' }}>
+                  Repos for this project <span className="ph-no-capture">({newProjRepos.size} selected)</span>
+                </div>
+                {pickerRepos.length === 0 ? (
+                  <div className="ob-empty">No repositories selected — go back to Repositories to pick some, or add projects later in Settings.</div>
+                ) : (
+                  <div className="ob-repolist ph-no-capture" style={{ maxHeight: '160px' }}>
+                    {pickerRepos.map((rp) => (
+                      <label key={rp} className={`ob-repo${newProjRepos.has(rp) ? " sel" : ""}`} style={{ padding: '0.25rem 0.5rem' }}>
+                        <input type="checkbox" checked={newProjRepos.has(rp)} onChange={() => toggleNewProjRepo(rp)} />
+                        <span className="ob-repo-name">{repoName(rp)}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
               </div>
-              {/* "Add at least one…" was a promise of a gate that does
-                  not exist and must not: Continue is never disabled here
-                  (onboardingNav.js locks only the terminal launch), the composer
-                  works with no project at all ("No projects yet — give the path
-                  of the repo to work in", TaskComposer.jsx), and a real gate
-                  would DEAD-END anyone who selected no repos — the only project
-                  they could add would bind none, and finish() refuses exactly
-                  those (unboundProjectsMessage). So the copy is what was wrong. */}
-              {projectDefs.length === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add them here or later in Settings.</div>}
+
+              {/* The created projects — a COMPACT list, never an expanded
+                  checklist each. Name, its repo count, a default-repo picker when
+                  it spans more than one, and a remove. */}
+              {projectDefs.length === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add them above or later in Settings.</div>}
               {projectDefs.map((pd, pi) => (
-                <div key={pd.name} className="ob-project-card ph-no-capture">
+                <div key={pd.name} className="ob-project-card ph-no-capture" style={{ marginBottom: '0.5rem' }}>
                   <div className="ob-project-head">
                     <strong className="ph-no-capture">{pd.name}</strong>
                     <span className="ob-faint">{pd.repos.size} repo{pd.repos.size !== 1 ? "s" : ""}</span>
-                    {/* Pick repos over ALL discovered repos (spec §3 B2), not just
-                        the ones ticked on the repos step — a repo-less project has
-                        nothing to tick otherwise, which is the Kika dead-end. */}
-                    <button type="button" className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }}
-                            aria-expanded={pickReposFor === pi} onClick={() => setPickReposFor(pickReposFor === pi ? null : pi)}>Pick repos</button>
-                    <button className="ob-btn-ghost" style={{ fontSize: '0.75rem' }} aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
+                    {/* "One repo should be the default but configurable" — the
+                        default is the project's primary_repo, which becomes the
+                        repo a task on this project runs in. */}
+                    {pd.repos.size > 1 && (
+                      <label className="ob-faint" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginLeft: 'auto', fontSize: '0.8rem' }}>
+                        Default
+                        <select
+                          className="ob-input" style={{ padding: '0.2rem 0.4rem', fontSize: '0.8rem' }}
+                          value={pd.primary || ""}
+                          onChange={(e) => chooseProjectPrimary(pi, e.target.value)}
+                        >
+                          {[...pd.repos].map((rp) => (
+                            <option key={rp} value={rp}>{repoName(rp)}</option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    <button className="ob-btn-ghost" style={{ marginLeft: pd.repos.size > 1 ? '0.4rem' : 'auto', fontSize: '0.75rem' }}
+                            aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
                   </div>
-                  {(pickReposFor === pi || pd.repos.size === 0) && (
-                    <div className="ob-repolist ph-no-capture" style={{ maxHeight: '140px' }}>
-                      {Array.from(new Set([...detected.map((r) => r.path), ...pd.repos])).map((rp) => (
-                        <label key={rp} className={`ob-repo${pd.repos.has(rp) ? " sel" : ""}`} style={{ padding: '0.25rem 0.5rem' }}>
-                          <input type="checkbox" checked={pd.repos.has(rp)} onChange={() => toggleProjectRepo(pi, rp)} />
-                          <span className="ob-repo-name">{rp.split("/").pop()}</span>
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                  {/* Said here, next to the empty tick-list that causes it, and
-                      again as a refusal at launch. The wizard used to print
-                      "Projects 1" on the summary and create none. */}
+                  {/* A project can only reach this list with the repos it was
+                      created with; a zero-repo one is still refused, named here
+                      and again at launch (the wizard used to print "Projects 1"
+                      and create none). */}
                   {pd.repos.size === 0 && (
                     <div className="ob-empty" style={{ marginTop: '0.4rem' }}>
-                      No repos ticked — {pd.name} cannot be created until at least one is.
+                      No repos — {pd.name} cannot be created until it has at least one. Remove it, or re-add it with a repo ticked.
                     </div>
-                  )}
-                  {/* "One repo should be the default but configurable" — the
-                      default is the project's primary_repo, which becomes the
-                      repo a task on this project runs in. */}
-                  {pd.repos.size > 1 && (
-                    <label className="ob-faint" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.4rem', fontSize: '0.8rem' }}>
-                      Default repo
-                      <select
-                        className="ob-input" style={{ flex: 1, padding: '0.2rem 0.4rem', fontSize: '0.8rem' }}
-                        value={pd.primary || ""}
-                        onChange={(e) => chooseProjectPrimary(pi, e.target.value)}
-                      >
-                        {[...pd.repos].map((rp) => (
-                          <option key={rp} value={rp}>{rp.split("/").pop()}</option>
-                        ))}
-                      </select>
-                    </label>
                   )}
                 </div>
               ))}
@@ -955,7 +985,8 @@ export default function Onboarding({ onComplete }) {
               )}
               <p className="ob-note">You can add or edit projects later in Settings. Repos not assigned to any project can still be used via the "other" option when creating a task.</p>
             </Stagger>
-          )}
+            );
+          })()}
 
           {step.key === "docs" && (
             <Stagger>
