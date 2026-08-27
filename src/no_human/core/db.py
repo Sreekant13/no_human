@@ -4211,6 +4211,7 @@ class Store:
 
     # ---- wiki generation jobs (migrations/0017) --------------------------- #
 
+    @serialized_write
     async def create_wiki_job(self, repo_path: str) -> str:
         """Insert a queued wiki-generation job for *repo_path*; return its id."""
         job_id = uuid.uuid4().hex
@@ -4227,6 +4228,7 @@ class Store:
             "SELECT * FROM wiki_jobs WHERE id = ?", (job_id,))
         return dict(row) if row else None
 
+    @serialized_write
     async def update_wiki_job(self, job_id: str, **fields: Any) -> None:
         """Update one job's mutable columns. Keys are whitelisted so only the
         job's own columns can be written, never arbitrary SQL."""

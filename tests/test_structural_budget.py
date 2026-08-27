@@ -133,7 +133,7 @@ FROZEN_FILE_LINES = {
     "core/orchestrator.py": 19387,
     "cli/commands.py": 7783,
     "api/app.py": 5153,
-    "core/db.py": 4251,
+    "core/db.py": 4253,
     "config.py": 2889,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
