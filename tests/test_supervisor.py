@@ -1,4 +1,4 @@
-"""Tests for the Supervisor hook (SUPERVISOR_AND_REVIEWER_PLAN.md Phase C1).
+"""Tests for the Supervisor hook.
 
 Covers:
   - Decision parsing (CONTINUE / CORRECT / ANSWER / STOP)

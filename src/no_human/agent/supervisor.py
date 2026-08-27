@@ -1,5 +1,5 @@
 """Supervisor hook — a PostToolUse evaluator that course-corrects the working
-agent in real time (SUPERVISOR_AND_REVIEWER_PLAN.md Phase A).
+agent in real time.
 
 Replaces the human-in-the-loop for:
   - Rule enforcement (the agent ignored a confirmed rule)
