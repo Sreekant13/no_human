@@ -684,7 +684,7 @@ export async function fetchReadiness() {
   return r.json();
 }
 export const extractHistory    = ()        => _post("/api/onboarding/history/extract", {});
-export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/analyze", { days });
+export const analyzeHistory    = (days = 30, repo_paths = []) => _post("/api/onboarding/history/analyze", { days, repo_paths });
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 // Minimal path (spec §3 B1): the deferred steps carried on the board's Finish-setup card.

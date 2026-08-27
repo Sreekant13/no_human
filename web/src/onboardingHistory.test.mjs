@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { scanSummary } from "./onboardingHistory.js";
+import { scanSummary, groupProposalsByProject } from "./onboardingHistory.js";
 
 // Measured on a live wizard run with an empty home, and it is the whole reason
 // this module exists:
@@ -52,6 +52,47 @@ test("the Claude Code split is named only when it is not the whole set", () => {
     /2 from Claude Code/);
   assert.doesNotMatch(scanSummary({ transcripts: 5, proposals: 1, claudeCode: 5 }),
     /from Claude Code/, "saying '5 of 5' adds nothing but length");
+});
+
+// ── proposals split into the selected repos vs other projects (spec §3 B5) ──
+
+test("proposals group by whether their project is inside a selected repo", () => {
+  const proposals = [
+    { id: "a", project: "/Users/u/mine/x" },   // inside → inScope
+    { id: "b", project: "/Users/u/other" },     // other project
+    { id: "c", project: "/Users/u/mine-other" },// prefix collision, NOT inside
+    { id: "d" },                                 // no project (skill) → inScope
+  ];
+  const { inScope, other } = groupProposalsByProject(proposals, ["/Users/u/mine"]);
+  assert.deepEqual(inScope.map((p) => p.id), ["a", "d"]);
+  const byProject = Object.fromEntries(other.map((g) => [g.project, g.items.map((i) => i.id)]));
+  assert.deepEqual(byProject, {
+    "/Users/u/other": ["b"],
+    "/Users/u/mine-other": ["c"],
+  });
+});
+
+test("with no repos selected, every proposal is in scope", () => {
+  const { inScope, other } = groupProposalsByProject(
+    [{ id: "a", project: "/x" }, { id: "b", project: "/y" }], []);
+  assert.equal(inScope.length, 2);
+  assert.equal(other.length, 0);
+});
+
+test("a trailing slash on a selected repo does not change containment", () => {
+  const { inScope, other } = groupProposalsByProject(
+    [{ id: "a", project: "/Users/u/mine/x" }], ["/Users/u/mine/"]);
+  assert.deepEqual(inScope.map((p) => p.id), ["a"]);
+  assert.equal(other.length, 0);
+});
+
+// ── the step states its scope and sends the selected repos ─────────────────
+
+test("the history scope copy states the selected-repo scope, and the scan sends the repos", () => {
+  assert.match(onboarding, /Scope: conversations from the last <strong>30 days<\/strong> in/);
+  assert.match(onboarding, /selected repo/);
+  assert.match(onboarding, /analyzeHistory\(30, \[\.\.\.selectedRepos\]\)/,
+    "the scan must scope the analyze call to the selected repos");
 });
 
 // ── the step must render the numbers from the pass it is describing ────────

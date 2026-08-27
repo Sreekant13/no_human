@@ -23,7 +23,7 @@ import {
   backDisabled, backDisabledReason, forwardDisabled, canJumpTo, stepButtonLabel,
 } from "./onboardingNav.js";
 import { canStartMinimal } from "./onboardingMinimal.js";
-import { scanSummary } from "./onboardingHistory.js";
+import { scanSummary, groupProposalsByProject } from "./onboardingHistory.js";
 import { summaryRepoCounts } from "./onboardingSummary.js";
 import {
   newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
@@ -506,7 +506,10 @@ export default function Onboarding({ onComplete, askTelemetry }) {
       setHistory(ext);
       if (ext.available && (ext.transcripts > 0 || ext.skills > 0)) {
         setScanPhase("analyzing");
-        const an = await analyzeHistory(30);
+        // Scope the scan to the selected repos (spec §3 B5): a repo-focused
+        // onboarding used to ingest transcripts from EVERY project on the
+        // machine. Empty (no repos ticked) keeps the every-project behaviour.
+        const an = await analyzeHistory(30, [...selectedRepos]);
         setAnalysis(an);
         setProposals(an.proposals || []);
         // Confirmation is OPT-IN per memory. Nothing is pre-ticked: a real user
@@ -1023,7 +1026,9 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 corrections you keep repeating — so the Supervisor enforces them for you.
               </p>
               <p className="ob-sub" style={{ opacity: 0.75, fontSize: "0.9em" }}>
-                Scope: your last <strong>30 days</strong> of conversations, read from this machine.
+                Scope: conversations from the last <strong>30 days</strong> in {selectedRepos.size > 0
+                  ? <><strong>{selectedRepos.size}</strong> selected repo{selectedRepos.size === 1 ? "" : "s"}</>
+                  : <>every project on this machine (no repos selected)</>}.
                 Recent messages are sent to <strong>Claude</strong> to distill the lessons —
                 personal details (home addresses, phone numbers, payment and ID info) are dropped
                 <strong> before a message is sent or saved</strong>.
@@ -1088,22 +1093,40 @@ export default function Onboarding({ onComplete, askTelemetry }) {
               <p className="ob-sub">Nothing is ticked and nothing is active. Tick only the ones you want — confirmed rules become standing guidance the Supervisor enforces.</p>
               {proposals.length === 0 ? (
                 <div className="ob-empty">No proposals — nothing extracted, or you skipped the scan. You can add rules anytime in Settings.</div>
-              ) : (
-                <div className="ob-rules">
-                  {proposals.map((p) => (
-                    <label key={p.id} className={`ob-rule${chosenRules.has(p.id) ? " sel" : ""}`}>
-                      <input type="checkbox" checked={chosenRules.has(p.id)} onChange={() => toggleRule(p.id)} />
-                      <div>
-                        <div className="ob-rule-head">
-                          <span className={`ob-rule-cat cat-${p.category}`}>{p.category}</span>
-                          {p.importance && <span className={`ob-rule-imp imp-${p.importance}`}>{p.importance}</span>}
-                        </div>
-                        <div className="ob-rule-text">{p.content}</div>
+              ) : (() => {
+                // Split the proposals by whether they came from the selected
+                // repos or another project (spec §3 B5). In-scope rules render
+                // normally; other projects render collapsed and off by default —
+                // a rule mined from an unrelated repo's chats shouldn't be one
+                // tick from becoming standing guidance for THIS onboarding.
+                const ruleLabel = (p) => (
+                  <label key={p.id} className={`ob-rule${chosenRules.has(p.id) ? " sel" : ""}`}>
+                    <input type="checkbox" checked={chosenRules.has(p.id)} onChange={() => toggleRule(p.id)} />
+                    <div>
+                      <div className="ob-rule-head">
+                        <span className={`ob-rule-cat cat-${p.category}`}>{p.category}</span>
+                        {p.importance && <span className={`ob-rule-imp imp-${p.importance}`}>{p.importance}</span>}
                       </div>
-                    </label>
-                  ))}
-                </div>
-              )}
+                      <div className="ob-rule-text">{p.content}</div>
+                    </div>
+                  </label>
+                );
+                const { inScope, other } = groupProposalsByProject(proposals, [...selectedRepos]);
+                return (
+                  <>
+                    <div className="ob-rules">{inScope.map(ruleLabel)}</div>
+                    {other.map((g) => (
+                      <details key={g.project} className="ob-rules-other">
+                        <summary>
+                          {g.items.length} from <strong>{g.project.split("/").pop() || g.project}</strong>
+                          {" "}<span className="ob-faint">(a different project — off by default)</span>
+                        </summary>
+                        <div className="ob-rules">{g.items.map(ruleLabel)}</div>
+                      </details>
+                    ))}
+                  </>
+                );
+              })()}
             </Stagger>
           )}
 

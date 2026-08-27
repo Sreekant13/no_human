@@ -54,3 +54,38 @@ export function scanSummary({ transcripts = 0, messages = 0, skills = 0, proposa
   return `Scanned ${withMessages} → ${items}`
     + (skills > 0 ? `, including ${skillPart} cataloged from this machine.` : ".");
 }
+
+/** Split proposals by whether their project is inside one of the selected repos.
+ *
+ * "Inside" is a real path-boundary containment, never a string prefix:
+ * /Users/u/mine-other is a SIBLING of /Users/u/mine, not inside it, so a
+ * correction from the sibling repo must not be presented as in-scope. A
+ * proposal with no project (a cataloged skill is machine-wide) counts as
+ * in-scope. With no repos selected, nothing is "other" — everything is in scope
+ * (matches the backend, where empty repo_paths keeps every project).
+ *
+ * Pure so the `node --test` harness can check it without a React renderer.
+ *
+ * @param proposals    the analyze response's proposals (each may carry `project`)
+ * @param selectedRepos the repo paths the user ticked on the repos step
+ * @returns {{inScope: object[], other: {project: string, items: object[]}[]}}
+ */
+export function groupProposalsByProject(proposals = [], selectedRepos = []) {
+  const repos = [...selectedRepos]
+    .map((r) => String(r).replace(/\/+$/, ""))
+    .filter(Boolean);
+  const under = (p) => repos.some((r) => p === r || p.startsWith(r + "/"));
+  const inScope = [];
+  const otherMap = new Map();  // project -> items, insertion-ordered
+  for (const prop of proposals) {
+    const project = prop.project || "";
+    if (!repos.length || !project || under(project)) {
+      inScope.push(prop);
+    } else {
+      if (!otherMap.has(project)) otherMap.set(project, []);
+      otherMap.get(project).push(prop);
+    }
+  }
+  const other = [...otherMap.entries()].map(([project, items]) => ({ project, items }));
+  return { inScope, other };
+}
