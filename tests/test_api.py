@@ -246,6 +246,36 @@ async def test_get_task_detail(client, store):
     assert data["title"] == t.title
     assert data["acceptance_criteria"] == ["Should work"]
     assert "attempts" in data
+    # D1.3 devil's-advocate: no phase rows yet (D1.2 writes them) — the detail
+    # payload carries the fields, empty. This is the SHIPPED state for every
+    # real task today, and the drawer must read it as "no ran chip".
+    assert data["phases"] == []
+    assert data["active_seconds"] in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_get_task_phases_populated(client, store):
+    t = await _seed_task(store)
+    await store.open_phase(t.id, attempt=1, phase="code")
+    await store.close_phase(t.id, outcome="done", reason="")
+    await store.open_phase(t.id, attempt=1, phase="review")  # still open
+    r = await client.get(f"/api/tasks/{t.id}")
+    assert r.status_code == 200
+    data = r.json()
+    phases = data["phases"]
+    assert [p["phase"] for p in phases] == ["code", "review"]
+    assert phases[0]["outcome"] == "done"
+    assert phases[0]["ended_at"] is not None
+    assert phases[1]["ended_at"] is None  # open phase still runs
+    for p in phases:
+        assert p["seconds"] >= 0
+    assert isinstance(data["active_seconds"], (int, float))
+    assert data["active_seconds"] > 0
+    # NB: not asserting active <= wall here — in this synthetic seed phase
+    # writes do not advance task.updated_at, so `wall_seconds` (created → last
+    # activity) stays ~0 while the open review phase accrues real time. The
+    # `active <= wall` invariant is a real-run property, not one this isolated
+    # store exercises; asserting it here would be flaky.
 
 
 @pytest.mark.asyncio

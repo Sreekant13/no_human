@@ -276,6 +276,12 @@ export function chipsFor(task) {
   const burn = taskBurn(task);
   const cost = taskCost(task);
   if (burn > 0) chips.push({ key: "cost", label: fmtCost(cost), sub: `${fmtTokens(burn)} tok` });
+  // "ran" (Σ phase durations, D1.3) sits before "wall". Only a POSITIVE number
+  // gets a chip: the phase table is empty until D1.2 lands, so every real task
+  // reads active_seconds null/0 and shows no ran chip — never a false "0s ran".
+  if (typeof task.active_seconds === "number" && task.active_seconds > 0) {
+    chips.push({ key: "ran", label: formatDuration(Math.round(task.active_seconds)), sub: "ran" });
+  }
   if (task.wall_seconds != null) chips.push({ key: "time", label: formatDuration(Math.round(task.wall_seconds)), sub: "wall time" });
   if (task.attempt_count > 0) {
     chips.push({ key: "attempts", label: String(task.attempt_count), sub: task.attempt_count === 1 ? "attempt" : "attempts" });

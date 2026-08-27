@@ -1831,6 +1831,67 @@ class Store:
         )
         await self.db.commit()
 
+    # --- task_phases: the per-phase timeline (PR-D1-3 / D1.1) ----------------
+    # One row per phase entry. `open_phase` starts a phase (closing any still-
+    # open phase of that task as 'superseded' first, so a task has at most one
+    # open phase); `close_phase` stamps the outcome/reason on that open row.
+    # `active_seconds` sums (ended_at - started_at) over closed rows plus
+    # (now - started_at) for the open one — parked time is never inside a row
+    # because parking closes the phase (D1.2), so it is excluded by construction.
+    # The orchestrator writes these rows (D1.2, a later PR); until then the
+    # table is empty and `phases_for` returns [] / `active_seconds` returns 0.0.
+
+    @serialized_write
+    async def open_phase(self, task_id: str, attempt: int, phase: str) -> int:
+        now = _now()
+        # At most one open phase per task: close any still-open row first.
+        await self.db.execute(
+            "UPDATE task_phases SET ended_at = ?, outcome = 'superseded' "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (now, task_id),
+        )
+        cur = await self.db.execute(
+            "INSERT INTO task_phases (task_id, attempt, phase, started_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, attempt, phase, now),
+        )
+        await self.db.commit()
+        return cur.lastrowid
+
+    @serialized_write
+    async def close_phase(self, task_id: str, outcome: str,
+                          reason: str = "") -> None:
+        # Close the currently-open phase (there is at most one). A close with no
+        # open phase is a no-op — a park may already have closed it.
+        await self.db.execute(
+            "UPDATE task_phases SET ended_at = ?, outcome = ?, reason = ? "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (_now(), outcome, reason, task_id),
+        )
+        await self.db.commit()
+
+    async def phases_for(self, task_id: str) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM task_phases WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def active_seconds(self, task_id: str) -> float:
+        rows = await self._fetchall(
+            "SELECT started_at, ended_at FROM task_phases WHERE task_id = ?",
+            (task_id,),
+        )
+        total = 0.0
+        # An open row (ended_at IS NULL) is counted up to the SAME clock that
+        # stamps started_at/ended_at (`_now()`), so a frozen/injected clock is
+        # honored end-to-end and the "still running" phase reads consistently.
+        for r in rows:
+            start = datetime.fromisoformat(r["started_at"])
+            end = datetime.fromisoformat(r["ended_at"] or _now())
+            total += (end - start).total_seconds()
+        return total
+
     @serialized_write
     async def add_attempt_usage(self, attempt_id: str, **fields: int | None) -> None:
         """ADD to the five usage columns on one attempt row, instead of

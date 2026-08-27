@@ -685,3 +685,60 @@ async def test_verifier_results_round_trips_and_survives_a_reconnect(tmp_path):
         "SELECT verifier_results FROM attempts WHERE id = ?", (a,))
     await s2.close()
     assert json.loads(row["verifier_results"]) == verifiers
+
+
+# --- task_phases (PR-D1-3 / D1.1) ---------------------------------------------
+
+
+@pytest.fixture
+async def task(store):
+    t = Task.new("phase task", repo_path="/tmp/r")
+    await store.create_task(t)
+    return t
+
+
+@pytest.fixture
+def freeze_time(monkeypatch):
+    """A tick()-able clock that monkeypatches the timestamp function Store uses
+    for started_at/ended_at (`db._now`), so a test can advance wall time in
+    controlled steps without sleeping."""
+    from no_human.core import db as _db
+
+    class Clock:
+        def __init__(self) -> None:
+            self.t = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        def now(self) -> str:
+            return self.t.isoformat()
+
+        def tick(self, seconds: float) -> None:
+            self.t += timedelta(seconds=seconds)
+
+    clock = Clock()
+    monkeypatch.setattr(_db, "_now", clock.now)
+    return clock
+
+
+async def test_open_phase_closes_previous_as_superseded(store, task):
+    await store.open_phase(task.id, 1, "code")
+    await store.open_phase(task.id, 1, "test")
+    rows = await store.phases_for(task.id)
+    assert [r["phase"] for r in rows] == ["code", "test"] and \
+        rows[0]["outcome"] == "superseded" and rows[0]["ended_at"]
+
+
+async def test_close_phase_records_outcome_and_reason(store, task):
+    await store.open_phase(task.id, 1, "review")
+    await store.close_phase(task.id, "failed", "tamper: test count dropped")
+    assert (await store.phases_for(task.id))[-1]["reason"] == \
+        "tamper: test count dropped"
+
+
+async def test_active_seconds_sums_closed_and_open_phases(store, task, freeze_time):
+    await store.open_phase(task.id, 1, "code")
+    freeze_time.tick(60)
+    await store.close_phase(task.id, "done")
+    freeze_time.tick(600)  # parked gap — no open phase
+    await store.open_phase(task.id, 2, "code")
+    freeze_time.tick(30)
+    assert abs(await store.active_seconds(task.id) - 90) < 1

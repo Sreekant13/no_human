@@ -55,7 +55,7 @@ from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
     AttemptOut, BoardPayload, CancelRequest, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
-    ImportedInfo, LandedOverrideRequest, ProjectOut, ReplyRequest,
+    ImportedInfo, LandedOverrideRequest, PhaseOut, ProjectOut, ReplyRequest,
     SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
     TaskSummaryOut, TelemetryConsentRequest, TrackerIssueOut, UpdateProjectRequest,
 )
@@ -1039,6 +1039,11 @@ async def get_task(task_id: str, request: Request) -> TaskOut:
     task = await _require_task(store, task_id)
     attempts = await store.list_attempts(task.id)
     out = TaskOut.from_task(task, attempts)
+    # D1.3: the phase timeline (D1.1 rows) + ran-time. Empty until the
+    # orchestrator writes rows (D1.2) — phases stays [] and active_seconds
+    # stays null, which the drawer reads as "no ran chip" rather than "0s".
+    out.phases = [PhaseOut.from_row(r) for r in await store.phases_for(task.id)]
+    out.active_seconds = (await store.active_seconds(task.id)) or None
     # SCRUM-16: same claimed contract as the board summaries (SCRUM-15) — the
     # slide-over must know whether a live session actually holds this task.
     sched = _sched(request)

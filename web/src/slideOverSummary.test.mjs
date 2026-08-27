@@ -215,6 +215,25 @@ test("chips omit zero/absent fields rather than showing a false 0", () => {
   assert.deepEqual(chips, []);
 });
 
+// D1.3: the "ran" chip (Σ phase durations) sits immediately before "wall time".
+test("a positive active_seconds adds a 'ran' chip right before wall time", () => {
+  const chips = chipsFor({ active_seconds: 2460, wall_seconds: 61200 });
+  const ran = chips.find((c) => c.key === "ran");
+  const wall = chips.find((c) => c.key === "time");
+  assert.deepEqual({ label: ran.label, sub: ran.sub }, { label: "41m", sub: "ran" });
+  assert.equal(wall.sub, "wall time");
+  assert.ok(chips.indexOf(ran) < chips.indexOf(wall), "'ran' must precede 'wall time'");
+});
+
+// Devil's advocate — the shipped state until D1.2 fills task_phases: no rows →
+// active_seconds null/0 → NO ran chip, and never a false "0s ran".
+test("no 'ran' chip when active_seconds is null or 0 (empty phase table)", () => {
+  for (const v of [null, undefined, 0]) {
+    const chips = chipsFor({ active_seconds: v, wall_seconds: 305 });
+    assert.equal(chips.find((c) => c.key === "ran"), undefined, `active_seconds=${v}`);
+  }
+});
+
 // Operator finding (demo walk): the PR affordance must survive the ticket
 // finishing - a DONE task with a pr_url still gets the open-pull-request chip.
 test("the PR chip renders for DONE tasks too, not only awaiting ones", () => {

@@ -133,6 +133,31 @@ def _operator_cancelled(task: Task) -> bool:
     return bool((task.context or {}).get("cancel_reason"))
 
 
+class PhaseOut(BaseModel):
+    """One `task_phases` row (D1.1). `seconds` = ended_at − started_at, and for
+    the still-open phase (ended_at is null) it runs to now."""
+    attempt: int
+    phase: str
+    started_at: str
+    ended_at: str | None = None
+    outcome: str | None = None
+    reason: str | None = None
+    seconds: float
+
+    @classmethod
+    def from_row(cls, row: dict) -> "PhaseOut":
+        from datetime import datetime, timezone
+        start = datetime.fromisoformat(row["started_at"])
+        end = (datetime.fromisoformat(row["ended_at"]) if row.get("ended_at")
+               else datetime.now(timezone.utc))
+        return cls(
+            attempt=row["attempt"], phase=row["phase"],
+            started_at=row["started_at"], ended_at=row.get("ended_at"),
+            outcome=row.get("outcome"), reason=row.get("reason") or None,
+            seconds=(end - start).total_seconds(),
+        )
+
+
 class TaskOut(BaseModel):
     id: str
     # SCRUM-16: the scheduler has this task actively in-flight right now —
@@ -210,6 +235,14 @@ class TaskOut(BaseModel):
     #: when no attempt on this task has recorded a report yet (predates this
     #: column, or the coder session produced no text).
     full_report: str | None = None
+    #: Per-phase timeline (D1.1 rows). Populated by the detail endpoint from
+    #: `store.phases_for` — `from_task` has no store, so it leaves these empty
+    #: and the endpoint fills them. Empty until the orchestrator writes rows
+    #: (D1.2): every real task reads `phases: []`, `active_seconds: null` today.
+    phases: list[PhaseOut] = []
+    #: Σ of phase-row durations (`store.active_seconds`); the "ran" time, which
+    #: parked time never enters. `null` when no phase rows exist yet.
+    active_seconds: float | None = None
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":
