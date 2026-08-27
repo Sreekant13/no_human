@@ -51,6 +51,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "verify_artefact.py"
 INSTALLER = REPO / "packaging" / "build-installer.sh"
+INSTALLER_PS1 = REPO / "packaging" / "build-installer.ps1"
 MAKEDMG = REPO / "packaging" / "make-dmg.sh"
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
@@ -748,6 +749,41 @@ def _stamp_block() -> str:
     block = "\n".join(lines[start:end])
     assert "_stamp=" in block and "board_sha256" in block, "extraction missed the block"
     return block
+
+
+def _ps1_board_digest_python() -> str:
+    """The python source build-installer.ps1 hands to python.exe via `-c`, lifted
+    out verbatim from between its `@'` … `'@` here-string delimiters."""
+    lines = INSTALLER_PS1.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.rstrip().endswith("-c @'"))
+    end = next(i for i, ln in enumerate(lines) if i > start and ln.startswith("'@"))
+    src = "\n".join(lines[start + 1:end])
+    # An empty extraction must fail here, not pass the guard vacuously.
+    assert "hashlib.sha256" in src and "rglob" in src, "extraction missed the python -c block"
+    return src
+
+
+def test_ps1_board_digest_python_carries_no_double_quotes():
+    """Windows PowerShell 5.1 — the ONLY PowerShell on a stock Windows box —
+    drops embedded double-quotes when it marshals a `-c` argument across to the
+    native python.exe, so `rglob("*")` reaches python as `rglob(*)`: a
+    SyntaxError that empties the board digest and (correctly) trips the stamp
+    gate. It shipped that way until a 2026-08-27 stock-5.1 build tripped it; CI
+    never saw it because CI runs `pwsh`, which fixed native-argument passing.
+
+    The durable fix is to keep this python source free of ASCII double-quotes —
+    single quotes are byte-identical for these literals, so the .sh/.ps1 digest
+    parity is untouched. This guard is a static text check that runs on EVERY
+    platform, so a reintroduced double-quote goes red in CI rather than only on
+    a stock-Windows release build (the one place the runtime gate can catch it).
+    """
+    src = _ps1_board_digest_python()
+    assert '"' not in src, (
+        "build-installer.ps1's `python -c` board-digest source contains an ASCII "
+        'double-quote. PowerShell 5.1 strips it at the native-exe boundary, so '
+        "python receives mangled source and the digest gate fails on stock "
+        "Windows. Use single quotes (or chr(34)) instead — see this test's docstring."
+    )
 
 
 def _write_board(dist: Path, files: dict[str, bytes]) -> None:

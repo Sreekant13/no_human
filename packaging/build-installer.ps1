@@ -182,17 +182,25 @@ if ($LASTEXITCODE -ne 0) { $dirty = 'unknown' }
 elseif ($gitStatus) { $dirty = 'yes' } else { $dirty = 'no' }
 $PyExe = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $PyExe)) { Fail "no python at $PyExe - run 'uv sync' first" }
+# SINGLE QUOTES ONLY in this python source — no ASCII double-quote (") anywhere.
+# Windows PowerShell 5.1 (the only PowerShell on a stock Windows box) strips
+# embedded double-quotes when it marshals this `-c` argument across to the native
+# python.exe, so `rglob("*")` would reach python as `rglob(*)` — a SyntaxError
+# that empties the digest and trips the gate below. CI never caught it because CI
+# runs pwsh, which fixed native-argument passing. Single quotes are byte-identical
+# for these literals, so the digest still matches build-installer.sh's. Guarded by
+# test_verify_artefact.py::test_ps1_board_digest_python_carries_no_double_quotes.
 $boardSha = & $PyExe -c @'
 import hashlib, os, sys
 from pathlib import Path
 root = Path(sys.argv[1])
-blobs = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+blobs = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
 lines = sorted(
-    hashlib.sha256(blobs[p]).hexdigest().encode("ascii") + b"  "
+    hashlib.sha256(blobs[p]).hexdigest().encode('ascii') + b'  '
     + os.fsencode(p.relative_to(root).as_posix())
     for p in sorted(blobs)
 )
-print(hashlib.sha256(b"\n".join(lines) + b"\n").hexdigest())
+print(hashlib.sha256(b'\n'.join(lines) + b'\n').hexdigest())
 '@ (Join-Path $Bundle 'web\dist')
 if ($LASTEXITCODE -ne 0 -or $boardSha -notmatch '^[0-9a-f]{64}$') {
   Fail "the board digest came out as '$boardSha', which is not a sha256. Refusing to write an unusable stamp."
