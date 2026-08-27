@@ -6482,26 +6482,27 @@ textarea:disabled {
 .nh-about-block p { margin: 0 0 10px; line-height: 1.6; }
 .nh-about-block code { color: var(--text-hi); }
 
-/* Finish-setup card (spec §3 B1): the minimal path's deferred steps on the board. */
-.finish-setup-card {
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
-  margin: 0 0 14px;
+/* Finish setup (spec §3 B1; reworked on real-user feedback): the minimal path's
+   deferred steps as a compact sidebar affordance directly above Settings, not a
+   board-body card. Collapsed it is one navrow (styled by .nh-navrow) with a
+   count badge; clicking expands this inline list. Gone once nothing's deferred. */
+.finish-setup { display: flex; flex-direction: column; gap: var(--sp-1); }
+.finish-setup-list {
+  list-style: none; margin: 0 0 var(--sp-1); padding: 0 0 0 var(--sp-3);
+  display: flex; flex-direction: column; gap: var(--sp-1);
 }
-.finish-setup-card h3 { font-size: 14px; color: var(--text-hi); margin: 0 0 4px; }
-.finish-setup-lede { font-size: 12.5px; color: var(--text); margin: 0 0 10px; }
-.finish-setup-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.finish-setup-list li { display: flex; align-items: center; gap: 8px; }
+.finish-setup-list li { display: flex; align-items: center; gap: var(--sp-2); }
 .finish-setup-open {
-  flex: 1; text-align: left; background: var(--surface-2); border: 1px solid var(--border);
-  color: var(--text-hi); border-radius: 8px; padding: 8px 10px; font-size: 13px; cursor: pointer;
+  flex: 1; min-width: 0; text-align: left;
+  background: transparent; border: none; color: var(--text-muted);
+  border-radius: var(--r-sm); padding: 4px 8px; font: inherit; font-size: 12.5px;
+  cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.finish-setup-open:hover { background: var(--surface-3); border-color: var(--border-hi); }
+.finish-setup-open:hover { background: var(--surface-2); color: var(--text-hi); }
 .finish-setup-done {
-  background: transparent; border: 1px solid var(--border); color: var(--text);
-  border-radius: 8px; padding: 8px 12px; font-size: 12.5px; cursor: pointer;
+  flex-shrink: 0;
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted);
+  border-radius: var(--r-sm); padding: 3px 8px; font: inherit; font-size: 11px; cursor: pointer;
 }
 .finish-setup-done:hover { border-color: var(--border-hi); color: var(--text-hi); }
 

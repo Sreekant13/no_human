@@ -1,6 +1,7 @@
 // Minimal onboarding path (spec §3 B1): tick one repo → "Skip setup — open the board"
-// → the board shows a Finish-setup card carrying the four deferred steps, and
-// each "Done" removes its step. Mocked API, no :8420.
+// → the sidebar shows a compact "Finish setup" entry (above Settings) carrying
+// the four deferred steps; clicking it expands the list, each "Done" removes its
+// step, each row deep-links to a real Settings pane. Mocked API, no :8420.
 import { chromium } from "playwright";
 import http from "node:http";
 import fs from "node:fs";
@@ -80,14 +81,29 @@ await page.waitForTimeout(500);
 
 check("POST /api/onboarding/complete was called", hits.has("complete"));
 
-// The board now shows the Finish-setup card with the four deferred items.
-const card = page.getByText(/Finish setup — optional\. Each item opens in Settings\./);
-check("Finish-setup card rendered on the board",
-  await card.isVisible().catch(() => false));
+// The sidebar now carries a compact "Finish setup" entry (collapsed) with a
+// count badge — NOT a big board card. It lives above the Settings nav row.
+const finishRow = page.locator(".nh-finish-setup-row");
+check("Finish-setup entry rendered in the sidebar",
+  await finishRow.isVisible().catch(() => false));
+check("the entry shows the deferred count (4)",
+  (await finishRow.locator(".nh-navrow-badge").textContent().catch(() => "")) === "4");
+// Collapsed by default: the item list is not shown until the entry is clicked.
+check("items hidden until the entry is expanded",
+  (await page.locator(".finish-setup-open").count()) === 0);
 
+// Expand it.
+await finishRow.click();
+await page.waitForTimeout(150);
 const openButtons = () => page.locator(".finish-setup-open");
 const before = await openButtons().count();
-check("card lists the four deferred items", before === 4, `saw ${before}`);
+check("expanded list shows the four deferred items", before === 4, `saw ${before}`);
+// The deep-link deep-links honestly — each row's title carries the real
+// Settings pane it lands on. The docs row maps to Projects (docs live with
+// repos), never the old generic fallback. (Which pane each key resolves to is
+// pinned by onboardingMinimal.test.mjs; opening the pane itself needs the whole
+// Settings data layer mocked, out of scope for this onboarding flow.)
+check("the docs row is present to deep-link", before >= 1);
 
 // "Done" on the first item (docs) removes it and calls the API.
 await page.locator(".finish-setup-done").first().click();
@@ -95,6 +111,15 @@ await page.waitForTimeout(300);
 check("clicking Done posted /deferred/docs/done", hits.has("done:docs"));
 const after = await openButtons().count();
 check("the dismissed item disappeared", after === 3, `saw ${after}`);
+
+// Clear the remaining three: the whole entry must disappear once nothing is
+// deferred (the "disappears when the setup is finished" the user asked for).
+for (let i = 0; i < 3; i++) {
+  await page.locator(".finish-setup-done").first().click();
+  await page.waitForTimeout(200);
+}
+check("the Finish-setup entry is gone once every item is done",
+  (await page.locator(".nh-finish-setup-row").count()) === 0);
 
 check("no page errors during the minimal path", errors.length === 0, errors[0] || "");
 

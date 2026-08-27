@@ -1204,6 +1204,18 @@ export default function App() {
             onClick={() => setPage("about")}
             title="What no_human is, docs, and contact"
           />
+          {/* The minimal path's leftover steps, as a compact affordance directly
+              above Settings — not the old board-body card (real-user feedback:
+              it "took half the screen" and every row deep-linked to the wrong
+              pane). Renders only while something is deferred; gone once the last
+              item is marked done. */}
+          {deferred.length > 0 && (
+            <FinishSetupCard
+              deferred={deferred}
+              onNavigate={({ tab }) => { setSettingsTab(tab); setSettingsOpen(true); }}
+              onDone={(step) => markDeferredDone(step).then((r) => setDeferred(r.deferred || [])).catch(() => {})}
+            />
+          )}
           <NavRow
             icon={<IconGear />}
             label="Settings"
@@ -1231,13 +1243,6 @@ export default function App() {
             <DrainReadoutChip readout={drainReadout} />
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
-        )}
-        {page === "board" && deferred.length > 0 && (
-          <FinishSetupCard
-            deferred={deferred}
-            onNavigate={({ tab }) => { setSettingsTab(tab); setSettingsOpen(true); }}
-            onDone={(step) => markDeferredDone(step).then((r) => setDeferred(r.deferred || [])).catch(() => {})}
-          />
         )}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
         {page === "backlog" && (

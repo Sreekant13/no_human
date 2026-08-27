@@ -16,7 +16,18 @@ test("minimal start needs at least one repo", () => {
 });
 
 test("deferred items name the settings pane", () => {
-  assert.deepEqual(deferredItems(["docs"]), [{ key: "docs", title: "Repo docs & wiki", page: "settings", tab: "docs" }]);
+  // docs has no pane of its own — it must resolve to a REAL Settings pane
+  // (projects), not the generic fallback (the deep-link bug a real user hit).
+  assert.deepEqual(deferredItems(["docs"]), [{ key: "docs", title: "Repo docs & wiki", page: "settings", tab: "projects" }]);
+});
+
+test("every deferred item resolves to a real Settings pane", () => {
+  // The four steps the minimal path can defer. None may keep a tab that
+  // Settings.jsx has no pane for, or the deep-link falls back to Projects.
+  const PANES = new Set(["projects", "rules", "skills", "learnings", "integrations", "models", "account", "insights", "updates"]);
+  for (const it of deferredItems(["docs", "integrations", "history", "rules"])) {
+    assert.ok(PANES.has(it.tab), `${it.key} → ${it.tab} is not a Settings pane`);
+  }
 });
 
 test("deferred items keep the server's order and drop unknown keys", () => {
@@ -36,8 +47,11 @@ test("the repos step footer offers a self-explanatory skip-setup button, gated o
   assert.match(src, /canStartMinimal\(/);
 });
 
-test("FinishSetupCard renders deferredItems and carries the exact copy", () => {
+test("FinishSetupCard is a compact sidebar affordance over deferredItems", () => {
   const src = readFileSync(here + "FinishSetupCard.jsx", "utf8");
   assert.match(src, /deferredItems\(/);
-  assert.match(src, /Finish setup — optional\. Each item opens in Settings\./);
+  // The collapsed entry: a navrow-styled button labelled "Finish setup" with a
+  // count badge — not the old board-body card.
+  assert.match(src, /Finish setup/);
+  assert.match(src, /nh-navrow-badge/);
 });
