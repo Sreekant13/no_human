@@ -83,6 +83,20 @@ const MARKS = {
       <path d="M8.4 8.9h8.2M8.4 12.1h5.4" />
     </g>
   ),
+  // Team chat — a GROUP conversation (two people + a speech bubble). Teams used
+  // to have no glyph at all, so it fell through to the plain-circle fallback and
+  // read as broken. This is a generic collaboration mark in the one neutral app
+  // accent, NOT Microsoft's Teams logo — same trademark reasoning as every other
+  // glyph in this file (see the header + TRADEMARK.md). It is distinct from
+  // slack's single message bubble so the two notification channels don't collide.
+  teams: (c) => (
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="8" r="2.6" />
+      <path d="M4 18.5v-1a5 5 0 0 1 9.2-2.7" />
+      <path d="M13.6 11.2a2.1 2.1 0 1 0 2.2-3.4" />
+      <path d="M20.5 19.4V18a3.4 3.4 0 0 0-3-3.4" />
+    </g>
+  ),
 };
 
 export const ICON_NAMES = Object.keys(MARKS);

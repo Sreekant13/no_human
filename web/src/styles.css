@@ -5350,30 +5350,13 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-flow .ob-flow-pr { color: var(--ink); background: var(--accent-500); font-weight: 600; }
 .ob-flow .ob-flow-you { color: var(--state-done); background: var(--green-dim); font-weight: 600; }
 
-/* history scan — "building your validator agent" (T-800 head assembling) */
+/* history scan — a neutral spinner + progress copy (the T-800 skull avatar was
+   removed after a real user read it as a "death robot" — F10) */
 .va-build { display: flex; align-items: center; gap: 18px; margin-top: 18px; padding: 16px 18px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-lg); }
 .va-build-text { line-height: 1.5; }
 .va-build-title { font-weight: 700; font-size: 14px; color: var(--text-hi); }
 .va-build-sub { font-size: 13px; color: var(--text-muted); margin-top: 3px; }
 .va-build-sub strong { color: var(--text-hi); font-weight: 700; }
-
-.validator-avatar { width: 96px; height: 104px; flex-shrink: 0; }
-/* skull powers in once, then gently floats */
-.va-skull { transform-origin: 60px 60px; animation: va-in 0.55s cubic-bezier(.2,.8,.2,1) both, va-float 3.4s ease-in-out 0.6s infinite; }
-.va-eye-red { transform-origin: 74px 63px; opacity: 0;
-  animation: va-ignite 0.7s ease 0.7s forwards, va-breathe 1.6s ease-in-out 1.4s infinite; }
-.va-scan { fill: #BFE0FF; opacity: 0; mix-blend-mode: screen;
-  animation: va-scan 1.9s ease-in-out 0.6s infinite; }
-
-@keyframes va-in     { 0% { opacity: 0; transform: scale(.82) translateY(6px); } 100% { opacity: 1; transform: none; } }
-@keyframes va-float  { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
-@keyframes va-ignite { 0% { opacity: 0; filter: none; } 55% { opacity: 1; filter: drop-shadow(0 0 9px #ff4d4d); } 100% { opacity: 1; filter: drop-shadow(0 0 5px #ff3b3b); } }
-@keyframes va-breathe{ 0%,100% { filter: drop-shadow(0 0 4px #E5202A); } 50% { filter: drop-shadow(0 0 9px #ff5b5b); } }
-@keyframes va-scan   { 0% { transform: translateY(0); opacity: 0; } 12% { opacity: .9; } 80% { opacity: .9; } 100% { transform: translateY(92px); opacity: 0; } }
-@media (prefers-reduced-motion: reduce) {
-  .va-skull, .va-eye-red, .va-scan { animation: none; }
-  .va-eye-red { opacity: 1; }
-}
 
 /* importance label on proposed rules */
 .ob-rule-imp { font-family: var(--font-ui); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 7px; border-radius: var(--r-pill); margin-left: 6px; }

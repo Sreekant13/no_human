@@ -61,6 +61,20 @@ test("the on/off switch is whatever the spec's enable_field names", () => {
   assert.match(CARD, /effectiveEnabled\(spec, values\)/);
 });
 
+test("clicking a card opens its setup even when the switch can't turn on (F9)", () => {
+  // teams is a mute switch that reads OFF-but-unconfigured and cannot be toggled
+  // ON in the UI. Before F9 its body was gated on isOn alone, so clicking teams
+  // did nothing and its webhook-setup note was unreachable. The body now opens
+  // on isOn OR an explicit expand, and flipping the switch flips that expand —
+  // so every card, teams included, reveals its setup on click.
+  assert.match(CARD, /const showBody = isOn \|\| expanded;/,
+    "the body must open on an explicit expand, not on isOn alone");
+  assert.match(CARD, /\{showBody && \(/,
+    "the card body must be gated on showBody, not isOn");
+  assert.match(CARD, /onToggleOpen\?\.\(\)/,
+    "toggling the switch must also toggle the card open, so a mute switch reveals its setup");
+});
+
 test("every other control comes from the spec's fields, typed by `kind`", () => {
   assert.match(CARD, /settings\.map\(\(f\)/);
   assert.match(CARD, /f\.kind === "bool"/);

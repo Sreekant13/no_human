@@ -31,53 +31,6 @@ import {
   projectsBlockContinue, launchReadiness,
 } from "./onboardingProjects.js";
 
-// "Building your validator agent" — a T-800-style head that assembles itself
-// while the (slow) history scan runs: the chrome skull draws in, plates snap on,
-// a scan line sweeps, and the iconic red eye powers up. Pure SVG + CSS.
-function ValidatorAvatar() {
-  return (
-    <svg className="validator-avatar" viewBox="0 0 120 130" role="img"
-         aria-label="Building validator agent">
-      <defs>
-        <linearGradient id="va-steel-g" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stopColor="#DDE2E9" />
-          <stop offset=".5" stopColor="#B4BCC8" />
-          <stop offset="1" stopColor="#8C95A4" />
-        </linearGradient>
-        <radialGradient id="va-red-g" cx="0.5" cy="0.45" r="0.6">
-          <stop offset="0" stopColor="#FF8A8A" />
-          <stop offset=".5" stopColor="#E5202A" />
-          <stop offset="1" stopColor="#8E0000" />
-        </radialGradient>
-        <clipPath id="va-clip">
-          <path d="M60 14 C40 14 30 28 30 47 C30 55 28 58 27 63 C26 68 30 71 34 72 C35 80 40 87 47 91 L49 99 C52 104 56 106 60 106 C64 106 68 104 71 99 L73 91 C80 87 85 80 86 72 C90 71 94 68 93 63 C92 58 90 55 90 47 C90 28 80 14 60 14 Z" />
-        </clipPath>
-      </defs>
-      <g className="va-skull">
-        <path fill="url(#va-steel-g)" stroke="#67717F" strokeWidth="1.5" d="M60 14 C40 14 30 28 30 47 C30 55 28 58 27 63 C26 68 30 71 34 72 C35 80 40 87 47 91 L49 99 C52 104 56 106 60 106 C64 106 68 104 71 99 L73 91 C80 87 85 80 86 72 C90 71 94 68 93 63 C92 58 90 55 90 47 C90 28 80 14 60 14 Z" />
-        <path fill="#ECEFF3" opacity=".55" d="M60 18 C45 18 36 28 35 44 C46 35 74 35 85 44 C84 28 75 18 60 18 Z" />
-        <path fill="#7B8493" d="M33 52 C44 47 76 47 87 52 L85 58 C75 53 45 53 35 58 Z" />
-        <ellipse cx="46" cy="63" rx="10.5" ry="8" fill="#363D4B" />
-        <ellipse cx="74" cy="63" rx="10.5" ry="8" fill="#363D4B" />
-        <circle cx="46" cy="63" r="3.8" fill="#9AA6B5" />
-        <path fill="#363D4B" d="M60 69 L56 79 L64 79 Z" />
-        <path stroke="#67717F" fill="none" strokeWidth="1.2" d="M32 70 L40 74 M88 70 L80 74" />
-        <rect x="45" y="84" width="30" height="12" rx="2.5" fill="#C7CDD8" stroke="#67717F" strokeWidth="1.2" />
-        <g stroke="#67717F" strokeWidth="1.1">
-          <line x1="45" y1="90" x2="75" y2="90" />
-          <line x1="52" y1="84" x2="52" y2="96" />
-          <line x1="60" y1="84" x2="60" y2="96" />
-          <line x1="68" y1="84" x2="68" y2="96" />
-        </g>
-        {/* the iconic red eye — powers on after the skull forms */}
-        <circle className="va-eye-red" cx="74" cy="63" r="4.6" fill="url(#va-red-g)" />
-        {/* scan line, clipped to the skull so it reads as an internal sweep */}
-        <rect className="va-scan" clipPath="url(#va-clip)" x="26" y="12" width="68" height="3" rx="1.5" />
-      </g>
-    </svg>
-  );
-}
-
 // Input with live directory autocomplete (via /api/fs/suggest). As you type a
 // path, matching sub-directories are offered through a native <datalist>.
 function PathInput({ value, onChange, placeholder, autoFocus }) {
@@ -197,6 +150,20 @@ export default function Onboarding({ onComplete }) {
   // persisted spec.verified) — a saved key that has not passed a test reads
   // "Saved — not verified". See integrationSetup.js readiness.
   const [intTest, setIntTest] = useState({});
+  // Which integration cards the user has expanded (F9). A card's body normally
+  // opens when its switch turns on (effectiveEnabled). But a mute switch that
+  // ships ON but is unconfigured (teams) reads as OFF and cannot be toggled ON
+  // in the UI — so clicking it did NOTHING and its setup (the webhook note) was
+  // unreachable. This tracks an explicit open so clicking any card reveals its
+  // setup, the way slack/others do; toggling the switch flips it.
+  const [openSetup, setOpenSetup] = useState(() => new Set());
+  function toggleSetupOpen(name) {
+    setOpenSetup((s) => {
+      const n = new Set(s);
+      n.has(name) ? n.delete(name) : n.add(name);
+      return n;
+    });
+  }
 
   const step = STEPS[i];
   // The repo to offer a first task in: the server's readiness answer, never a
@@ -1071,6 +1038,8 @@ export default function Onboarding({ onComplete }) {
                       test={intTest[spec.name]}
                       onField={setIntField}
                       onSave={() => saveIntegration(spec)}
+                      expanded={openSetup.has(spec.name)}
+                      onToggleOpen={() => toggleSetupOpen(spec.name)}
                     />
                   ))}
                 </div>
@@ -1102,11 +1071,12 @@ export default function Onboarding({ onComplete }) {
                   : "Scan my AI history"}
               </button>
 
-              {/* While the (slow) scan runs, build the validator agent on screen
-                  so it never looks stuck. */}
+              {/* While the (slow) scan runs, show a neutral spinner + progress
+                  copy so it never looks stuck. (The old T-800 skull avatar read
+                  as a "death robot" to a real user and was removed — F10.) */}
               {scanning && (
                 <div className="va-build">
-                  <ValidatorAvatar />
+                  <span className="grill-spinner" style={{ width: 32, height: 32, flexShrink: 0 }} />
                   <div className="va-build-text">
                     <div className="va-build-title">Claude is building your validator agent…</div>
                     <div className="va-build-sub">
@@ -1438,7 +1408,7 @@ export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
 // The credential rule is structural, not a convention: there is no branch
 // that renders an input for a secret, because the API never describes one.
 // Credentials are stated as env-var NAMES via secretHint().
-function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField, onSave }) {
+function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField, onSave, expanded, onToggleOpen }) {
   const values = draft[spec.name] || {};
   // Verified this session (a passing /test) OR persisted on the server
   // (spec.verified from integrations.<name>.last_verified_at). Fail-closed:
@@ -1457,6 +1427,12 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField
   const dirty = Object.keys(changedValues(spec, draft)).length > 0;
   const settings = (spec.fields || []).filter((f) => f.name !== enableField);
   const label = NAME_LABEL[spec.name] || spec.name;
+  // Open the setup body when the switch is on OR the user has explicitly
+  // expanded this card (F9). The explicit-open path is what rescues a mute
+  // switch like teams, whose switch reads OFF-but-unconfigured and can't be
+  // toggled ON in the UI: without it, clicking teams did nothing and its
+  // webhook setup note was unreachable.
+  const showBody = isOn || expanded;
 
   return (
     <div className={`ob-integration-card${isOn ? " on" : ""}`}>
@@ -1470,14 +1446,16 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, test, onField
             <input
               type="checkbox"
               checked={isOn}
-              onChange={(e) => onField(spec.name, enableField, e.target.checked)}
+              // Flipping the switch also flips this card open/closed, so a mute
+              // switch reveals its setup on click the way every other card does.
+              onChange={(e) => { onField(spec.name, enableField, e.target.checked); onToggleOpen?.(); }}
             />
             <span>{switchLabel(spec, label)}</span>
           </label>
         )}
       </div>
 
-      {isOn && (
+      {showBody && (
         <div className="ob-integration-body">
           {settings.length > 0 && (
             <div className="ob-integration-fields">
