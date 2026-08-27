@@ -69,6 +69,38 @@ class ProjectProfile:
     # now on, so a value typed today is never re-converted and the ambiguity
     # this field exists for cannot be created again.
     default_budget_unit: str = ""
+    # UI evidence (no-human-67): opt-in browser-walk verification. Off by
+    # default (`enabled: False`) so an unconfigured repo's attempts are
+    # byte-identical to before this field existed. Read today by
+    # `core/prompt_blocks.py`'s `ui_evidence_block` (the coder prompt block)
+    # and by `testing/ui_evidence.py`'s manifest runner (`MANIFEST`/`run`);
+    # the attempt-time invocation of that runner is not wired yet — it
+    # lands in part 2. Keys:
+    #   enabled: bool           - opt-in switch.
+    #   start_cmd: str           - argv (shlex-split) to boot the app.
+    #   base_url: str            - http(s)://127.0.0.1|localhost:<port>, the
+    #                              only hosts the orchestrator will start a
+    #                              subprocess and poll for (never a remote
+    #                              host — this runs inside the attempt's own
+    #                              worktree, on the attempt's own machine).
+    #   ready_path: str          - path polled for readiness (default '/').
+    #   ready_timeout_s: int     - seconds to wait for `base_url+ready_path`
+    #                              before giving up (default 60).
+    #   ui_paths: list[str]      - globs (fnmatch, matched like
+    #                              `test_commands`) deciding whether an
+    #                              attempt's declared plan files are "UI
+    #                              work" — only then does the prompt block
+    #                              appear.
+    ui_evidence: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "start_cmd": "",
+            "base_url": "",
+            "ready_path": "/",
+            "ready_timeout_s": 60,
+            "ui_paths": ["web/**", "src/**/*.jsx", "src/**/*.tsx", "**/*.html", "**/*.css"],
+        }
+    )
 
     # --- serialization ---------------------------------------------------- #
 
@@ -95,6 +127,7 @@ class ProjectProfile:
             "default_attempt_tokens": self.default_attempt_tokens,
             "default_lifetime_tokens": self.default_lifetime_tokens,
             "default_budget_unit": self.default_budget_unit,
+            "ui_evidence": self.ui_evidence,
         }
 
     @classmethod

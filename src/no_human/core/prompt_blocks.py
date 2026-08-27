@@ -1147,6 +1147,46 @@ def build_profile_block(prof: Any) -> str:
     return "Project profile (confirmed):\n" + "\n".join(f"  {p}" for p in parts if p) + "\n\n"
 
 
+def ui_evidence_block(profile: Any) -> str:
+    """UI-evidence opt-in instructions (no-human-67), or '' when unusable.
+
+    Pure — takes only the profile, same contract as ``build_profile_block``.
+    Returns '' when there is no profile, ``ui_evidence`` is absent/disabled,
+    or ``start_cmd``/``base_url`` are unset (nothing the harness could
+    actually run). WHETHER this attempt is UI work — matching the edited/
+    declared files against ``ui_evidence["ui_paths"]`` — is the CALLER's
+    job (``Orchestrator._build_implement_prompt``): this function has no
+    file list to check, only the profile, so it never gates on globs
+    itself. Caps text at a few sentences — this rides in the cacheable
+    prompt prefix alongside ``build_profile_block``.
+
+    The promise this text makes to the coder — that the harness runs the
+    walk after tests pass — is made true by part 2's attempt-time run step;
+    on this branch (part 1) that step is not wired.
+    """
+    if not profile:
+        return ""
+    ui = getattr(profile, "ui_evidence", None) or {}
+    if not ui.get("enabled") or not ui.get("start_cmd") or not ui.get("base_url"):
+        return ""
+    base_url = str(ui.get("base_url", ""))
+    ready_path = str(ui.get("ready_path", "/"))
+    return (
+        "UI EVIDENCE — this attempt touches UI code. After your tests pass, "
+        "the harness will start the app itself, wait for it to be ready at "
+        f"{base_url}{ready_path}, and drive a real browser through a walk "
+        "YOU define — write `.no_human/ui_evidence.json` (never committed) "
+        'as {"base_url": "...", "steps": [...]}, where each step is one of '
+        "goto/wait_for/click/fill/press/assert_text/shot (in order); use "
+        "`shot` at any point worth capturing. The harness runs this walk, "
+        "not you — it records whatever the page actually shows (screenshots, "
+        "a video, console errors) as evidence on the PR, proving nothing "
+        "beyond what each screenshot shows. Skipping this file means no "
+        "walk runs and no UI evidence is attached; either way this never "
+        "blocks the attempt.\n\n"
+    )
+
+
 def build_repo_hints_block(hints: list[str] | None) -> str:
     """Hints the TARGET REPO ships in its own `.no_human.yml` (C3-G2).
 

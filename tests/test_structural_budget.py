@@ -81,7 +81,10 @@ FROZEN_FUNCTION_LINES = {
     "agent/claude_backend.py:ClaudeBackend.stream": 407,
     "core/orchestrator.py:Orchestrator._run_review": 386,
     "cli/commands.py:bench_run": 377,
-    "core/orchestrator.py:Orchestrator._build_implement_prompt": 339,
+    # Grew to 371 when the UI-evidence prompt block landed (task 389210fa):
+    # an inline enable+glob gate + the ui_evidence_block call. Reviewed on
+    # its merits (the block is inert until a profile opts in); frozen here.
+    "core/orchestrator.py:Orchestrator._build_implement_prompt": 371,
     "eval/northstar_card.py:render_northstar_md": 332,
     "core/orchestrator.py:Orchestrator._reformat_summary_markdown": 327,
     "core/orchestrator.py:Orchestrator._generate_plan": 322,
@@ -102,6 +105,8 @@ FROZEN_FUNCTION_CC = {
     "agent/guard.py:_approve_denial": 81,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 73,
     "core/orchestrator.py:Orchestrator._run_review": 73,
+    # Crossed 60 (to 67) with the UI-evidence gate landed by task 389210fa.
+    "core/orchestrator.py:Orchestrator._build_implement_prompt": 67,
 }
 
 # 9 files > 2,500 lines.
@@ -124,7 +129,8 @@ FROZEN_FUNCTION_CC = {
 # began; re-anchored to the measured baseline so the ratchet gates growth
 # from here again. (A red ratchet the fleet lands through protects nothing.)
 FROZEN_FILE_LINES = {
-    "core/orchestrator.py": 19354,
+    # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
+    "core/orchestrator.py": 19387,
     "cli/commands.py": 7783,
     "api/app.py": 5153,
     "core/db.py": 4251,

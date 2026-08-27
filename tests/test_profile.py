@@ -304,3 +304,100 @@ def test_mixed_units_are_refused_in_the_OTHER_direction_too():
     assert apply_default_task_config(
         both_weighted, {BUDGET_UNIT_KEY: WEIGHTED_UNIT}) == {
             "lifetime_tokens": 8_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+
+
+# --------------------------------------------------------------------------- #
+# no-human-67: ui_evidence                                                    #
+# --------------------------------------------------------------------------- #
+
+def test_ui_evidence_defaults_are_off_and_documented():
+    prof = ProjectProfile(repo_path="/r")
+    assert prof.ui_evidence["enabled"] is False
+    assert prof.ui_evidence["start_cmd"] == ""
+    assert prof.ui_evidence["base_url"] == ""
+    assert prof.ui_evidence["ready_path"] == "/"
+    assert prof.ui_evidence["ready_timeout_s"] == 60
+    assert prof.ui_evidence["ui_paths"] == [
+        "web/**", "src/**/*.jsx", "src/**/*.tsx", "**/*.html", "**/*.css",
+    ]
+
+
+def test_ui_evidence_defaults_are_independent_per_instance():
+    """The dict default is a `default_factory` — two instances must not
+    share (and mutate) the same underlying dict."""
+    a = ProjectProfile(repo_path="/a")
+    b = ProjectProfile(repo_path="/b")
+    a.ui_evidence["enabled"] = True
+    assert b.ui_evidence["enabled"] is False
+
+
+def test_ui_evidence_round_trips_via_to_dict_from_dict():
+    prof = ProjectProfile(
+        repo_path="/r",
+        ui_evidence={
+            "enabled": True,
+            "start_cmd": "npm run dev",
+            "base_url": "http://127.0.0.1:5173",
+            "ready_path": "/healthz",
+            "ready_timeout_s": 30,
+            "ui_paths": ["web/**"],
+            "publish": False,
+        },
+    )
+    restored = ProjectProfile.from_dict(prof.to_dict())
+    assert restored.ui_evidence == prof.ui_evidence
+
+
+def test_ui_evidence_round_trips_via_yaml(tmp_path):
+    prof = _sample(tmp_path)
+    prof.ui_evidence = {
+        "enabled": True,
+        "start_cmd": "uv run uvicorn app:app",
+        "base_url": "http://localhost:8000",
+        "ready_path": "/",
+        "ready_timeout_s": 45,
+        "ui_paths": ["web/**", "**/*.html"],
+    }
+    prof.save()
+    loaded = ProjectProfile.load(tmp_path)
+    assert loaded is not None
+    assert loaded.ui_evidence == prof.ui_evidence
+
+
+async def test_ui_evidence_round_trips_via_store(store, tmp_path):
+    prof = _sample(tmp_path)
+    prof.ui_evidence["enabled"] = True
+    prof.ui_evidence["start_cmd"] = "python -m http.server"
+    await store.upsert_profile(prof)
+    got = await store.get_profile(str(tmp_path))
+    assert got is not None
+    assert got.ui_evidence["enabled"] is True
+    assert got.ui_evidence["start_cmd"] == "python -m http.server"
+
+
+async def test_ui_evidence_is_in_data_json_not_a_mirror_column(store, tmp_path):
+    """no-human-67's explicit constraint: `ui_evidence` must live in the
+    `data` JSON blob only, never a dedicated `project_profiles` column —
+    the mirror columns (repo_path/ecosystem/install_cmd/test_cmd/lint_cmd/
+    confirmed) are a fixed, deliberately small set (`get_profile.data-json-
+    is-the-record` lesson: a partial write to a mirror column changes
+    nothing the reader sees)."""
+    prof = _sample(tmp_path)
+    prof.ui_evidence["enabled"] = True
+    await store.upsert_profile(prof)
+    cols = await store.db.execute("PRAGMA table_info(project_profiles)")
+    names = {r["name"] for r in await cols.fetchall()}
+    assert "ui_evidence" not in names
+    row = await store._fetchone(
+        "SELECT data FROM project_profiles WHERE repo_path = ?", (str(tmp_path),)
+    )
+    import json as _json
+    assert _json.loads(row["data"])["ui_evidence"]["enabled"] is True
+
+
+def test_from_dict_defaults_ui_evidence_for_an_old_profile_with_no_key():
+    """A profile persisted before this field existed has no `ui_evidence`
+    key in its stored dict — `from_dict` must fall back to the disabled
+    default rather than raise or leave the field unset."""
+    prof = ProjectProfile.from_dict({"repo_path": "/r", "test_cmd": "pytest"})
+    assert prof.ui_evidence["enabled"] is False
