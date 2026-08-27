@@ -151,6 +151,9 @@ export default function Onboarding({ onComplete, askTelemetry }) {
     [askTelemetry]
   );
   const [root, setRoot] = useState("");
+  // The folder a manual "Search another folder" run actually scanned, so the
+  // empty/searching state can name it ("" = the initial home+roots auto-scan).
+  const [searchedPath, setSearchedPath] = useState("");
   const [detected, setDetected] = useState([]);
   // The auto-discovery response, kept whole so the roots it searched, the cap
   // note and the refused roots can all be reported (discoveryMessage).
@@ -284,6 +287,7 @@ export default function Onboarding({ onComplete, askTelemetry }) {
   // hand-built roots_scanned like the retired detect path needed.
   async function scanFolder(r) {
     if (!r || !r.trim()) return;
+    setSearchedPath(r.trim());
     await guard(async () => {
       const res = await discoverRepos({ root: r.trim() });
       setDetected(res.repos || []);
@@ -811,7 +815,11 @@ export default function Onboarding({ onComplete, askTelemetry }) {
                 </>
               )}
               <div className="ob-repolist ph-no-capture">
-                {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Looking for your repositories…</> : "No repositories found. Search another folder above."}</div>}
+                {detected.length === 0 && <div className="ob-empty">{busy
+                  ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />{searchedPath ? `Searching ${searchedPath}…` : "Looking for your repositories…"}</>
+                  // An empty result reads as "broken" without saying WHAT was
+                  // searched. Name the folder the user actually pointed at.
+                  : searchedPath ? `Searched ${searchedPath} — no git repositories there.` : "No repositories found. Search another folder above."}</div>}
                 {restRepos.map((r) => {
                   const st = onboarded[r.path];
                   const pv = proveState[r.path];
