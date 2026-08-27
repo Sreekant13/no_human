@@ -112,7 +112,7 @@ function PathInput({ value, onChange, placeholder, autoFocus }) {
   );
 }
 
-// The first-run wizard. Warm-editorial, dark-first (see docs/DESIGN_SYSTEM.md).
+// The first-run wizard. Warm-editorial, dark-first (see DESIGN.md).
 // Every step wires to real /api/onboarding/* endpoints — no fake data.
 
 const BASE_STEPS = [
