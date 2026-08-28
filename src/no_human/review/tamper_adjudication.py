@@ -438,6 +438,12 @@ def pr_body_section(entries: list[dict]) -> str:
     if not entries:
         return ""
     k = len(entries)
+    # This row's only interpolation is `k`, an `int` — never model text — so
+    # no cell here can carry a `|`; it deliberately stays a plain f-string
+    # rather than routing through `orchestrator.py`'s `_table_cell`. This
+    # module intentionally does not import `Orchestrator` (see module
+    # docstring/imports above), so it could not call `_table_cell` even for
+    # a future model-authored cell without crossing that boundary.
     lines = [
         f"| Test-change guard | ⚠️ fired — waived as LEGITIMATE ({k}) — "
         "see below |",

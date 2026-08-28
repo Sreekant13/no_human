@@ -103,6 +103,14 @@ class PrEvidence:
                 f"{t.get('failed', 0)} failed, {t.get('errors', 0)} errors")
 
     def ci_state_pin(self) -> str | None:
+        # This pin holds the row's UNESCAPED text, while `orchestrator.py`'s
+        # `_evidence_section` now renders the CI row through `_table_cell`
+        # (a pipe-bearing `ci_state` would otherwise truncate the row — see
+        # `orchestrator.py`'s `_TABLE_PIPE`). So when `ci_state` itself
+        # contains a `|`, this pin is no longer an exact substring of the
+        # rendered body — by design: fixing the truncation necessarily means
+        # the pin (a fact string, not markdown) and the row (markdown) can
+        # diverge on escaping alone, never on content.
         if not self.ci_state:
             return None
         return f"| CI | {self.ci_state} |"

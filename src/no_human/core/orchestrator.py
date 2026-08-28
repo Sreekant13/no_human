@@ -18550,7 +18550,7 @@ SIX of them read a checkpoint and TWO do not — but do
         tests = self._test_evidence_section(evidence.tests)
         ci = ""
         if evidence.ci_state:
-            ci = f"| CI | {self._inline_cell(str(evidence.ci_state), None)} |\n"
+            ci = f"| CI | {self._table_cell(str(evidence.ci_state), None)} |\n"
         # Merge policy LAST: it is a verdict ABOUT the rows above it, so it
         # reads best once a reviewer already has review/verifiers/tamper/
         # tests/CI in view.
@@ -18862,6 +18862,12 @@ SIX of them read a checkpoint and TWO do not — but do
                     "commit yet — the rounds on record judged a different "
                     "commit of this task |\n")
         n = int(rv["rounds"])
+        # `rv["verdict"]` is `_review_verdict_data`'s own closed set
+        # (`"PASSED"` or `"not passed"`, never model text), so no cell here
+        # can carry a `|` — this row deliberately stays on plain
+        # interpolation rather than `_table_cell`. That also keeps
+        # `review_verdict_pin()` (`pr_evidence.py`) an exact substring of
+        # this row, unlike `ci_state_pin`.
         glyph = "✅" if rv["verdict"] == "PASSED" else "❌"
         row = (f"| Independent review | {glyph} **{rv['verdict']}** — "
                f"{n} round{'s' if n != 1 else ''} |\n")
@@ -18885,11 +18891,16 @@ SIX of them read a checkpoint and TWO do not — but do
         `_review_evidence_section`'s precedent). "" when no verifiers ran
         for this head — never a row for an empty list.
 
-        Every model-authored cell (a rule's own id, the file path it
-        reports, its ``evidence`` string extracted from the diff/repo) goes
-        through `_inline_cell`: that text did not come from a human, and a
-        single newline in it is the same heading-injection channel the
-        `<h1>` incident at `_inline_cell`'s own docstring describes.
+        The summary row's cell (the pin, which embeds joined verifier ids)
+        goes through `_table_cell`: it is a TABLE cell, so a literal `|` in
+        a verifier id would otherwise end the row early (the truncation this
+        module exists to fix). Every model-authored cell BELOW the row (a
+        rule's own id, the file path it reports, its ``evidence`` string
+        extracted from the diff/repo) goes through `_inline_cell`: those are
+        `<details>` list items, not table cells, so a raw `|` there is
+        literal and harmless — only newline-folding/heading-demotion apply,
+        which is the same heading-injection channel the `<h1>` incident at
+        `_inline_cell`'s own docstring describes.
         """
         results = evidence.verifiers
         if not results:
@@ -18911,7 +18922,9 @@ SIX of them read a checkpoint and TWO do not — but do
             glyph = "⚠️"
         else:
             glyph = "✅"
-        row = f"| Verifiers | {glyph} {Orchestrator._inline_cell(pin, None)} |\n"
+        row = f"| Verifiers | {glyph} {Orchestrator._table_cell(pin, None)} |\n"
+        # The items below render into a `<details>` list, not a table row —
+        # a raw `|` there ends nothing, so these stay on `_inline_cell`.
         items: list[str] = []
         for r in results:
             vid = Orchestrator._inline_cell(str(r.get("verifier_id") or ""), None)
@@ -18982,7 +18995,10 @@ SIX of them read a checkpoint and TWO do not — but do
         # own policy demands happens to pass.
         glyph = ("⚠️" if mp.get("policy_changed_in_diff")
                  else ("✅" if mp.get("ready") else "❌"))
-        row = f"| Merge policy | {glyph} {Orchestrator._inline_cell(pin, None)} |\n"
+        row = f"| Merge policy | {glyph} {Orchestrator._table_cell(pin, None)} |\n"
+        # `warn` is a plain paragraph (not a table cell) and `items` render
+        # into a `<details>` list — a raw `|` in either is literal and
+        # harmless, so both stay on `_inline_cell`.
         warn = ""
         problems = mp.get("problems") or []
         if problems:
@@ -19373,7 +19389,7 @@ SIX of them read a checkpoint and TWO do not — but do
         counted = _n("passed") + _n("failed") + _n("errors")
 
         if isinstance(layers, list) and layers:
-            lines = [f"| Tests | {Orchestrator._inline_cell(s, None)} |" for s in layers]
+            lines = [f"| Tests | {Orchestrator._table_cell(s, None)} |" for s in layers]
         elif test_evidence.get("invocation_error") and not counted:
             # C3: THE RUNNER NEVER STARTED. This used to render as
             # "FAIL — 0 passed, 0 failed, 0 errors", which a human reads as a
@@ -19381,6 +19397,8 @@ SIX of them read a checkpoint and TWO do not — but do
             # there is no test signal at all. `_run_attempt` already persisted
             # both the flag and the base-tree verdict that says whether the
             # change caused it; the body simply never read them.
+            # `says` is one of a fixed 3-string set, never model text, so this
+            # NOT-RUN row stays a literal — no cell here can carry a `|`.
             on_base = test_evidence.get("reproduces_on_base")
             says = {True: "yes", False: "no"}.get(on_base, "could not be checked")
             lines = [
@@ -19395,6 +19413,7 @@ SIX of them read a checkpoint and TWO do not — but do
             # with no tests is structural absence, not a failed gate — but the
             # body used to print nothing for it, and nothing is what a reader
             # takes for "fine". The disclosure is the ledger entry.
+            # Literal row, no interpolation at all — nothing here can carry `|`.
             lines = [
                 "| Tests | ⚠️ **NOT RUN — no test command detected** — this change "
                 "carries NO test evidence; do not read the absence of failures "
@@ -19404,14 +19423,20 @@ SIX of them read a checkpoint and TWO do not — but do
         # `ran=False` is handled above, and the layered writer always sets
         # `layers` (first branch).
         elif test_evidence.get("ran"):
+            # `passed`/`failed`/`errors` are normally ints, but a malformed
+            # attempt row can put a string there (C3's own concern one level
+            # up) — `_table_cell(str(...), None)` is uniform, a no-op for
+            # ints, and makes "every cell" here literally true.
             if test_evidence.get("ok"):
-                lines = [f"| Tests | ✅ PASS — {test_evidence.get('passed', 0)} passed, "
-                         f"{test_evidence.get('failed', 0)} failed, "
-                         f"{test_evidence.get('errors', 0)} errors |"]
+                lines = [f"| Tests | ✅ PASS — "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('passed', 0)), None)} passed, "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('failed', 0)), None)} failed, "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('errors', 0)), None)} errors |"]
             else:
-                lines = [f"| Tests | ❌ FAIL — {test_evidence.get('passed', 0)} passed, "
-                         f"{test_evidence.get('failed', 0)} failed, "
-                         f"{test_evidence.get('errors', 0)} errors |"]
+                lines = [f"| Tests | ❌ FAIL — "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('passed', 0)), None)} passed, "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('failed', 0)), None)} failed, "
+                         f"{Orchestrator._table_cell(str(test_evidence.get('errors', 0)), None)} errors |"]
                 # The names are stored on the attempt row and were invisible on
                 # the artifact — a reviewer had a count and no way to act on it.
                 failing = [Orchestrator._inline_cell(f, None)

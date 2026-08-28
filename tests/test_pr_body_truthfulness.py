@@ -4119,3 +4119,342 @@ def test_the_summary_reformatter_has_exactly_the_callers_its_docstring_names():
         "the call graph moved out from under `_reformat_summary_markdown`'s "
         "non-idempotence note — every caller must apply it exactly ONCE, and "
         "the docstring must name the callers that exist: " + repr(calls))
+
+
+# ── the Evidence table's ROW cells: a `|` must not truncate a row ────────── #
+#
+# `c514fba1d` gave the reviewer-checklist table its own escaper (`_table_cell`
+# = `_inline_cell` + the idempotent `_TABLE_PIPE` pipe escape) after a `|` in
+# a checklist item silently dropped that row's remaining columns. The SAME
+# defect was still live in the Evidence table's own rows: `_evidence_section`
+# built the CI/Tests/Verifiers/Merge-policy rows through raw `_inline_cell`,
+# which never escapes a pipe (most of its callers are not table cells at
+# all — fold items, paragraphs, list bullets — so it was never asked to).
+# `ci_state` (a CI provider's free-text summary), a test layer's summary
+# line, a joined `verifier_id` list and a merge-policy rule-name list are
+# all routine carriers of a literal `|` — a shell pipeline in a failing
+# command, a regex, an "a | b" union in a rule's own name — so this was not
+# a hypothetical, just unexercised.
+#
+# Every test below is pinned against a REAL renderer (pandoc, and — opt-in —
+# GitHub's own `/markdown` endpoint), not a hand-rolled GFM pipe-counting
+# heuristic: the `#642` review flagged exactly that anti-pattern
+# (`.replace("\\|", "").count("|")`, which cannot tell "the pipe count is
+# balanced" from "the row means what it says"). Reading the ACTUAL cell
+# text a renderer produces is the only check that catches a truncated row
+# the way a human reading the rendered PR would.
+
+
+def _cells_from_html(html: str) -> list[list[str]]:
+    """Every rendered TABLE ROW's cell texts, tags stripped and entities
+    unescaped, one row per `<tr>` in document order — spanning `<thead>`
+    and `<tbody>` alike, the same way `_headings_from_html` already spans
+    `<h1>` and `<h2>` without caring which section wraps them.
+    """
+    rows: list[list[str]] = []
+    for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
+        cells = [
+            htmlmod.unescape(re.sub(r"<[^>]+>", "", c)).strip()
+            for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row_html, re.S | re.I)
+        ]
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _pandoc_cells(md: str) -> list[list[str]]:
+    """*md*'s table rows according to `pandoc`, read as GFM — the same
+    independent-oracle discipline as `_pandoc_headings` (see its docstring),
+    applied to table cells instead of headings: nobody who wrote the escaper
+    also wrote this reader.
+    """
+    if not shutil.which("pandoc"):                            # pragma: no cover
+        pytest.skip("pandoc is not installed — the independent oracle is the "
+                    "one thing that cannot be stubbed, so this skips rather "
+                    "than falling back to a hand-rolled pipe count")
+    out = subprocess.run(["pandoc", "-f", "gfm", "-t", "html", "--wrap=none"],
+                         input=md, capture_output=True, text=True)
+    if out.returncode != 0:                                   # pragma: no cover
+        pytest.skip(f"pandoc failed: {out.stderr.strip()[:200]}")
+    return _cells_from_html(out.stdout)
+
+
+def _github_cells(md: str) -> list[list[str]]:
+    """*md*'s table rows according to GitHub's OWN renderer. Reuses
+    `_render_on_github`'s `gh`-absent / unauthenticated / rate-limited /
+    network-failure skip semantics wholesale — callers gate on
+    `NH_GITHUB_RENDERER` themselves, exactly like every other
+    github-suffixed test in this file.
+    """
+    return _cells_from_html(_render_on_github(md))
+
+
+def _verifier_dict(*, verifier_id: str, passed: bool, evidence: str = "e",
+                    file: str = "", line: int = 0) -> dict:
+    """Mirrors `tests/test_pr_evidence.py:149`'s helper of the same name and
+    shape. Not imported from there — it is that module's own private test
+    helper — so the fields `_verifiers_evidence_section` actually reads
+    (`verifier_id`, `passed`, `unavailable`, `evidence`, `file`, `line`,
+    `files_checked`) are duplicated here rather than crossing a test-module
+    boundary for it.
+    """
+    return {
+        "verifier_id": verifier_id, "passed": passed, "unavailable": False,
+        "evidence": evidence, "file": file, "line": line,
+        "files_checked": [],
+    }
+
+
+def _evidence_slice(body: str) -> str:
+    return body.split("## Evidence\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_a_pipe_in_the_ci_state_keeps_the_ci_row_two_cells(store, tmp_path):
+    """RED before the fix: `_evidence_section`'s CI row used to interpolate
+    `evidence.ci_state` through `_inline_cell` (no pipe escape). A CI
+    provider's free-text summary routinely carries one (`"failing: a | b"`
+    reads as "failing on job a, or job b" — ordinary shell/log text, not an
+    attack), and the raw `|` silently ended the row's second cell early:
+    pandoc read the row as three cells (`['CI', 'failing: a', 'b']`), the
+    third with nowhere to go in a two-column table. After the fix the row
+    goes through `_table_cell`, so the pipe survives escaped and pandoc
+    reads exactly two cells with the summary intact.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    task.context = {"ci_status": "failing: a | b"}
+    body = orch._pr_body(task, _Commit(), _Result())
+    ev = _evidence_slice(body)
+    # Unconditional (no oracle, cannot skip): the rendered line itself
+    # carries the escaped pipe.
+    assert "| CI | failing: a \\| b |" in ev, ev
+    rows = _pandoc_cells(ev)
+    ci_rows = [r for r in rows if r and r[0] == "CI"]
+    assert ci_rows == [["CI", "failing: a | b"]], (
+        f"pandoc did not read the CI row as exactly two cells: {ci_rows}\n{ev}")
+
+
+def test_a_pipe_in_a_test_layer_summary_keeps_the_tests_row_two_cells(
+    store, tmp_path,
+):
+    """Same defect, the Tests row: a layer's summary line comes from the
+    test runner (`testing/runner.py`) and can read like `"PASS | 10
+    passed"` — a pipe is unremarkable in a one-line test-layer summary.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    test_evidence = {"ran": True, "ok": True, "layers": ["PASS | 10 passed"]}
+    body = orch._pr_body(task, _Commit(), _Result(), test_evidence=test_evidence)
+    ev = _evidence_slice(body)
+    assert "| Tests | PASS \\| 10 passed |" in ev, ev
+    rows = _pandoc_cells(ev)
+    tests_rows = [r for r in rows if r and r[0] == "Tests"]
+    assert tests_rows == [["Tests", "PASS | 10 passed"]], (
+        f"pandoc did not read the Tests row as exactly two cells: {tests_rows}\n{ev}")
+
+
+def test_a_pipe_in_a_verifier_id_keeps_the_verifiers_row_two_cells(
+    store, tmp_path,
+):
+    """Same defect, the Verifiers row: its cell is `verifiers_pin()`, which
+    joins failing `verifier_id`s (`pr_evidence.py`'s `verifiers_pin`) — a
+    rule id is config/model-authored text, not a closed set.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    commit = _Commit()
+    commit.sha = "c" * 40
+    task.context = {"verifier_results": {commit.sha: [
+        _verifier_dict(verifier_id="no|todo", passed=False, evidence="x"),
+    ]}}
+    body = orch._pr_body(task, commit, _Result())
+    ev = _evidence_slice(body)
+    assert "no\\|todo" in ev, ev
+    rows = _pandoc_cells(ev)
+    v_rows = [r for r in rows if r and r[0] == "Verifiers"]
+    assert len(v_rows) == 1 and len(v_rows[0]) == 2, (
+        f"pandoc did not read the Verifiers row as exactly two cells: {v_rows}\n{ev}")
+    assert "no|todo" in v_rows[0][1]
+
+
+def test_a_pipe_in_the_merge_policy_summary_keeps_the_row_two_cells(
+    store, tmp_path,
+):
+    """Same defect, the Merge-policy row: its cell is `merge_policy_pin()`,
+    exactly `PolicyVerdict.summary` (`core/merge_policy.py`), which joins
+    failed RULE NAMES — driven through a REAL `PolicyVerdict`, mirroring
+    `tests/test_pr_evidence.py:386`, not a hand-built dict.
+    """
+    from no_human.core.merge_policy import PolicyVerdict, RuleVerdict
+
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    verdict = PolicyVerdict(
+        ready=False,
+        rules=(RuleVerdict(name="review | passed", passed=False, detail="x"),),
+        source="default",
+    )
+    assert "|" in verdict.summary, "fixture must actually exercise the defect"
+    body = orch._pr_body(task, _Commit(), _Result(), merge_policy=verdict.as_dict())
+    ev = _evidence_slice(body)
+    assert "review \\| passed" in ev, ev
+    rows = _pandoc_cells(ev)
+    mp_rows = [r for r in rows if r and r[0] == "Merge policy"]
+    assert len(mp_rows) == 1 and len(mp_rows[0]) == 2, (
+        f"pandoc did not read the Merge policy row as exactly two cells: "
+        f"{mp_rows}\n{ev}")
+    assert "review | passed" in mp_rows[0][1]
+
+
+def test_the_evidence_rows_double_escape_nothing(store, tmp_path):
+    """Idempotency, both at the string level and the source level.
+    `_TABLE_PIPE`'s own docstring names the risk it guards against: an
+    ALREADY-escaped `a\\|b` must stay `a\\|b`, not become `a\\\\|b` (an
+    escaped backslash followed by a live column break — the same defect one
+    layer down). And there must be exactly ONE pipe-escaper in the source —
+    this fix routes MORE call sites through the existing `_table_cell`, it
+    does not add a second escaper beside it.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    task.context = {"ci_status": r"a\|b"}
+    body = orch._pr_body(task, _Commit(), _Result())
+    ev = _evidence_slice(body)
+    assert "| CI | a\\|b |" in ev, ev
+    rows = _pandoc_cells(ev)
+    ci_rows = [r for r in rows if r and r[0] == "CI"]
+    assert ci_rows == [["CI", "a|b"]], ci_rows
+
+    assert (Orchestrator._table_cell(Orchestrator._table_cell(r"a\|b", None), None)
+            == Orchestrator._table_cell(r"a\|b", None))
+
+    import inspect
+    import no_human.core.orchestrator as orch_mod
+    src = inspect.getsource(orch_mod)
+    defs = re.findall(r"^\s*_TABLE_PIPE\s*=\s*re\.compile", src, re.M)
+    assert len(defs) == 1, (
+        f"expected exactly one `_TABLE_PIPE` definition, found {len(defs)} — "
+        "a second escaper was added instead of reusing the existing one")
+
+
+def test_escaped_rows_still_split_as_rows(store, tmp_path):
+    """Row-shape invariant: `_split_rows` (`orchestrator.py`) classifies a
+    line as a table row purely by `startswith("| ")` / `endswith(" |")`.
+    Escaping only inserts a backslash BEFORE an interior pipe, so a value
+    ending in a pipe (`_TABLE_PIPE` still fires on the last character) must
+    still produce a line `_split_rows` puts in `rows`, not `rest` — the
+    escape must never shift where the row's own closing `" |"` sits.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    task.context = {"ci_status": "trailing pipe |"}
+    body = orch._pr_body(task, _Commit(), _Result())
+    ev = _evidence_slice(body)
+    line = next(l for l in ev.splitlines() if l.startswith("| CI |"))
+    assert line == "| CI | trailing pipe \\| |", line
+    rows, rest = Orchestrator._split_rows(line + "\n")
+    assert rows.strip("\n") == line, (
+        f"an escaped trailing pipe knocked the row out of `_split_rows`'s "
+        f"`rows` bucket: rows={rows!r} rest={rest!r}")
+    assert rest == ""
+
+
+def test_inline_cell_still_passes_pipes_through():
+    """OUT OF SCOPE, pinned rather than assumed: `_inline_cell` itself must
+    not gain pipe-escaping — it guards every NON-table text carrier (fold
+    items, list items, paragraphs), where a raw `|` is literal and harmless.
+    Only `_table_cell` (a distinct wrapper) escapes; this is the case the
+    existing parametrized `test_the_one_line_cell_contract` table does not
+    cover.
+    """
+    assert Orchestrator._inline_cell("a | b", None) == "a | b"
+
+
+def test_a_verifier_fold_item_keeps_its_raw_pipe(store, tmp_path):
+    """The per-rule bullet under the Verifiers `<details>` fold is a LIST
+    ITEM, not a table cell — `_verifiers_evidence_section`'s own docstring
+    says it deliberately stays on `_inline_cell`. Pinning the deliberate
+    non-change: a `|` in a verifier's `evidence` string (the judge's own
+    prose, quoting a diff) must reach the body unescaped.
+    """
+    orch = _orch(store, tmp_path)
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    commit = _Commit()
+    commit.sha = "d" * 40
+    task.context = {"verifier_results": {commit.sha: [
+        _verifier_dict(verifier_id="no-todo", passed=False,
+                        evidence="found a | pattern", file="c.py", line=4),
+    ]}}
+    body = orch._pr_body(task, commit, _Result())
+    ev = _evidence_slice(body)
+    assert "found a | pattern" in ev, ev
+    assert "found a \\| pattern" not in ev, ev
+
+
+def _ci_github_fixture(orch):
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    task.context = {"ci_status": "failing: a | b"}
+    body = orch._pr_body(task, _Commit(), _Result())
+    return body, "CI", ["CI", "failing: a | b"]
+
+
+def _tests_github_fixture(orch):
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    test_evidence = {"ran": True, "ok": True, "layers": ["PASS | 10 passed"]}
+    body = orch._pr_body(task, _Commit(), _Result(), test_evidence=test_evidence)
+    return body, "Tests", ["Tests", "PASS | 10 passed"]
+
+
+def _verifiers_github_fixture(orch):
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    commit = _Commit()
+    commit.sha = "e" * 40
+    task.context = {"verifier_results": {commit.sha: [
+        _verifier_dict(verifier_id="no|todo", passed=False, evidence="x"),
+    ]}}
+    body = orch._pr_body(task, commit, _Result())
+    return body, "Verifiers", None
+
+
+def _merge_policy_github_fixture(orch):
+    from no_human.core.merge_policy import PolicyVerdict, RuleVerdict
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    verdict = PolicyVerdict(
+        ready=False,
+        rules=(RuleVerdict(name="review | passed", passed=False, detail="x"),),
+        source="default",
+    )
+    body = orch._pr_body(task, _Commit(), _Result(), merge_policy=verdict.as_dict())
+    return body, "Merge policy", None
+
+
+@pytest.mark.slow
+@pytest.mark.skipif("not os.environ.get('NH_GITHUB_RENDERER')",
+                    reason="set NH_GITHUB_RENDERER=1 to verify against GitHub")
+@pytest.mark.parametrize(
+    "fixture",
+    [_ci_github_fixture, _tests_github_fixture, _verifiers_github_fixture,
+     _merge_policy_github_fixture],
+    ids=["ci", "tests", "verifiers", "merge-policy"],
+)
+def test_the_evidence_rows_survive_github_for_real(store, tmp_path, fixture):
+    """The real-renderer pin for all four row families in one test, opt-in
+    exactly like `test_the_live_heading_scanner_sees_what_github_sees`
+    above (`NH_GITHUB_RENDERER=1`): asserts the same two-cells-per-row
+    property AND that pandoc agrees with GitHub, the file's existing
+    "oracle can't drift" discipline (see `test_the_live_heading_scanner_
+    sees_what_github_sees`'s own closing assertion).
+    """
+    orch = _orch(store, tmp_path)
+    body, label, expected = fixture(orch)
+    ev = _evidence_slice(body)
+    github_rows = [r for r in _github_cells(ev) if r and r[0] == label]
+    pandoc_rows = [r for r in _pandoc_cells(ev) if r and r[0] == label]
+    assert len(github_rows) == 1 and len(github_rows[0]) == 2, (
+        f"GitHub did not read the {label} row as exactly two cells: "
+        f"{github_rows}\n{ev}")
+    assert github_rows == pandoc_rows, (
+        f"pandoc and GitHub disagree on the {label} row:\n"
+        f"pandoc={pandoc_rows}\ngithub={github_rows}\n{ev}")
+    if expected is not None:
+        assert github_rows == [expected]
