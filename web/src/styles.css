@@ -576,6 +576,12 @@ html, body, #root {
 .outcome-page { padding: 0 24px 22px; overflow-y: auto; }
 /* Top spacing via first-child margin, not padding — see .stats-page note. */
 .outcome-page > :first-child { margin-top: 22px; }
+
+/* Generic scroll+pad wrapper for a panel that carries neither, promoted from
+   the Settings overlay into nh-main (which is overflow:hidden, no padding) —
+   e.g. the LearningsPanel ("Second brain"). Mirrors .settings-overlay-body's
+   scroll container so the panel's own styles stay untouched. */
+.nh-page { flex: 1; overflow-y: auto; padding: 28px; }
 .stats-page > :first-child { margin-top: 32px; }
 .outcome-title {
   font-family: var(--font-display);

@@ -4,7 +4,7 @@ import FinishSetupCard from "./FinishSetupCard.jsx";
 import { initTelemetry, captureScreen } from "./telemetry.js";
 import Board from "./Board.jsx";
 import Backlog from "./Backlog.jsx";
-import SettingsOverlay from "./Settings.jsx";
+import SettingsOverlay, { LearningsPanel } from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
@@ -113,6 +113,15 @@ function IconStats() {
       <path d="M4.5 13.5V9" />
       <path d="M8 13.5V5.5" />
       <path d="M11.5 13.5V7" />
+    </svg>
+  );
+}
+function IconBrain() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 3.2v9.6" />
+      <path d="M8 4.4A2 2 0 0 0 4.3 5.2 1.9 1.9 0 0 0 3 7a1.9 1.9 0 0 0 .5 3.1A1.9 1.9 0 0 0 6 12.4" />
+      <path d="M8 4.4A2 2 0 0 1 11.7 5.2 1.9 1.9 0 0 1 13 7a1.9 1.9 0 0 1-.5 3.1A1.9 1.9 0 0 1 10 12.4" />
     </svg>
   );
 }
@@ -910,7 +919,7 @@ export default function App() {
     const off = window.nhDesktop?.onMenu?.((action) => {
       if (action === "new-task") setShowNewTask(true);
       else if (action === "settings") setSettingsOpen(true);
-      else if (action === "board" || action === "backlog" || action === "stats") setPage(action);
+      else if (action === "board" || action === "backlog" || action === "stats" || action === "learnings") setPage(action);
     });
     return off;
   }, []);
@@ -1096,6 +1105,14 @@ export default function App() {
               current={page === "stats"}
               onClick={() => setPage("stats")}
             />
+            <NavRow
+              icon={<IconBrain />}
+              label="Second brain"
+              active={page === "learnings"}
+              current={page === "learnings"}
+              onClick={() => setPage("learnings")}
+              title="Rules, skills and learnings captured from your tasks"
+            />
           </NavGroup>
         </nav>
         <NightLedger tasks={tasks} authMode={authMode} />
@@ -1228,6 +1245,7 @@ export default function App() {
             : page === "done" ? "Done tasks"
             : page === "failed" ? "Failed tasks"
             : page === "stats" ? "Performance"
+            : page === "learnings" ? "Second brain"
             : page === "about" ? "About no_human"
             : "Settings"}
         </h1>
@@ -1248,6 +1266,7 @@ export default function App() {
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}
+        {page === "learnings" && <div className="nh-page"><LearningsPanel /></div>}
         {page === "about" && <About />}
       </main>
       {showNewTask && (

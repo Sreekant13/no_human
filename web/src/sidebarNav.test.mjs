@@ -67,6 +67,30 @@ test("Backlog is a Work-group nav row that routes to its own page and is rendere
   assert.match(appJsx, /page === "backlog" \? "Backlog"/, "the sr-only h1 must name the page");
 });
 
+// Must-have #2: the learning queue ("second brain") is a first-class page in
+// the Insights group, not buried in the Settings overlay. It reuses the
+// already-tested LearningsPanel (imported from Settings.jsx) as the page body.
+test("the Insights group has a 'Second brain' row that routes to setPage('learnings') and renders LearningsPanel", () => {
+  const insights = appJsx.match(/<NavGroup title="Insights">[\s\S]*?<\/NavGroup>/)?.[0];
+  assert.ok(insights, "the Insights group must be found");
+  assert.match(insights, /label="Second brain"/, "a 'Second brain' row must sit in the Insights group");
+  // Stats stays first; Second brain follows it.
+  assert.ok(insights.indexOf('label="Stats"') < insights.indexOf('label="Second brain"'));
+  const row = insights.match(/<NavRow\s+icon=\{<IconBrain \/>\}[\s\S]*?\/>/)?.[0];
+  assert.ok(row, "the Second brain NavRow must use the IconBrain icon");
+  assert.match(row, /active=\{page === "learnings"\}/);
+  assert.match(row, /current=\{page === "learnings"\}/);
+  assert.match(row, /setPage\(\s*["']learnings["']\s*\)/);
+  // The page it routes to actually renders the reused, already-tested panel.
+  assert.match(appJsx, /import SettingsOverlay,\s*\{\s*LearningsPanel\s*\}\s*from\s*["']\.\/Settings\.jsx["']/, "LearningsPanel must be imported from Settings.jsx");
+  assert.match(appJsx, /page === "learnings" &&[\s\S]{0,60}<LearningsPanel \/>/, "the learnings page must render LearningsPanel");
+  assert.match(appJsx, /page === "learnings" \? "Second brain"/, "the sr-only h1 must name the page");
+  // IconBrain is a real inline <svg> (CSP forbids remote icons).
+  const iconFn = appJsx.match(/function IconBrain\([^)]*\)\s*\{[^]*?\n\}/);
+  assert.ok(iconFn, "IconBrain must be defined");
+  assert.match(iconFn[0], /<svg/i, "IconBrain must render an inline <svg>");
+});
+
 test("every sidebar nav row (Board/Backlog/Done/Failed/Stats/Settings) pairs an inline-SVG icon with a text label — never icon-only", () => {
   const rowFn = appJsx.match(/function NavRow\([^)]*\)\s*\{[^]*?\n\}/);
   assert.ok(rowFn, "a shared NavRow component must exist");

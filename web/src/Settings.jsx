@@ -762,7 +762,7 @@ function AddMemoryModal({ kind, onClose, onSaved, addFn }) {
 
 /* ── Learnings queue ─────────────────────────────────────────────────────── */
 
-function LearningsPanel() {
+export function LearningsPanel() {
   const [pending, setPending] = useState([]);
   const [active, setActive] = useState([]);
   const [view, setView] = useState("pending");
