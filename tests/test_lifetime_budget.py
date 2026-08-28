@@ -15,7 +15,7 @@ import pytest
 from no_human.blockers import BlockerCategory, apply_action, route_for
 from no_human.core.bounds import Bounds
 from no_human.core.db import Store
-from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT
+from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT, weighted_tokens
 from no_human.core.task import Task, TaskStatus
 
 
@@ -1868,3 +1868,71 @@ async def test_unflushed_aux_spend_is_not_yet_in_the_qualified_residual(store):
         "0 calls, 0 cost-weighted tokens "
         "(aged-out or not-yet-flushed spend is not shown)"
     ) in b.evidence
+
+
+# --------------------------------------------------------------------------- #
+# f22495d8: the detail payload surfaces the gate's budget (used/cap/remaining) #
+# --------------------------------------------------------------------------- #
+async def _detail(store, tmp_path, task_id):
+    """GET /api/tasks/{id} against `store`, returning the JSON body."""
+    import no_human.config as nh_config
+    from httpx import ASGITransport, AsyncClient
+
+    from no_human.api.app import app
+
+    app.state.store = store
+    app.state.config = nh_config.load_config(tmp_path / "config.yaml")
+    app.state.scheduler = None
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.get(f"/api/tasks/{task_id}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+async def test_detail_payload_budget_matches_the_gate_killer_metric(store, tmp_path):
+    """The drawer's `budget` is the EXACT number BUDGET_EXHAUSTED kills on.
+
+    A cache-read-heavy attempt: 1M fresh (weight 1.0) + 10M cache-read (weight
+    0.1) = 2M cost-weighted, against 11M RAW. The gate compares the WEIGHTED
+    figure to the cap, so the surfaced `used` must be 2M — the raw 11M the old
+    meter showed would misreport how close this task is to being killed.
+    """
+    t = Task.new("burn", repo_path="/tmp/x")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        aid, tokens_used=1_000_000, cache_read_tokens=10_000_000)
+
+    # What the gate itself would compute for this task, from the same helpers.
+    _, by_class, _ = await store.lifetime_usage_by_class(t.id)
+    gate_used = weighted_tokens(**by_class)
+    _, gate_cap = _orch(store)._lifetime_limits(t)
+
+    body = await _detail(store, tmp_path, t.id)
+    assert "budget" in body and body["budget"] is not None
+    budget = body["budget"]
+    assert budget["used"] == gate_used == 2_000_000
+    assert budget["cap"] == gate_cap == 4_000_000  # default bounds.lifetime_tokens
+    assert budget["remaining"] == gate_cap - gate_used == 2_000_000
+    # It is the WEIGHTED killer metric, not the raw 11M every other meter shows.
+    raw = sum(by_class[n] for n in ("tokens_used", "cache_read_tokens",
+                                    "cache_creation_tokens"))
+    assert raw == 11_000_000 and budget["used"] != raw
+
+
+async def test_detail_payload_budget_honours_a_per_task_cap_override(store, tmp_path):
+    """The surfaced cap tracks the SAME per-task override the gate honours —
+    a human raise (`_stored_token_cap`, weighted-stamped) moves both together,
+    so the drawer never shows a cap the gate is not using."""
+    t = Task.new("burn", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 9_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, tokens_used=1_000_000)
+
+    _, gate_cap = _orch(store)._lifetime_limits(t)
+    body = await _detail(store, tmp_path, t.id)
+    assert gate_cap == 9_000_000
+    assert body["budget"]["cap"] == gate_cap
+    assert body["budget"]["remaining"] == 9_000_000 - 1_000_000

@@ -49,11 +49,13 @@ from ..agent.session_mark import AGENT_SESSION_HEADER, request_is_marked
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
+from ..core.bounds import Bounds
 from ..core.orchestrator import Orchestrator, is_agent_session, is_narration
+from ..core.pricing import weighted_tokens
 from ..core.task import Task, TaskStatus, normalise_priority
 from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
-    AttemptOut, BoardPayload, CancelRequest, CreateProjectRequest, CreateTaskRequest,
+    AttemptOut, BoardPayload, BudgetOut, CancelRequest, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
     ImportedInfo, LandedOverrideRequest, PhaseOut, ProjectOut, ReplyRequest,
     SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
@@ -1044,6 +1046,21 @@ async def get_task(task_id: str, request: Request) -> TaskOut:
     # stays null, which the drawer reads as "no ran chip" rather than "0s".
     out.phases = [PhaseOut.from_row(r) for r in await store.phases_for(task.id)]
     out.active_seconds = (await store.active_seconds(task.id)) or None
+    # f22495d8: surface the SAME cost-weighted lifetime budget the
+    # BUDGET_EXHAUSTED gate kills on (`Orchestrator._check_lifetime_budget`), so
+    # a human sees how close a task is to being killed — the #1 real-failure
+    # class. The EXACT helpers and args the gate uses, not a second estimate:
+    # `weighted_tokens` over the INCLUDED classes from `lifetime_usage_by_class`
+    # (infra/mechanical/dead-interrupted spend is excluded from the cap there),
+    # and `Orchestrator._stored_token_cap` against the same config-driven bounds
+    # default the gate reads in `_lifetime_limits`.
+    _, by_class, _ = await store.lifetime_usage_by_class(task.id)
+    cap = Orchestrator._stored_token_cap(
+        task.config or {}, "lifetime_tokens",
+        Bounds.from_config(request.app.state.config.data.get("bounds")).lifetime_tokens,
+        task)
+    used = weighted_tokens(**by_class)
+    out.budget = BudgetOut(used=used, cap=cap, remaining=cap - used)
     # SCRUM-16: same claimed contract as the board summaries (SCRUM-15) — the
     # slide-over must know whether a live session actually holds this task.
     sched = _sched(request)

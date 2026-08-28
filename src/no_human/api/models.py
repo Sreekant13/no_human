@@ -158,6 +158,26 @@ class PhaseOut(BaseModel):
         )
 
 
+class BudgetOut(BaseModel):
+    """The lifetime COST-WEIGHTED budget the BUDGET_EXHAUSTED gate kills on —
+    the #1 real-failure class, made visible before it fires.
+
+    `used`/`cap`/`remaining` are the EXACT numbers
+    `Orchestrator._check_lifetime_budget` compares, not a second estimate:
+    `used = pricing.weighted_tokens(**store.lifetime_usage_by_class(...)[1])`
+    (the INCLUDED classes only — infra/mechanical/dead-interrupted spend is
+    excluded from the cap, exactly as the gate excludes it), and `cap =
+    Orchestrator._stored_token_cap(task.config, "lifetime_tokens", <bounds
+    default>)` — the same per-task-overridable, unit-guarded cap. Populated by
+    the detail endpoint (`from_task` has no store), like `phases`. The cap is
+    config-driven (`bounds.lifetime_tokens`, default 4M) and per-task
+    overridable, so it is read live, never hard-coded here.
+    """
+    used: int
+    cap: int
+    remaining: int
+
+
 class TaskOut(BaseModel):
     id: str
     # SCRUM-16: the scheduler has this task actively in-flight right now —
@@ -243,6 +263,13 @@ class TaskOut(BaseModel):
     #: Σ of phase-row durations (`store.active_seconds`); the "ran" time, which
     #: parked time never enters. `null` when no phase rows exist yet.
     active_seconds: float | None = None
+    #: The lifetime cost-weighted budget the BUDGET_EXHAUSTED gate enforces —
+    #: how close this task is to being killed (used/cap/remaining). Populated by
+    #: the detail endpoint (`from_task` has no store); `null` there. See
+    #: `BudgetOut`. Frontend note: `web/src/SlideOver.jsx`'s `sys-summary` block
+    #: (near the "Attempt: #N" item, ~line 1658) is the obvious place to add a
+    #: "used/cap · N% of budget" chip from `task.budget`; no UI is built here.
+    budget: BudgetOut | None = None
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":

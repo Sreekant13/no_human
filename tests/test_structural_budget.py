@@ -132,7 +132,7 @@ FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py": 19473,
     "cli/commands.py": 7783,
-    "api/app.py": 5153,
+    "api/app.py": 5170,
     "core/db.py": 4253,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
