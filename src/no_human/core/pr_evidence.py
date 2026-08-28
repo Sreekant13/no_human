@@ -51,6 +51,14 @@ class PrEvidence:
       advisory, never blocking — see `orchestrator._finalize`). Advisory to
       the human ONLY: nothing in this repo merges, waits, or gates a push on
       this field.
+    * ``merge_policy_error`` — the exception CLASS NAME (never the message —
+      messages can carry model-authored text and this module's fields are
+      rendered) of a merge-policy compute that raised in `_finalize`, or
+      ``None``. Two states stay distinguishable: ``(merge_policy=None,
+      merge_policy_error=None)`` means no policy was ever attempted for this
+      head — say nothing; ``(merge_policy=None, merge_policy_error="...")``
+      means the compute was tried and failed — disclose it. A stamped
+      ``merge_policy`` always wins over a stale error string.
     """
 
     repro: dict[str, Any] | None = None
@@ -60,6 +68,7 @@ class PrEvidence:
     verifiers: list[dict[str, Any]] | None = None
     ci_state: Any = None
     merge_policy: dict[str, Any] | None = None
+    merge_policy_error: str | None = None
 
     def has(self, field: str) -> bool:
         return getattr(self, field, None) is not None

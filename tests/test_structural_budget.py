@@ -72,7 +72,7 @@ FROZEN_FUNCTION_LINES = {
     "core/orchestrator.py:Orchestrator._drive": 760,
     "core/db.py:Store._ensure_task_columns": 448,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
-    "core/orchestrator.py:Orchestrator._finalize": 405,
+    "core/orchestrator.py:Orchestrator._finalize": 418,
     # Pre-existing on main (measured red at d3d7d3a82a, this session's start):
     # an earlier fleet land grew stream() +6 without re-freezing it on its
     # merge result — the same "landed without measuring the ratchet" failure
@@ -130,7 +130,7 @@ FROZEN_FUNCTION_CC = {
 # from here again. (A red ratchet the fleet lands through protects nothing.)
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
-    "core/orchestrator.py": 19413,
+    "core/orchestrator.py": 19448,
     "cli/commands.py": 7783,
     "api/app.py": 5153,
     "core/db.py": 4253,

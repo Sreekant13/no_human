@@ -429,6 +429,64 @@ def test_the_merge_policy_row_renders_from_a_real_policyverdict(store, tmp_path)
     assert "ready — 3 of 3 rules satisfied" in set(evidence.truth_pins().values())
 
 
+def test_merge_policy_section_discloses_a_failed_compute():
+    """`_merge_policy_evidence_section` is a pure function of `PrEvidence` —
+    exercised directly here (unit-level, no orchestrator run) against its
+    three distinguishable states:
+
+    1. ``merge_policy=None, merge_policy_error="RuntimeError"`` — the compute
+       was attempted and raised: a NOT-COMPUTED row naming the exception
+       class, and neither a fabricated ✅/❌ verdict nor a fold with nothing
+       to show.
+    2. ``merge_policy=None, merge_policy_error=None`` — no policy was ever
+       attempted for this head (the ordinary case for most of this repo's
+       history, and for any head with no `.no_human/merge_policy.yaml`
+       compute yet run): renders "", exactly as before this field existed.
+    3. ``merge_policy={...ready...}, merge_policy_error="RuntimeError"`` — a
+       stamped verdict always wins over a stale error string (this shape
+       cannot arise from `_finalize`'s own `replace(...)` calls, but the
+       renderer's OWN precedence must not depend on that never happening).
+    """
+    failed = PrEvidence(merge_policy_error="RuntimeError")
+    section = Orchestrator._merge_policy_evidence_section(failed)
+    assert "| Merge policy |" in section
+    assert "NOT COMPUTED — the merge-ready verdict could not be computed" in section
+    assert "RuntimeError" in section
+    assert "✅" not in section
+    assert "❌" not in section
+
+    empty = PrEvidence()
+    assert Orchestrator._merge_policy_evidence_section(empty) == ""
+
+    from no_human.core.merge_policy import PolicyVerdict, RuleVerdict
+
+    verdict = PolicyVerdict(
+        ready=True,
+        rules=(RuleVerdict(name="review_passed", passed=True, detail="PASSED — 2 rounds"),),
+        source="default",
+    )
+    stamped_and_stale_error = PrEvidence(
+        merge_policy=verdict.as_dict(), merge_policy_error="RuntimeError")
+    section2 = Orchestrator._merge_policy_evidence_section(stamped_and_stale_error)
+    assert "| Merge policy | ✅ ready — 1 of 1 rules satisfied |" in section2
+    assert "NOT COMPUTED" not in section2
+    assert "RuntimeError" not in section2
+
+
+def test_merge_policy_error_is_inline_cell_safe():
+    """A `merge_policy_error` string is an exception CLASS NAME, so in
+    practice it can never carry a newline — but the renderer routes it
+    through `_inline_cell` anyway rather than trusting that invariant, the
+    same discipline every other model-influenced cell in the PR body follows
+    (see `test_a_model_authored_verifier_comment_cannot_inject_a_heading`
+    for the sibling case on a verifier's `evidence` string). This proves the
+    discipline is actually wired for THIS field, not merely assumed safe."""
+    evidence = PrEvidence(merge_policy_error="Boom\n# MERGED AND APPROVED BY NO_HUMAN")
+    section = Orchestrator._merge_policy_evidence_section(evidence)
+    assert "\n# MERGED AND APPROVED BY NO_HUMAN" not in section
+    assert "# MERGED AND APPROVED BY NO_HUMAN" in section  # still reaches the row, inertly
+
+
 def test_evidence_renders_as_a_table_with_one_row_per_gate(store, tmp_path):
     """The operator's directive (2026-08-21): a reviewer meets the gate results
     FIRST, as one table of mechanical facts, and the detail behind each row is

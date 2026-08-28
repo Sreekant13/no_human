@@ -6257,7 +6257,10 @@ class Orchestrator:
         # `PrEvidence` object, and threaded into `_pr_body` via its
         # `evidence=` param so the render never re-gathers (and could never
         # re-derive a different answer for tamper/review/CI state than the
-        # one the persisted verdict below was computed from).
+        # one the persisted verdict below was computed from). The gather now
+        # precedes the policy compute below, so a policy failure cannot
+        # change what the body is built from — it can only record its own
+        # failure onto that same object (see the `except` below).
         #
         # ADVISORY ONLY. This block computes and PERSISTS a verdict for a
         # human to read (`task.context["merge_policy"]`, read by the API's
@@ -6266,8 +6269,18 @@ class Orchestrator:
         # below. Wrapped like the two evidence blocks above it — a failure
         # here is an advisory note, never a reason this PR doesn't ship.
         merge_policy_dict: dict | None = None
-        policy_evidence: PrEvidence | None = None
         head_sha = (getattr(commit, "sha", "") or "").strip()
+        # Gathered here, BEFORE the policy try-block, so a policy-compute
+        # failure below can never change what `_pr_body` builds from — it
+        # only records the failure onto this SAME object (`replace(...,
+        # merge_policy=None, merge_policy_error=...)` in the `except`). This
+        # is the only `_gather_evidence` call on this path; `_pr_body`'s own
+        # `if evidence is None:` re-gather is therefore unreachable here.
+        policy_evidence = self._gather_evidence(
+            task, test_evidence=test_evidence, receipts=receipts,
+            head_sha=head_sha, repo=repo, review_checklist=review_checklist_raw,
+            observable=self._backend_is_observable(),
+        )
         try:
             review_base = self._review_base(repo, base)
             # An empty diff read is NOT a safe default here: `paths_within`
@@ -6299,11 +6312,6 @@ class Orchestrator:
                     f"the diff could not be read ({exc}) — max_changed_lines "
                     "could not be evaluated")
             repro_state = getattr(self, "_last_repro", None) or {}
-            policy_evidence = self._gather_evidence(
-                task, test_evidence=test_evidence, receipts=receipts,
-                head_sha=head_sha, repo=repo, review_checklist=review_checklist_raw,
-                observable=self._backend_is_observable(),
-            )
             verdict = merge_policy.evaluate_repo(
                 repo.path,
                 extra_problems=tuple(evidence_problems),
@@ -6337,7 +6345,12 @@ class Orchestrator:
             self.emit("merge_policy", verdict.summary, ready=verdict.ready)
         except Exception as exc:  # noqa: BLE001 — advisory only; never blocks the PR
             self._advisory(f"merge policy verdict missing from PR body: {exc}")
-            policy_evidence = None
+            # `merge_policy=None` explicitly, so a failure AFTER the
+            # `replace(...)` above (e.g. `store.merge_context` raising)
+            # cannot leave a stamped verdict rendered as if the block
+            # completed. Same object either way — never a second gather.
+            policy_evidence = replace(policy_evidence, merge_policy=None,
+                                       merge_policy_error=type(exc).__name__)
         body = self._pr_body(task, commit, result, test_evidence=test_evidence,
                              receipts=receipts,
                              repo=repo, base=base, branch=branch,
@@ -18416,13 +18429,17 @@ SIX of them read a checkpoint and TWO do not — but do
         # "how many commands ran". See `core/pr_evidence.py`.
         #
         # `evidence` may already be gathered by the caller (`_finalize` builds
-        # it once to compute the merge-policy verdict, then folds that verdict
-        # into the SAME object and passes it here) — a second gather in that
-        # case could read a different tamper/review/CI state than the one the
-        # persisted verdict was computed from, which is exactly the bug this
-        # parameter exists to close. Callers with nothing pre-gathered (the
-        # pre-review draft body, this file's own unit tests) leave it at the
-        # default `None` and get the old gather-it-here behaviour.
+        # it once, BEFORE attempting the merge-policy compute, and passes that
+        # SAME object here whether or not the compute succeeds — a policy
+        # failure only records itself onto the object via `merge_policy_error`,
+        # it never drops back to `None`) — a second gather in that case could
+        # read a different tamper/review/CI state than the one the persisted
+        # verdict was computed from, which is exactly the bug this parameter
+        # exists to close. `_finalize` therefore never reaches this branch;
+        # it stays live only for callers with nothing pre-gathered (the
+        # pre-review draft body at ~10789, the body rebuild at ~8477, and this
+        # file's own unit tests), which leave it at the default `None` and get
+        # the old gather-it-here behaviour.
         if evidence is None:
             evidence = self._gather_evidence(
                 task, test_evidence=test_evidence, receipts=receipts,
@@ -18936,9 +18953,27 @@ SIX of them read a checkpoint and TWO do not — but do
         a VISIBLE warning line ABOVE the fold — never buried inside the
         `<details>`, since a human deciding whether to trust "ready" must
         see this without expanding anything.
+
+        ``evidence.merge_policy_error`` distinguishes the two ways this can be
+        empty: ``(None, None)`` means no policy was ever attempted for this
+        head and the row stays "" (unchanged); ``(None, "<ExceptionClass>")``
+        means `_finalize` tried and the compute raised, and that gets its own
+        NOT-COMPUTED row — same shape as the `_verification_section` NOT-RUN
+        disclosures — so a reader sees the gap instead of reading "" as "no
+        policy configured". A stamped ``merge_policy`` always wins over a
+        stale error string (`replace(..., merge_policy=None, ...)` in
+        `_finalize`'s `except` keeps the two from ever coexisting).
         """
         mp = evidence.merge_policy
         if not mp:
+            err = evidence.merge_policy_error
+            if err:
+                return (
+                    "| Merge policy | ⚠️ **NOT COMPUTED — the merge-ready "
+                    "verdict could not be computed** — "
+                    f"{Orchestrator._inline_cell(str(err), None)} — no "
+                    "verdict is claimed either way |\n"
+                )
             return ""
         pin = evidence.merge_policy_pin() or ""
         # ⚠️ outranks ✅/❌: a diff that edits the policy file is authoring its

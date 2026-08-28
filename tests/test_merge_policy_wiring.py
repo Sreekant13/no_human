@@ -281,6 +281,43 @@ async def test_gather_evidence_called_exactly_once_on_success(store, tmp_path, m
         f"expected exactly one _gather_evidence call on the success path, "
         f"got {count['n']}")
 
+    # Extended to the FAILURE path too: `_gather_evidence` is hoisted above
+    # the policy `try:` now, so a broken evaluator must not cause a second
+    # (re-)gather via `_pr_body`'s own fallback — the whole point of folding
+    # the failure onto the SAME `policy_evidence` object via `replace(...)`
+    # instead of re-gathering from scratch.
+    ctx2 = _stamp({}, reviewed_sha)
+    task2 = Task.new("Fix the thing", repo_path=str(work))
+    task2.context = ctx2
+    await store.create_task(task2)
+    await store.set_status(task2, TaskStatus.TESTING, validate=False)
+    attempt_id2 = await store.create_attempt(task2.id, 1)
+
+    orch2 = _orch(store, tmp_path)
+    count2 = {"n": 0}
+    original2 = orch2._gather_evidence
+
+    def spy2(*a, **k):
+        count2["n"] += 1
+        return original2(*a, **k)
+
+    orch2._gather_evidence = spy2
+
+    def raise_evaluate_repo(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orch_mod.merge_policy, "evaluate_repo", raise_evaluate_repo)
+
+    commit2 = _Commit()
+    commit2.sha = repo.head_sha()
+    out2 = await orch2._finalize(
+        task2, repo, "nh/attempt-1", "main", commit2, attempt_id2, _Result())
+
+    assert out2.status == TaskStatus.AWAITING_APPROVAL, out2.detail
+    assert count2["n"] == 1, (
+        f"expected exactly one _gather_evidence call on the FAILURE path too, "
+        f"got {count2['n']}")
+
 
 # ---------------------------------------------------------------------------
 # `policy_changed_in_diff`: the ⚠️ override, and its unchanged control case.
@@ -421,8 +458,11 @@ async def test_evaluator_failure_is_advisory_not_silence_and_never_blocks(
     assert any(
         a.startswith("merge policy verdict missing from PR body:") for a in advisories
     ), advisories
-    # Not silence: no fabricated row, and no fabricated persisted verdict.
-    assert "| Merge policy |" not in bodies[0], bodies[0]
+    # Not silence: no fabricated verdict row — the row that DOES render (see
+    # `test_a_failed_policy_compute_says_so_in_the_body` for the full text
+    # assertion) discloses the failure, it never claims ready or not-ready.
+    assert "| Merge policy | ✅" not in bodies[0], bodies[0]
+    assert "| Merge policy | ❌" not in bodies[0], bodies[0]
     mp = (task.context or {}).get("merge_policy") or {}
     assert reviewed_sha not in mp, mp
 
@@ -460,6 +500,238 @@ async def test_advisory_count_reads_the_real_checklist_not_the_capped_trail(
     # The real, uncapped count (7) — never the capped trail's count (2).
     assert "❌ no_advisory_findings — 7 advisory findings" in body, body
     assert "2 advisory findings" not in body, body
+
+
+# ---------------------------------------------------------------------------
+# A failed policy compute still carries the uncapped advisory count — the bug
+# this whole change exists to fix: `policy_evidence` is now hoisted before
+# the policy `try:` and folded (never re-gathered) on failure, so it still
+# holds the review_checklist-derived count `_pr_body` was given.
+# ---------------------------------------------------------------------------
+
+async def test_a_failed_policy_compute_still_carries_the_uncapped_advisory_count(
+    store, tmp_path, monkeypatch,
+):
+    """This is asserted on the `evidence=` OBJECT `_pr_body` receives, not on
+    rendered body text: on the failure path nothing renders `advisory_count`
+    as text (only `merge_policy.facts_from_evidence` — which never ran here,
+    since the evaluator raised — would have turned it into the
+    `no_advisory_findings` row). So the only way to prove the hoisted, folded
+    evidence object still carries the real count is to intercept the object
+    itself.
+
+    RED before the fix: on `main`, a failed policy compute set
+    `policy_evidence = None`, so `_pr_body` fell back to its own
+    `if evidence is None:` re-gather — WITHOUT `review_checklist=` — and
+    `seen["evidence"]` would either be a *different* object than the one
+    built from the real checklist (silently reading the capped trail's count
+    of 2), or in a stricter reading, simply not the same object at all. Either
+    way this assertion (`advisory_count == 7`, matching the uncapped
+    checklist, not the capped 2-item trail) fails on unpatched `main`.
+    """
+    work = _repo_with_a_commit(tmp_path)
+    reviewed_sha = _git(work, "rev-parse", "HEAD")
+    # The stamped round's own capped trail — 2 entries. If the fix regressed
+    # to reading this instead of the real checklist, this test would see 2.
+    ctx = _stamp({}, reviewed_sha, advisory=["cap-1", "cap-2"])
+    checklist = json.dumps({"items": [
+        {"label": f"nit {i}", "passed": False, "severity": "low",
+         "evidence": "", "file": "", "line": 0, "comment": ""}
+        for i in range(7)
+    ]})
+
+    import no_human.core.orchestrator as orch_mod
+
+    def raise_evaluate_repo(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orch_mod.merge_policy, "evaluate_repo", raise_evaluate_repo)
+
+    seen: dict = {}
+    original_pr_body = Orchestrator._pr_body
+
+    def spy_pr_body(self, *a, **k):
+        seen["evidence"] = k.get("evidence")
+        return original_pr_body(self, *a, **k)
+
+    monkeypatch.setattr(Orchestrator, "_pr_body", spy_pr_body)
+
+    def fake_open_pr(repo, branch, title, body, **kw):
+        return _FakePR("https://github.com/o/r/pull/1", repo.head_sha())
+
+    orch, task, attempt_id, out = await _finalize_task(
+        store, tmp_path, work, ctx, fake_open_pr, monkeypatch,
+        review_checklist=checklist)
+
+    assert out.status == TaskStatus.AWAITING_APPROVAL, out.detail
+    assert seen.get("evidence") is not None, "expected _pr_body to receive evidence"
+    review_verdict = seen["evidence"].review_verdict or {}
+    assert review_verdict.get("advisory_count") == 7, review_verdict
+    assert seen["evidence"].merge_policy is None, seen["evidence"].merge_policy
+
+
+async def test_a_failed_policy_compute_says_so_in_the_body(store, tmp_path, monkeypatch):
+    """The disclosure row itself: no fabricated ✅/❌ verdict, no fold that
+    claims to have anything to fold, and the exception CLASS NAME is visible
+    — a human reading the body sees the gap instead of reading silence as
+    "no policy configured"."""
+    work = _repo_with_a_commit(tmp_path)
+    reviewed_sha = _git(work, "rev-parse", "HEAD")
+    ctx = _stamp({}, reviewed_sha)
+    bodies = []
+
+    def fake_open_pr(repo, branch, title, body, **kw):
+        bodies.append(body)
+        return _FakePR("https://github.com/o/r/pull/1", repo.head_sha())
+
+    import no_human.core.orchestrator as orch_mod
+
+    def raise_evaluate_repo(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orch_mod.merge_policy, "evaluate_repo", raise_evaluate_repo)
+
+    events: list[dict] = []
+    orch, task, attempt_id, out = await _finalize_task(
+        store, tmp_path, work, ctx, fake_open_pr, monkeypatch, events=events)
+
+    assert out.status == TaskStatus.AWAITING_APPROVAL, out.detail
+    body = bodies[0]
+    assert "NOT COMPUTED — the merge-ready verdict could not be computed" in body, body
+    assert "RuntimeError" in body, body
+    assert "| Merge policy | ✅" not in body, body
+    assert "| Merge policy | ❌" not in body, body
+    assert "<details><summary>Merge-ready policy" not in body, body
+
+    mp = (task.context or {}).get("merge_policy") or {}
+    assert reviewed_sha not in mp, mp
+
+    advisories = [e["text"] for e in events if e.get("kind") == "advisory"]
+    assert any(
+        a.startswith("merge policy verdict missing from PR body:") for a in advisories
+    ), advisories
+
+
+async def test_merge_context_failure_also_discloses(store, tmp_path, monkeypatch):
+    """The `except` in `_finalize` covers the WHOLE `try:` block, not just the
+    evaluator call — a failure in `store.merge_context` (persisting the
+    verdict) after a successful `evaluate_repo` call must disclose exactly
+    the same way, naming ITS OWN exception class."""
+    work = _repo_with_a_commit(tmp_path)
+    reviewed_sha = _git(work, "rev-parse", "HEAD")
+    ctx = _stamp({}, reviewed_sha)
+    bodies = []
+
+    def fake_open_pr(repo, branch, title, body, **kw):
+        bodies.append(body)
+        return _FakePR("https://github.com/o/r/pull/1", repo.head_sha())
+
+    async def raise_merge_context(*a, **k):
+        raise ValueError("disk full")
+
+    monkeypatch.setattr(store, "merge_context", raise_merge_context)
+
+    orch, task, attempt_id, out = await _finalize_task(
+        store, tmp_path, work, ctx, fake_open_pr, monkeypatch)
+
+    assert out.status == TaskStatus.AWAITING_APPROVAL, out.detail
+    body = bodies[0]
+    assert "NOT COMPUTED — the merge-ready verdict could not be computed" in body, body
+    assert "ValueError" in body, body
+    assert "| Merge policy | ✅" not in body, body
+    assert "| Merge policy | ❌" not in body, body
+
+
+# ---------------------------------------------------------------------------
+# The success path's rendered body is unchanged by moving to a single gather.
+# ---------------------------------------------------------------------------
+
+async def test_the_success_path_body_is_unchanged_by_the_single_gather(
+    store, tmp_path, monkeypatch,
+):
+    """A strong CONTENT assertion — the real evaluator still produces the
+    same visible verdict row it did before the gather was hoisted — not a
+    byte-identity/golden-file comparison (no golden exists for this body)."""
+    work = _repo_with_a_commit(tmp_path, policy_yaml="rules:\n  - no_advisory_findings\n")
+    _commit(work, "impl.py", "print('x')\n", "implement")
+    reviewed_sha = _git(work, "rev-parse", "HEAD")
+    ctx = _stamp({}, reviewed_sha, advisory=["cap-1", "cap-2"])
+    checklist = json.dumps({"items": [
+        {"label": f"nit {i}", "passed": False, "severity": "low",
+         "evidence": "", "file": "", "line": 0, "comment": ""}
+        for i in range(7)
+    ]})
+    bodies = []
+
+    def fake_open_pr(repo, branch, title, body, **kw):
+        bodies.append(body)
+        return _FakePR("https://github.com/o/r/pull/1", repo.head_sha())
+
+    seen: dict = {}
+    original_pr_body = Orchestrator._pr_body
+
+    def spy_pr_body(self, *a, **k):
+        seen["evidence"] = k.get("evidence")
+        return original_pr_body(self, *a, **k)
+
+    monkeypatch.setattr(Orchestrator, "_pr_body", spy_pr_body)
+
+    orch, task, attempt_id, out = await _finalize_task(
+        store, tmp_path, work, ctx, fake_open_pr, monkeypatch,
+        review_checklist=checklist)
+
+    assert out.status == TaskStatus.AWAITING_APPROVAL, out.detail
+    body = bodies[0]
+    assert "❌ no_advisory_findings — 7 advisory findings" in body, body
+    assert "NOT COMPUTED" not in body, body
+    assert seen.get("evidence") is not None
+    assert seen["evidence"].merge_policy_error is None, seen["evidence"].merge_policy_error
+
+
+# ---------------------------------------------------------------------------
+# Static: `_finalize` gathers evidence exactly once, and no `= None` reset.
+# ---------------------------------------------------------------------------
+
+def test_finalize_gathers_evidence_once():
+    """AST-scans `Orchestrator._finalize` for calls whose attribute is
+    `_gather_evidence` — exactly one is allowed in the whole function body —
+    and for any `policy_evidence = None` assignment, which would reintroduce
+    the bug this change fixes (a `None` reset makes `_pr_body`'s fallback
+    branch reachable again, defeating the single-gather invariant).
+
+    Modeled on `test_land_task_is_referenced_only_by_cli_and_api`'s AST-scan
+    idiom in this same file.
+    """
+    import no_human
+    src_root = Path(no_human.__file__).resolve().parent
+    tree = ast.parse((src_root / "core" / "orchestrator.py").read_text(encoding="utf-8"))
+
+    finalize_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_finalize":
+            finalize_def = node
+            break
+    assert finalize_def is not None, "_finalize not found"
+
+    gather_calls = [
+        n for n in ast.walk(finalize_def)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_gather_evidence"
+    ]
+    assert len(gather_calls) == 1, (
+        f"expected exactly one _gather_evidence call inside _finalize, "
+        f"found {len(gather_calls)}")
+
+    none_resets = [
+        n for n in ast.walk(finalize_def)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "policy_evidence" for t in n.targets)
+        and isinstance(n.value, ast.Constant) and n.value.value is None
+    ]
+    assert not none_resets, (
+        "policy_evidence must never be reset to None — fold the failure "
+        "with dataclasses.replace(...) instead")
 
 
 # ---------------------------------------------------------------------------
