@@ -729,9 +729,11 @@ class SaveIntegrationConfigRequest(BaseModel):
 
 
 class TelemetryConsentRequest(BaseModel):
-    """Settings > Usage insights toggle. `enabled` is the ONLY field: the
-    anonymous instance id is minted server-side on first enable — never
-    accepted from the browser."""
+    """Body of `PUT /api/telemetry/consent` — persists `telemetry.enabled` to
+    config.yaml (the config-level opt-out; the onboarding step + Settings pane
+    that once drove this were removed, operator 2026-08-26). `enabled` is the
+    ONLY field: the anonymous instance id is minted server-side on first enable
+    — never accepted from the browser."""
     enabled: bool
 
 

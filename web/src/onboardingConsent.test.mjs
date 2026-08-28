@@ -5,12 +5,12 @@ import { fileURLToPath } from "node:url";
 
 import {
   TELEMETRY_CONSENT_QUESTION,
-  TELEMETRY_CONSENT_SETTINGS_HINT,
   CONSENT_YES_LABEL,
   CONSENT_NO_LABEL,
   shouldAskTelemetry,
   submitConsent,
 } from "./onboardingConsent.js";
+import * as consent from "./onboardingConsent.js";
 
 // Onboarding never asked about telemetry, so the toggle sat buried in Settings
 // and no real install ever showed up in a replay. This is the one-time consent
@@ -108,8 +108,11 @@ test("the question names exactly what is collected and nothing more", () => {
   );
 });
 
-test("the settings hint points at the real place to change it later", () => {
-  assert.match(TELEMETRY_CONSENT_SETTINGS_HINT, /Settings > Usage insights/);
+test("the removed Settings-hint constant does not creep back", () => {
+  // TELEMETRY_CONSENT_SETTINGS_HINT ("Settings > Usage insights") was removed
+  // with the onboarding step + Settings pane it named (operator, 2026-08-26);
+  // config.yaml `telemetry.enabled: false` is the opt-out. It must not return.
+  assert.equal(consent.TELEMETRY_CONSENT_SETTINGS_HINT, undefined);
 });
 
 test("no dark patterns in the button copy", () => {

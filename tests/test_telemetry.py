@@ -365,9 +365,12 @@ async def test_onboarding_yes_lands_enabled_true_in_config_yaml(
 
 
 def test_onboarding_consent_copy_matches_the_config_contract():
-    """web/src/onboardingConsent.js pins a byte-identical twin of these two
-    constants (its own header comment says so) — catch drift either way."""
-    from no_human.config import TELEMETRY_CONSENT_QUESTION, TELEMETRY_CONSENT_SETTINGS_HINT
+    """web/src/onboardingConsent.js pins a byte-identical twin of the privacy-
+    posture QUESTION constant (its own header comment says so) — catch drift
+    either way. The former TELEMETRY_CONSENT_SETTINGS_HINT ("Settings > Usage
+    insights") was removed with the onboarding step + Settings pane it named
+    (operator, 2026-08-26); config.yaml `telemetry.enabled: false` is the opt-out."""
+    from no_human.config import TELEMETRY_CONSENT_QUESTION
 
     js_path = (Path(__file__).resolve().parent.parent
                / "web" / "src" / "onboardingConsent.js")
@@ -380,8 +383,11 @@ def test_onboarding_consent_copy_matches_the_config_contract():
         return "".join(parts)
 
     assert _extract("TELEMETRY_CONSENT_QUESTION") == TELEMETRY_CONSENT_QUESTION
-    assert _extract("TELEMETRY_CONSENT_SETTINGS_HINT") == TELEMETRY_CONSENT_SETTINGS_HINT
     assert "never code, prompts, titles, paths or tokens" in TELEMETRY_CONSENT_QUESTION
+    # The removed hint must not creep back in either surface.
+    assert "TELEMETRY_CONSENT_SETTINGS_HINT" not in js
+    assert not hasattr(__import__("no_human.config", fromlist=["config"]),
+                       "TELEMETRY_CONSENT_SETTINGS_HINT")
 
 
 def test_legacy_kind_queue_lines_drain_as_name(temp_home, no_network, no_thread):

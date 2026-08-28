@@ -1,16 +1,13 @@
-// The one-time onboarding telemetry consent step. `node --test` has no React
-// renderer (see onboardingNav.js's header comment for the established idiom),
-// so every decision a test needs to reach lives here; Onboarding.jsx only
-// prints these constants and calls submitConsent().
-//
-// The copy below is a byte-identical twin of no_human.config's
-// TELEMETRY_CONSENT_QUESTION / TELEMETRY_CONSENT_SETTINGS_HINT — pinned
-// together by tests/test_telemetry.py so a comment edit and a copy edit
-// cannot part ways.
+// Telemetry consent helpers. The onboarding consent STEP and the Settings >
+// Usage insights pane that once showed the question were removed (operator,
+// 2026-08-26): telemetry ships on, with config.yaml `telemetry.enabled: false`
+// the one opt-out, and this module is no longer rendered by Onboarding.jsx. The
+// QUESTION constant is kept as the canonical privacy-posture wording — a
+// byte-identical twin of no_human.config's TELEMETRY_CONSENT_QUESTION, pinned
+// together by tests/test_telemetry.py so a comment edit and a copy edit cannot
+// part ways.
 export const TELEMETRY_CONSENT_QUESTION =
   "Share anonymous usage events and masked screen recordings of the app's own interface — never code, prompts, titles, paths or tokens?";
-export const TELEMETRY_CONSENT_SETTINGS_HINT =
-  "You can change this anytime in Settings > Usage insights.";
 export const CONSENT_YES_LABEL = "Yes, share";
 export const CONSENT_NO_LABEL = "No";
 

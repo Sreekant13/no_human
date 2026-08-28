@@ -1,7 +1,8 @@
 """Anonymous, opt-out usage telemetry (server-side events).
 
-Default ON (`telemetry.enabled: true` — consent, turned off in onboarding or
-Settings). Note server-side events ALSO require a configured `endpoint`, which
+Default ON (`telemetry.enabled: true` — consent). The onboarding and Settings
+toggles were removed (operator, 2026-08-26): the one opt-out now is
+`config.yaml` `telemetry.enabled: false`. Note server-side events ALSO require a configured `endpoint`, which
 ships empty, so this queue stays inert until an endpoint is set even with
 consent on. When enabled AND endpointed, a CLOSED allowlist of event kinds is
 buffered to ``~/.no_human/telemetry-queue.jsonl``

@@ -2120,8 +2120,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "telemetry": {
         # Opt-OUT usage telemetry + masked session replay. CONSENT, default
         # ON — usage events and masked recordings are sent unless the user turns
-        # this OFF in the onboarding "Usage insights" step, Settings > Usage
-        # insights, or config.yaml. The published privacy posture: anonymous
+        # this OFF. The onboarding step and the Settings > Usage insights pane
+        # were removed (operator, 2026-08-26); the one opt-out now is config.yaml
+        # `telemetry.enabled: false`. The published privacy posture: anonymous
         # usage events and masked recordings of the app's OWN interface — never
         # code, prompts, titles, paths or tokens.
         "enabled": True,
@@ -2152,17 +2153,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
-# The one-time onboarding consent question (web/src/onboardingConsent.js holds
-# the byte-identical twin; tests/test_telemetry.py pins them together). The
-# wording is the SAME contract the "telemetry" block above states — never
-# widen it here without widening the comment, the Settings panel and the
-# privacy policy.
+# The canonical privacy-posture wording (web/src/onboardingConsent.js holds the
+# byte-identical twin; tests/test_telemetry.py pins them together). SAME contract
+# the "telemetry" block above states — never widen it here without widening the
+# comment and the privacy policy. The onboarding consent step and the Settings >
+# Usage insights pane that once showed this were removed (operator, 2026-08-26);
+# telemetry now ships on with config.yaml `telemetry.enabled: false` the one
+# opt-out, so this is kept as documentation of the posture, not a UI prompt.
 TELEMETRY_CONSENT_QUESTION = (
     "Share anonymous usage events and masked screen recordings of the app's "
     "own interface — never code, prompts, titles, paths or tokens?"
-)
-TELEMETRY_CONSENT_SETTINGS_HINT = (
-    "You can change this anytime in Settings > Usage insights."
 )
 
 

@@ -557,7 +557,8 @@ the exact contract.
 ## Usage insights: the complete event list
 
 `telemetry.enabled` (default `true`) turns on anonymous, opt-out usage
-telemetry (PostHog) — on unless the user turns it off in onboarding or Settings. This section is the complete, machine-checked list of
+telemetry (PostHog) — on unless it is turned off in `config.yaml`
+(`telemetry.enabled: false`). This section is the complete, machine-checked list of
 what can ever be sent — two tests keep it that way:
 `tests/test_telemetry.py::test_every_server_event_kind_is_documented` /
 `test_documented_list_has_no_phantom_events` fail if the server's closed
@@ -605,8 +606,12 @@ list, which is why the list is enforced by tests rather than left to review.
 prompts/specs, diffs, or any credential/token.
 
 Telemetry defaults to **on** (`telemetry.enabled: true` in
-`config.DEFAULT_CONFIG`); everything above is sent unless the user opts out in
-the onboarding "Usage insights" step or Settings > Usage insights.
+`config.DEFAULT_CONFIG`); everything above is sent unless it is opted out in
+`config.yaml` (`telemetry.enabled: false`). The onboarding "Usage insights" step
+and the Settings > Usage insights pane were removed (operator, 2026-08-26), so
+`config.yaml` is the one opt-out. Server-side events additionally require a
+configured `telemetry.endpoint`, which ships empty — so with the default config
+nothing is sent at all.
 
 ## Tests command
 

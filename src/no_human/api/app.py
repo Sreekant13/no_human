@@ -3882,11 +3882,11 @@ async def save_integration_config_endpoint(
 async def save_telemetry_consent(
     body: TelemetryConsentRequest, request: Request
 ) -> dict[str, Any]:
-    """Settings > Usage insights: persist `telemetry.enabled` to config.yaml.
+    """Persist `telemetry.enabled` to config.yaml (the config-level opt-out).
 
     On FIRST enable, mints the anonymous `telemetry.instance_id` (uuid4)
     HERE, server-side, in the same write — the id never comes from the
-    browser. Off by default; turning it off writes `enabled: false` and
+    browser. ON by default; turning it off writes `enabled: false` and
     leaves the id in place (so re-enabling keeps one stable anonymous id
     rather than manufacturing a fresh "new install" every toggle)."""
     import uuid
