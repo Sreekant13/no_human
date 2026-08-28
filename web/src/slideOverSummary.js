@@ -6,6 +6,7 @@
 // backend enum. Kept out of SlideOver.jsx so the "what does the operator read
 // at a glance" logic is node-testable without a DOM.
 
+import { routeTask } from "./boardLanes.js";
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 import { httpPrUrl } from "./prUrl.js";
@@ -841,4 +842,49 @@ export function verifierRows(results) {
     };
   });
   return { summary, rows };
+}
+
+// mergePolicyRows() is a pure formatter over `task.context.merge_policy[sha]`
+// (core/merge_policy.py's `PolicyVerdict.as_dict()`) — the same verdict
+// `nh status`'s `merge-ready: N` line and the board's MERGE-READY chip
+// (mergeReadyChip, below) read via `api/models.py`'s `merge_ready_for`. It
+// must not compute its own "ready" logic — it only reshapes the verdict
+// already decided server-side, so the Review tab can never disagree with the
+// chip or the CLI about what "ready" means.
+//
+// Null discipline mirrors verifierRows: no verdict was ever persisted for
+// this exact head sha (no attempt yet, or a verdict stamped for an OLDER
+// commit that the sha-keyed lookup already excluded) reads as "nothing to
+// show", not as an empty/failing section.
+export function mergePolicyRows(verdict) {
+  if (!verdict || typeof verdict !== "object" || Array.isArray(verdict)) return null;
+  if (!Array.isArray(verdict.rules) || verdict.rules.length === 0) return null;
+  const source = verdict.source === "file" ? "file" : "default";
+  const sourceLine =
+    source === "file" ? "policy: .no_human/merge_policy.yaml" : "policy: built-in default";
+  const rows = verdict.rules.map((r) => ({
+    name: String(r?.name ?? ""),
+    ok: !!r?.passed,
+    detail: String(r?.detail ?? ""),
+  }));
+  return {
+    summary: String(verdict.summary ?? ""),
+    ready: !!verdict.ready,
+    source,
+    sourceLine,
+    policyChanged: !!verdict.policy_changed_in_diff,
+    problems: Array.isArray(verdict.problems) ? verdict.problems.map(String) : [],
+    rows,
+  };
+}
+
+// mergeReadyChip() — the board card's MERGE-READY chip. Advisory only: it
+// reflects the repo's merge-ready policy for the task's current head, not a
+// merge precondition (`nh approve` decides from its own independent-reviewer
+// PASS check — see api/models.py's merge_ready_for docstring). Shown only in
+// the Review PR lane: a task that has since moved on (approved+landed →
+// done, or re-opened → back to working) no longer has a PR to review, so the
+// chip would be stale noise anywhere else.
+export function mergeReadyChip(task) {
+  return task?.merge_ready === true && routeTask(task) === "review" ? "MERGE-READY" : null;
 }

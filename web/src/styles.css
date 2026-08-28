@@ -1254,6 +1254,17 @@ html, body, #root {
   border: 1px solid var(--green); letter-spacing: 0.02em;
 }
 
+/* Merge-ready policy chip (Review PR lane only) — advisory only, mirrors the
+   spec-ready badge above; see mergeReadyChip (slideOverSummary.js). Uses
+   color-mix (theme-token-relative, see .rich-file-chip above) rather than a
+   fixed rgba literal so the tint tracks --green across both themes. */
+.card-merge-ready {
+  font-size: 10px; padding: 2px 6px; border-radius: 10px;
+  background: color-mix(in oklab, var(--green) 15%, transparent);
+  color: var(--green);
+  border: 1px solid var(--green); letter-spacing: 0.02em;
+}
+
 /* Cancelled tasks live in the Failed lane (they share FAILED status) but were
    an operator decision, not a capability failure — a muted, neutral badge, not
    the alarming red of a real failure. Matches the honest Stats breakdown. */
@@ -5698,6 +5709,22 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .unmet-item {
   display: flex; align-items: center; gap: 6px;
   font-size: 13px; color: var(--red, #ef4444); padding: 3px 0;
+}
+
+/* ReviewTab "Merge policy" block (mergePolicyRows, slideOverSummary.js) —
+   advisory display of core/merge_policy.py's verdict for the current head. */
+.so-merge-policy {
+  padding: 8px 0;
+}
+.so-merge-policy-source {
+  font-size: 11px; color: var(--text-muted); margin-top: 4px;
+}
+.so-merge-policy-warn {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--warn); padding: 3px 0;
+  border-left: 3px solid var(--warn);
+  padding-left: 8px;
+  margin: 4px 0;
 }
 
 .review-suggested-next {

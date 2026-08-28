@@ -133,6 +133,33 @@ def _operator_cancelled(task: Task) -> bool:
     return bool((task.context or {}).get("cancel_reason"))
 
 
+def merge_ready_for(task: Task, attempts: list[dict] | None) -> bool | None:
+    """The merge-ready policy verdict (core/merge_policy.py) for `task`'s
+    CURRENT head — `task.context.merge_policy[<latest attempt's commit_sha>]
+    .ready`, keyed the same way `_finalize` persists it and `verifier_results`
+    already is. None when there is no commit yet, or no verdict was ever
+    computed/persisted for that exact sha (a verdict stamped for an OLDER
+    commit must not read as ready for this one — the sha key is what makes a
+    stale verdict read as absent, because nothing re-evaluates it).
+
+    Extracted verbatim from `TaskSummaryOut.from_task` so `nh status`'s
+    `merge-ready: N` count (cli/commands.py) and the board card (this class)
+    can never disagree about which tasks are ready. ADVISORY ONLY: nothing
+    reads this to merge anything — `nh approve`, the only merge path, decides
+    from its own independent-reviewer PASS check, not this field.
+    """
+    merge_ready = None
+    if attempts:
+        for a in reversed(attempts):
+            sha = a.get("commit_sha")
+            if sha:
+                mp = ((task.context or {}).get("merge_policy") or {}).get(sha)
+                if isinstance(mp, dict) and "ready" in mp:
+                    merge_ready = bool(mp.get("ready"))
+                break
+    return merge_ready
+
+
 class PhaseOut(BaseModel):
     """One `task_phases` row (D1.1). `seconds` = ended_at − started_at, and for
     the still-open phase (ended_at is null) it runs to now."""
@@ -574,19 +601,7 @@ class TaskSummaryOut(BaseModel):
             total_review_cache_read = _rsum("review_cache_read_tokens")
             total_review_cache_creation = _rsum("review_cache_creation_tokens")
         total_aux_tokens, total_aux_cache_read, total_aux_cache_creation = _aux_totals(attempts)
-        # Same "latest attempt with a recorded commit_sha" lookup `get_diff`
-        # uses for the PR diff — the current head as far as no_human's own
-        # recorded state goes, which is also the sha `_finalize` persisted
-        # the verdict under.
-        merge_ready = None
-        if attempts:
-            for a in reversed(attempts):
-                sha = a.get("commit_sha")
-                if sha:
-                    mp = ((task.context or {}).get("merge_policy") or {}).get(sha)
-                    if isinstance(mp, dict) and "ready" in mp:
-                        merge_ready = bool(mp.get("ready"))
-                    break
+        merge_ready = merge_ready_for(task, attempts)
         return cls(
             id=task.id,
             external_id=task.external_id,

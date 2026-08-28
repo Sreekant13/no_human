@@ -807,12 +807,72 @@ def test_land_task_is_referenced_only_by_cli_and_api():
 
 
 # ---------------------------------------------------------------------------
-# Docs guard: no overclaim of unshipped `nh approve --ready` / a board chip.
+# Docs guard: the shipped `nh approve --ready` / `--yes` / board chip are
+# actually described, and the advisory/never-auto-merges sentences survive.
 # ---------------------------------------------------------------------------
 
-def test_docs_do_not_claim_unshipped_merge_ready_ui():
+def test_docs_describe_the_shipped_merge_ready_ui():
     repo_root = Path(__file__).resolve().parent.parent
-    for relpath in ("docs/verification.md", "docs/pr-body.md"):
-        text = (repo_root / relpath).read_text(encoding="utf-8")
-        assert "approve --ready" not in text, relpath
-        assert "MERGE-READY" not in text, relpath
+    text = (repo_root / "docs/verification.md").read_text(encoding="utf-8")
+    assert "approve --ready" in text
+    assert "--yes" in text
+    assert "MERGE-READY" in text
+    # The advisory / nothing-auto-merges guarantees must survive the
+    # `--ready`/`--yes` addition, word for word.
+    assert "**This is advisory to the human; nothing merges on it.**" in text
+    assert "a human still has to" in text
+
+    # `docs/pr-body.md` is about PR body rendering, not the CLI/board — it
+    # must not pick up an unrelated claim about `--ready` or the chip.
+    pr_body_text = (repo_root / "docs/pr-body.md").read_text(encoding="utf-8")
+    assert "approve --ready" not in pr_body_text
+    assert "MERGE-READY" not in pr_body_text
+
+
+# ---------------------------------------------------------------------------
+# `approval.auto_merge_on_approval` stays False and unread: constraint #2
+# ("the agent never merges... no auto-merge anywhere") pinned at the config
+# layer, not just by convention. A new REAL read (a `.get("auto_merge_on_
+# approval")`/`["auto_merge_on_approval"]` access, as opposed to the key's
+# own definition in DEFAULT_CONFIG or a prose mention in a docstring/comment)
+# would be the seed of exactly the auto-merge path this project's standing
+# rules forbid: the agent never merges, only a human `nh approve` does.
+# ---------------------------------------------------------------------------
+
+def test_auto_merge_on_approval_stays_false_and_unread():
+    from no_human.config import DEFAULT_CONFIG
+
+    approval = DEFAULT_CONFIG.get("approval") or {}
+    assert approval.get("auto_merge_on_approval") is False, approval
+
+    import no_human
+    src_root = Path(no_human.__file__).resolve().parent
+    key = "auto_merge_on_approval"
+    offenders: list[str] = []
+    for f in sorted(src_root.rglob("*.py")):
+        rel = str(f.relative_to(src_root))
+        if rel == "config.py":
+            continue  # the key's own definition site (DEFAULT_CONFIG dict literal)
+        try:
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+
+        def _is_key_const(node: ast.AST) -> bool:
+            return isinstance(node, ast.Constant) and node.value == key
+
+        for node in ast.walk(tree):
+            # `something["auto_merge_on_approval"]`
+            if isinstance(node, ast.Subscript) and _is_key_const(node.slice):
+                offenders.append(rel)
+                break
+            # `something.get("auto_merge_on_approval", ...)`
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and node.args and _is_key_const(node.args[0])):
+                offenders.append(rel)
+                break
+    assert offenders == [], (
+        f"auto_merge_on_approval must stay unread by src/**/*.py; found a "
+        f"real read in {offenders}")

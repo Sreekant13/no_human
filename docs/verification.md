@@ -172,15 +172,30 @@ merge_ready=1` filters to it) and the full verdict on task detail.
 recorded opinion a human reads before deciding — no code path in this repo
 merges, blocks a push, or gates PR delivery on it (a failed or missing
 compute is caught and logged, never a reason a PR does not ship — see the
-`try`/`except` around the block in `_finalize`). `nh approve` is the only
-merge path, and it does not read this verdict at all — running it IS the
-human decision. What it *does* check before landing is the independent
-reviewer's own PASS on the branch head (`_review_pass_evidence`, in both the
-CLI and the API path, which refuse the merge otherwise); the merge-ready
-verdict is not among those preconditions. The verdict is keyed by head sha
-precisely because nothing re-evaluates it: a verdict stamped for an older commit is shown as absent
-(`merge_ready: null`) for the commit sitting in the PR now, rather than
-carried forward as if it still applied.
+`try`/`except` around the block in `_finalize`). `nh approve <task_id>` is
+the base merge path, and it does not read this verdict at all — running it
+IS the human decision. What it *does* check before landing is the
+independent reviewer's own PASS on the branch head (`_review_pass_evidence`,
+in both the CLI and the API path, which refuse the merge otherwise); the
+merge-ready verdict is not among those preconditions. The verdict is keyed
+by head sha precisely because nothing re-evaluates it: a verdict stamped for
+an older commit is shown as absent (`merge_ready: null`) for the commit
+sitting in the PR now, rather than carried forward as if it still applied.
+
+`nh approve --ready` is a convenience LISTING over that same base path — it
+prints every `awaiting_approval` task whose verdict is `ready: true` for its
+*current* branch head (a stale-sha verdict, or one with
+`policy_changed_in_diff: true`, is excluded, same rule as above) alongside
+its `rules passed/total` and PR URL, and does nothing else. Add `--yes` and
+it walks that list through `nh approve <task_id>`'s own procedure — one task
+at a time, in listed order, stopping at the first failure — so every
+precondition `nh approve <task_id>` already enforces (the reviewer PASS
+above included) still applies per task; the verdict only decides what gets
+offered to a human to land, never whether a task is *allowed* to land. The
+board shows the same verdict as a `MERGE-READY` chip on a task's card. This
+does not change who merges: `--yes` still runs the identical git-identity
+squash-land as a single `nh approve <task_id>`, and a human still has to
+type it.
 
 ## When it cannot finish
 

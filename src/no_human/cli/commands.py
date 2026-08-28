@@ -3964,7 +3964,7 @@ def status(as_json):
         # TaskOut.cancelled field read, so `nh status`, the CLI Failed lane,
         # and the API can never disagree about which failed tasks were
         # operator cancels.
-        from ..api.models import _operator_cancelled
+        from ..api.models import _operator_cancelled, merge_ready_for
         async with Store(config.db_path) as store:
             tasks = await store.list_tasks()
             waiting_ids = await store.tasks_waiting_for_slot()
@@ -4025,6 +4025,16 @@ def status(as_json):
             # computing it only on the human-readable branch would hide the
             # spend from exactly the operator who generated it.
             resid = await store.unattributed_usage_totals()
+            # Board's MERGE-READY chip, counted here too: only tasks actually
+            # sitting in Review PR (awaiting_approval) with a ready verdict
+            # for their CURRENT head — the same `merge_ready_for` the board
+            # card (api/models.py) reads, so the two can never disagree.
+            by_task = await store.attempts_by_task()
+            merge_ready_n = sum(
+                1 for t in tasks
+                if t.status == TaskStatus.AWAITING_APPROVAL
+                and merge_ready_for(t, by_task.get(t.id) or []) is True
+            )
             if as_json:
                 # Nested under its own key so the existing bucket keys keep
                 # their shape — a consumer that ignores it sees no change, and
@@ -4060,6 +4070,7 @@ def status(as_json):
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {failed_display}  "
                 f"[green]done[/] {buckets['done']}")
+            console.print(f"[dim]merge-ready:[/] {merge_ready_n}")
             # Same fields the board header reads from `/api/queue/health` —
             # a quota-paused pool prints WHY nothing is moving instead of a
             # bare `working 0/N` next to a ETA computed as if work were
@@ -4629,8 +4640,287 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
     return passed, evidence
 
 
+def _ready_batch_non_merge_message(tag, outcome):
+    """Per-tag message for a `--ready --yes` step that is not a hard
+    failure and did not land a merge — mirrors the single-task
+    `nh approve <task_id>` wording for the same tag (`_approve_go_single`
+    below) so the two paths stay in sync, condensed to one line for the
+    batch listing."""
+    result = outcome["result"]
+    branch = outcome["branch"]
+    pr_url = outcome["pr_url"]
+    if tag == "already_satisfied":
+        return "already satisfied claim confirmed; task done."
+    if tag == "no_pr":
+        return "merge the PR in your git host (no PR URL recorded)."
+    if tag == "no_branch":
+        return f"merge the PR in your git host (no branch/repo recorded). PR: {pr_url}"
+    if tag == "already_landed":
+        return f"content already on the default branch; task done. PR: {pr_url}"
+    if tag == "unresolved_head":
+        return (
+            f"the branch {branch!r} could not be resolved locally; "
+            f"merge the PR in your git host. PR: {pr_url}"
+        )
+    if tag == "skipped":
+        return (result.message if result is not None and result.message
+                else "merge the PR in your git host.") + f" PR: {pr_url}"
+    return tag
+
+
+async def _approve_find_ready(store, config):
+    """Discover every AWAITING_APPROVAL task whose merge-policy verdict is
+    ready for its CURRENT head sha — re-resolving the head so a verdict
+    stamped for an older commit, or one whose policy file changed in the
+    diff, is excluded. Returns [(task, pr_url, rules_passed, rules_total)]
+    in the order `store.list_tasks()` returned them (discovery order)."""
+    from ..vcs.git import GitError, GitRepo
+    from ..vcs.task_pr import resolve_task_pr
+
+    tasks = await store.list_tasks()
+    candidates = [t for t in tasks if t.status == TaskStatus.AWAITING_APPROVAL]
+
+    ready = []
+    for t in candidates:
+        resolved = await resolve_task_pr(store, t)
+        branch = resolved.branch
+        if not branch or not t.repo_path:
+            continue
+        git_cfg = config.get("git") or {}
+        try:
+            repo = GitRepo(
+                Path(t.repo_path),
+                identity_name=git_cfg.get("agent_identity_name", "no_human"),
+                identity_email=git_cfg.get("agent_identity_email", "no-human@acme.com"),
+                never_push_to=git_cfg.get("never_push_to")
+                or ["main", "master", "release/*"],
+            )
+            repo.fetch()
+            ref = repo.resolve_commitish(branch)
+            head_sha = repo._run("rev-parse", ref) if ref else ""
+        except (GitError, OSError):
+            head_sha = ""
+        if not head_sha:
+            continue
+        mp = ((t.context or {}).get("merge_policy") or {}).get(head_sha)
+        if not isinstance(mp, dict):
+            continue
+        if mp.get("ready") is not True or mp.get("policy_changed_in_diff"):
+            continue
+        rules = mp.get("rules") or []
+        total = len(rules)
+        passed = sum(1 for r in rules if isinstance(r, dict) and r.get("passed"))
+        ready.append((t, resolved.url, passed, total))
+    return ready
+
+
+async def _approve_go_ready(config, assume_yes, land_one):
+    """`nh approve --ready [--yes]` — list every merge-ready
+    awaiting_approval task; with `--yes`, land them one at a time through
+    `land_one` (the same procedure a plain `nh approve <task_id>` uses),
+    stopping at the first hard failure. `land_one` is the caller's
+    `_land_one` closure — kept nested in `approve` itself so the one
+    `land_task` call site in this command stays attributed to `approve`
+    for `test_land_task_is_referenced_only_by_cli_and_api`."""
+    async with Store(config.db_path) as store:
+        ready = await _approve_find_ready(store, config)
+
+        if not ready:
+            console.print("[dim]no awaiting_approval task is merge-ready for its current head.[/]")
+            return
+
+        for t, pr_url, passed, total in ready:
+            console.print(
+                f"{t.id[:8]} · {t.title} · rules {passed}/{total} · {pr_url}"
+            )
+
+        if not assume_yes:
+            console.print(
+                f"\n{len(ready)} task(s) merge-ready — re-run with "
+                "--yes to land them one at a time."
+            )
+            return
+
+        console.print("")
+        landed = 0
+        # Only "precondition" and "failed" are hard failures — the same two
+        # tags single-task `nh approve <task_id>` maps to sys.exit(1)
+        # (`_approve_go_single`). Every other tag ("already_satisfied",
+        # "no_pr", "no_branch", "already_landed", "unresolved_head",
+        # "skipped") is a normal non-merge success there (approval
+        # recorded; nothing to auto-merge, or gh/approve_merge is
+        # unavailable) — the batch must keep walking, not stop, or
+        # `--ready --yes` would abort at task 1 on any host without
+        # `gh` installed even though nothing actually failed.
+        for t, pr_url, passed, total in ready:
+            outcome = await land_one(store, t)
+            tag = outcome["tag"]
+            result = outcome["result"]
+            if tag in ("precondition", "failed"):
+                step = result.step if result is not None else tag
+                detail = result.stderr if (result is not None and result.stderr) else outcome["evidence"]
+                console.print(
+                    f"[bold red]stopped at[/] {t.id[:8]} — step {step!r}"
+                    + (f":\n{detail}" if detail else "")
+                )
+                console.print(f"landed {landed}/{len(ready)} before stopping.")
+                sys.exit(1)
+            if tag == "done":
+                landed += 1
+                console.print(
+                    f"[bold green]merged[/] {t.id[:8]} — landed "
+                    f"{result.landed_sha[:12]}"
+                )
+                continue
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — "
+                f"{_ready_batch_non_merge_message(tag, outcome)}"
+            )
+
+
+async def _approve_go_landed(config, task_id, landed_sha, justification, base_branch):
+    """`nh approve <task_id> --landed <sha> --because ...` — the human
+    landed-override path (no `land_task` call: containment already
+    refused, or the task never opened a PR)."""
+    from ..blockers.landed_override import OverrideRefused, approve_landed_override
+    async with Store(config.db_path) as store:
+        t = await store.find_task(task_id)
+        if not t:
+            print_no_task_matching(task_id)
+            sys.exit(1)
+        try:
+            result = await approve_landed_override(
+                store, t, landed_sha, justification or "",
+                base=base_branch)
+        except OverrideRefused as exc:
+            console.print(f"[bold red]refused:[/] {exc.reason}")
+            sys.exit(1)
+        residue = result["residue"]
+        residue_text = ", ".join(residue) if residue else "none"
+        prior_note = (
+            " (was failed, no PR)"
+            if result.get("prior_status") == "failed" else ""
+        )
+        matched_branch = result.get("matched_branch")
+        branch_note = f" on {matched_branch}" if matched_branch else ""
+        console.print(
+            f"[bold green]override recorded[/] — {t.id[:8]} completed"
+            f"{prior_note} on human assertion that content landed at "
+            f"{landed_sha[:12]}{branch_note}. residue: {residue_text}"
+        )
+
+
+async def _approve_go_single(config, task_id, land_one):
+    """Plain `nh approve <task_id>` — the same procedure `--ready --yes`
+    (`_approve_go_ready`) walks over several tasks, rendered as the
+    single-task console output. `land_one` is the caller's `_land_one`
+    closure (see `_approve_go_ready`'s docstring for why it stays nested)."""
+    async with Store(config.db_path) as store:
+        t = await store.find_task(task_id)
+        if not t:
+            print_no_task_matching(task_id)
+            sys.exit(1)
+        if t.status != TaskStatus.AWAITING_APPROVAL:
+            console.print(
+                f"[yellow]task is {t.status.value!r}, not awaiting_approval — cannot approve[/]"
+            )
+            sys.exit(1)
+
+        outcome = await land_one(store, t)
+        tag = outcome["tag"]
+        pr_url = outcome["pr_url"]
+        branch = outcome["branch"]
+        evidence = outcome["evidence"]
+        result = outcome["result"]
+
+        if tag == "already_satisfied":
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — already satisfied "
+                "claim confirmed; no code change was needed. Task done."
+            )
+            return
+
+        if tag == "no_pr":
+            console.print(f"[bold green]approved[/] {t.id[:8]} — merge the PR in your git host.")
+            console.print("  [dim](no PR URL recorded)[/]")
+            return
+
+        if tag == "no_branch":
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — merge the PR in your "
+                "git host (no branch/repo recorded to merge automatically)."
+            )
+            console.print(f"  PR: {pr_url}")
+            return
+
+        if tag == "already_landed":
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — content is already "
+                "on the default branch; task done (no merge attempted)."
+            )
+            console.print(f"  PR: {pr_url}")
+            return
+
+        if tag == "unresolved_head":
+            # Can't even resolve the branch locally — there is nothing to
+            # decide a merge from, so this is the same "auto-merge isn't
+            # possible, merge it yourself" outcome as no branch/repo
+            # recorded at all (above), not a hard failure: exit 0, the
+            # approval stands, the task stays awaiting_approval.
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — the branch {branch!r} "
+                "could not be resolved in the local repo; merge the PR in "
+                "your git host."
+            )
+            console.print(f"  PR: {pr_url}")
+            return
+
+        if tag == "precondition":
+            console.print(
+                f"[bold red]cannot merge:[/] preconditions — {evidence}. "
+                "Approval recorded; task remains awaiting_approval."
+            )
+            sys.exit(1)
+
+        if tag == "skipped":
+            console.print(
+                f"[bold green]approved[/] {t.id[:8]} — "
+                f"{result.message or 'merge the PR in your git host.'}"
+            )
+            console.print(f"  PR: {pr_url}")
+            return
+
+        if tag == "failed":
+            console.print(
+                f"[bold red]merge FAILED[/] at step {result.step!r}:\n{result.stderr}"
+            )
+            console.print(
+                "Approval recorded; task remains awaiting_approval. Fix the "
+                "issue and re-run `nh approve`."
+            )
+            sys.exit(1)
+
+        # tag == "done"
+        console.print(
+            f"[bold green]merged[/] {t.id[:8]} — landed "
+            f"{result.landed_sha[:12]} onto the default branch. Task done."
+        )
+
+
 @cli.command("approve")
-@click.argument("task_id")
+@click.argument("task_id", required=False)
+@click.option("--ready", "list_ready", is_flag=True, default=False,
+              help="List every awaiting_approval task whose merge-ready "
+                   "policy verdict is ready for its CURRENT head sha (a "
+                   "verdict stamped for an older commit, or one whose "
+                   "policy file changed in the PR, does not count), instead "
+                   "of approving a single TASK_ID. Combine with --yes to "
+                   "land them.")
+@click.option("--yes", "assume_yes", is_flag=True, default=False,
+              help="With --ready, land the listed tasks sequentially "
+                   "through the same approve path as a plain `nh approve "
+                   "<task_id>`, stopping at the first failure. Without it, "
+                   "--ready only lists — nothing lands.")
 @click.option("--landed", "landed_sha", default=None,
               help="Human landed-override: assert this task's content landed "
                    "at this commit (an ancestor of its base branch), when "
@@ -4654,186 +4944,147 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
                    "trivial ancestor, so passing the same value here as "
                    "--landed proves nothing; name a branch if you want the "
                    "check to mean something.")
-def approve(task_id, landed_sha, justification, base_branch):
+def approve(task_id, list_ready, assume_yes, landed_sha, justification, base_branch):
     """Approve and merge — squash-lands the PR under the operator identity
     (the agent still never merges on its own)."""
     _refuse_agent_gate_act("approve")
+
+    if list_ready and task_id:
+        console.print(
+            "[bold red]error:[/] --ready lists awaiting_approval tasks; it "
+            "does not take a TASK_ID."
+        )
+        sys.exit(2)
+    if assume_yes and not list_ready:
+        console.print("[bold red]error:[/] --yes only applies together with --ready.")
+        sys.exit(2)
+    if list_ready and landed_sha is not None:
+        console.print("[bold red]error:[/] --ready and --landed are mutually exclusive.")
+        sys.exit(2)
+    if not list_ready and not task_id:
+        raise click.UsageError("Missing argument 'TASK_ID'.")
+
     config, _ = _bootstrap(require_auth=False)
 
-    if landed_sha is not None:
-        async def _go_landed():
-            from ..blockers.landed_override import OverrideRefused, approve_landed_override
-            async with Store(config.db_path) as store:
-                t = await store.find_task(task_id)
-                if not t:
-                    print_no_task_matching(task_id)
-                    sys.exit(1)
-                try:
-                    result = await approve_landed_override(
-                        store, t, landed_sha, justification or "",
-                        base=base_branch)
-                except OverrideRefused as exc:
-                    console.print(f"[bold red]refused:[/] {exc.reason}")
-                    sys.exit(1)
-                residue = result["residue"]
-                residue_text = ", ".join(residue) if residue else "none"
-                prior_note = (
-                    " (was failed, no PR)"
-                    if result.get("prior_status") == "failed" else ""
-                )
-                matched_branch = result.get("matched_branch")
-                branch_note = f" on {matched_branch}" if matched_branch else ""
-                console.print(
-                    f"[bold green]override recorded[/] — {t.id[:8]} completed"
-                    f"{prior_note} on human assertion that content landed at "
-                    f"{landed_sha[:12]}{branch_note}. residue: {residue_text}"
-                )
+    async def _land_one(store, t):
+        """Run the approve→land procedure for one AWAITING_APPROVAL task —
+        the body of `nh approve <task_id>` (below `--landed`/lane checks),
+        extracted so `--ready --yes` can walk several tasks through the
+        exact same path `nh approve <task_id>` uses one at a time. Never
+        prints or calls sys.exit: both callers render their own console
+        output from the returned dict.
 
-        asyncio.run(_go_landed())
-        return
-
-    async def _go():
-        async with Store(config.db_path) as store:
-            t = await store.find_task(task_id)
-            if not t:
-                print_no_task_matching(task_id)
-                sys.exit(1)
-            if t.status != TaskStatus.AWAITING_APPROVAL:
-                console.print(
-                    f"[yellow]task is {t.status.value!r}, not awaiting_approval — cannot approve[/]"
-                )
-                sys.exit(1)
-            t.context = await store.merge_context(
-                t.id, {"approved_at": _now_iso()})
-            # An already-satisfied claim has no PR to merge — approval IS the
-            # human confirmation its terminal promised, so it completes here
-            # (the agent still never merges anything; there is nothing to).
-            # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone
-            # (live incident, task 8c8b36b5): a draft PR opened pre-review is
-            # recorded only in `context["pr_draft_created"]` or a `pr_draft`
-            # event, never on an attempt row — reading attempts alone missed
-            # it and completed the task while its PR sat open. After a
-            # send-back a LATER attempt may ship a real PR — that approval
-            # must stay a merge instruction, never a false DONE (PR #101
-            # round-2 review).
-            pr_url = await task_has_pr_evidence(store, t)
-            if (t.context or {}).get("already_satisfied_report") and not pr_url:
-                from ..blockers import process_actor
-                await store.set_status(
-                    t, TaskStatus.DONE, validate=False,
-                    event={"source": "human", "kind": "approved_already_satisfied",
-                           "text": "already-satisfied claim confirmed by approve",
-                           "actor": process_actor()},
-                )
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — already satisfied "
-                    "claim confirmed; no code change was needed. Task done."
-                )
-                return
-
-            if not pr_url:
-                console.print(f"[bold green]approved[/] {t.id[:8]} — merge the PR in your git host.")
-                console.print("  [dim](no PR URL recorded)[/]")
-                return
-
-            from ..vcs.approve_merge import land_task
-            from ..vcs.git import GitError, GitRepo
-            from ..vcs.task_pr import resolve_task_pr
-
-            resolved = await resolve_task_pr(store, t)
-            branch = resolved.branch
-            if not branch or not t.repo_path:
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — merge the PR in your "
-                    "git host (no branch/repo recorded to merge automatically)."
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            from ..blockers.shipped import complete_if_approved_and_landed
-            if await complete_if_approved_and_landed(
-                    store, t, pr_url, branch=branch) is not None:
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — content is already "
-                    "on the default branch; task done (no merge attempted)."
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            git_cfg = config.get("git") or {}
-            try:
-                repo = GitRepo(
-                    Path(t.repo_path),
-                    identity_name=git_cfg.get("agent_identity_name", "no_human"),
-                    identity_email=git_cfg.get("agent_identity_email", "no-human@acme.com"),
-                    never_push_to=git_cfg.get("never_push_to")
-                    or ["main", "master", "release/*"],
-                )
-                repo.fetch()
-                ref = repo.resolve_commitish(branch)
-                head_sha = repo._run("rev-parse", ref) if ref else ""
-            except (GitError, OSError):
-                head_sha = ""
-
-            if not head_sha:
-                # Can't even resolve the branch locally — there is nothing to
-                # decide a merge from, so this is the same "auto-merge isn't
-                # possible, merge it yourself" outcome as no branch/repo
-                # recorded at all (above), not a hard failure: exit 0, the
-                # approval stands, the task stays awaiting_approval.
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — the branch {branch!r} "
-                    "could not be resolved in the local repo; merge the PR in "
-                    "your git host."
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            passed, evidence = _review_pass_evidence(t.context or {}, head_sha, repo)
-            if not passed:
-                console.print(
-                    f"[bold red]cannot merge:[/] preconditions — {evidence}. "
-                    "Approval recorded; task remains awaiting_approval."
-                )
-                sys.exit(1)
-
-            result = land_task(
-                repo_path=t.repo_path, branch=branch, pr_url=pr_url,
-                task_id=t.id, task_title=t.title, review_evidence=evidence,
-                config=config.data,
-            )
-
-            if result.skipped:
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — "
-                    f"{result.message or 'merge the PR in your git host.'}"
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            if not result.ok:
-                console.print(
-                    f"[bold red]merge FAILED[/] at step {result.step!r}:\n{result.stderr}"
-                )
-                console.print(
-                    "Approval recorded; task remains awaiting_approval. Fix the "
-                    "issue and re-run `nh approve`."
-                )
-                sys.exit(1)
-
+        Returns {"tag": <outcome>, "pr_url": str, "branch": str,
+        "evidence": str, "result": LandResult | None}. `tag` is one of
+        "already_satisfied", "no_pr", "no_branch", "already_landed",
+        "unresolved_head", "precondition", "skipped", "failed", "done".
+        """
+        t.context = await store.merge_context(
+            t.id, {"approved_at": _now_iso()})
+        # An already-satisfied claim has no PR to merge — approval IS the
+        # human confirmation its terminal promised, so it completes here
+        # (the agent still never merges anything; there is nothing to).
+        # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone
+        # (live incident, task 8c8b36b5): a draft PR opened pre-review is
+        # recorded only in `context["pr_draft_created"]` or a `pr_draft`
+        # event, never on an attempt row — reading attempts alone missed
+        # it and completed the task while its PR sat open. After a
+        # send-back a LATER attempt may ship a real PR — that approval
+        # must stay a merge instruction, never a false DONE (PR #101
+        # round-2 review).
+        pr_url = await task_has_pr_evidence(store, t)
+        if (t.context or {}).get("already_satisfied_report") and not pr_url:
             from ..blockers import process_actor
             await store.set_status(
                 t, TaskStatus.DONE, validate=False,
-                event={"source": "human", "kind": "human_merged",
-                       "sha": result.landed_sha, "text": result.message,
+                event={"source": "human", "kind": "approved_already_satisfied",
+                       "text": "already-satisfied claim confirmed by approve",
                        "actor": process_actor()},
             )
-            console.print(
-                f"[bold green]merged[/] {t.id[:8]} — landed "
-                f"{result.landed_sha[:12]} onto the default branch. Task done."
-            )
+            return {"tag": "already_satisfied", "pr_url": pr_url, "branch": "",
+                    "evidence": "", "result": None}
 
-    asyncio.run(_go())
+        if not pr_url:
+            return {"tag": "no_pr", "pr_url": pr_url, "branch": "",
+                    "evidence": "", "result": None}
+
+        from ..vcs.approve_merge import land_task
+        from ..vcs.git import GitError, GitRepo
+        from ..vcs.task_pr import resolve_task_pr
+
+        resolved = await resolve_task_pr(store, t)
+        branch = resolved.branch
+        if not branch or not t.repo_path:
+            return {"tag": "no_branch", "pr_url": pr_url, "branch": branch or "",
+                    "evidence": "", "result": None}
+
+        from ..blockers.shipped import complete_if_approved_and_landed
+        if await complete_if_approved_and_landed(
+                store, t, pr_url, branch=branch) is not None:
+            return {"tag": "already_landed", "pr_url": pr_url, "branch": branch,
+                    "evidence": "", "result": None}
+
+        git_cfg = config.get("git") or {}
+        try:
+            repo = GitRepo(
+                Path(t.repo_path),
+                identity_name=git_cfg.get("agent_identity_name", "no_human"),
+                identity_email=git_cfg.get("agent_identity_email", "no-human@acme.com"),
+                never_push_to=git_cfg.get("never_push_to")
+                or ["main", "master", "release/*"],
+            )
+            repo.fetch()
+            ref = repo.resolve_commitish(branch)
+            head_sha = repo._run("rev-parse", ref) if ref else ""
+        except (GitError, OSError):
+            head_sha = ""
+
+        if not head_sha:
+            # Can't even resolve the branch locally — there is nothing to
+            # decide a merge from, so this is the same "auto-merge isn't
+            # possible, merge it yourself" outcome as no branch/repo
+            # recorded at all (above), not a hard failure.
+            return {"tag": "unresolved_head", "pr_url": pr_url, "branch": branch,
+                    "evidence": "", "result": None}
+
+        passed, evidence = _review_pass_evidence(t.context or {}, head_sha, repo)
+        if not passed:
+            return {"tag": "precondition", "pr_url": pr_url, "branch": branch,
+                    "evidence": evidence, "result": None}
+
+        result = land_task(
+            repo_path=t.repo_path, branch=branch, pr_url=pr_url,
+            task_id=t.id, task_title=t.title, review_evidence=evidence,
+            config=config.data,
+        )
+
+        if result.skipped:
+            return {"tag": "skipped", "pr_url": pr_url, "branch": branch,
+                    "evidence": evidence, "result": result}
+
+        if not result.ok:
+            return {"tag": "failed", "pr_url": pr_url, "branch": branch,
+                    "evidence": evidence, "result": result}
+
+        from ..blockers import process_actor
+        await store.set_status(
+            t, TaskStatus.DONE, validate=False,
+            event={"source": "human", "kind": "human_merged",
+                   "sha": result.landed_sha, "text": result.message,
+                   "actor": process_actor()},
+        )
+        return {"tag": "done", "pr_url": pr_url, "branch": branch,
+                "evidence": evidence, "result": result}
+
+    if list_ready:
+        asyncio.run(_approve_go_ready(config, assume_yes, _land_one))
+        return
+
+    if landed_sha is not None:
+        asyncio.run(_approve_go_landed(config, task_id, landed_sha, justification, base_branch))
+        return
+
+    asyncio.run(_approve_go_single(config, task_id, _land_one))
 
 
 @cli.command("review-comments")

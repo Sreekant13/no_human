@@ -131,13 +131,18 @@ FROZEN_FUNCTION_CC = {
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py": 19599,
-    # cli/commands.py 7801 -> 7860 (+59): the `_print_learning_harvest` helper
-    # shared by `nh learnings --harvest` and the new scheduled `HarvestJob`
-    # pass, plus the `--no-harvest` serve flag wiring.
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
-    "cli/commands.py": 7860,
+    # cli/commands.py 7801 -> 8111: +59 the `_print_learning_harvest` helper
+    # shared by `nh learnings --harvest` and the scheduled `HarvestJob` plus
+    # the `--no-harvest` serve flag; +251 `nh approve --ready [--yes]` (batch
+    # listing/landing) and the `approve` refactor into named top-level helpers
+    # (_approve_find_ready / _approve_go_ready / _approve_go_landed /
+    # _approve_go_single / _ready_batch_non_merge_message). Measured via
+    # `len(Path(...).read_text().splitlines())` (the scanner's own metric) on
+    # the combined tree.
+    "cli/commands.py": 8111,
     "api/app.py": 5338,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the

@@ -9,6 +9,7 @@ import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
 import { cardBlockerLine } from "./cardBlockerLine.js";
 import { escalationLatencyLine } from "./escalationLatency.js";
 import { httpPrUrl } from "./prUrl.js";
+import { mergeReadyChip } from "./slideOverSummary.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -398,6 +399,14 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         )}
         {priority === "high" && <span className="card-priority card-priority-high">HI</span>}
         {priority === "low"  && <span className="card-priority card-priority-low">LO</span>}
+        {mergeReadyChip(task) && (
+          <span
+            className="card-merge-ready"
+            title="the repo's merge-ready policy passed for this commit — advisory; you still merge"
+          >
+            {mergeReadyChip(task)}
+          </span>
+        )}
         {task.pr_url && (
           httpPrUrl(task.pr_url) ? (
             <a

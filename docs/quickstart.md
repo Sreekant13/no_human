@@ -301,6 +301,18 @@ uv run nh diff <task-id>     # the git diff
 uv run nh approve <task-id>  # your approval squash-lands the PR (as git.approve_identity)
 ```
 
+With several tasks awaiting approval, `nh approve --ready` lists every one
+whose merge-ready policy verdict is `ready` for its current branch head (the
+board shows the same verdict as a `MERGE-READY` chip); add `--yes` to land
+that list one task at a time through the exact same approve path, stopping
+at the first failure. It is still advisory and still your approval —
+`--ready`/`--yes` never merges anything `nh approve <task-id>` wouldn't:
+
+```bash
+uv run nh approve --ready        # list what's merge-ready; lands nothing
+uv run nh approve --ready --yes  # land the listed tasks, one at a time
+```
+
 If you want changes:
 
 ```bash

@@ -26,6 +26,7 @@ import {
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
   fxCountsLabel, mergeStepLabel, landFailureFeedback, verifierRows,
+  mergePolicyRows,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -2269,6 +2270,7 @@ function ReviewTab({ task, diff, onOpenSection }) {
 
   const verdict = reviewVerdict(checklist);
   const vr = verifierRows(lastAttempt?.verifier_results);
+  const mp = mergePolicyRows(task.context?.merge_policy?.[lastAttempt?.commit_sha]);
   const testResults = lastAttempt?.test_results;
   const tamperFlag = testResults?.tamper_flag;
   const testVerdict = testResultVerdict(testResults);
@@ -2499,6 +2501,36 @@ function ReviewTab({ task, diff, onOpenSection }) {
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+        {mp && (
+          <div className="so-merge-policy" data-testid="merge-policy">
+            <div className="so-section-label">Merge policy — {mp.summary}</div>
+            {mp.policyChanged && (
+              <div className="so-merge-policy-warn" data-testid="merge-policy-changed-warning">
+                <span className="ci-icon fail"><IconAlertTriangle size={12} /></span>
+                <span>POLICY FILE CHANGED IN THIS PR</span>
+              </div>
+            )}
+            <ul className="unmet-list">
+              {mp.rows.map((r, i) => (
+                <li key={i} className={`unmet-item ${r.ok ? "pass" : "fail"}`}>
+                  <span className={`ci-icon ${r.ok ? "" : "fail"}`}>
+                    {r.ok ? <IconCheck size={12} /> : <IconX size={12} />}
+                  </span>
+                  <span>
+                    {r.name}
+                    {r.detail ? ` — ${r.detail}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <div className="so-merge-policy-source">{mp.sourceLine}</div>
+            {mp.problems.length > 0 && (
+              <div className="so-merge-policy-warn" data-testid="merge-policy-problems">
+                {mp.problems.map((p, i) => <div key={i}>{p}</div>)}
+              </div>
+            )}
           </div>
         )}
         <div className="so-checklist">
