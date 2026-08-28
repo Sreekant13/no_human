@@ -556,9 +556,10 @@ def test_a_missing_openai_key_refuses_rather_than_finding_other_auth():
     assert "lawyer" in msg.lower()  # names the uncertainty honestly
 
 
-def test_the_claude_credential_is_not_exported_into_the_codex_subprocess():
+def test_the_claude_credential_is_not_exported_into_the_codex_subprocess(monkeypatch):
     """It could not bill anything through `codex`, but any command the agent
     runs could read it. Not exporting it is free."""
+    _stub_cli(monkeypatch)  # api_key billing gate must not shell out to the real CLI
     env = cx.CodexBackend(env={
         **FAKE_ENV,
         "CLAUDE_CODE_OAUTH_TOKEN": "not-a-real-token",

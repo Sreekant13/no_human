@@ -67,6 +67,18 @@ from no_human.core.task import Task, TaskStatus
 pytestmark = pytest.mark.usefixtures("isolated_env_file")
 
 
+def _stub_codex_login_status(monkeypatch):
+    """Make the api_key billing gate (`assert_api_key_billing_path`) pass
+    WITHOUT shelling out to the real `codex` CLI, so `_child_env()` proceeds
+    to its real assertions on a bare CI runner with no api_key-backed session.
+    Mirrors the kwarg-accepting form the gate calls `codex_login_status` with."""
+    monkeypatch.setattr(
+        cx, "codex_login_status",
+        lambda cli_path=None, timeout_s=10.0, *, env_overrides=None:
+            cx.CodexSessionStatus(True, "api_key", "stub"),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # A. session_mark.py — pure logic                                             #
 # --------------------------------------------------------------------------- #
@@ -168,6 +180,7 @@ def test_codex_backend_api_key_child_env_carries_the_mark(monkeypatch):
     `assert_api_key_billing_path` calls it with: ``lambda cli_path=None,
     timeout_s=10.0, *, env_overrides=None: cx.CodexSessionStatus(True,
     "api_key", "stub")``."""
+    _stub_codex_login_status(monkeypatch)  # gate must not shell out to the real CLI
     env = {"OPENAI_API_KEY": "not-a-real-key", "PATH": "/usr/bin:/bin"}
     b = cx.CodexBackend(auth_mode="api_key", env=env)
     child_env = b._child_env()
@@ -178,6 +191,7 @@ def test_codex_backend_api_key_child_env_carries_the_mark(monkeypatch):
 def test_codex_backend_mark_never_leaks_into_this_process_env(monkeypatch):
     import os
 
+    _stub_codex_login_status(monkeypatch)  # gate must not shell out to the real CLI
     monkeypatch.delenv(NO_HUMAN_AGENT_SESSION, raising=False)
     env = {"OPENAI_API_KEY": "not-a-real-key", "PATH": "/usr/bin:/bin"}
     cx.CodexBackend(auth_mode="api_key", env=env)._child_env()
