@@ -39,7 +39,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -66,6 +66,15 @@ class Snapshot:
     #: (symref -> symref) from a detach or garbage write — the hash alone
     #: cannot say which shape either side had.
     common_head: str | None = None
+    #: Per git-config FILE (keyed as in `git_entries`, e.g. "common/config"),
+    #: the EFFECTIVE `key=value` set of that one file at snapshot time. Like
+    #: `common_head`, `compare` needs the semantic content, not the inventory
+    #: hash, to tell a byte-only re-serialization of config (whitespace,
+    #: section reordering, comments — what git and concurrent shared-dir
+    #: writers produce) from a real key change (`include.path`, `alias.*`,
+    #: `filter.*`, `core.hooksPath`, …). Only present-and-parseable files
+    #: appear; a missing key reads as "could not establish" -> fail closed.
+    config_norm: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -236,6 +245,15 @@ _SKIPPED_GIT_DIR_PREFIXES = frozenset({
 # out of scope, but detecting a write to it is not), and the `.git` pointer
 # file itself (rewriting it repoints the whole admin dir for a linked
 # worktree).
+#
+# `config`/`config.worktree` stay WATCHED here, but they are NOT byte-hash
+# compared: `compare()` adjudicates them by EFFECTIVE key set (see
+# `_config_effective` and the config branch in `compare`), the same
+# content-shape treatment `common/HEAD` gets and for the same reason — git
+# and concurrent shared-dir writers re-serialize config on ordinary
+# bookkeeping and byte-hashing that discarded real verdicts. This is NOT a
+# volatile-path exclusion: every added/changed key (the `include.path`/
+# `alias.*`/filter surfaces above) is still caught.
 
 
 def _is_volatile_git_path(rel: str, label: str) -> bool:
@@ -358,6 +376,61 @@ def _resolve_git_root(repo_path: Path, arg: str, *, timeout: float) -> Path:
     except (OSError, RuntimeError) as exc:
         raise WorktreeCheckFailed(
             f"could not resolve git dir from {arg}={raw!r}: {exc}") from exc
+
+
+#: The two git-config FILES `compare` adjudicates by EFFECTIVE content rather
+#: than by raw byte-hash — same name under either root. `config.worktree` is
+#: git's per-worktree config file (present only under `extensions.worktreeConfig`).
+_CONFIG_FILENAMES = ("config", "config.worktree")
+
+
+def _config_effective(path: Path, *, timeout: float) -> str | None:
+    """The normalized `key\\0value` set of a SINGLE git-config file, or None if
+    it cannot be read as config.
+
+    Reads ONLY *path* (`git config --list --file`), so — critically for a file
+    this guard is judging for tampering — it does NOT expand `include.path`
+    (no `--includes`), never loads system/global config, and never executes a
+    filter, pager or hook. It is the same file `_git_dir_inventory` hashed,
+    read for its EFFECTIVE content instead of its bytes: a byte-only
+    re-serialization normalizes to the same set, while any added/changed
+    key — `include.path`, `alias.*`, `filter.*.process`, `core.hooksPath`, the
+    exact execution surfaces the inventory watches config FOR — changes it.
+
+    None (unreadable, syntactically broken, or git absent) is deliberately not
+    an empty set: `compare` treats it as "could not establish equality" and
+    keeps the byte-level violation, so garbage written over config fails closed.
+    """
+    if not path.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--list", "-z", "--file", str(path)],
+            capture_output=True, text=True, errors="replace", timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return "\0".join(sorted(proc.stdout.split("\0")))
+
+
+def _config_norm_map(
+    admin_dir: Path, common_dir: Path, *, timeout: float
+) -> dict[str, str]:
+    """`{git_entry_key: effective_config}` for every config file that exists,
+    keyed exactly as `_git_dir_inventory` keys it (`"<label>/<name>"`), so
+    `compare` can look the snapshot value up by the same path it iterates."""
+    roots = [("admin", admin_dir)]
+    if common_dir != admin_dir:
+        roots.append(("common", common_dir))
+    out: dict[str, str] = {}
+    for label, root in roots:
+        for name in _CONFIG_FILENAMES:
+            norm = _config_effective(root / name, timeout=timeout)
+            if norm is not None:
+                out[f"{label}/{name}"] = norm
+    return out
 
 
 def _stat_entry(path: Path) -> tuple[int, int, str]:
@@ -586,8 +659,9 @@ def snapshot(repo_path: Path, *, timeout: float) -> Snapshot:
             common_head = (common_dir / "HEAD").read_text(errors="replace")
         except OSError:
             common_head = None  # unreadable reads as "not a symref" -> fail closed
+    config_norm = _config_norm_map(admin_dir, common_dir, timeout=timeout)
     return Snapshot(head=head, entries=entries, git_entries=git_entries,
-                    common_head=common_head)
+                    common_head=common_head, config_norm=config_norm)
 
 
 #: One branch symref line, exactly — what `git checkout <branch>` writes.
@@ -663,6 +737,26 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
             # simply skipped.
             if (_is_branch_symref(before.common_head)
                     and _is_branch_symref(after.common_head)):
+                continue
+        if (path.rsplit("/", 1)[-1] in _CONFIG_FILENAMES
+                and a is not None and b is not None):
+            # CONTENT, not bytes — the same shape of adjudication as
+            # `common/HEAD` above, for the same reason. config stays WATCHED
+            # (it is an exec-on-checkout surface: `include.path`, `alias.*`,
+            # smudge/clean/textconv filters, `core.hooksPath`), but git and
+            # concurrent writers of the SHARED common dir re-serialize it with
+            # the same effective keys — different whitespace, section order,
+            # comments — on ordinary bookkeeping. Byte-hashing that discarded
+            # completed verdicts with a `.git/common/config` path (the
+            # incident in `_git_dir_inventory`'s docstring, which the earlier
+            # mtime-drop only fixed for a bit-identical rewrite). A change to
+            # the EFFECTIVE set — every new/changed key, including the
+            # `include.path` `git pwn` the byte-hash was watching for — is not
+            # equal and still reported; an unparseable/unreadable file has no
+            # snapshot value and also falls through, fail-closed.
+            bn = before.config_norm.get(path)
+            an = after.config_norm.get(path)
+            if bn is not None and an is not None and bn == an:
                 continue
         display = f".git/{path}"
         if a is None:

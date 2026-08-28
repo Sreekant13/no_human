@@ -249,6 +249,56 @@ def test_excluded_volatile_paths_do_not_trigger_reviewer_wrote(worktree_env):
     )
 
 
+def test_config_reserialization_excused_but_key_change_and_source_edit_caught(
+    worktree_env,
+):
+    """Root-cause regression for the `.git/common/config` verdict-discard.
+
+    git and concurrent writers of the SHARED common dir re-serialize `config`
+    with the SAME effective keys — different whitespace, section order,
+    comments — on ordinary bookkeeping. Byte-hashing that (the guard's prior
+    behaviour) reported it as a reviewer write and discarded completed
+    verdicts, each named with a `.git/common/config` path. `compare` now
+    adjudicates config by EFFECTIVE key set, the same content-shape treatment
+    `common/HEAD` gets, so:
+
+      - a byte-different, effective-EQUAL rewrite is NOT reported (green), while
+      - a real execution-relevant key (`include.path`) AND a real source-file
+        edit — the guard's core protection — are BOTH still caught (red).
+    """
+    wt = worktree_env["wt"]
+    cfg = worktree_env["common_dir"] / "config"
+
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    # Benign: change config's BYTES (leading comment + retabbed) while leaving
+    # every effective key identical — exactly the shared-dir bookkeeping churn
+    # that used to discard verdicts.
+    original = cfg.read_text()
+    cfg.write_text("# a concurrent tool rewrote me\n"
+                   + original.replace("\t", "    ") + "\n")
+    assert cfg.read_text() != original, "the reformat did not change the bytes"
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert delta.is_empty(), (
+        "an effective-equal config re-serialization was reported as a write: "
+        f"added={delta.added} modified={delta.modified} deleted={delta.deleted}"
+    )
+
+    # Real: an include.path key (an exec-on-checkout surface) added to config
+    # AND a reviewer edit of a tracked source file. Both must fire against the
+    # SAME baseline the benign churn was measured against.
+    _git(wt, "config", "--file", str(cfg), "include.path", "/tmp/evil")
+    (wt / "src" / "main.py").write_text("v2 -- reviewer edit\n")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert "src/main.py" in delta.modified, (
+        f"reviewer source edit was not caught: modified={delta.modified}")
+    assert any(p.endswith("/config") for p in delta.modified), (
+        "an include.path addition to config was not caught: "
+        f"modified={delta.modified}")
+
+
 # --------------------------------------------------------------------------- #
 # Part B: hook-safe revert
 # --------------------------------------------------------------------------- #
