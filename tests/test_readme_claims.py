@@ -1749,8 +1749,8 @@ CITATION_TABLE = (
     ("security.md", ":544", "agent/claude_backend.py", "PreToolUse guard"),
     ("security.md", "vcs/pr_watcher.py:507-533", "vcs/pr_watcher.py",
      '"gh", "pr", "view"'),
-    ("security.md", "vcs/git.py:775", "vcs/git.py", '"git", "fetch"'),
-    ("security.md", ":807", "vcs/git.py", '["fetch", remote]'),
+    ("security.md", "vcs/git.py:884", "vcs/git.py", '"git", "fetch"'),
+    ("security.md", ":916", "vcs/git.py", '["fetch", remote]'),
     ("security.md", "cli/commands.py:2807", "cli/commands.py",
      '"gh", "pr", "merge"'),
     ("security.md", "cli/commands.py:4637", "cli/commands.py",
@@ -1974,8 +1974,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
         "the traceback no longer cites db.py:1842 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:4067" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4067 — this test is "
+    assert "orchestrator.py:4154" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:4154 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -1994,13 +1994,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
-    assert 1 <= 4067 <= len(orch_lines), "orchestrator.py is now shorter than line 4067"
-    assert "self.store.update_attempt(" in orch_lines[4066], (
-        f"orchestrator.py:4067 is now {orch_lines[4066]!r}, not the "
+    assert 1 <= 4154 <= len(orch_lines), "orchestrator.py is now shorter than line 4136"
+    assert "self.store.update_attempt(" in orch_lines[4153], (
+        f"orchestrator.py:4154 is now {orch_lines[4153]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (
-        "line 4067 is no longer inside _run_attempt's body"
+        "line 4154 is no longer inside _run_attempt's body"
     )
 
 

@@ -2908,6 +2908,93 @@ class Orchestrator:
             "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
         }
 
+    def _foreign_authored_commits(
+        self, repo: GitRepo, base: str | None, since: str | None = None,
+    ) -> list[str]:
+        """Post-hoc attribution gate for constraint #2 ("the agent commits
+        under a distinct identity"). `_agent_git_identity` EXPORTS that
+        identity into the coder's env, but export is not enforcement:
+        `git commit --author=`, `env -u GIT_AUTHOR_*`, and `git -c
+        user.email=` are all ALLOWed by the guard (`agent/guard.py`, a
+        PreToolUse hook that exists only on the Claude backend — the Codex
+        backend has no veto seam at all), and any of them can land a commit
+        stamped with the operator's own identity.
+
+        DELIBERATE CHOICE — option 1 (post-hoc), not option 2 (enumerate the
+        spellings as guard denials), not both: `docs/security.md` already
+        argues against enumerating spellings, and the set here is not closed
+        (`env -u`, `--author`, `-c user.email=`, a re-exported `GIT_AUTHOR_*`,
+        `commit-tree`, `filter-branch`, a plain `git config user.email` in the
+        worktree, ...). Reading the RESULT — what git itself recorded as
+        author/committer — catches every one of them at once, including ones
+        not yet invented, and it runs on the single backend-agnostic
+        `_run_attempt` path so the Codex backend gets it for free.
+
+        Window is `since..HEAD` when the caller supplies `since` — the sha
+        `_run_attempt` captures right before the coder session starts, i.e.
+        "commits THIS attempt itself made" (its own coder-session commits and
+        any checkpoint commit taken during it). Without `since` (direct/test
+        calls, and the read-failure diagnostic below), it falls back to
+        `merge-base(base, HEAD)..HEAD` (`_review_base`) — the same range the
+        tamper guard, the reviewer and the PR diff already treat as "the
+        attempt's change". `_review_base` is DELIBERATELY wider than one
+        attempt: a resumed attempt carries a prior session's own
+        [WIP-BLOCKED]/[WIP-PARTIAL] checkpoint commit on the branch, and that
+        commit was already checked for attribution when the attempt that made
+        it ran this same gate — re-checking it here on every later resume
+        would flag an already-credited, legitimately-resumed commit the
+        moment its identity predates or otherwise differs from the CURRENT
+        run's configured identity (a config change, a fixture default, ...).
+        Scoping to `since` answers that without touching `_review_base`
+        itself or any gate that still needs its wider window.
+
+        This DETECTS and FAILS the attempt; it does not and cannot make
+        forgery impossible — a commit outside this window, or a run where the
+        configured agent identity itself equals the operator's, is not
+        covered by this check.
+
+        FAILS CLOSED on a read failure. `commit_identities` raises `GitError`
+        (not a silent `[]`) when the window itself can't be read — an
+        unresolvable base ref, a corrupt object, anything that makes "what
+        commits are here" unanswerable. Treating that the same as "read
+        succeeded, found no offenders" would make a broken gate silently a
+        passing one (constraint #4, "trust only verifiable signals" — an
+        unreadable history is not a verifiable signal of a clean branch).
+        So a read failure returns ONE diagnostic offender describing the
+        read failure itself, which the caller fails the attempt on exactly
+        like a real mismatch — loud and stop, not quiet and pass.
+        """
+        window = since if since is not None else self._review_base(repo, base)
+        try:
+            commits = repo.commit_identities(window)
+        except GitError as exc:
+            log.warning("commit_identities(%s) failed: %s", window, exc)
+            return [
+                f"attribution unverifiable — could not read commits in "
+                f"{window}..HEAD: {exc}"
+            ]
+        identity = self._agent_git_identity()
+        want_name = identity["GIT_AUTHOR_NAME"].casefold()
+        want_email = identity["GIT_AUTHOR_EMAIL"].casefold()
+        offenders: list[str] = []
+        for c in commits:
+            ok = (
+                c.author_name.casefold() == want_name
+                and c.author_email.casefold() == want_email
+                and c.committer_name.casefold() == want_name
+                and c.committer_email.casefold() == want_email
+            )
+            if not ok:
+                offenders.append(
+                    f"{c.sha[:8]} author={c.author_name} <{c.author_email}> "
+                    f"committer={c.committer_name} <{c.committer_email}> "
+                    f"— expected {identity['GIT_AUTHOR_NAME']} "
+                    f"<{identity['GIT_AUTHOR_EMAIL']}>"
+                )
+        if len(offenders) > 8:
+            offenders = offenders[:8] + [f"(+{len(offenders) - 8} more)"]
+        return offenders
+
     def _utility_model(self) -> str:
         """Model for advisory, single-turn summarize/classify/distill jobs."""
         from ..config import DEFAULT_CONFIG
@@ -4342,6 +4429,19 @@ class Orchestrator:
         # under `.no_human/` and the scope guard fights it (task 61406d02).
         self._scratch_dir(repo).mkdir(parents=True, exist_ok=True)
 
+        # Captured HERE — after checkout/checkpoint-resolution above, before the
+        # coder ever runs — so it is exactly "where THIS attempt's own commits
+        # begin". `_foreign_authored_commits` uses it as the attribution-check
+        # window's lower bound instead of `_review_base`: `_review_base` spans
+        # merge-base(base, HEAD)..HEAD, which DELIBERATELY includes a prior
+        # session's already-resumed [WIP-BLOCKED]/[WIP-PARTIAL] checkpoint
+        # commit (see its docstring) — commits that were already checked for
+        # attribution when THAT attempt made them. Re-checking them here would
+        # flag a legitimately-credited resume as attribution failure the moment
+        # any fixture or historical commit predates this run's configured
+        # identity. See `_foreign_authored_commits` for the full reasoning.
+        attempt_start_sha = repo.head_sha()
+
         # --- implement (the SDK session) ---
         await self.store.set_status(task, TaskStatus.IMPLEMENTING)
         self.emit("state", "implementing", status="implementing")
@@ -5309,6 +5409,32 @@ class Orchestrator:
                 + (f" (+{len(leftover) - 8} more)" if len(leftover) > 8 else "")
             )
             self.emit("commit_incomplete", detail, leftover=leftover[:20])
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=detail)
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # Attribution gate (constraint #2): a commit whose author or
+        # committer is not the agent's configured identity — see
+        # `_foreign_authored_commits` for why this is post-hoc (option 1) and
+        # not a guard denial-list (option 2). Placed after every commit this
+        # attempt can make (the coder's own in-session commits AND the
+        # checkpoint commit above) and before the reviewer spends any tokens
+        # or anything is pushed. On the shared `_run_attempt` path, so the
+        # Codex backend is covered with no extra infrastructure — it has no
+        # PreToolUse veto seam, so this is the only place it CAN be caught.
+        # `since=attempt_start_sha` scopes the check to commits THIS attempt
+        # made — see `_foreign_authored_commits` for why the wider
+        # `_review_base` window is wrong here (it would re-flag an
+        # already-credited prior-session checkpoint commit on every resume).
+        # Linked repos (`task.linked_repos`) are not covered by this check.
+        foreign = self._foreign_authored_commits(repo, base, since=attempt_start_sha)
+        if foreign:
+            detail = (
+                "commit attribution mismatch — one or more commits on this "
+                "branch are not authored/committed as the agent identity: "
+                + "; ".join(foreign)
+            )
+            self.emit("identity_mismatch", detail, commits=foreign[:20])
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)

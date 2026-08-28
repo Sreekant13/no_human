@@ -8,6 +8,7 @@ branch (never_push_to).
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import subprocess
 import time
@@ -131,6 +132,29 @@ def _behind_message(branch: str, remote: str, sha: str) -> str:
     )
 
 
+#: Env vars that OUTRANK `-c user.name=`/`-c user.email=` in git's own
+#: precedence order. The orchestrator exports these into the process env for
+#: the coder's Bash tool (`Orchestrator._agent_git_identity`) — on that same
+#: machine, a commit-writing `_run` call would otherwise pick up the SAME
+#: identity by inheritance today, but silently drift from `self.identity_*`
+#: the moment either one is reconfigured. Scrubbed from commit-writing
+#: subcommands so this class's own commits are always attributed by
+#: `-c user.name=`/`-c user.email=`, never by ambient env.
+_IDENTITY_ENV = frozenset((
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+))
+
+#: git subcommands that can create a new commit object (and therefore a new
+#: author/committer stamp). Deliberately used only to decide which calls get
+#: the env scrub above — this is NOT a security boundary and is not meant to
+#: enumerate every way a commit can be forged (see
+#: `Orchestrator._foreign_authored_commits`, which reads the result instead).
+_COMMIT_WRITING_SUBCOMMANDS = frozenset((
+    "commit", "merge", "cherry-pick", "revert", "rebase", "am",
+))
+
+
 @dataclass
 class CommitResult:
     branch: str
@@ -138,6 +162,20 @@ class CommitResult:
     files_changed: int
     insertions: int
     deletions: int
+
+
+@dataclass(frozen=True)
+class CommitIdentity:
+    """Author/committer as git itself recorded them for one commit — the
+    RESULT of a `git commit`, not the command that produced it. Read back by
+    `GitRepo.commit_identities` and compared against the configured agent
+    identity in `Orchestrator._foreign_authored_commits`."""
+    sha: str
+    author_name: str
+    author_email: str
+    committer_name: str
+    committer_email: str
+    subject: str
 
 
 def _branch_protected(branch: str, never_push_to: list[str]) -> bool:
@@ -170,13 +208,27 @@ class GitRepo:
             "-c", f"user.email={self.identity_email}",
             *args,
         ]
+        # GIT_AUTHOR_*/GIT_COMMITTER_* env vars outrank `-c user.name=` in
+        # git's own precedence order. The orchestrator exports the AGENT's
+        # identity into os.environ for the coder's Bash tool
+        # (`Orchestrator._agent_git_identity`) — on that same process, a
+        # commit-writing call here would otherwise inherit that same env
+        # instead of `self.identity_name/email`. Scrubbing keeps `-c
+        # user.name=`/`-c user.email=` authoritative for every commit THIS
+        # CLASS makes, so the pipeline's own checkpoint/manifest-repair
+        # commits stay correctly attributed regardless of what the ambient
+        # env holds.
+        run_env = (
+            {k: v for k, v in os.environ.items() if k not in _IDENTITY_ENV}
+            if args and args[0] in _COMMIT_WRITING_SUBCOMMANDS else None
+        )
         # Lock-contention retry, INLINE in both runners rather than a shared
         # helper taking `cmd`: the egress-allowlist scanner resolves the git
         # subcommand from the literal ["git", ...] construction at the
         # subprocess.run site, and a helper parameter turns every call into
         # an unclassifiable `exec:git <dynamic>` (test_egress_allowlist).
         proc = subprocess.run(
-            cmd, cwd=self.path, capture_output=True, text=True,
+            cmd, cwd=self.path, capture_output=True, text=True, env=run_env,
             **hidden_console_kwargs(),
         )
         if check:
@@ -186,7 +238,7 @@ class GitRepo:
                 time.sleep(backoff)
                 proc = subprocess.run(
                     cmd, cwd=self.path, capture_output=True, text=True,
-                    **hidden_console_kwargs(),
+                    env=run_env, **hidden_console_kwargs(),
                 )
         if check and proc.returncode != 0:
             raise GitError(
@@ -477,6 +529,63 @@ class GitRepo:
             args.append("--no-verify")
         self._run(*args)
         return CommitResult(branch=branch, sha=self.head_sha(), **self._diffstat())
+
+    def commit_identities(self, base: str) -> list[CommitIdentity]:
+        """Author/committer as git itself recorded them for every commit in
+        `base..HEAD` — the RESULT of whatever commit-writing command(s) ran,
+        not a re-derivation of which command ran them. Used by
+        `Orchestrator._foreign_authored_commits` to catch every spelling
+        that can stamp a commit with something other than the agent's
+        configured identity (`--author=`, `env -u GIT_AUTHOR_*`, `-c
+        user.email=`, and any future one) without enumerating any of them.
+
+        `check=True` (the default — no `check=False` here): an unreadable
+        `base..HEAD` (bad/unresolvable base ref, corrupt object, ...) raises
+        `GitError` instead of returning `[]`. A genuinely empty range (base
+        == HEAD, no new commits) still returns `[]` — `git log` exits 0 with
+        empty stdout for that case, so `[]` only ever means "read succeeded,
+        found nothing", never "the read failed". Deciding what a raised
+        `GitError` MEANS is the orchestrator's call (see
+        `Orchestrator._foreign_authored_commits`), but it needs the read
+        failure as a distinct signal to make that call — `check=False` would
+        make a failed read and a clean branch produce the identical `[]`."""
+        out = self._run(
+            "log", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%s",
+            f"{base}..HEAD",
+        )
+        identities: list[CommitIdentity] = []
+        # Split on the literal "\n" git puts between records — NOT
+        # str.splitlines(), which also breaks on \x0b, \x0c, \x1c-\x1e, \x85,
+        # U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR). A commit
+        # *subject* containing one of those (legal UTF-8, just unusual) would
+        # make splitlines() fracture one record into two lines, each missing
+        # fields; a previous version of this method `continue`d past both,
+        # silently dropping the whole commit — including a possibly foreign
+        # author/committer — from the result with no signal at all. That is
+        # the exact failure mode the rest of
+        # this method's fail-closed design (see the class/method docstrings)
+        # exists to rule out, so a record that still doesn't parse to exactly
+        # 6 NUL-separated fields after this split is treated as unreadable
+        # output and raises, rather than being guessed at or skipped.
+        lines = out.split("\n")
+        if lines and lines[-1] == "":
+            # `git log` terminates its last record with "\n" too, so
+            # split("\n") always leaves one empty trailing element for a
+            # non-empty range — that is expected, not a malformed record.
+            lines = lines[:-1]
+        for line in lines:
+            parts = line.split("\x00")
+            if len(parts) != 6:
+                raise GitError(
+                    f"unparseable `git log` record in commit_identities("
+                    f"{base}..HEAD): {line!r}"
+                )
+            sha, an, ae, cn, ce, subject = parts
+            identities.append(CommitIdentity(
+                sha=sha, author_name=an, author_email=ae,
+                committer_name=cn, committer_email=ce, subject=subject,
+            ))
+        return identities
 
     # Code-only extensions safe to auto-stage for *untracked* files.
     # Deliberately excludes data formats (.json, .yaml, .txt, .xml, .csv)

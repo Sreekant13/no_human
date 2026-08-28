@@ -54,6 +54,13 @@ said "read-only: all write tools are blocked unconditionally" until 2026-08-22.
 `6ef8921ae` corrected it and `da3599ae4` reverted it; `guard.py:58` defines
 WRITE_TOOLS as those four names and Bash is in no read-only denial set.)
 
+The guard does not enumerate ways to spoof the identity (`--author=`, `env -u
+GIT_AUTHOR_*`, `git -c user.email=`, ...); instead `Orchestrator._foreign_authored_commits`
+reads back every commit's actual author/committer after the attempt and fails
+it on any mismatch. This *detects* a misattributed commit and stops the
+attempt before review or push — it does not and cannot make forging the
+identity impossible.
+
 ## 4. Trust only verifiable signals
 
 - **Tamper guard**: any net reduction in test count / assertions between the base
@@ -132,7 +139,7 @@ named here.
   and line and quote the lines they are about. Same destination as the push.
 - **PR receipt and status polling** — `gh` / `glab` calls for the PR's head SHA
   and its mergeability (`vcs/pr_watcher.py:507-533`, `vcs/receipts.py`), plus
-  `git fetch origin` (`vcs/git.py:775`, `:807`), while a task waits on CI or review.
+  `git fetch origin` (`vcs/git.py:884`, `:916`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
   (`cli/commands.py:2807`). This is *your* command, not the agent's — an agent

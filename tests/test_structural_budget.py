@@ -68,7 +68,7 @@ MAX_FILE_LINES = 2500
 # Measured with the scanner below; see the PR body for the full table.
 # 16 functions > 300 lines.
 FROZEN_FUNCTION_LINES = {
-    "core/orchestrator.py:Orchestrator._run_attempt": 2060,
+    "core/orchestrator.py:Orchestrator._run_attempt": 2099,
     "core/orchestrator.py:Orchestrator._drive": 760,
     "core/db.py:Store._ensure_task_columns": 448,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
@@ -100,7 +100,7 @@ FROZEN_FUNCTION_LINES = {
 
 # 5 functions with estimated cyclomatic complexity > 60.
 FROZEN_FUNCTION_CC = {
-    "core/orchestrator.py:Orchestrator._run_attempt": 249,
+    "core/orchestrator.py:Orchestrator._run_attempt": 250,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 73,
@@ -130,7 +130,7 @@ FROZEN_FUNCTION_CC = {
 # from here again. (A red ratchet the fleet lands through protects nothing.)
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
-    "core/orchestrator.py": 19473,
+    "core/orchestrator.py": 19599,
     "cli/commands.py": 7801,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
