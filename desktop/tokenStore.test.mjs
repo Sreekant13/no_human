@@ -428,3 +428,14 @@ test("codex subscription writes NOTHING: no OPENAI_API_KEY from a Claude-only sa
     "no OpenAI credential may appear when the codex section is subscription/skipped");
   assert.ok(!/OPENAI/.test(text), "not even an OPENAI-prefixed line is written");
 });
+
+test("setAuthMode preserves a CRLF file's newline convention (no mixed EOL)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nh-eol-"));
+  const cfgDir = join(dir, ".no_human"); fs.mkdirSync(cfgDir, { recursive: true });
+  const p = join(cfgDir, "config.yaml");
+  fs.writeFileSync(p, "llm:\r\n  auth_mode: subscription\r\n  auth_profile: default\r\n");
+  setAuthMode("api_key", dir);
+  const out = fs.readFileSync(p, "utf8");
+  assert.match(out, /auth_mode: api_key/);
+  assert.ok(out.split("\n").every((l, i, a) => i === a.length - 1 || l.endsWith("\r")), "every line keeps its CR (no bare LF in a CRLF file)");
+});

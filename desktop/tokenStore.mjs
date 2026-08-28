@@ -466,9 +466,11 @@ export function setAuthMode(mode, home = os.homedir()) {
     throw new Error(`unknown auth mode: ${mode}`);
   }
   const p = path.join(home, ".no_human", "config.yaml");
-  let lines;
+  let lines, eol = "\n";
   try {
-    lines = fs.readFileSync(p, "utf8").split("\n");
+    const text = fs.readFileSync(p, "utf8");
+    eol = text.includes("\r\n") ? "\r\n" : "\n";
+    lines = text.split(/\r?\n/);
   } catch {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, `llm:\n  auth_mode: ${mode}\n`);
@@ -478,7 +480,7 @@ export function setAuthMode(mode, home = os.homedir()) {
   if (llmIdx === -1) {
     while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
     lines.push("llm:", `  auth_mode: ${mode}`, "");
-    fs.writeFileSync(p, lines.join("\n"));
+    fs.writeFileSync(p, lines.join(eol));
     return p;
   }
   let end = lines.length;
@@ -491,7 +493,7 @@ export function setAuthMode(mode, home = os.homedir()) {
     if (m) { lines[i] = `${m[1]}auth_mode: ${mode}`; replaced = true; break; }
   }
   if (!replaced) lines.splice(llmIdx + 1, 0, `  auth_mode: ${mode}`);
-  fs.writeFileSync(p, lines.join("\n"));
+  fs.writeFileSync(p, lines.join(eol));
   return p;
 }
 
