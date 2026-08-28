@@ -6,6 +6,59 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+Draft for 0.1.6 (finalize the range + date at cut time). Release range so far
+`8a55a92d3..732c869727`, each change landed behind an independent
+fresh-context review. Themed highlights below; the git range is the full record.
+
+### Changed — onboarding, rebuilt around real-user feedback
+
+- **The setup wizard was reworked screen by screen** from a real-user walk plus
+  an impeccable design pass. The welcome headline is the product's binding
+  slogan verbatim; the repositories step lists recently-worked-on repos as
+  quick-add cards, names exactly what it scanned, and — the headline fix —
+  **those cards now show their profile result and the Prove-test-command panel
+  in-flow**, so the core "prove a test command" trust step is reachable for the
+  repos a user actually adds (previously only 30-days-untouched list rows had
+  it). Continue on the repos step now profiles and registers the selected repos,
+  so Launch no longer reports "Repos 0" for a repo you just added.
+- **Projects are added one at a time** with their own repo picker; the step
+  warns before discarding a typed-but-unadded project. The rules step groups
+  proposals by project and states the scan's scope. The AI-history step no
+  longer names a third-party IDE a Claude Code user never installed, and its
+  privacy/scope copy meets the AA-contrast bar.
+- **Usage insights (telemetry) is on by default and no longer asked about or
+  shown** in onboarding or Settings (operator decision); `config.yaml`
+  `telemetry.enabled: false` is the one opt-out. It stays inert until an
+  ingestion endpoint is configured, which ships empty.
+- Minimal one-repo path + clickable/jumpable steps + validate-at-the-step; a
+  compact "Finish setup" sidebar entry that deep-links to real Settings panes
+  and disappears when done.
+
+### Fixed — Windows, reliability, and the review loop
+
+- **Windows: no more empty console windows.** The app-spawned server ran with
+  `detached`, which made Windows ignore `CREATE_NO_WINDOW`, so every
+  `claude.exe`/`git.exe` grandchild opened its own visible empty console. Not
+  detached on win32, plus a shared console-suppression helper at nh's own spawn
+  sites (git, codex, test runner).
+- **Desktop first-launch self-heals**: a slow first launch that had already
+  started a healthy server no longer latches a credential-error page — it
+  re-probes and recovers.
+- **A `create_wiki_job`/`update_wiki_job` SQLite write-lock race** (the wiki
+  feature committed without the shared write lock, unsafe under the concurrent
+  workers) is fixed.
+- Repo discovery no longer triggers a macOS access prompt during setup, treats
+  `$HOME` itself as a depth-1 root, and dropped a second unbounded scanner.
+
+### Added
+
+- Wiki generation as a persisted background job with structured output.
+- `verify-history --since <ref>` for an incremental public-export history scan.
+- Per-phase task timestamps + a "ran vs wall" breakdown in the task drawer.
+- _(pending this cut: a coder-backend + local-model/server-URL selector in the
+  Settings → Models pane, so a local-model install is configurable from the
+  board — coder role only, per the pinned-roles constraint.)_
+
 ## [0.1.5] — 2026-08-27
 
 Release range `70b880cf5..8a55a92d3` (134 commits since 0.1.4, each landed
