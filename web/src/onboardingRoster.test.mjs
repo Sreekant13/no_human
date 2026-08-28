@@ -82,7 +82,7 @@ test("the intro paragraph carries the operator's 2026-08-09 copy, and does NOT c
     /read-only/i,
     "the .ob-lede must NOT call investigations read-only — they are not, and this claim was retracted 2026-07-29",
   );
-  // The headline is now the BINDING slogan (PRODUCT.md), verbatim and
+  // The headline is now the BINDING slogan, operator-pinned, verbatim and
   // do-not-reword: two sentences, the second set as a secondary line.
   assert.match(jsx, /From ticket to reviewed pull request\./);
   assert.match(jsx, /Free and open-source, on your machine\./);

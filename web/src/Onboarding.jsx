@@ -735,7 +735,7 @@ export default function Onboarding({ onComplete }) {
                   `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
                   reset near the top of styles.css. If that reset is ever narrowed, this
                   headline needs an explicit margin-top. */}
-              {/* BINDING slogan, do-not-reword (PRODUCT.md). Two sentences, verbatim;
+              {/* BINDING slogan, operator-pinned, do-not-reword. Two sentences, verbatim;
                   the second is set smaller/secondary but the words are unchanged. */}
               <h2 className="ob-h1">
                 From ticket to reviewed pull request.

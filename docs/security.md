@@ -132,7 +132,7 @@ named here.
   and line and quote the lines they are about. Same destination as the push.
 - **PR receipt and status polling** — `gh` / `glab` calls for the PR's head SHA
   and its mergeability (`vcs/pr_watcher.py:507-533`, `vcs/receipts.py`), plus
-  `git fetch origin` (`vcs/git.py:767`, `:797`), while a task waits on CI or review.
+  `git fetch origin` (`vcs/git.py:775`, `:807`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
   (`cli/commands.py:2793`). This is *your* command, not the agent's — an agent
@@ -300,9 +300,9 @@ named here.
   `~/.no_human/config.yaml` or `NH_NO_UPDATE_CHECK=1`
   (`updates.py:57`, which also covers CI).
 - **The desktop app checks GitHub Releases at startup**, once a day
-  (`desktop/main.mjs:213` → `desktop/updater.mjs:104`, called at startup from
-  `desktop/main.mjs:901`, feed `provider: github, owner: no-human-ai, repo:
-  no_human` — `desktop/electron-builder.config.cjs:342`). It never downloads on its own
+  (`desktop/main.mjs:231` → `desktop/updater.mjs:104`, called at startup from
+  `desktop/main.mjs:978`, feed `provider: github, owner: no-human-ai, repo:
+  no_human` — `desktop/electron-builder.config.cjs:366`). It never downloads on its own
   (`autoDownload` is off, `desktop/updater.mjs:66`). **This is a separate code
   path from the PyPI check above and neither `NH_NO_UPDATE_CHECK` nor
   `updates.enabled` exists in `desktop/` — those switches do not reach it.**
@@ -374,7 +374,7 @@ config key that turns it on and the default that keeps it off.
 - **Integration health checks.** `nh integrations` / the board's integrations
   page authenticate against whichever of Jira, Linear, CircleCI and the Teams
   webhook you have configured, to show a live status
-  (`integrations/__init__.py:499`, `:533`). Nothing configured → nothing sent.
+  (`integrations/__init__.py:512`, `:546`). Nothing configured → nothing sent.
 - **Team brain control plane.** `team_brain.enabled` defaults to **`false`** and
   `team_brain.control_plane_url` to **`""`**; when set, the client exchanges
   task patterns with that URL over `https` (loopback excepted)

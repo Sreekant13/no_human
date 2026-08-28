@@ -3,14 +3,14 @@
 This documents the design system the board **already ships**, so a change can be
 judged against what exists rather than re-invented. It is descriptive, not
 aspirational: every token and rule here is drawn from `web/src/styles.css` and
-the brand commitments in `PRODUCT.md`. Fix real weaknesses; **do not reskin for
+the product's brand commitments. Fix real weaknesses; **do not reskin for
 its own sake.**
 
 ## Identity
 
 A **dark-first operations board** — the surface an engineer watches tasks move
-across. Voice is plain, engineer-to-engineer, evidence-first (`PRODUCT.md`
-"Voice"). Warm-editorial in tone, not a neon dashboard.
+across. Voice is plain, engineer-to-engineer, evidence-first. Warm-editorial in
+tone, not a neon dashboard.
 
 ## Colour (source of truth: `web/src/styles.css` `:root`)
 
@@ -46,7 +46,7 @@ These are incumbent and fixed.
 ## Layout & protected invariants
 
 The following are load-bearing product behaviours, not styling choices, and
-design work **must not break** them (`PRODUCT.md`, operator walk 2026-07-11):
+design work **must not break** them (operator walk 2026-07-11):
 
 - the **lane model** (`web/src/boardLanes.js`) and the single **`isNeedsYou`**
   predicate — one definition of "this needs a human", never a second;
@@ -67,4 +67,4 @@ design work **must not break** them (`PRODUCT.md`, operator walk 2026-07-11):
 ## Scope
 
 This file records the board's system. Whether the hosted tier's UI shares it is
-an open product decision (`PRODUCT.md`), not settled here.
+an open product decision, not settled here.
