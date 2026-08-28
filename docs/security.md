@@ -135,7 +135,7 @@ named here.
   `git fetch origin` (`vcs/git.py:775`, `:807`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:2793`). This is *your* command, not the agent's — an agent
+  (`cli/commands.py:2807`). This is *your* command, not the agent's — an agent
   session's Bash is denied it for the spellings the rule models
   (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
   in both session modes; see §2 for the bound.
@@ -224,7 +224,7 @@ named here.
   launch (`ClaudeBackend._options()`, `CodexBackend._child_env()`) with an
   env-var mark that is inherited by every descendant of that session, no
   matter how it is invoked. `nh approve` and `nh merge-stack run`
-  (`_refuse_agent_gate_act`, `cli/commands.py:4623`, `:2763`) refuse before
+  (`_refuse_agent_gate_act`, `cli/commands.py:4637`, `:2777`) refuse before
   `_bootstrap` runs when the calling process carries that mark, and an HTTP
   middleware in `api/app.py` (`_refuse_marked_gate_acts`, by `_csp_header`)
   refuses
