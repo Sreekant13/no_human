@@ -55,6 +55,18 @@ ORIGIN_SUPERVISOR = "supervisor"  # B2: a recurring supervisor `correct` decisio
 ORIGIN_HISTORY = "history"        # `nh history --analyze`, mining past transcripts
 ORIGIN_REPLY = "reply"            # a rule mined from the operator's own `nh reply`
 ORIGIN_CURATOR = "curator"        # curator.py's consolidation of N proposals into 1
+# The failure-harvest loop (`learning/failures.py`): three more recurring
+# signals clustered through the SAME machinery as ORIGIN_SUPERVISOR. Each is
+# its own origin, not a shared "failure" bucket, for the same reason B2 has
+# its own: a human triaging `nh learnings` needs to filter by WHICH signal
+# recurred. `ORIGIN_REVIEW_FAIL` is deliberately distinct from `ORIGIN_REVIEW`
+# (B1's per-round proposal from ONE FAIL round's findings) — different origin
+# strings mean different dedupe keys (`correction_dedupe_key` includes
+# `cluster.source`), so a recurring finding harvested here can never collide
+# with, or be shadowed by, B1's own in-flight proposal for the same finding.
+ORIGIN_ESCALATION = "escalation"    # an agent escalating to a human, repeated
+ORIGIN_REVIEW_FAIL = "review_fail"  # a reviewer FAIL finding, repeated across rounds
+ORIGIN_TAMPER = "tamper"            # a tripped tamper guard, repeated
 
 # Origins whose "no" must ARCHIVE rather than delete — the same treadmill
 # argument `reject()`'s docstring makes for ORIGIN_SUPERVISOR, applied to the
@@ -69,7 +81,16 @@ ORIGIN_CURATOR = "curator"        # curator.py's consolidation of N proposals in
 # is new evidence and worth re-asking about. That asymmetry is the rule, not
 # the list: the question is "can this producer regenerate the proposal without
 # new evidence?", and the answer decides the verb.
-ARCHIVE_ON_REJECT = frozenset({ORIGIN_SUPERVISOR, ORIGIN_HISTORY, ORIGIN_CURATOR})
+#
+# The three failure-harvest origins (`ORIGIN_ESCALATION`, `ORIGIN_REVIEW_FAIL`,
+# `ORIGIN_TAMPER`) are batch-driven the same way `ORIGIN_SUPERVISOR` is — the
+# scheduled `HarvestJob` re-reads the whole escalation/review-fail/tamper
+# history on every pass — so the identical treadmill argument applies: a
+# delete would let the next pass re-propose a lesson the human just rejected.
+ARCHIVE_ON_REJECT = frozenset({
+    ORIGIN_SUPERVISOR, ORIGIN_HISTORY, ORIGIN_CURATOR,
+    ORIGIN_ESCALATION, ORIGIN_REVIEW_FAIL, ORIGIN_TAMPER,
+})
 
 
 # WHO confirmed a memory into the active set — the `memories.confirmed_by`
@@ -181,26 +202,42 @@ def _tags_from_findings(findings: list[dict[str, Any]]) -> list[str]:
 def correction_dedupe_key(cluster: CorrectionCluster) -> str:
     """The dedupe signature for a correction cluster.
 
-    Keyed on the GIST and the project — never on the distilled text or on the
-    example messages. The gist is a pure function of one message
-    (``corrections.normalize_gist``), so the key is stable when the cluster
-    grows and when the store is re-harvested; an LLM's phrasing is not stable
-    enough to dedupe on.
+    Keyed on the SOURCE, the GIST and the project — never on the distilled
+    text or on the example messages. The gist is a pure function of one
+    message (``corrections.normalize_gist``), so the key is stable when the
+    cluster grows and when the store is re-harvested; an LLM's phrasing is not
+    stable enough to dedupe on. ``source`` is included so the SAME gist from
+    two different signals (e.g. a supervisor correction and an escalation that
+    happen to share their four leading tokens) never collide onto one key —
+    they are not the same lesson, and ``cluster_corrections`` already never
+    merges them into one cluster (source is part of the bucket key too).
+
+    STABILITY UNDER THE S2 CHANGE: ``cluster.source`` defaults to
+    ``"supervisor"``, so every pre-existing cluster (built before this field
+    existed) produces the BYTE-IDENTICAL key it always did —
+    ``test_supervisor_dedupe_key_is_unchanged_by_the_source_field`` pins this.
 
     A module-level function rather than a method because BOTH the builder and
     the batch harvest need it, and the harvest needs it BEFORE the distillation
     it would otherwise pay for.
     """
-    return _sig("supervisor", cluster.gist, cluster.project or "")
+    return _sig(cluster.source, cluster.gist, cluster.project or "")
 
 
-def _tags_from_gist(gist: str) -> list[str]:
+def _tags_from_gist(gist: str, *, prefix: str = ORIGIN_SUPERVISOR) -> list[str]:
     """Trigger keywords for a correction cluster, from its gist. Same contract
     as `_tags_from_findings` — a leading provenance tag so the queue can be
     filtered by where a lesson came from, then keywords `learning/triggers.py`
-    can match as substrings of a future task's text."""
+    can match as substrings of a future task's text.
+
+    `prefix` names which of the four harvest signals produced the cluster
+    (every pre-existing call site leaves it at its default, `ORIGIN_SUPERVISOR`).
+    `_build_from_corrections` already de-duplicates this against the row's
+    real `origin` before storing, so `prefix` only ever matters on the
+    undistilled fallback path, where nothing else supplies a source-aware tag.
+    """
     words = [w for w in gist.split() if w not in _STOP_TAGS]
-    return ["supervisor", *words[:4]]
+    return [prefix, *words[:4]]
 
 
 def build_review_distill_prompt(task: Task, findings: list[dict[str, Any]]) -> str:
@@ -276,6 +313,58 @@ class Proposal:
     # laundering the tag and storing the rest would be exactly the
     # redact-instead-of-drop behaviour learning/pii.py refuses.
     raw_tags: list[str] = field(default_factory=list)
+
+
+# Which `ORIGIN_*` a cluster's `source` maps to. `cluster.source` (from
+# `learning/corrections.py`) is the clustering-machine's own vocabulary
+# ("supervisor"/"escalation"/"review_fail"/"tamper"); ORIGIN_* is the
+# `memories.origin` vocabulary. They read the same today by construction
+# (`ORIGIN_ESCALATION = "escalation"` etc.), but this map is the single place
+# that fact is asserted, so the two are free to diverge without hunting every
+# call site.
+_SOURCE_ORIGIN: dict[str, str] = {
+    "supervisor": ORIGIN_SUPERVISOR,
+    "escalation": ORIGIN_ESCALATION,
+    "review_fail": ORIGIN_REVIEW_FAIL,
+    "tamper": ORIGIN_TAMPER,
+}
+
+# Source-aware prose for `_build_from_corrections`, keyed on `cluster.source`.
+# `title`/`head` are `.format()` templates (`{gist}`, `{provenance}`,
+# `{lesson}`, `{count}`, `{tasks}`); `label` and `kind` are literal. Falls
+# back to the `"supervisor"` entry for any unrecognised source, which is also
+# the entry every pre-existing call site (all of them supervisor-sourced)
+# exercises — unchanged prose, unchanged `kind` string.
+_SOURCE_PROSE: dict[str, dict[str, str]] = {
+    "supervisor": {
+        "title": "Repeated supervisor correction: {gist}",
+        "head": "Corrected repeatedly by the supervisor ({provenance}).\nLesson: {lesson}\n",
+        "label": "What the supervisor kept saying:\n",
+        "what": "the supervisor issued the same correction {count}x across {tasks} task(s)",
+        "kind": "supervisor_correction",
+    },
+    "escalation": {
+        "title": "Repeated escalation: {gist}",
+        "head": "Escalated to a human repeatedly for the same reason ({provenance}).\nLesson: {lesson}\n",
+        "label": "What it escalated about:\n",
+        "what": "the agent escalated to a human for the same reason {count}x across {tasks} task(s)",
+        "kind": "escalation",
+    },
+    "review_fail": {
+        "title": "Repeated reviewer FAIL: {gist}",
+        "head": "Blocked by the reviewer for the same finding repeatedly ({provenance}).\nLesson: {lesson}\n",
+        "label": "What the reviewer kept blocking on:\n",
+        "what": "the reviewer raised the same blocking finding {count}x across {tasks} task(s)",
+        "kind": "review_finding_recurring",
+    },
+    "tamper": {
+        "title": "Repeated tamper trip: {gist}",
+        "head": "Tripped the tamper guard repeatedly for the same summary ({provenance}).\nLesson: {lesson}\n",
+        "label": "What tripped the tamper guard:\n",
+        "what": "the tamper guard tripped on the same summary {count}x across {tasks} task(s)",
+        "kind": "tamper_trip",
+    },
+}
 
 
 def _evidence_strings(evidence: dict[str, Any] | None) -> list[str]:
@@ -801,6 +890,8 @@ class LearningQueue:
             # a caller assembling a cluster by hand must not be the way round
             # the rule that makes 257 corrections into a handful of lessons.
             return None
+        prose = _SOURCE_PROSE.get(cluster.source, _SOURCE_PROSE[ORIGIN_SUPERVISOR])
+        origin = _SOURCE_ORIGIN.get(cluster.source, ORIGIN_SUPERVISOR)
         examples = cluster.examples()
         evidence = "\n".join(f"  - {e}" for e in examples)
 
@@ -812,23 +903,22 @@ class LearningQueue:
             if parsed is not None:
                 mem_type, title, lesson, tags = parsed
         if not title:
-            title = f"Repeated supervisor correction: {cluster.gist}"
+            title = prose["title"].format(gist=cluster.gist)
         if not lesson:
             # Degraded but honest, exactly as B1 degrades: the corrections ARE
             # the lesson, unpolished.
             lesson = "(not distilled) " + (examples[0] if examples else cluster.gist)
         if not tags:
-            tags = _tags_from_gist(cluster.gist)
+            tags = _tags_from_gist(cluster.gist, prefix=origin)
         # The provenance tag is UNCONDITIONAL here (B1 matched this in B3):
-        # the queue has two producers and a human triaging it needs "show me
-        # the supervisor ones" to work on every row, not on the subset the
-        # utility tier happened to fail. B3: the free tags behind it — an
-        # LLM's TAGS line, gist words — are reduced to the reviewed
+        # the queue has multiple producers and a human triaging it needs
+        # "show me the escalation ones" to work on every row, not on the
+        # subset the utility tier happened to fail. B3: the free tags behind
+        # it — an LLM's TAGS line, gist words — are reduced to the reviewed
         # vocabulary before they become stored data (learning/vocab.py); the
         # raw ones survive on the proposal for the PII gate only.
         raw_tags = list(tags)
-        tags = [ORIGIN_SUPERVISOR,
-                *(t for t in sanitize_tags(tags) if t != ORIGIN_SUPERVISOR)]
+        tags = [origin, *(t for t in sanitize_tags(tags) if t != origin)]
 
         tasks = cluster.task_ids
         provenance = "{}x across {} task(s): {}".format(
@@ -837,8 +927,8 @@ class LearningQueue:
         # Same ordering rule B1 had to learn: the lesson is what the utility
         # call was spent on, so it goes FIRST and whole; the verbatim
         # corrections get the room that is left.
-        head = f"Corrected repeatedly by the supervisor ({provenance}).\nLesson: {lesson}\n"
-        label = "What the supervisor kept saying:\n"
+        head = prose["head"].format(provenance=provenance, lesson=lesson)
+        label = prose["label"]
         room = _MAX_CONTENT - len(head) - len(label)
         content = (head + label + evidence[:room]) if room > 0 else head[:_MAX_CONTENT]
         return Proposal(
@@ -846,14 +936,27 @@ class LearningQueue:
             correction_dedupe_key(cluster),
             tags=tags,
             raw_tags=raw_tags,
-            origin=ORIGIN_SUPERVISOR,
+            origin=origin,
             # B3: what happened, in which tasks, citing the correction events
             # themselves — (task_id, ts) is exactly the key that finds each
-            # `supervisor_decision` row in `task_events` again.
+            # source event row again (`task_events` for supervisor/escalation/
+            # tamper, `attempts.review_checklist` for review_fail).
+            #
+            # `kind` keeps its EXACT pre-S2 value for the default supervisor
+            # source (`"supervisor_correction"`, pinned by
+            # `test_lesson_evidence_vocab.py` and switched on by
+            # `cli/commands.py:_learning_evidence_line`); the three new
+            # sources get their own `kind` rather than reusing
+            # `"review_finding"` (B1's per-round evidence, a DIFFERENT shape:
+            # `task_id`/`attempt`/`review_round` vs this cluster's
+            # `task_ids`/`count`). `source_type` is the new, uniform field
+            # that always equals `cluster.source` — the one place a reader can
+            # tell which of the four signals produced a row without a
+            # per-`kind` lookup table.
             evidence={
-                "kind": "supervisor_correction",
-                "what": (f"the supervisor issued the same correction "
-                         f"{cluster.count}x across {len(tasks)} task(s)"),
+                "kind": prose["kind"],
+                "source_type": cluster.source,
+                "what": prose["what"].format(count=cluster.count, tasks=len(tasks)),
                 "gist": cluster.gist,
                 "count": cluster.count,
                 "task_ids": tasks[:8],
@@ -928,6 +1031,61 @@ class LearningQueue:
             if await self.store.memory_dedupe_key_exists(key):
                 if note is not None:
                     note(f"recurring supervisor correction ({cluster.count}x), "
+                         f"deduped to {key}")
+                continue
+            mem_id = await self.propose_from_corrections(
+                cluster, distill=distill, note=note)
+            if mem_id:
+                written.append(mem_id)
+        return written
+
+    async def harvest_failure_signals(
+        self, *, project: str | None = None,
+        min_occurrences: int = MIN_OCCURRENCES,
+        distill: DistillFn | None = None, note: NoteFn | None = None,
+        limit: int = 5000,
+    ) -> list[str]:
+        """The failure-harvest loop's batch pass: read every persisted
+        escalation, reviewer FAIL finding and tamper trip, cluster them, and
+        queue one proposal per RECURRING cluster. Returns the ids written.
+
+        Literally ``harvest_supervisor_corrections``'s body with
+        ``learning.failures.load_failure_records`` as the input instead of
+        ``store.list_supervisor_corrections`` — same clustering, same
+        spend-guard dedupe check before distillation, same
+        ``propose_from_corrections`` write path. The two harvests are kept as
+        separate methods (not one parameterized by source) because that is
+        the shape ``nh learnings --harvest`` and the scheduled ``HarvestJob``
+        both already call two named things, and because a caller wanting
+        "only the supervisor one" (as ``nh learnings --harvest`` historically
+        was) should not have to pass a source filter to get the old behaviour.
+
+        Imports ``learning.failures`` locally rather than at module level:
+        ``failures.py`` imports ``NON_LEARNABLE_CATEGORIES`` and
+        ``_is_infra_finding`` FROM this module, so a top-level import here
+        would be circular. By the time this method runs both modules have
+        already finished importing.
+        """
+        from .failures import load_failure_records
+
+        records = await load_failure_records(
+            self.store, project=project, limit=limit, note=note)
+        # Same conservative exclusion as the supervisor harvest, and the same
+        # reason: a record with no `repo_path` cannot be scoped to a
+        # repository, and a proposal written with `project=None` is a GLOBAL
+        # rule injected into every project.
+        unscoped = sum(1 for r in records if not is_project_scoped(r))
+        if unscoped and note is not None:
+            note(f"{unscoped} failure signal(s) skipped: their task has no "
+                 "repo_path, and a repo-less lesson would become a rule in "
+                 "every project")
+        clusters = cluster_corrections(records, min_occurrences=min_occurrences)
+        written: list[str] = []
+        for cluster in clusters:
+            key = correction_dedupe_key(cluster)
+            if await self.store.memory_dedupe_key_exists(key):
+                if note is not None:
+                    note(f"recurring {cluster.source} signal ({cluster.count}x), "
                          f"deduped to {key}")
                 continue
             mem_id = await self.propose_from_corrections(

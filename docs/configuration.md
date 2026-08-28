@@ -711,6 +711,16 @@ either shape, add it here too: nothing will remind you.
   `nh history --analyze` ignores the flag and still works. (`nh serve` starts
   the job, so it does honour it.) The `reanalysis` section is not written into
   the defaults file.
+- `harvest.enabled` (default **true**), `harvest.interval_seconds` (43200,
+  floored at 60) — the periodic pass, inside the same `nh serve` loop, that
+  runs BOTH existing harvest loops: the bench-candidate harvest
+  (`eval/harvest.py`, one `runnable: false` YAML per harvest-worthy terminal
+  task) and the learning-proposal harvest (`LearningQueue`, supervisor
+  corrections plus escalations/reviewer-FAIL-findings/tamper trips, clustered
+  the same `>=2` recurrence rule as `nh learnings --harvest`). It makes no
+  backend call (`distill=None`) and never applies anything — every row lands
+  a proposal for `nh learnings` to review. `nh serve --no-harvest` skips it
+  for that run regardless of the config value.
 - `onboarding.extra_scan_roots` — extra directories the repo-discovery scan
   looks in, beyond the conventional clone roots. A single string is accepted
   as well as a list, and a leading `~` means the home the scan is bound to.

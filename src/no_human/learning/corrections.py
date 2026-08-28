@@ -50,6 +50,14 @@ lexicographically smallest tokens (2-3 clusters) and the k longest tokens (2-4
 clusters). Neither grouped paraphrases either, and both grouped less. The knob
 is one constant, and the trade is precision — does a cluster really name ONE
 recurring mistake — against how many lessons are found at all.
+
+FOUR SIGNALS, ONE CLUSTERING MACHINE. The failure-harvest loop
+(``learning/failures.py``) mines three more sources through this same
+``(project, gist)`` clustering: escalations, reviewer FAIL findings, and
+tamper trips. ``source`` is now part of the bucket key, so clusters never mix
+signals — "the tamper guard tripped twice" and "the supervisor said the same
+thing twice" are never the same cluster even if their gists collided, because
+they are not the same lesson.
 """
 
 from __future__ import annotations
@@ -129,26 +137,35 @@ def normalize_gist(message: str | None, *, tokens: int = _GIST_TOKENS) -> str:
 
 @dataclass(frozen=True)
 class CorrectionRecord:
-    """One persisted supervisor ``correct`` decision.
+    """One persisted supervisor ``correct`` decision — or, since the failure-
+    harvest loop, one persisted escalation / reviewer FAIL finding / tamper
+    trip. ``message`` is the correction text as emitted — already truncated to
+    200 characters by ``Orchestrator.emit``'s ``message[:200]``, which is the
+    only form that was ever stored. ``project`` is the task's ``repo_path``.
 
-    ``message`` is the correction text as emitted — already truncated to 200
-    characters by ``Orchestrator.emit``'s ``message[:200]``, which is the only
-    form that was ever stored. ``project`` is the task's ``repo_path``.
+    ``source`` is LAST and defaulted so every existing construction site
+    (``supervisor``) is unchanged; ``learning/failures.py`` is the only other
+    writer, tagging ``escalation`` / ``review_fail`` / ``tamper``.
     """
 
     task_id: str
     project: str | None
     message: str
     ts: float = 0.0
+    source: str = "supervisor"
 
 
 @dataclass
 class CorrectionCluster:
-    """A recurring correction: same project, same gist, seen N times."""
+    """A recurring correction: same project, same source, same gist, seen N
+    times. ``source`` defaults to ``"supervisor"`` for the same reason as
+    ``CorrectionRecord.source`` — every pre-existing construction site is
+    unchanged."""
 
     project: str | None
     gist: str
     records: list[CorrectionRecord] = field(default_factory=list)
+    source: str = "supervisor"
 
     @property
     def count(self) -> int:
@@ -213,7 +230,7 @@ def cluster_corrections(
     * an unattributable project (:func:`is_project_scoped`) — a proposal with
       ``project=None`` is a GLOBAL rule injected into every repository.
     """
-    buckets: dict[tuple[str | None, str], CorrectionCluster] = {}
+    buckets: dict[tuple[str | None, str, str], CorrectionCluster] = {}
     dropped_global = dropped_empty = 0
     for rec in records or []:
         if not is_project_scoped(rec):
@@ -223,10 +240,11 @@ def cluster_corrections(
         if not gist:
             dropped_empty += 1
             continue
-        key = (rec.project, gist)
+        key = (rec.project, rec.source, gist)
         cluster = buckets.get(key)
         if cluster is None:
-            cluster = buckets[key] = CorrectionCluster(rec.project, gist)
+            cluster = buckets[key] = CorrectionCluster(
+                rec.project, gist, source=rec.source)
         cluster.records.append(rec)
     if dropped_global or dropped_empty:
         log.info(
@@ -235,8 +253,33 @@ def cluster_corrections(
             "content", dropped_global, dropped_empty)
     return sorted(
         (c for c in buckets.values() if c.count >= min_occurrences),
-        key=lambda c: (-c.count, c.gist),
+        key=lambda c: (-c.count, c.source, c.gist),
     )
+
+
+# The opening sentence of the distill prompt, parameterized on
+# ``cluster.source`` — the four-line reply contract below and
+# ``learning.queue.parse_review_lesson`` that reads it are untouched; only how
+# the recurrence is DESCRIBED to the utility tier changes per source.
+_SOURCE_OPENING = {
+    "supervisor": (
+        "A supervisor watching an autonomous coding agent issued the SAME "
+        "correction repeatedly while it worked in this repository."
+    ),
+    "escalation": (
+        "An autonomous coding agent escalated to a human for the SAME "
+        "reason repeatedly while working in this repository."
+    ),
+    "review_fail": (
+        "An independent code reviewer raised the SAME blocking finding "
+        "repeatedly against an autonomous coding agent's changes to this "
+        "repository."
+    ),
+    "tamper": (
+        "The tamper guard tripped on the SAME summary repeatedly while an "
+        "autonomous coding agent worked in this repository."
+    ),
+}
 
 
 def build_correction_distill_prompt(cluster: CorrectionCluster) -> str:
@@ -244,13 +287,15 @@ def build_correction_distill_prompt(cluster: CorrectionCluster) -> str:
 
     Same four-line contract as B1's review distiller, so the SAME parser
     (``learning.queue.parse_review_lesson``) reads both replies — one shape to
-    test, one shape to change.
+    test, one shape to change. The opening sentence is parameterized on
+    ``cluster.source`` (see ``_SOURCE_OPENING``) so the prompt honestly
+    describes which of the four signals recurred.
     """
     examples = "\n".join(f"  - {e}" for e in cluster.examples())
     tasks = len(cluster.task_ids)
+    opening = _SOURCE_OPENING.get(cluster.source, _SOURCE_OPENING["supervisor"])
     return (
-        "A supervisor watching an autonomous coding agent issued the SAME "
-        "correction repeatedly while it worked in this repository. It fired "
+        f"{opening} It fired "
         f"{cluster.count} times across {tasks} separate task(s). Examples of "
         f"what it said:\n{examples}\n"
         "\nDistill ONE durable lesson a FUTURE task in THIS repository should "

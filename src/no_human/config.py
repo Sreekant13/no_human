@@ -2161,6 +2161,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # turns off the unattended daily tick.
         "sweep_enabled": True,
     },
+    # The scheduled learning-harvest pass (`core/scheduler.py` `HarvestJob`):
+    # supervisor corrections + escalations + reviewer FAIL findings + tamper
+    # trips, clustered and proposed on a cadence inside `nh serve` — the same
+    # `harvest_supervisor_corrections`/`harvest_failure_signals` a human can
+    # already run by hand via `nh learnings --harvest`. `distill` is never
+    # configured here (always `None`): the scheduled pass makes NO LLM call,
+    # ever — it proposes the verbatim-clustered lesson, same as an
+    # un-configured manual harvest. It only ever PROPOSES: every row lands
+    # `source="proposed"`, `confirmed=False`, and stays inert until a human
+    # runs `nh learnings --confirm <id>` — see `learning/failures.py`'s
+    # module docstring for why that stays reviewable entries, not a PR.
+    "harvest": {
+        # Both harvest loops (eval/harvest.py's bench candidates and
+        # learning/queue.py's supervisor-correction + failure-signal
+        # proposals) on a cadence inside the EXISTING `nh serve` tick — no
+        # cron, no queue, no daemon (core/scheduler.py's HarvestJob). The
+        # scheduled pass never calls a model (distill=None), which is why
+        # it defaults on, and it only ever PROPOSES: nothing is applied,
+        # confirmed or opened as a PR without a human running
+        # `nh learnings --confirm` (or editing a harvested bench task by
+        # hand).
+        "enabled": True,
+        # Once per 12 hours by default — a persisted signal is not
+        # time-sensitive the way task dispatch is, so this rides a much
+        # slower cadence than the dispatch loop itself.
+        "interval_seconds": 43200,
+    },
     # The `unattributed_usage` ledger (core/db.py) is append-only and never
     # DELETEd wholesale: it is the whole-cost residual `nh status` reads as
     # the true total, and a plain DELETE would make that number silently

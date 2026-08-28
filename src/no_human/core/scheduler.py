@@ -475,6 +475,7 @@ class Scheduler:
         reanalysis_job: ReanalysisJob | None = None,
         wiki_refresh_job: "WikiRefreshJob | None" = None,
         retirement_job: "RetirementSweepJob | None" = None,
+        harvest_job: "HarvestJob | None" = None,
         config: dict | None = None,
     ):
         self.store = store
@@ -522,6 +523,7 @@ class Scheduler:
         self.reanalysis = reanalysis_job
         self.wiki_refresh = wiki_refresh_job
         self.retirement = retirement_job
+        self.harvest = harvest_job
         self._config = config or {}
         # Orchestrators whose `run_task` is being awaited right now, so a
         # shutdown can ask each one to checkpoint and requeue
@@ -1940,6 +1942,25 @@ class Scheduler:
                     )
             except Exception as exc:  # noqa: BLE001 — never kill the pool
                 log.warning("memory retirement sweep failed: %s", exc)
+        # Learning harvest: supervisor corrections + failure signals
+        # (escalations / reviewer FAIL findings / tamper trips), best-effort,
+        # never blocks task dispatch — same shape as reanalysis/wiki_refresh/
+        # retirement above. UNLIKE those three this fires its event on the
+        # zero-result case too — see `HarvestJob`'s docstring for why.
+        if self.harvest is not None:
+            try:
+                harvest_result = await self.harvest.maybe_run()
+                if harvest_result is not None:
+                    msg = (
+                        f"{harvest_result['candidates']} bench candidate(s), "
+                        f"{harvest_result['proposals']} learning proposal(s) "
+                        f"({harvest_result['supervisor']} supervisor, "
+                        f"{harvest_result['failures']} escalation/review-fail/tamper)"
+                    )
+                    log.info("harvest: %s", msg)
+                    self._on_event("harvest", msg)
+            except Exception as exc:  # noqa: BLE001 — never kill the pool
+                log.warning("learning harvest failed: %s", exc)
         return started
 
     def task_events(self, task_id: str) -> list[dict]:
@@ -2476,6 +2497,114 @@ class RetirementSweepJob:
                  "proposal(s) older than %d day(s)",
                  len(report.archived_ids), self.archive_after_days)
         return {"archived": len(report.archived_ids)}
+
+
+# --------------------------------------------------------------------------- #
+# Learning harvest scheduler                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class HarvestJob:
+    """Runs BOTH of the product's existing harvest loops on a cadence, inside
+    the same ``nh serve`` loop that already drives reanalysis / wiki refresh /
+    the retirement sweep. Same ``due()``/``maybe_run()`` shape as
+    ``RetirementSweepJob``:
+
+    * ``eval.harvest.harvest`` — the bench-candidate harvest. Writes one
+      ``runnable: false`` YAML per harvest-worthy terminal task to
+      ``~/.no_human/harvest`` (or ``out_dir``), idempotent by filename. This
+      job only *calls* it; the candidate shape and location are frozen in
+      ``eval/harvest.py`` and are not touched here.
+    * ``LearningQueue.harvest_supervisor_corrections`` (B2, supervisor
+      ``correct`` decisions) and ``LearningQueue.harvest_failure_signals``
+      (escalations, reviewer FAIL findings and tamper trips) — the
+      learning-proposal harvest.
+
+    ``distill=None`` by default: the scheduled pass never calls a model. It
+    proposes the verbatim-clustered lesson, exactly like an un-configured
+    ``nh learnings --harvest``. Nothing here spends a token, opens a PR, or
+    confirms a proposal — every learning row lands with ``source="proposed"``,
+    ``confirmed=False``, inert until a human runs ``nh learnings --confirm
+    <id>``; every bench candidate lands with ``runnable: false``, inert until
+    a human edits it. See ``learning/failures.py``'s module docstring (and
+    ``eval/harvest.py``'s, for the bench side) for why this stays reviewable
+    entries rather than something more automatic — Tessl's loop proposes PRs;
+    this one proposes entries a human reviews. That reasoning is exactly as
+    true of the scheduled pass as of the manual one; do not "upgrade" this to
+    auto-apply or auto-PR.
+
+    UNLIKE its neighbors (``ReanalysisJob``/``WikiRefreshJob``/
+    ``RetirementSweepJob``), this job's caller reports the ZERO case too
+    (see the ``harvest`` block in ``Scheduler.tick``). Those three suppress a
+    zero-result event because "nothing changed" is uninteresting there; here
+    it matters that the pass RAN — for a human to trust an unattended
+    12-hour cadence at all, "0 candidates, 0 proposals" and "the job
+    silently never fires" must be distinguishable in the log.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        interval_seconds: float = 43200,  # default: once per 12 hours
+        distill: "DistillFn | None" = None,
+        out_dir: "Path | None" = None,
+    ):
+        self.store = store
+        self.interval = max(60, interval_seconds)
+        self._distill = distill
+        self.out_dir = out_dir
+        # 0.0 means "never run" — same first-tick-after-boot convention as
+        # `RetirementSweepJob`.
+        self._last_run: float = 0.0
+        self._running = False
+
+    def due(self, now: float | None = None) -> bool:
+        return (now or time.time()) - self._last_run >= self.interval
+
+    async def maybe_run(self) -> dict | None:
+        """Run both harvest loops if due and not already running. Returns a
+        result dict (never None once due — see `_run`'s docstring for why
+        the zero case is still a dict, not a skip) or None if not due yet.
+
+        ``_last_run`` is stamped in ``finally``, matching every other job
+        here — a raising pass must still advance it, or a persistently
+        failing harvest would retry every tick instead of backing off.
+        """
+        if not self.due() or self._running:
+            return None
+        self._running = True
+        try:
+            return await self._run()
+        finally:
+            self._running = False
+            self._last_run = time.time()
+
+    async def _run(self) -> dict:
+        from ..eval.harvest import harvest
+        from ..learning import LearningQueue
+
+        notes: list[str] = []
+        candidates = await harvest(self.store, out_dir=self.out_dir)
+        q = LearningQueue(self.store)
+        sup = await q.harvest_supervisor_corrections(
+            distill=self._distill, note=notes.append)
+        fail = await q.harvest_failure_signals(
+            distill=self._distill, note=notes.append)
+        result = {
+            "candidates": len(candidates),
+            "proposals": len(sup) + len(fail),
+            "supervisor": len(sup),
+            "failures": len(fail),
+            "notes": notes[:20],
+        }
+        log.info(
+            "harvest: %d bench candidate(s), %d learning proposal(s) "
+            "(%d supervisor, %d escalation/review-fail/tamper)",
+            result["candidates"], result["proposals"],
+            result["supervisor"], result["failures"],
+        )
+        return result
 
 
 # --------------------------------------------------------------------------- #

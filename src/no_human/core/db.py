@@ -4021,6 +4021,90 @@ class Store:
         )
         return [dict(r) for r in rows]
 
+    async def list_escalations(
+        self, *, project: str | None = None, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Every persisted ``escalated`` event, oldest first.
+
+        The orchestrator emits this event with ``blocker=blocker.to_dict()``
+        when a task escalates to a human. ``message`` is the blocker's
+        ``question`` — NOT the rendered report, which embeds the task's own
+        title and id and would make every escalation gist unique, clustering
+        nothing. ``category`` is returned alongside it so the caller can drop
+        ``NON_LEARNABLE_CATEGORIES`` (environment facts, not reusable lessons).
+        """
+        clauses = ["json_extract(e.data, '$.kind') = 'escalated'"]
+        params: list[Any] = []
+        if project is not None:
+            clauses.append("t.repo_path = ?")
+            params.append(project)
+        params.append(int(limit))
+        rows = await self._fetchall(
+            "SELECT e.task_id AS task_id, t.repo_path AS project, e.ts AS ts, "
+            "       json_extract(e.data, '$.blocker.question') AS message, "
+            "       json_extract(e.data, '$.blocker.category') AS category "
+            "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY e.ts ASC LIMIT ?",
+            params,
+        )
+        return [dict(r) for r in rows]
+
+    async def list_tamper_trips(
+        self, *, project: str | None = None, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Every persisted tamper-guard TRIP, oldest first.
+
+        The orchestrator emits a ``tamper`` event on every check, pass or
+        fail (``self.emit("tamper", tamper.summary, tampered=tamper.tampered)``);
+        only the trips (``tampered = 1``) are a learnable signal. ``message``
+        is the guard's own summary text.
+        """
+        clauses = [
+            "json_extract(e.data, '$.kind') = 'tamper'",
+            "json_extract(e.data, '$.tampered') = 1",
+        ]
+        params: list[Any] = []
+        if project is not None:
+            clauses.append("t.repo_path = ?")
+            params.append(project)
+        params.append(int(limit))
+        rows = await self._fetchall(
+            "SELECT e.task_id AS task_id, t.repo_path AS project, e.ts AS ts, "
+            "       json_extract(e.data, '$.text') AS message "
+            "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY e.ts ASC LIMIT ?",
+            params,
+        )
+        return [dict(r) for r in rows]
+
+    async def list_review_fails(
+        self, *, project: str | None = None, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Every attempt whose review FAILed and persisted a checklist, oldest
+        first. Returns the raw ``review_checklist`` JSON string — parsing it
+        into findings belongs one layer up, where ``findings_from_checklist``
+        (``review/reviewer.py``) already lives and is already used by
+        ``nh task show``.
+        """
+        clauses = ["a.review_passed = 0", "a.review_checklist IS NOT NULL"]
+        params: list[Any] = []
+        if project is not None:
+            clauses.append("t.repo_path = ?")
+            params.append(project)
+        params.append(int(limit))
+        rows = await self._fetchall(
+            "SELECT a.task_id AS task_id, t.repo_path AS project, "
+            "       a.review_checklist AS review_checklist, "
+            "       a.started_at AS ts "
+            "FROM attempts a LEFT JOIN tasks t ON t.id = a.task_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY a.started_at ASC LIMIT ?",
+            params,
+        )
+        return [dict(r) for r in rows]
+
     async def last_event_ts(self, task_id: str) -> float | None:
         """Epoch seconds of the newest persisted event, or None if none. Used
         by the stuck-active-task watchdog to detect a task frozen mid-run."""

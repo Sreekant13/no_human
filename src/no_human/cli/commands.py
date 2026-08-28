@@ -3644,7 +3644,13 @@ async def _monday_poll_loop(poller, stop, poll_interval: int) -> None:
                    "it becomes claimable. Parked tasks (blocked/awaiting-"
                    "input/escalated/paused-quota) are not claimable: they "
                    "end the drain and do not fail it.")
-def serve(max_workers, until_empty):
+@click.option("--no-harvest", is_flag=True, default=False,
+              help="Skip the scheduled learning-harvest pass for this "
+                   "invocation, even if harvest.enabled is true in config "
+                   "(config on disk is left untouched). The pass only ever "
+                   "PROPOSES (nothing auto-applies) — see `nh learnings "
+                   "--harvest` to run it by hand instead.")
+def serve(max_workers, until_empty, no_harvest):
     """Run the concurrent scheduler daemon (Phase 7): drain pending + resumed
     tasks into a bounded worker pool, each task in its own git worktree, running
     the wake-watcher in the same loop. Ctrl-C to stop (drains in-flight tasks).
@@ -3750,12 +3756,29 @@ def serve(max_workers, until_empty):
                 )
                 console.print("[green]wiki auto-refresh[/] enabled "
                               f"(every {docs_cfg.get('refresh_interval_seconds', 3600)}s)")
+            # Learning harvest: supervisor corrections + escalations +
+            # reviewer FAIL findings + tamper trips, clustered and proposed
+            # on a cadence in this same loop. `--no-harvest` and
+            # `harvest.enabled: false` are both opt-outs for this run; the
+            # pass never calls a model and never does anything beyond
+            # propose (see `HarvestJob`'s docstring in core/scheduler.py).
+            harvest = None
+            harvest_cfg = config.data.get("harvest", {})
+            if harvest_cfg.get("enabled", True) and not no_harvest:
+                from ..core.scheduler import HarvestJob
+                harvest = HarvestJob(
+                    store,
+                    interval_seconds=float(harvest_cfg.get("interval_seconds", 43200)),
+                )
+                console.print("[green]learning harvest[/] enabled "
+                              f"(every {harvest_cfg.get('interval_seconds', 43200)}s)")
             sched = Scheduler(
                 store, lambda task=None: _build_orchestrator(config, store, event_sink=render_event, task=task),
                 max_workers=workers, wake_watcher=watcher,
                 on_event=lambda k, t: console.print(f"[magenta]▸ {k}[/] {t}"),
                 reanalysis_job=reanalysis,
                 wiki_refresh_job=wiki_refresh,
+                harvest_job=harvest,
                 config=config.data)
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -5356,13 +5379,56 @@ def _learning_evidence_line(raw) -> str | None:
     return escape(f"{kind or 'recorded'}: {what}"[:120]) if (kind or what) else None
 
 
+async def _print_learning_harvest(q, harvest_project, distill) -> None:
+    """Run both harvest passes (B2 supervisor corrections, then the
+    escalation/reviewer-FAIL/tamper-trip pass from `learning/failures.py`)
+    and print what each produced. Shared by `nh learnings --harvest` (once,
+    by hand) and `HarvestJob` (`core/scheduler.py`, on a cadence inside
+    `nh serve`) — same clustering, same dedupe key, same proposal-only
+    output either way."""
+    notes: list[str] = []
+    written = await q.harvest_supervisor_corrections(
+        project=harvest_project, distill=distill, note=notes.append,
+    )
+    for n in notes:
+        console.print(f"  [dim]{escape(n)}[/]", emoji=False)
+    console.print(
+        f"[green]{len(written)} supervisor-correction proposal(s) "
+        f"queued[/] — nothing is active until you confirm it below"
+        if written else
+        "[green]no new supervisor-correction proposals[/] — either "
+        "no correction recurred, or they are already queued")
+    # The failure-harvest pass: escalations, reviewer FAIL findings and
+    # tamper trips, clustered and dedup-guarded the SAME way as the
+    # supervisor-correction pass above — see `learning/failures.py`'s
+    # module docstring for what each signal is and why this stays
+    # proposals, never PRs.
+    fail_notes: list[str] = []
+    fail_written = await q.harvest_failure_signals(
+        project=harvest_project, distill=distill, note=fail_notes.append,
+    )
+    for n in fail_notes:
+        console.print(f"  [dim]{escape(n)}[/]", emoji=False)
+    console.print(
+        f"[green]{len(fail_written)} escalation/review-fail/tamper "
+        f"proposal(s) queued[/] — nothing is active until you "
+        "confirm it below"
+        if fail_written else
+        "[green]no new escalation/review-fail/tamper proposals[/] "
+        "— either no escalation/reviewer FAIL/tamper trip "
+        "recurred, or they are already queued")
+
+
 @cli.command("learnings")
 @click.option("--confirm", "confirm_id", default=None, help="Confirm a proposal by id.")
 @click.option("--reject", "reject_id", default=None, help="Reject/delete a proposal by id.")
 @click.option("--active", is_flag=True, help="Show the confirmed active rule set instead.")
 @click.option("--harvest", is_flag=True,
-              help="Aggregate recurring supervisor corrections into proposals "
-                   "(B2), then show the queue.")
+              help="Aggregate recurring supervisor corrections (B2), "
+                   "escalations, reviewer FAIL findings and tamper trips "
+                   "into proposals, then show the queue. The same passes "
+                   "`nh serve` runs on a cadence (harvest.interval_seconds) "
+                   "unless --no-harvest — this runs them once, by hand.")
 @click.option("--harvest-project", default=None,
               help="Limit --harvest to one repo path (default: every project).")
 @click.option("--stale", is_flag=True,
@@ -5404,17 +5470,22 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
     a repo you have not touched this month makes its rules briefly "stale"
     without making them bad. Use `--reject` if you actually want one gone.
 
-    ``--harvest`` runs the B2 pass: every persisted supervisor ``correct``
-    decision is clustered by (project, normalized gist) and a cluster seen
-    twice or more becomes ONE proposal. A single correction is a one-off nudge
-    and is never proposed — repetition, not isolation, is what marks a durable
-    lesson. Corrections from a task with no repo_path are skipped and counted:
-    a repo-less lesson would become a rule in EVERY project.
+    ``--harvest`` runs BOTH harvest passes: the B2 pass (every persisted
+    supervisor ``correct`` decision) and the failure-harvest pass (every
+    persisted escalation, reviewer FAIL finding and tamper trip — see
+    ``learning/failures.py``). Each signal is clustered by (project, source,
+    normalized gist) and a cluster seen twice or more becomes ONE proposal. A
+    single occurrence is a one-off nudge and is never proposed — repetition,
+    not isolation, is what marks a durable lesson. A record from a task with
+    no repo_path is skipped and counted: a repo-less lesson would become a
+    rule in EVERY project. `nh serve` runs the identical two passes on a
+    cadence (`harvest.interval_seconds`, default 12h) unless started with
+    `--no-harvest`; this flag runs them once, synchronously, by hand.
 
     Re-running is a no-op, and stays one after you have triaged: a cluster
     already queued is skipped by its dedupe key, and so is one you REJECTED —
-    rejecting a supervisor proposal archives it rather than deleting it, so
-    your "no" survives the next harvest.
+    rejecting a proposal from any of these four sources archives it rather
+    than deleting it, so your "no" survives the next harvest.
 
     ``--usage`` answers a different question than ``--stale``: not just
     whether a rule has EVER been injected, but how often, and what happened
@@ -5459,19 +5530,7 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
         async with Store(config.db_path) as store:
             q = LearningQueue(store)
             if harvest:
-                notes: list[str] = []
-                written = await q.harvest_supervisor_corrections(
-                    project=harvest_project, distill=_distill,
-                    note=notes.append,
-                )
-                for n in notes:
-                    console.print(f"  [dim]{escape(n)}[/]", emoji=False)
-                console.print(
-                    f"[green]{len(written)} supervisor-correction proposal(s) "
-                    f"queued[/] — nothing is active until you confirm it below"
-                    if written else
-                    "[green]no new supervisor-correction proposals[/] — either "
-                    "no correction recurred, or they are already queued")
+                await _print_learning_harvest(q, harvest_project, _distill)
             if usage:
                 rows = await store.memory_usage_report()
                 if not rows:

@@ -200,6 +200,9 @@ _REJECT_VERB = {
     "supervisor": "archive",  # re-reads the whole correction history each run
     "history": "archive",     # re-reads every transcript each `--analyze`
     "reply": "delete",        # the operator saying it again IS new evidence
+    "escalation": "archive",    # HarvestJob re-reads every escalation each pass
+    "review_fail": "archive",   # HarvestJob re-reads every reviewer FAIL each pass
+    "tamper": "archive",        # HarvestJob re-reads every tamper trip each pass
     "curator": "archive",     # re-reads every surviving proposal each `--curate`
 }
 

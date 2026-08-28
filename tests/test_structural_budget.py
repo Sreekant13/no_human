@@ -131,23 +131,32 @@ FROZEN_FUNCTION_CC = {
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py": 19599,
-    "cli/commands.py": 7801,
+    # cli/commands.py 7801 -> 7860 (+59): the `_print_learning_harvest` helper
+    # shared by `nh learnings --harvest` and the new scheduled `HarvestJob`
+    # pass, plus the `--no-harvest` serve flag wiring.
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
+    "cli/commands.py": 7860,
     "api/app.py": 5338,
     # +51: W5 active-time phase writer (phase instrumentation).
-    "core/db.py": 4304,
+    # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
+    # three new failure-signal sources the recurring learning harvest mines.
+    "core/db.py": 4388,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.
-    "config.py": 3049,
+    # +27: the `harvest` config section (interval_hours, enabled) for the
+    # recurring learning-harvest cadence.
+    "config.py": 3076,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2801,
     # +44: idle-path recover_quota_cooldown gate in tick() and the
     # never-shorten-a-live-wall guard in _run — the quota-wall storm cost fix.
-    "core/scheduler.py": 2566,
+    # +129: `HarvestJob` — the cadence job (`due()`/`maybe_run()`) that runs
+    # both harvest passes from inside `nh serve`'s existing wake-watcher loop.
+    "core/scheduler.py": 2695,
 }
 
 
