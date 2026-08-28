@@ -4,6 +4,34 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — 0.1.7
+
+Server/fleet reliability + cost-observability work landed after the 0.1.6 cut
+(068db272). Each change landed behind an independent fresh-context review.
+
+### Fixed — the review loop and PR body
+
+- **The reviewer-worktree integrity guard no longer discards a verdict on a
+  benign `.git/common/config` reserialization.** Concurrent writers of the
+  shared common dir rewrite that file with the same *effective* keys (different
+  whitespace/order); the guard byte-hashed it and threw away the review, forcing
+  a wasted re-attempt — the dominant cause of discarded verdicts. It now
+  adjudicates config by its effective key set (`git config --list --file`, no
+  `--includes`, no hook/filter execution), still catching every executable-key
+  change.
+- **A merge-policy compute failure no longer drops the review checklist from the
+  PR body** (evidence is gathered once, before the try; a NOT-COMPUTED row is
+  disclosed).
+- **A `|` in a value no longer truncates the PR body's two-column tables** — the
+  CI/Verifiers/Merge-policy/Tests rows render through the pipe-safe cell helper.
+- The `max-height:1080px` sidebar block no longer leaks into mobile.
+
+### Added
+
+- **The task-detail API surfaces the lifetime budget** (used/cap/remaining,
+  cost-weighted — the exact metric BUDGET_EXHAUSTED kills on), so a human can see
+  how close a task is to being killed, sourced from the gate's own helpers.
+
 ## [0.1.6] — 2026-08-28
 
 Release range `8a55a92d3..c3cd200bf1`, each change landed behind an independent
