@@ -2550,7 +2550,82 @@ def _auth_status_payload(request: Request) -> dict[str, Any]:
         # Settings can warn instead of letting the operator discover it one
         # failed task at a time.
         "backend_cli_present": _backend_cli_present(),
+        # The Codex coding backend, made first-class in Settings alongside
+        # Claude: its auth mode, credential presence and model. None (rather
+        # than an absent key) when the on-disk config can't be read, so the
+        # frontend degrades the same way an older server with no key at all does.
+        "codex": _codex_status_payload(data),
     }
+
+
+def _codex_status_payload(running_data: dict[str, Any]) -> dict[str, Any] | None:
+    """The Codex sub-object of the auth status. Names and booleans ONLY — no
+    OpenAI credential value is ever read into this, in EITHER mode (constraint
+    §8 and constraint #6b: in subscription mode no_human holds no OpenAI
+    credential and only existence-checks a live session via the CLI).
+
+    ``auth_mode``/``model`` come from the ON-DISK config — what the operator
+    just saved and the next task will use — not ``running_data``'s stale bound
+    copy, so a value written by ``PUT /api/auth/codex-mode`` shows immediately.
+    ``restart_required`` is the same file-vs-process comparison the Claude
+    payload and ``/api/models`` do. Returns None on any failure so the Claude
+    status GET can never be 500'd by a Codex-subsystem problem.
+    """
+    try:
+        from ..config import (
+            CODEX_API_KEY_VAR,
+            CONFIG_PATH,
+            AuthError,
+            codex_auth_mode,
+            load_config,
+        )
+        from ..config import _read_env_file as _env_file
+        from ..agent.backend import default_codex_model
+
+        def _mode(d: dict[str, Any]) -> str | None:
+            try:
+                return codex_auth_mode(d)
+            except AuthError:
+                # A malformed llm.codex_auth_mode on disk must not 500 a GET
+                # (mirrors the Claude payload's invalid-profile handling). The
+                # value is a mode word, never a secret, but None keeps the
+                # contract "names and booleans only" and lets the UI show "—".
+                return None
+
+        on_disk = load_config(CONFIG_PATH).data
+        mode = _mode(on_disk)
+        running_mode = _mode(running_data)
+        # BOTH sources — a key in .env is invisible to os.environ until the next
+        # start — exactly like the Claude payload's metered_key_present.
+        api_key_present = bool(
+            os.environ.get(CODEX_API_KEY_VAR) or _env_file().get(CODEX_API_KEY_VAR))
+        # subscription_session_present: only meaningful in subscription mode.
+        # None means "not applicable / could not determine" — in api_key mode
+        # (no session concept), or when the codex CLI is not resolvable so the
+        # existence check cannot run. NEVER calls `codex login`, only the
+        # non-raising `codex login status` probe.
+        subscription_session_present: bool | None = None
+        if mode == "subscription":
+            from ..agent.codex_backend import codex_login_status, find_codex_cli
+            if find_codex_cli() is not None:
+                st = codex_login_status()
+                # via == "api_key" is a key-backed session, not the ChatGPT plan
+                # this mode wants — treat it as "not signed in" for this field.
+                subscription_session_present = bool(
+                    st.present and st.via != "api_key")
+        model = str(
+            (on_disk.get("llm") or {}).get("codex_model")
+            or default_codex_model(mode or "api_key"))
+        return {
+            "auth_mode": mode,
+            "api_key_present": api_key_present,
+            "subscription_session_present": subscription_session_present,
+            "model": model,
+            "restart_required": bool(
+                running_mode is not None and running_mode != mode),
+        }
+    except Exception:  # noqa: BLE001 — a Codex problem must not break Claude status
+        return None
 
 
 def _backend_cli_present() -> bool:
@@ -2566,7 +2641,11 @@ def _backend_cli_present() -> bool:
 @app.get("/api/auth/status")
 async def api_auth_status(request: Request) -> dict[str, Any]:
     _require_local_origin(request)
-    return _auth_status_payload(request)
+    # Offloaded because the codex block can shell out to `codex login status`
+    # (up to a 10s timeout) in subscription mode — the same reason /api/models
+    # runs its payload in a thread. In the default api_key mode this is a pure
+    # in-memory read and the thread hop is negligible.
+    return await asyncio.to_thread(_auth_status_payload, request)
 
 
 @app.put("/api/auth/token")
@@ -2611,7 +2690,7 @@ async def api_set_auth_token(request: Request) -> dict[str, Any]:
         # the token; surfacing one is what makes the Settings form usable.
         raise HTTPException(422, str(exc)) from exc
 
-    payload = _auth_status_payload(request)
+    payload = await asyncio.to_thread(_auth_status_payload, request)
     # A restart is needed whenever the RUNNING process is still exporting a
     # different value for the profile it is billing — which is exactly what
     # rotating the active profile's token does, and the case the name-only
@@ -2621,6 +2700,80 @@ async def api_set_auth_token(request: Request) -> dict[str, Any]:
         if running and written == profile_token_var(running):
             if os.environ.get(SUBSCRIPTION_TOKEN_VAR) != token:
                 payload["restart_required"] = True
+    return payload
+
+
+@app.put("/api/auth/codex-mode")
+async def api_set_codex_mode(request: Request) -> dict[str, Any]:
+    """Set ``llm.codex_auth_mode`` (``"api_key"`` | ``"subscription"``).
+
+    The MODE may live in config.yaml (constraint #6b); this writes it through
+    the same config-splice discipline ``/api/config/models`` and
+    ``/api/config/coder-backend`` use (``config.set_codex_auth_mode`` ->
+    ``_splice_llm_scalar``, preserving the operator's comments), never a
+    hand-rolled YAML edit. The body is parsed by hand so a malformed request
+    gets one short operator-facing sentence, not pydantic's error tree. No
+    credential is read or written here — only a mode word.
+    """
+    from ..config import (
+        CODEX_AUTH_MODES,
+        CONFIG_PATH,
+        AuthError,
+        set_codex_auth_mode,
+    )
+
+    _require_local_origin(request, writing=True)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(422, "expected a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected a JSON object")
+    mode = body.get("mode")
+    if not isinstance(mode, str) or mode.strip().lower() not in CODEX_AUTH_MODES:
+        raise HTTPException(
+            422, f"'mode' must be one of {sorted(CODEX_AUTH_MODES)}")
+    try:
+        await asyncio.to_thread(
+            set_codex_auth_mode, mode.strip().lower(), CONFIG_PATH)
+    except (ValueError, AuthError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return await asyncio.to_thread(_auth_status_payload, request)
+
+
+@app.put("/api/auth/codex-key")
+async def api_set_codex_key(request: Request) -> dict[str, Any]:
+    """Store the Codex backend's API key in ``~/.no_human/.env`` (never config.yaml).
+
+    The Codex twin of ``PUT /api/auth/token``: a `.env`-only credential write
+    through ``config.set_codex_api_key`` (``upsert_env_var``, chmod 600). The
+    body is parsed BY HAND so a pydantic 422 can never echo the key back
+    (constraint §8), and the response returns the VARIABLE NAME only — the key
+    value is never returned, logged or echoed. Allowed here ONLY because it is
+    an .env write; the key never reaches config.
+    """
+    from ..config import AuthError, set_codex_api_key
+
+    _require_local_origin(request, writing=True)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — never surface the raw body
+        raise HTTPException(422, "expected a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected a JSON object")
+    key = body.get("key")
+    # Shape only — never the value.
+    if not isinstance(key, str):
+        raise HTTPException(422, "'key' is required and must be a string")
+    try:
+        written = await asyncio.to_thread(set_codex_api_key, key)
+    except AuthError as exc:
+        # AuthError messages are written to be human-facing and never contain
+        # the key.
+        raise HTTPException(422, str(exc)) from exc
+
+    payload = await asyncio.to_thread(_auth_status_payload, request)
+    payload["codex_key_var"] = written
     return payload
 def _bench_payload(card: "NorthStarCard", refusals: list[str]) -> dict[str, Any]:
     """The wire shape of a bench card. One function so the healthy and the

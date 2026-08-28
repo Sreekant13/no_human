@@ -398,6 +398,21 @@ export async function setAuthToken(profile, token) {
   return _put("/api/auth/token", { profile, token });
 }
 
+// Set the Codex coder backend's auth mode ("api_key" | "subscription"). Writes
+// llm.codex_auth_mode to config.yaml server-side; the KEY never travels here.
+// `_put` throws Error(detail) verbatim on a 422. Returns the auth status shape.
+export async function setCodexMode(mode) {
+  return _put("/api/auth/codex-mode", { mode });
+}
+
+// Write the OpenAI API key to ~/.no_human/.env (never config). Same write-only
+// discipline as setAuthToken: the value is cleared on submit and never returned
+// by the server (the response carries the variable NAME only). `_put` throws
+// Error(detail) verbatim on a 422 (empty/newline-injected key).
+export async function setCodexKey(key) {
+  return _put("/api/auth/codex-key", { key });
+}
+
 // Settings → Models pane. Returns null when the endpoint is absent (an older
 // server build) OR when the SPA catch-all answers with `index.html` at status
 // 200 instead of real JSON — `r.json()` on an HTML body throws, and that

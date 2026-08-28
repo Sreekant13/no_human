@@ -6,7 +6,7 @@ import {
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo,
-  fetchAuthStatus, setAuthToken, fetchVersion,
+  fetchAuthStatus, setAuthToken, setCodexMode, setCodexKey, fetchVersion,
   fetchRetireCandidates, retireLearning, restoreLearning,
   fetchQuarantineCounts, fetchTelemetryConsent, saveTelemetryConsent,
 } from "./api.js";
@@ -326,6 +326,129 @@ function AuthPanel() {
               {saving ? "Saving…" : "Save token"}
             </button>
           </form>
+        </>
+      )}
+
+      <CodexSection codex={status.codex} onStatus={setStatus} />
+    </div>
+  );
+}
+
+// The Codex coder backend, first-class in the Account panel alongside Claude:
+// its auth mode, credential presence and a write-only key field (api_key mode)
+// or a `codex login` session indicator (subscription mode). Degrades to nothing
+// when the payload lacks `codex` (an older server), so no crash there.
+function CodexSection({ codex, onStatus }) {
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  if (!codex) return null;
+
+  async function apply(fn) {
+    setBusy(true); setError(null); setSaved(false);
+    try {
+      const next = await fn();
+      onStatus(next);
+      setSaved(true);
+    } catch (err) {
+      setError(err.message);   // the backend's 422 detail, verbatim
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function switchMode(mode) {
+    if (busy || mode === codex.auth_mode) return;
+    await apply(() => setCodexMode(mode));
+  }
+
+  async function saveKey(e) {
+    e.preventDefault();
+    if (!key.trim() || busy) return;
+    await apply(async () => {
+      const next = await setCodexKey(key);
+      setKey("");              // write-only — never keep the key after submit
+      return next;
+    });
+  }
+
+  return (
+    <div className="auth-codex">
+      <div className="memory-header">
+        <h3 className="memory-title"><span className="panel-title-text">Codex</span></h3>
+      </div>
+
+      {codex.restart_required && (
+        <div className="nh-alarm auth-alarm" role="alert">
+          Restart required — the running server is still using the previous
+          Codex auth mode. Restart no_human to switch.
+        </div>
+      )}
+
+      <dl className="auth-status">
+        <div><dt>Auth mode</dt><dd>{codex.auth_mode || "—"}</dd></div>
+        <div><dt>Model</dt><dd><code>{codex.model || "—"}</code></dd></div>
+      </dl>
+
+      <div className="auth-codex-modes" role="group" aria-label="Codex auth mode">
+        <button type="button" className="btn"
+                aria-pressed={codex.auth_mode === "api_key"}
+                disabled={busy || codex.auth_mode === "api_key"}
+                onClick={() => switchMode("api_key")}>
+          Your OpenAI API key
+        </button>
+        <button type="button" className="btn"
+                aria-pressed={codex.auth_mode === "subscription"}
+                disabled={busy || codex.auth_mode === "subscription"}
+                onClick={() => switchMode("subscription")}>
+          ChatGPT subscription
+        </button>
+      </div>
+
+      {codex.auth_mode === "api_key" && (
+        <>
+          <dl className="auth-status">
+            <div><dt>API key set</dt><dd>{codex.api_key_present ? "yes" : "no"}</dd></div>
+            <div><dt>Key source</dt><dd><code>~/.no_human/.env</code> (chmod 600)</dd></div>
+          </dl>
+          <form className="auth-form" onSubmit={saveKey} autoComplete="off">
+            <label className="auth-label">OpenAI API key
+              <input className="new-task-input" type="password" autoComplete="off"
+                     spellCheck={false} value={key} aria-label="OpenAI API key"
+                     placeholder="OPENAI_API_KEY (sk-…)"
+                     onChange={(e) => { setKey(e.target.value); setSaved(false); setError(null); }} />
+            </label>
+            <p className="auth-hint">
+              Your own OpenAI API key. Stored write-only in the private .env and
+              never shown again — never in config.yaml.
+            </p>
+            {error && <div className="settings-error" role="alert">{error}</div>}
+            {saved && <div className="auth-saved" role="status">Saved.</div>}
+            <button className="btn btn-approve" type="submit" disabled={!key.trim() || busy}>
+              {busy ? "Saving…" : "Save key"}
+            </button>
+          </form>
+        </>
+      )}
+
+      {codex.auth_mode === "subscription" && (
+        <>
+          <dl className="auth-status">
+            <div><dt>Signed in via <code>codex login</code></dt>
+              <dd>
+                {codex.subscription_session_present === true && "✓ signed in"}
+                {codex.subscription_session_present === false && "✗ run codex login"}
+                {codex.subscription_session_present == null && "— unknown (codex CLI not found)"}
+              </dd>
+            </div>
+          </dl>
+          <p className="auth-hint">
+            no_human holds no OpenAI credential in this mode — sign in yourself
+            with <code>codex login</code>. There is no key to enter here.
+          </p>
+          {error && <div className="settings-error" role="alert">{error}</div>}
         </>
       )}
     </div>

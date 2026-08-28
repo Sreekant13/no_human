@@ -1124,6 +1124,46 @@ def set_profile_token(profile: str, token: str,
     return key
 
 
+def assert_codex_api_key_usable(key: str) -> str:
+    """Refuse an OpenAI API key that cannot be written; return it stripped.
+
+    The Codex twin of :func:`assert_oauth_token_usable`: reject an empty key,
+    an implausibly long one, or one carrying a line break that would forge a
+    second .env line (a planted ``ANTHROPIC_API_KEY=`` among them — the
+    metered-billing escape constraint #1 shuts). No vendor-shape check: unlike
+    the OAuth field, any non-empty single line is a plausible ``OPENAI_API_KEY``.
+    Never echoes the key.
+    """
+    key = (key or "").strip()
+    if not key:
+        raise AuthError("key must not be empty")
+    if len(key) > MAX_TOKEN_LEN:
+        raise AuthError(
+            f"key is implausibly long ({len(key)} chars, max {MAX_TOKEN_LEN}) "
+            "— refusing to write it")
+    assert_single_env_line(key, "key")
+    return key
+
+
+def set_codex_api_key(key: str, env_path: Path | None = None) -> str:
+    """Store the OpenAI API key in ``~/.no_human/.env``; return the VARIABLE NAME.
+
+    The KEY never goes in config.yaml — only the .env (chmod 600, gitignored),
+    the same discipline :func:`set_profile_token` follows for the OAuth token
+    (``_reject_api_key_in_config`` names both vendors' keys). Returns
+    ``CODEX_API_KEY_VAR`` (``"OPENAI_API_KEY"``) only; the key is never
+    returned, logged or echoed (constraint §8).
+
+    ``env_path`` is resolved at CALL time, not bound as a default argument —
+    the same trap :func:`set_profile_token` documents (a captured ``= ENV_PATH``
+    default clobbers the operator's REAL credential file under a test redirect).
+    """
+    env_path = ENV_PATH if env_path is None else env_path
+    key = assert_codex_api_key_usable(key)
+    upsert_env_var(env_path, CODEX_API_KEY_VAR, key)
+    return CODEX_API_KEY_VAR
+
+
 def _assert_api_key_mode(env_path: Path | None) -> ScrubReport:
     """BYO-API-key billing (``llm.auth_mode: "api_key"``).
 
@@ -2636,6 +2676,41 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
             f"after the edit, not {profile!r}. The file has been restored."
         )
     return profile
+
+
+def set_codex_auth_mode(mode: str, config_path: Path = CONFIG_PATH) -> str:
+    """Pin ``llm.codex_auth_mode`` in config.yaml. Returns the normalized mode.
+
+    The MODE may live in config.yaml (constraint #6b); the OpenAI KEY never
+    does — that goes to ``~/.no_human/.env`` via :func:`set_codex_api_key`.
+    Same text-splice-preserving-comments discipline as :func:`set_auth_profile`
+    (the value — ``api_key`` / ``subscription`` — is a bare word that cannot
+    inject YAML structure): validate first, splice via ``_splice_llm_scalar``,
+    verify by re-resolving, restore the original file on any mismatch.
+    """
+    mode = str(mode or "").strip().lower()
+    if mode not in CODEX_AUTH_MODES:
+        raise ValueError(
+            f"codex auth mode {mode!r} is invalid; must be one of "
+            f"{sorted(CODEX_AUTH_MODES)!r}"
+        )
+
+    load_config(config_path)  # materialize a default file if there is none
+    original = config_path.read_text()
+    lines = original.splitlines()
+    _splice_llm_scalar(lines, "codex_auth_mode", mode)
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(config_path, original, "set codex auth mode")
+
+    resolved = load_config(config_path).data.get("llm", {}).get("codex_auth_mode")
+    if resolved != mode:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set codex auth mode: {config_path} resolved to "
+            f"{resolved!r} after the edit, not {mode!r}. The file has been "
+            "restored."
+        )
+    return mode
 
 
 #: A bare model id, as YAML would parse it back unquoted: letters, digits,

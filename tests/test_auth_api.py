@@ -28,7 +28,13 @@ async def client(tmp_path, monkeypatch):
     app.state.store = store
     app.state.config = load_config(tmp_path / "config.yaml")
     monkeypatch.setattr("no_human.config.ENV_PATH", tmp_path / ".env")
+    # SAME HARD GUARD for config.yaml: the Codex-mode write endpoint and the
+    # codex status block both splice/read the REAL ~/.no_human/config.yaml via
+    # config.CONFIG_PATH. Redirect it to the tmp file app.state.config was
+    # loaded from, or a test would edit the operator's live config.
+    monkeypatch.setattr("no_human.config.CONFIG_PATH", tmp_path / "config.yaml")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     # HARD GUARD. These tests write real-looking credentials. An earlier draft
     # of set_profile_token bound `env_path = ENV_PATH` as a DEFAULT ARGUMENT,
     # captured at import, so this redirect was silently ignored and the test
@@ -828,3 +834,169 @@ def test_a_symlinked_home_logs_the_downgrade_but_a_planted_leaf_is_silent(
         cfg.ensure_private_dir(linked_home)
     assert any("symlink" in r.message and "0600" in r.message
                for r in caplog.records), caplog.text
+
+
+# =========================== Codex, first-class ============================= #
+#
+# Codex made first-class in Settings' Account panel alongside Claude: the auth
+# MODE may live in config.yaml (constraint #6b), the OpenAI KEY only in the
+# private .env, and neither the status block nor either write ever returns,
+# logs or echoes a credential value (constraint §8).
+
+@pytest.mark.asyncio
+async def test_status_carries_a_codex_block(client):
+    """The default install (llm.codex_auth_mode unset) reads as api_key, and
+    every codex field is a name/bool/None — never a credential value."""
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200
+    codex = r.json()["codex"]
+    assert codex["auth_mode"] == "api_key"
+    assert isinstance(codex["api_key_present"], bool)
+    # subscription session is not a concept in api_key mode -> null, never a probe
+    assert codex["subscription_session_present"] is None
+    assert isinstance(codex["model"], str) and codex["model"]
+
+
+@pytest.mark.asyncio
+async def test_status_codex_never_leaks_the_openai_key(client, tmp_path):
+    """api_key_present detects a key in .env; the value never reaches the wire."""
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-openai-SECRET-xyz\n")
+    r = await client.get("/api/auth/status")
+    assert r.json()["codex"]["api_key_present"] is True
+    assert "sk-openai-SECRET-xyz" not in r.text
+    assert "SECRET" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_status_codex_subscription_session_null_when_cli_absent(
+        client, tmp_path, monkeypatch):
+    """subscription mode + no resolvable codex CLI -> null (can't run the
+    existence check), and the GET must not shell out or 500."""
+    (tmp_path / "config.yaml").write_text("llm:\n  codex_auth_mode: subscription\n")
+    monkeypatch.setattr(
+        "no_human.agent.codex_backend.find_codex_cli", lambda *a, **k: None)
+    r = await client.get("/api/auth/status")
+    codex = r.json()["codex"]
+    assert codex["auth_mode"] == "subscription"
+    assert codex["subscription_session_present"] is None
+
+
+@pytest.mark.asyncio
+async def test_status_codex_subscription_session_present_when_signed_in(
+        client, tmp_path, monkeypatch):
+    """A live ChatGPT session (via `codex login status`, existence-check only)
+    surfaces as True — never `codex login`, never a credential value."""
+    from no_human.agent.codex_backend import CodexSessionStatus
+    (tmp_path / "config.yaml").write_text("llm:\n  codex_auth_mode: subscription\n")
+    monkeypatch.setattr(
+        "no_human.agent.codex_backend.find_codex_cli", lambda *a, **k: "/x/codex")
+    monkeypatch.setattr(
+        "no_human.agent.codex_backend.codex_login_status",
+        lambda *a, **k: CodexSessionStatus(present=True, via="chatgpt"))
+    r = await client.get("/api/auth/status")
+    assert r.json()["codex"]["subscription_session_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_codex_mode_writes_config_not_env(client, tmp_path, monkeypatch):
+    """The MODE goes to config.yaml, never .env — the mirror of the KEY rule."""
+    monkeypatch.setattr(
+        "no_human.agent.codex_backend.find_codex_cli", lambda *a, **k: None)
+    r = await client.put("/api/auth/codex-mode", json={"mode": "subscription"})
+    assert r.status_code == 200, r.text
+    assert "codex_auth_mode: subscription" in (tmp_path / "config.yaml").read_text()
+    assert not (tmp_path / ".env").exists()       # a MODE write never touches .env
+    assert r.json()["codex"]["auth_mode"] == "subscription"
+
+
+@pytest.mark.asyncio
+async def test_put_codex_mode_rejects_an_unknown_mode(client):
+    r = await client.put("/api/auth/codex-mode", json={"mode": "gpt5"})
+    assert r.status_code == 422
+    assert "api_key" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_codex_mode_cross_origin_is_refused(client, tmp_path):
+    r = await client.put("/api/auth/codex-mode", json={"mode": "subscription"},
+                         headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    # nothing written under a rejected origin
+    cfg = tmp_path / "config.yaml"
+    assert not cfg.exists() or "codex_auth_mode: subscription" not in cfg.read_text()
+
+
+@pytest.mark.asyncio
+async def test_put_codex_key_writes_env_not_config_and_never_echoes(
+        client, tmp_path):
+    """The KEY goes to ~/.no_human/.env only; the response carries the variable
+    NAME, never the value (constraint §8)."""
+    r = await client.put("/api/auth/codex-key", json={"key": "sk-openai-REAL-99"})
+    assert r.status_code == 200, r.text
+    assert "OPENAI_API_KEY=sk-openai-REAL-99" in (tmp_path / ".env").read_text()
+    cfg = tmp_path / "config.yaml"
+    if cfg.exists():
+        assert "sk-openai-REAL-99" not in cfg.read_text()
+    assert r.json()["codex_key_var"] == "OPENAI_API_KEY"
+    assert "sk-openai-REAL-99" not in r.text
+    assert r.json()["codex"]["api_key_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_codex_key_file_is_owner_only(client, tmp_path):
+    await client.put("/api/auth/codex-key", json={"key": "sk-openai-x"})
+    assert oct((tmp_path / ".env").stat().st_mode)[-3:] == "600"
+
+
+@pytest.mark.asyncio
+async def test_put_codex_key_refuses_an_empty_key(client, tmp_path):
+    r = await client.put("/api/auth/codex-key", json={"key": "   "})
+    assert r.status_code == 422
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r", " ", "\x00"])
+@pytest.mark.asyncio
+async def test_put_codex_key_refuses_line_injection(client, tmp_path, sep):
+    """A break in the key would forge a second .env line — an ANTHROPIC_API_KEY
+    among them is the metered-billing escape constraint #1 shuts."""
+    r = await client.put(
+        "/api/auth/codex-key",
+        json={"key": f"sk-openai{sep}ANTHROPIC_API_KEY=sk-ant-api03-forged"})
+    assert r.status_code == 422, sep
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_put_codex_key_refusal_never_echoes_the_key(client):
+    """The 422 detail names the problem, never the submitted value."""
+    r = await client.put(
+        "/api/auth/codex-key", json={"key": "sk-openai-LEAKME\nX=y"})
+    assert r.status_code == 422
+    assert "sk-openai-LEAKME" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_codex_key_cross_origin_is_refused(client, tmp_path):
+    """The same drive-by CSRF guard the token route has — this route writes the
+    SAME ~/.no_human/.env."""
+    r = await client.put("/api/auth/codex-key", json={"key": "sk-openai-x"},
+                         headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    assert not (tmp_path / ".env").exists()
+
+
+def test_set_codex_api_key_returns_the_var_name_only(tmp_path):
+    """Unit guard: the writer returns the NAME, and .env holds the value while
+    config.yaml never can (the KEY-in-.env, MODE-in-config split)."""
+    from no_human.config import set_codex_api_key
+    env = tmp_path / ".env"
+    assert set_codex_api_key("sk-openai-unit", env_path=env) == "OPENAI_API_KEY"
+    assert "OPENAI_API_KEY=sk-openai-unit" in env.read_text()
+
+
+def test_set_codex_auth_mode_rejects_a_bad_value(tmp_path):
+    from no_human.config import set_codex_auth_mode
+    cfg = tmp_path / "config.yaml"
+    with pytest.raises(ValueError):
+        set_codex_auth_mode("chatgpt-please", config_path=cfg)

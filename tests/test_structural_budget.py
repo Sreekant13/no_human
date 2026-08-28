@@ -132,11 +132,16 @@ FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py": 19473,
     "cli/commands.py": 7801,
-    "api/app.py": 5175,
-    "core/db.py": 4253,
+    # +163: Codex account section in the Settings Account tab —
+    # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
+    # scoping filter in _gather_history.
+    "api/app.py": 5338,
+    # +51: W5 active-time phase writer (phase instrumentation).
+    "core/db.py": 4304,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
-    "config.py": 2974,
+    # +75: Codex account config helpers.
+    "config.py": 3049,
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2801,
