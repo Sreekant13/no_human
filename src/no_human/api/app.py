@@ -46,6 +46,7 @@ from pydantic import BaseModel
 
 from .. import __version__
 from ..agent.session_mark import AGENT_SESSION_HEADER, request_is_marked
+from ..blockers import process_actor
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
@@ -1193,7 +1194,8 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
                 await store.set_status(
                     task, TaskStatus.DONE, validate=False,
                     event={"source": "human", "kind": "approved_already_satisfied",
-                           "text": "already-satisfied claim confirmed by approve"},
+                           "text": "already-satisfied claim confirmed by approve",
+                           "actor": process_actor()},
                 )
                 message = ("Already satisfied claim confirmed — no code change was "
                            "needed. Task done (there is no PR; the agent never merges).")
@@ -1422,7 +1424,8 @@ async def _merge_task_pr(
     await store.set_status(
         task, TaskStatus.DONE, validate=False,
         event={"source": "human", "kind": "human_merged",
-               "sha": result.landed_sha, "text": result.message},
+               "sha": result.landed_sha, "text": result.message,
+               "actor": process_actor()},
     )
     await _emit_task_event(
         store, task.id, "human_merged", result.message, persist=False,
@@ -1448,7 +1451,8 @@ async def finish_review(task_id: str, request: Request) -> dict[str, Any]:
     await store.set_status(
         task, TaskStatus.DONE, validate=False,
         event={"source": "human", "kind": "review_finished",
-               "text": f"review finished — {posted}/{len(drafts)} comment(s) posted"},
+               "text": f"review finished — {posted}/{len(drafts)} comment(s) posted",
+               "actor": process_actor()},
     )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
@@ -1954,7 +1958,8 @@ async def mark_shipped(
     await store.set_status(
         task, TaskStatus.DONE, validate=False, human_override=True,
         event={"source": "human", "kind": "human_merged",
-               "sha": sha, "note": body.note, "ts": time.time()},
+               "sha": sha, "note": body.note, "ts": time.time(),
+               "actor": process_actor()},
     )
     attempts = await store.list_attempts(task.id)
     tasks = await _board_tasks(store, scheduler=_sched(request))

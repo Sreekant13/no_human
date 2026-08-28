@@ -24,12 +24,42 @@ Typed-stop matrix (a PAUSE and a HOLD are mutually exclusive stop shapes):
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from ..core.task import TaskStatus
+
+#: Actor strings are rendered through rich's markup path (`[...]` = markup),
+#: and are treated as untrusted-adjacent, so only these characters survive.
+#: `[`/`]` are NOT in the set, which neutralises markup injection at the source.
+_ACTOR_ALLOWED = re.compile(r"[^A-Za-z0-9._:-]")
+
+
+def process_actor() -> str:
+    """A SERVER/PROCESS-derived actor for human landing/approval events, so a
+    landing can be attributed when several agent sessions share one git
+    identity (fleet task 61c219c8).
+
+    Composed ONLY of process-side facts: this process's pid, plus the
+    ``NO_HUMAN_AGENT_SESSION`` mark it was launched with when present (via
+    ``current_mark()`` — the same fail-closed read the gate uses; the mark's
+    *kind* is the useful discriminator, ``session:<kind>``). It NEVER folds in
+    any client- or request-supplied value (no request header, no
+    ``x-request-id``) — those are attacker-controllable and must not reach an
+    audit actor. The result is sanitised to ``[A-Za-z0-9._:-]`` and truncated,
+    so it is safe to render through any rich/markup path.
+    """
+    from ..agent.session_mark import current_mark
+
+    parts = [f"pid:{os.getpid()}"]
+    mark = current_mark()
+    if mark is not None:
+        parts.append(f"session:{mark}")
+    return _ACTOR_ALLOWED.sub("_", ":".join(parts))[:96]
 
 
 class BlockerCategory(str, Enum):

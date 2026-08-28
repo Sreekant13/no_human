@@ -94,7 +94,7 @@ FROZEN_FUNCTION_LINES = {
     # Grew to 314 (> 300) when the done_no_evidence repair shape landed
     # (task bf413cc6): two new refusal guards + the DONE branch. The growth
     # was reviewed on its merits; frozen here as its landing baseline.
-    "blockers/landed_override.py:approve_landed_override": 314,
+    "blockers/landed_override.py:approve_landed_override": 315,
     "core/metrics.py:compute_metrics": 313,
 }
 
@@ -131,8 +131,8 @@ FROZEN_FUNCTION_CC = {
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py": 19473,
-    "cli/commands.py": 7783,
-    "api/app.py": 5170,
+    "cli/commands.py": 7801,
+    "api/app.py": 5175,
     "core/db.py": 4253,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).

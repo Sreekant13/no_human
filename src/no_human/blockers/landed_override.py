@@ -180,6 +180,7 @@ from ..vcs.pr_watcher import (
 )
 from ..vcs.task_pr import DONE_EVIDENCE_KINDS, task_has_pr_evidence
 from .pr_closeout import close_task_prs_on_completion
+from .taxonomy import process_actor
 
 LANDED_OVERRIDE_KIND = "approved_landed_override"
 
@@ -751,6 +752,7 @@ async def approve_landed_override(
     event = {
         "source": human,
         "kind": LANDED_OVERRIDE_KIND,
+        "actor": process_actor(),
         "sha": sha,
         "justification": justification,
         "residue": residue,

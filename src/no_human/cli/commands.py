@@ -1576,6 +1576,19 @@ def task_show(task_id):
                 console.print(
                     f"[yellow]Escalated at attempt {lat['attempts_before_escalation']} "
                     f"after {lat['tokens_before_escalation']:,} tokens[/]")
+            # Completion events carry WHO landed the task (the process-derived
+            # `actor`, fleet task 61c219c8) — surface it so a landing is
+            # attributable even when several agent sessions share one git
+            # identity. `markup=False`: the actor is already sanitised at the
+            # write end, this is defence in depth for the whole line.
+            for e in events:
+                if e.get("kind") in _COMPLETION_EVENT_KINDS:
+                    line = f"completion: {e.get('kind')}"
+                    if e.get("actor"):
+                        line += f" (actor: {e['actor']})"
+                    if e.get("text"):
+                        line += f" — {e['text']}"
+                    console.print(line, markup=False)
             attempts = await store.list_attempts(t.id)
             for a in attempts:
                 console.print(
@@ -1743,6 +1756,7 @@ def task_resume(task_id):
 _COMPLETION_EVENT_KINDS = frozenset({
     "merged", "shipped", "shipped_pr_closed", "shipped_comment_after_landing",
     "human_merged", "approved_already_satisfied", "review_finished",
+    "approved_landed_override",
 })
 
 
@@ -4681,10 +4695,12 @@ def approve(task_id, landed_sha, justification, base_branch):
             # round-2 review).
             pr_url = await task_has_pr_evidence(store, t)
             if (t.context or {}).get("already_satisfied_report") and not pr_url:
+                from ..blockers import process_actor
                 await store.set_status(
                     t, TaskStatus.DONE, validate=False,
                     event={"source": "human", "kind": "approved_already_satisfied",
-                           "text": "already-satisfied claim confirmed by approve"},
+                           "text": "already-satisfied claim confirmed by approve",
+                           "actor": process_actor()},
                 )
                 console.print(
                     f"[bold green]approved[/] {t.id[:8]} — already satisfied "
@@ -4782,10 +4798,12 @@ def approve(task_id, landed_sha, justification, base_branch):
                 )
                 sys.exit(1)
 
+            from ..blockers import process_actor
             await store.set_status(
                 t, TaskStatus.DONE, validate=False,
                 event={"source": "human", "kind": "human_merged",
-                       "sha": result.landed_sha, "text": result.message},
+                       "sha": result.landed_sha, "text": result.message,
+                       "actor": process_actor()},
             )
             console.print(
                 f"[bold green]merged[/] {t.id[:8]} — landed "
