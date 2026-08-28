@@ -145,7 +145,9 @@ FROZEN_FILE_LINES = {
     "review/reviewer.py": 2835,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2801,
-    "core/scheduler.py": 2522,
+    # +44: idle-path recover_quota_cooldown gate in tick() and the
+    # never-shorten-a-live-wall guard in _run — the quota-wall storm cost fix.
+    "core/scheduler.py": 2566,
 }
 
 

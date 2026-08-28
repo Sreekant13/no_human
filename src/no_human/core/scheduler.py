@@ -1831,6 +1831,31 @@ class Scheduler:
             self._infra_cooldown_active = True
             self._on_event("quota_pause", f"fleet paused — {infra_reason}")
 
+        # Re-derive an open quota wall the DB already names but this PROCESS's
+        # memory does not — the same recovery `run_forever` does once at
+        # startup, now also mid-run so a running fleet stops feeding the queue
+        # into a wall recorded by a worker whose `_run` has set the row
+        # PAUSED_QUOTA (`_park_quota`) but not yet unwound to arm the in-memory
+        # clock (that arming is one tick late), or by another process.
+        #
+        # Gated on `self._quota_wall is None`: once THIS process has resolved
+        # ANY wall (its own `_run` park or startup recovery both set it, even
+        # after it lapses), the resume path owns lapse handling and re-deriving
+        # the pool clock from a park's own raise-time-plus-an-hour
+        # `wake_check_at` would re-arm a wall that has actually reset — the
+        # 2026-08-20 starvation `_resume_quota_parks` exists to prevent. Before
+        # the first wall there is no resume in flight to fight, and startup
+        # recovery has already seeded `_quota_wall` from any park that predated
+        # this process — so a park seen here with `_quota_wall` still None is a
+        # FRESH wall whose future reset is real. `recover_quota_cooldown` never
+        # shortens a live cooldown and arms nothing for a lapsed/other-profile/
+        # infra park, so this is a cheap no-op on the healthy path.
+        if self._quota_wall is None and not self._in_quota_cooldown(now):
+            try:
+                await self.recover_quota_cooldown()
+            except Exception as exc:  # noqa: BLE001 — recovery must not kill the pool
+                log.warning("idle quota-cooldown recovery failed: %s", exc)
+
         # Edge-detect "the cooldown just ended" (or "this is the very first
         # tick", since `_was_cooling`/`_resume_parks_pending` both start
         # False/True respectively) so the resume sweep below runs exactly
@@ -1986,10 +2011,29 @@ class Scheduler:
                     and not parked_blocker.get("infra")):
                 resets = _parse_iso(getattr(outcome.task, "wake_check_at", None))
                 if resets is not None:
+                    now = datetime.now(timezone.utc)
+                    prof = active_auth_profile()
+                    # Never let THIS park SHORTEN a wall this process is already
+                    # holding for the same profile. Two workers dispatched
+                    # before the clock armed race the same wall, and the one
+                    # that parks second can carry an EARLIER reset — a stale
+                    # banner, or the fallback hour under-estimating a longer
+                    # real reset. Overwriting the live clock with it resumes the
+                    # pool early, straight back into the same wall it just
+                    # paused on. Keep the later of the two; a genuinely later
+                    # reset (the fresher, more accurate one) still extends it.
+                    # An UNRELATED park (a different `auth_profile`, or an
+                    # unattributed one) is a wall of its own and adopts its own
+                    # reset — the guard restricts the floor to same/unstamped.
+                    if (self._quota_wall is not None
+                            and self._quota_wall_profile in (None, prof)
+                            and self._quota_wall > now
+                            and self._quota_wall > resets):
+                        resets = self._quota_wall
                     self._quota_cooldown_until = resets
                     self._infra_cooldown_active = False
                     self._quota_wall = resets
-                    self._quota_wall_profile = active_auth_profile()
+                    self._quota_wall_profile = prof
                     self._on_event("quota_pause",
                                    f"pool paused until {resets.isoformat()}")
         except Exception as exc:  # noqa: BLE001 — one task must not kill the pool
