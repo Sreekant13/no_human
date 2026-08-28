@@ -746,6 +746,25 @@ def test_codex_version_timeout_degrades_to_the_placeholder(monkeypatch):
 # 2c. The legal wording is sourced, honest, and behaviour-free                 #
 # --------------------------------------------------------------------------- #
 
+def _shipped_src_and_docs(root: Path) -> list[Path]:
+    """The git-TRACKED ``.py`` under ``src/`` and ``.md`` under ``docs/`` — the
+    files that can actually ship. An ``rglob`` over the filesystem also sweeps up
+    untracked local working notes (a dev's scratch plan under docs/), which a
+    "no *shipped* file …" guard must never judge and which no clean checkout or
+    CI run even has — only what git tracks reaches the export.
+    """
+    out = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--", "src", "docs"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return [
+        root / p
+        for p in out.split("\0")
+        if p and ((p.startswith("src/") and p.endswith(".py"))
+                  or (p.startswith("docs/") and p.endswith(".md")))
+    ]
+
+
 def test_no_shipped_file_asserts_an_unsourced_openai_prohibition():
     """AC1: no shipped file under src/ or docs/ asserts, as fact, that
     OpenAI's terms prohibit using ChatGPT to power a third-party service —
@@ -760,7 +779,7 @@ def test_no_shipped_file_asserts_an_unsourced_openai_prohibition():
     assert literal in needle
 
     root = Path(cx.__file__).resolve().parents[3]
-    scanned = list((root / "src").rglob("*.py")) + list((root / "docs").rglob("*.md"))
+    scanned = _shipped_src_and_docs(root)
     assert scanned, "the scan must not be scanning nothing"
     # Second positive control: this file is in the scanned set and carries a
     # known-present token, so an empty/misdirected scan cannot pass silently.
@@ -806,7 +825,7 @@ def test_the_api_key_comment_names_the_real_enforcement_and_not_the_ignored_flag
     assert retired.search(needle), "the scanner's own regex is broken"
 
     root = Path(cx.__file__).resolve().parents[3]
-    scanned = list((root / "src").rglob("*.py")) + list((root / "docs").rglob("*.md"))
+    scanned = _shipped_src_and_docs(root)
     assert scanned, "the scan must not be scanning nothing"
     assert any(
         p.name == "codex_backend.py" and "preferred_auth_method" in p.read_text()
