@@ -4,10 +4,9 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.6] — 2026-08-28
 
-Draft for 0.1.6 (finalize the range + date at cut time). Release range so far
-`8a55a92d3..732c869727`, each change landed behind an independent
+Release range `8a55a92d3..c3cd200bf1`, each change landed behind an independent
 fresh-context review. Themed highlights below; the git range is the full record.
 
 ### Changed — onboarding, rebuilt around real-user feedback
@@ -55,9 +54,15 @@ fresh-context review. Themed highlights below; the git range is the full record.
 - Wiki generation as a persisted background job with structured output.
 - `verify-history --since <ref>` for an incremental public-export history scan.
 - Per-phase task timestamps + a "ran vs wall" breakdown in the task drawer.
-- _(pending this cut: a coder-backend + local-model/server-URL selector in the
-  Settings → Models pane, so a local-model install is configurable from the
-  board — coder role only, per the pinned-roles constraint.)_
+- **A local-model selector in Settings → Models**: the `local` coder backend
+  and its model + server-URL are now configurable from the board (previously the
+  backend could only be reached from the CLI/API, so an installed local server
+  was unselectable in the UI). Coder role only — the reviewer, planner,
+  supervisor and utility tiers stay on Claude per the pinned-roles constraint;
+  the server's key never enters `config.yaml` (only the mode/URL), staying in
+  `~/.no_human/.env`. The local base-URL validator was hardened to loopback or
+  literal RFC1918 only, closing a metadata-endpoint (cloud IMDS) SSRF surface
+  that the new write path would otherwise have exposed.
 
 ## [0.1.5] — 2026-08-27
 
