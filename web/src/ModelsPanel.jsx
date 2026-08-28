@@ -118,6 +118,19 @@ function CoderBackendRow() {
       </span>
       {showLocal && (
         <div className="local-backend-fields">
+          <div className="ntm-hint">
+            <span aria-hidden="true">ⓘ</span> You run your own
+            Anthropic-compatible server (vLLM, llama.cpp, LM Studio, …) on
+            localhost or an RFC1918 address; no_human points its coder at it.
+            Enter the model id it exposes and its base URL below.{" "}
+            <a
+              href="https://getnohuman.com/docs#backends"
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              Local models docs ↗
+            </a>
+          </div>
           {lf.fields.map((f) => (
             <label className="auth-label" key={f.key}>
               {f.label}
