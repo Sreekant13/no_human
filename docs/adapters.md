@@ -1,8 +1,9 @@
 # Adapters
 
 no_human is a lean system: SQLite, agentic grep (no RAG/pgvector), and one
-coding backend per install — the Claude Agent SDK by default, OpenAI Codex as
-the sanctioned alternative (`worker.backend`; see [BACKENDS.md](BACKENDS.md)).
+coding backend per install — the Claude Agent SDK by default, with OpenAI Codex
+and a `local` Anthropic-compatible server as the two sanctioned alternatives
+(`worker.backend`; see [BACKENDS.md](BACKENDS.md)).
 "Adapters" are the read/write integrations around that core. They degrade gracefully: a missing CLI or down source is a
 best-effort skip, not a crash.
 

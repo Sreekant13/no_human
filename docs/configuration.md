@@ -20,7 +20,7 @@ changes in code and not here fails the suite.
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `concurrency.stop_grace_s` | `60` | Seconds a stopping server (`nh stop`, SIGTERM) waits for running attempts to checkpoint (`[WIP-PARTIAL]` commit + `resume_from`) and unwind before exiting anyway. `nh stop --timeout` defaults to this plus 15 |
-| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK) or `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. One task can override it: `nh task add --backend codex` (or `backend` on `POST /api/tasks`). See [BACKENDS.md](BACKENDS.md) |
+| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK), `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`) or `local` (the Claude Agent SDK pointed at an Anthropic-compatible server on loopback/RFC1918). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. One task can override it: `nh task add --backend codex` (or `backend` on `POST /api/tasks`). See [BACKENDS.md](BACKENDS.md) |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
@@ -73,6 +73,8 @@ credential at runtime, no_human escalates a `MISSING_ACCESS` blocker naming the
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Default `llm.auth_mode: subscription` — **required**, the coding backend's subscription auth. Create with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | Only when `llm.auth_mode: api_key` — the operator's own metered key, BYO-API-key billing (see below). Never set otherwise. |
+| `OPENAI_API_KEY` | **Required** when the coder runs on the `codex` backend (`worker.backend: codex`, or a task's `--backend codex`) in the default `llm.codex_auth_mode: api_key`. Not needed in codex `subscription` mode, where a `codex login` ChatGPT session pays instead. See [BACKENDS.md](BACKENDS.md). |
+| `LOCAL_LLM_API_KEY` | Only when the coder runs on the `local` backend (`worker.backend: local`) **and** your local server enforces a key — otherwise omit it. Never goes in `config.yaml`. See [BACKENDS.md](BACKENDS.md). |
 | `JIRA_API_TOKEN` | Jira intake (`integrations.jira.enabled: true`). An Atlassian Cloud API token; auth is HTTP Basic `integrations.jira.email` + this token. See [adapters.md](adapters.md#jira). |
 | `LINEAR_API_KEY` | Linear intake (`integrations.linear.enabled`). Create at Linear → Security & access settings. |
 | `MONDAY_API_TOKEN` | monday.com intake (`integrations.monday.enabled`). Create at monday.com → Administration → Connections → API. Sent raw as `Authorization`, not `Bearer`. See [adapters.md](adapters.md#mondaycom-specifics). |
@@ -128,7 +130,7 @@ notifications:                    # write-only notify-out; null = log only
                                   # "Open in no_human" button. Leave null unless
                                   # the board is reachable from where Teams is
                                   # read — a 127.0.0.1 link is dead on a phone.
-  email_to: you@example.com
+  email_to: dev@example.com
 
 integrations:
   jira:                           # polled intake (not `nh task add`); off by default
@@ -188,10 +190,18 @@ wired), so an integration with every setting filled in but
 `enabled: false` does nothing, and both UIs say so rather than reporting it as
 configured.
 
-approval:
-  require_before_merge: true      # ALWAYS true — agent never merges
-  auto_merge_on_approval: false   # there is no auto-merge
-  approval_timeout: 24h           # re-notify; never auto-proceed
+approval:                         # RESERVED — no code reads any key in this
+                                  # block (grep the names under src/no_human:
+                                  # each resolves only to its DEFAULT_CONFIG
+                                  # line). They are not live controls:
+  require_before_merge: true      #   the never-merge guarantee is structural
+                                  #   (constraint #2), not driven by this key;
+  auto_merge_on_approval: false   #   the key exists but no code path acts on
+                                  #   it — there is simply no auto-merge; and
+  approval_timeout: 24h           #   nothing re-notifies or times out on this.
+                                  # What actually governs whether `nh approve`
+                                  # LANDS the PR is the `approve_merge:` block
+                                  # (top-of-file table), which IS read.
 
 git:
   branch_prefix: "no-human/"
@@ -438,8 +448,8 @@ config, the key never does. If the local server enforces a key, it goes in
 `~/.no_human/.env` as `LOCAL_LLM_API_KEY`, never in `config.yaml`.
 `local_cli_path` is optional; `null` uses the SDK-bundled CLI.
 **These keys are live.** `local` is in `SUPPORTED_BACKENDS`
-(`agent/backend.py:256`) and `make_backend` has a real branch for it
-(`backend.py:448`); `worker.backend: local` resolves. It fails only when
+(`agent/backend.py:260`) and `make_backend` has a real branch for it
+(`backend.py:505`); `worker.backend: local` resolves. It fails only when
 `llm.local_base_url` / `llm.local_model` are unset, or when the URL is not a
 loopback/RFC1918 address (`config.assert_local_backend_mode`).
 

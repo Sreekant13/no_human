@@ -7,6 +7,7 @@
 | [verification.md](verification.md) | The gates that stop a broken change, the bounded loop, the limits |
 | [security.md](security.md) | Subscription-auth boundary, the never-merge rule, guards |
 | [adapters.md](adapters.md) | Intake (TRACKER/GitHub/GitLab), context, VCS, CI backends |
+| [BACKENDS.md](BACKENDS.md) | The three coding backends (`claude`, `codex`, `local`): switching, credentials, per-mode defaults |
 | [eval.md](eval.md) | Golden set, replay scoring, scorecard/CI gate, shadow mode |
 | [blockers.md](blockers.md) | Part 22 taxonomy, escalation, wake watcher, `nh reply` |
 | [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | Reproduced defects that are not fixed yet, and what a fix must prove |
