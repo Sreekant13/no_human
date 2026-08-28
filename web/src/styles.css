@@ -327,12 +327,14 @@ html, body, #root {
      the 24h ledger + the status foot + Settings). `.nh-shell` is
      `height: 100%; overflow: hidden`, so on a viewport shorter than that
      total the bottom rows were CLIPPED, not scrolled — Settings/About were
-     unreachable. Measured 2026-08-17 on the Windows app on a 4K laptop at
-     300 % (viewport 1280x672 CSS px): 716px of sidebar for 672px of height,
-     Settings below the fold and NOT reachable; a 1080p @ 100 % desktop with
-     the taskbar (1032px) is the same failure at a lower margin. The
-     column now scrolls when it must (overflow-y) instead of clipping;
-     overflow-x stays hidden so no horizontal bar can appear at 232px. */
+     unreachable. Re-measured 2026-08-22 in headless Chromium against the
+     built bundle: natural (unclamped) sidebar content is 698px tall; at
+     1280x672 that is 26px of overflow with Settings below the fold and NOT
+     reachable (98px overflow at 1280x600). 1920x1032 (1080p with a taskbar)
+     does NOT reproduce this — overflow is 0 there, with or without the
+     short-viewport block below. The column now scrolls when it must
+     (overflow-y) instead of clipping; overflow-x stays hidden so no
+     horizontal bar can appear at 232px. */
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
@@ -433,19 +435,39 @@ html, body, #root {
   border-color: color-mix(in oklab, var(--red) 30%, transparent);
 }
 
-/* Short viewports (1080p with a taskbar = 1032px; a 4K laptop at 300 % =
-   672px, measured on the Windows app 2026-08-17): tighten the sidebar's own
-   spacing first — outer padding, the gap between nav groups, the foot rows —
-   so those cases fit WITHOUT scrolling (692px -> 664px of content at 672px)
-   and Settings stays visible at the bottom; the overflow-y above is the
-   backstop for anything shorter still. Every value stays on the --sp scale. */
-@media (max-height: 1080px) {
+/* Short viewports (measured 2026-08-22 in headless Chromium against the
+   built bundle, re-checked against the stale 2026-08-17 Windows-app figures
+   below): tighten the sidebar's own spacing first — outer padding, the gap
+   between nav groups, the foot rows — so those cases fit WITHOUT scrolling
+   (698px -> 610px of natural content, ~88px saved, not the 28px this
+   comment used to claim) and Settings stays visible at the bottom; the
+   overflow-y above is the backstop for anything shorter still. Every value
+   stays on the --sp scale. Reproduces at 1280x672 (26px overflow, Settings
+   unreachable) and 1280x600 (98px); does NOT reproduce at 1920x1032 ("1080p
+   with a taskbar" — overflow is 0 there, block or no block) or at 1366x768
+   (a real device height, overflow 0) — so the boundary sits just above the
+   698px failure threshold and below 768, not at the old 1080px, which fired
+   on every desktop including ones that never overflowed. */
+@media (max-height: 760px) {
   .nh-sidebar { gap: var(--sp-3); padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
-  /* Descendant selectors on purpose: .nh-ledger's base rule is defined
-     later in this file, and same-specificity order would silently win. */
-  .nh-sidebar .nh-sidenav { gap: var(--sp-3); }
-  .nh-sidebar .nh-navgroup { gap: var(--sp-1); }
-  .nh-sidebar .nh-sidebar-foot { gap: var(--sp-2); }
+  /* Plain selectors here, NOT `.nh-sidebar .x` — this block used to prefix
+     all five rules with `.nh-sidebar `, which made .nh-sidenav/.nh-navgroup/
+     .nh-sidebar-foot (0,2,0) beat the max-width:640px mobile block's plain
+     `.nh-sidenav { gap: 2px }` (0,1,0) regardless of source order, since
+     every phone is also a short viewport. Their base rules are EARLIER in
+     this file (.nh-sidenav :350, .nh-navgroup :351, .nh-sidebar-foot :401),
+     so a plain selector here still wins on source order alone and the
+     mobile block regains control of the gap on phones. */
+  .nh-sidenav { gap: var(--sp-3); }
+  .nh-navgroup { gap: var(--sp-1); }
+  .nh-sidebar-foot { gap: var(--sp-2); }
+  /* These two KEEP the `.nh-sidebar ` descendant prefix: `.nh-ledger`'s own
+     base rule (padding, :6306) and its sibling-combinator margin rule onto
+     `.nh-sidebar-foot` (:6332) are both defined LATER in this file, so
+     without the extra specificity here, source order would let the later,
+     unprefixed base rules silently win over this block's tightened values.
+     There is no mobile-block rule for `.nh-ledger` to lose to (mobile hides
+     it, see :494), so raising its specificity here is safe. */
   .nh-sidebar .nh-ledger { padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
   .nh-sidebar .nh-ledger ~ .nh-sidebar-foot { margin-top: var(--sp-2); }
 }

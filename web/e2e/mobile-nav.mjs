@@ -29,6 +29,10 @@ const browser = await chromium.launch();
 for (const [label, viewport] of [
   ["mobile", { width: 390, height: 844 }],
   ["small", { width: 360, height: 780 }],
+  // Inside BOTH the max-width:640px mobile block and the short-viewport
+  // max-height block — the exact overlap where a specificity leak between
+  // them would show up (a phone is always also a "short" viewport).
+  ["mobile-short", { width: 360, height: 700 }],
   ["desktop", { width: 1440, height: 900 }],
 ]) {
   for (const theme of ["dark", "light"]) {
@@ -85,6 +89,11 @@ for (const [label, viewport] of [
         settingsExpanded: settingsBtn?.getAttribute("aria-expanded") || null,
         newTaskPopup: newTaskBtn?.getAttribute("aria-haspopup") || null,
         newTaskExpanded: newTaskBtn?.getAttribute("aria-expanded") || null,
+        navColumnGap: nav ? getComputedStyle(nav).columnGap : null,
+        navRowGap: nav ? getComputedStyle(nav).rowGap : null,
+        clippedLabels: [...document.querySelectorAll(".nh-navrow-label")]
+          .filter((l) => l.scrollWidth > l.clientWidth + 1)
+          .map((l) => `${l.textContent.trim()} ${l.scrollWidth}>${l.clientWidth}`),
       };
     });
 
@@ -104,6 +113,27 @@ for (const [label, viewport] of [
       geom.navOverflow <= 1,
       `scrollWidth - clientWidth = ${geom.navOverflow}px`,
     );
+
+    // Regression guard for the short-viewport-block specificity leak: the
+    // mobile block sets `.nh-sidenav { gap: 2px }` (0,1,0). The short-viewport
+    // block used to set `.nh-sidebar .nh-sidenav { gap: var(--sp-3) }`
+    // (0,2,0) — higher specificity always wins over source order, and every
+    // phone is also a short viewport, so the desktop gap silently leaked onto
+    // every phone (12px instead of 2px), shrinking each row until "In
+    // progress" started to ellipsise. Only phone widths are guarded here —
+    // the desktop gap value is legitimately larger and checked elsewhere.
+    if (geom.vw <= 640) {
+      check(
+        `[${label}/${theme}] mobile nav keeps its own 2px gap (no short-viewport-block specificity leak)`,
+        geom.navColumnGap === "2px",
+        `columnGap=${geom.navColumnGap} rowGap=${geom.navRowGap}`,
+      );
+      check(
+        `[${label}/${theme}] no nav label is clipped`,
+        geom.clippedLabels.length === 0,
+        geom.clippedLabels.join(", "),
+      );
+    }
     check(`[${label}/${theme}] theme toggle is on screen`, geom.toggleOnScreen !== false);
     check(`[${label}/${theme}] no horizontal page overflow`, !geom.pageOverflowX);
 
@@ -171,6 +201,43 @@ for (const [label, viewport] of [
 
     await ctx.close();
   }
+}
+
+// Tall-viewport guard: `.nh-sidebar`'s `overflow-y: auto` is the backstop for
+// short viewports, and it must stay a no-op backstop on a tall one — no
+// scroll, no clipping, `overflow-y` still `auto` (not accidentally dropped).
+{
+  const ctx = await browser.newContext({ viewport: { width: 1920, height: 1200 } });
+  const page = await ctx.newPage();
+  await page.route("**/api/**", (route) => {
+    const u = route.request().url();
+    const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+    if (u.includes("/api/onboarding")) return j({ completed: true });
+    if (u.includes("/api/tasks")) return j([]);
+    if (u.includes("/api/projects")) return j([]);
+    return j({});
+  });
+  await page.goto("http://127.0.0.1:4620/", { waitUntil: "networkidle" });
+  await page.waitForTimeout(500);
+  const tall = await page.evaluate(() => {
+    const sidebar = document.querySelector(".nh-sidebar");
+    return {
+      overflowY: sidebar ? getComputedStyle(sidebar).overflowY : null,
+      scrollHeight: sidebar ? sidebar.scrollHeight : null,
+      clientHeight: sidebar ? sidebar.clientHeight : null,
+    };
+  });
+  check(
+    `[tall/1920x1200] sidebar does not scroll (overflow-y:auto stays a no-op backstop)`,
+    tall.scrollHeight !== null && tall.scrollHeight <= tall.clientHeight + 1,
+    `scrollHeight=${tall.scrollHeight} clientHeight=${tall.clientHeight}`,
+  );
+  check(
+    `[tall/1920x1200] sidebar overflow-y is still "auto"`,
+    tall.overflowY === "auto",
+    `overflowY=${tall.overflowY}`,
+  );
+  await ctx.close();
 }
 
 await browser.close();
