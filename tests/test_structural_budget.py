@@ -130,7 +130,7 @@ FROZEN_FUNCTION_CC = {
 # from here again. (A red ratchet the fleet lands through protects nothing.)
 FROZEN_FILE_LINES = {
     # 19354 -> 19387 (+33) with the UI-evidence gate landed by task 389210fa.
-    "core/orchestrator.py": 19387,
+    "core/orchestrator.py": 19413,
     "cli/commands.py": 7783,
     "api/app.py": 5153,
     "core/db.py": 4253,

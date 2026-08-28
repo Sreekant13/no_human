@@ -48,6 +48,8 @@ from ..agent.verification_receipts import KINDS
 from ..blockers import (
     MACHINE_REQUEUE_PROVENANCE,
     PENDING_KEY,
+    REFUSED_AT_KEY,
+    REFUSED_GATE_KEY,
     SERVER_STOP_REASON,
     Blocker,
     BlockerCategory,
@@ -57,6 +59,7 @@ from ..blockers import (
     fallback_blocker,
     find_stored_answer,
     human_event,
+    mark_send_back_refused,
     missing_access,
     notification_line,
     parse_blocker,
@@ -8742,12 +8745,24 @@ class Orchestrator:
 
         No pending send-back: byte-identical to the direct ``_raise_blocker``
         call this replaced (negative control — AC3).
+
+        A pending send-back that was ALREADY refused (the marker carries
+        ``REFUSED_AT_KEY``) still gets the blocker text — the human still
+        needs the remedy on every wake — but emits no second
+        ``send_back_refused`` event: a PR-side consumer de-duping on the
+        event stream would otherwise see a fresh ``refused_at`` (and post a
+        fresh comment) on every later resume of the same exhausted budget.
+        A NEW send-back re-arms this (`record_pending_send_back` deletes
+        both stamp fields via the same RFC 7396 patch).
         """
         pending = (task.context or {}).get(PENDING_KEY)
         if not pending:
             return await self._raise_blocker(
                 task, blocker, repo=repo, branch=branch
             )
+        # Corrupt/hand-edited context (non-dict marker) must not raise —
+        # fall back to the unstamped path, same as no marker at all.
+        already = bool(pending.get(REFUSED_AT_KEY)) if isinstance(pending, dict) else False
 
         remedy = remedy_text(blocker)
         note = refusal_note(pending, gate=gate, remedy=remedy)
@@ -8767,14 +8782,25 @@ class Orchestrator:
         event = refusal_event(
             task, pending, blocker, gate=gate, remedy=remedy, pr_url=pr_url,
         )
+        if already:
+            # Reuse the FIRST refusal's stamp so the persisted blocker
+            # payload is byte-identical across repeats too — a consumer
+            # de-duping on `blocker.send_back_refused` converges even
+            # without touching the event stream.
+            event[REFUSED_AT_KEY] = pending[REFUSED_AT_KEY]
+            event[REFUSED_GATE_KEY] = pending.get(REFUSED_GATE_KEY, gate)
         blocker.send_back_refused = {
             k: v for k, v in event.items() if k != "send_back_refused"
         }
-        self.emit(
-            "send_back_refused",
-            f"send-back refused a round: {gate} — {remedy}",
-            **event,
-        )
+        if not already:
+            self.emit(
+                "send_back_refused",
+                f"send-back refused a round: {gate} — {remedy}",
+                **event,
+            )
+            await mark_send_back_refused(
+                self.store, task, gate=gate, at=event[REFUSED_AT_KEY],
+            )
         return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
     async def _raise_blocker(

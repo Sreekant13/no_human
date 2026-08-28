@@ -428,3 +428,211 @@ def test_blocker_round_trips_the_sendback_refusal_marker():
     )
     round_tripped = Blocker.from_dict(b.to_dict())
     assert round_tripped.send_back_refused == b.send_back_refused
+
+
+# --------------------------------------------------------------------------- #
+# Repeat-refusal suppression (2026-08-26 fix, `.no_human/PLAN.md`): a refused  #
+# send-back's pending marker used to never get stamped, so every later resume #
+# of the same exhausted budget emitted a fresh `send_back_refused` event with #
+# a new `refused_at` — a PR-side consumer de-duping on the event stream would #
+# post a duplicate comment per wake.                                          #
+# --------------------------------------------------------------------------- #
+
+async def test_a_second_refused_resume_does_not_emit_a_second_refusal_event(
+    bare_repo, tmp_path, store,
+):
+    cfg = _config(tmp_path)
+    backend = _MustNotRunBackend()
+    events = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("fix the thing", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["it works"]
+    t.config = {"lifetime_tokens": 100, "budget_unit": "weighted"}
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=1, tokens_each=10_000)
+
+    await record_pending_send_back(
+        store, t, source="send_back", message="please fix it",
+        actor="operator:api")
+
+    await orch.run_task(t)
+    first = await store.find_task(t.id)
+    sbr1 = (first.blocker or {}).get("send_back_refused") or {}
+    assert sbr1.get("refused_at"), sbr1
+
+    # Second resume, no new human action — re-read the task between runs, as
+    # a real resume would.
+    await orch.run_task(first)
+    second = await store.find_task(t.id)
+
+    assert backend.calls == [], "a loop-head gate should have refused both resumes"
+    refusals = _events_of_kind(events, "send_back_refused")
+    assert len(refusals) == 1, events
+
+    pending = (second.context or {}).get("pending_send_back") or {}
+    assert pending.get("refused_at"), pending
+    assert pending.get("refused_gate") == "lifetime budget", pending
+
+    blocker = second.blocker or {}
+    rc = blocker.get("root_cause_hypothesis", "")
+    assert "your send-back could not start a round" in rc, rc
+    assert "nh task config" in rc, rc
+    assert "remedy: waiting on a human" in rc, rc
+
+    sbr2 = blocker.get("send_back_refused") or {}
+    assert sbr2.get("refused_at") == sbr1.get("refused_at"), (sbr1, sbr2)
+
+
+async def test_a_new_send_back_after_a_refusal_emits_again(
+    bare_repo, tmp_path, store,
+):
+    cfg = _config(tmp_path)
+    backend = _MustNotRunBackend()
+    events = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("fix the thing", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["it works"]
+    t.config = {"lifetime_tokens": 100, "budget_unit": "weighted"}
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=1, tokens_each=10_000)
+
+    await record_pending_send_back(
+        store, t, source="send_back", message="please fix it",
+        actor="operator:api")
+
+    await orch.run_task(t)
+    first = await store.find_task(t.id)
+    refusals = _events_of_kind(events, "send_back_refused")
+    assert len(refusals) == 1, events
+
+    new_message = "second try, please also handle negatives"
+    await record_pending_send_back(
+        store, first, source="send_back", message=new_message,
+        actor="operator:cli")
+
+    second = await store.find_task(t.id)
+    await orch.run_task(second)
+    third = await store.find_task(t.id)
+
+    assert backend.calls == [], "still no round should have started"
+    refusals = _events_of_kind(events, "send_back_refused")
+    assert len(refusals) == 2, events
+    assert refusals[0]["refused_at"] != refusals[1]["refused_at"], events
+    assert refusals[1]["feedback_chars"] == len(new_message), refusals[1]
+    assert refusals[1]["actor"] == "operator:cli", refusals[1]
+    assert new_message in refusals[1]["excerpt"], refusals[1]
+
+    pending = (third.context or {}).get("pending_send_back") or {}
+    assert pending.get("refused_at") == refusals[1]["refused_at"], pending
+    assert pending.get("refused_gate") == "lifetime budget", pending
+
+
+async def test_raising_the_budget_after_a_refusal_clears_the_stamped_marker(
+    bare_repo, tmp_path, store,
+):
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    backend = _MustNotRunBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    t.config = {"lifetime_tokens": 100, "budget_unit": "weighted"}
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=1, tokens_each=10_000)
+
+    await record_pending_send_back(
+        store, t, source="send_back", message="please add mul()",
+        actor="operator:api")
+
+    await orch.run_task(t)
+    assert backend.calls == []
+    refusals = _events_of_kind(events, "send_back_refused")
+    assert len(refusals) == 1, events
+
+    fresh = await store.find_task(t.id)
+    assert (fresh.context or {}).get("pending_send_back", {}).get("refused_at"), (
+        "the marker must be stamped by the refused round above")
+
+    # Give headroom, then force the status back to PENDING the same way
+    # `test_lifetime_budget.py::test_a_review_pass_freeze_is_exempt_from_the_startup_floor`
+    # forces a status for a test (`set_status(..., validate=False)`):
+    # `update_task` never writes the status column (db.py:1559-1576), and a
+    # plain FAILED row (no `cancel_reason`) stays writable per `set_status`'s
+    # own CAS-guard docstring, so this is the same bypass a human's `nh task
+    # retry` uses, done directly for the test.
+    fresh.config = {"lifetime_tokens": 10_000_000, "budget_unit": "weighted"}
+    await store.update_task(fresh)
+    await store.set_status(fresh, TaskStatus.PENDING, validate=False)
+    fresh = await store.find_task(t.id)
+
+    orch2 = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                         event_sink=events.append)
+    outcome = await orch2.run_task(fresh)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome
+    final = await store.find_task(t.id)
+    assert (final.context or {}).get("pending_send_back") is None, (
+        "attempt_start must clear the pending marker once a round actually starts")
+
+    refusals = _events_of_kind(events, "send_back_refused")
+    assert len(refusals) == 1, events
+
+
+async def test_mark_send_back_refused_is_fail_open_and_owns_only_its_two_fields(
+    store,
+):
+    from no_human.blockers import mark_send_back_refused
+
+    class _ExplodingStore:
+        async def merge_context(self, task_id, patch):
+            raise RuntimeError("boom")
+
+    class _StubTask:
+        id = "deadbeef"
+        context: dict = {}
+
+    result = await mark_send_back_refused(
+        _ExplodingStore(), _StubTask(), gate="lifetime budget")
+    assert result is None
+
+    # Real-store case: the stamp is a MERGE, not a rewrite — the existing
+    # at/source/actor/excerpt/chars/pr_comment_ref fields on the marker
+    # survive byte-identical.
+    t = Task.new("fix the thing", repo_path="/tmp/repo")
+    await store.create_task(t)
+    entry = await record_pending_send_back(
+        store, t, source="send_back", message="please fix it",
+        actor="operator:api", at="2026-01-01T00:00:00+00:00")
+    assert entry is not None
+
+    stamped = await mark_send_back_refused(
+        store, t, gate="lifetime budget", at="2026-01-02T00:00:00+00:00")
+    assert stamped == {
+        "refused_at": "2026-01-02T00:00:00+00:00",
+        "refused_gate": "lifetime budget",
+    }
+
+    fresh = await store.find_task(t.id)
+    pending = (fresh.context or {}).get("pending_send_back") or {}
+    assert pending.get("at") == entry["at"]
+    assert pending.get("source") == entry["source"]
+    assert pending.get("actor") == entry["actor"]
+    assert pending.get("excerpt") == entry["excerpt"]
+    assert pending.get("chars") == entry["chars"]
+    assert pending.get("pr_comment_ref") == entry["pr_comment_ref"]
+    assert pending.get("refused_at") == "2026-01-02T00:00:00+00:00"
+    assert pending.get("refused_gate") == "lifetime budget"

@@ -42,7 +42,10 @@ from .taxonomy import (
 from .wake import WakeWatcher, parse_duration
 from .send_back import (
     PENDING_KEY,
+    REFUSED_AT_KEY,
+    REFUSED_GATE_KEY,
     clear_pending_send_back,
+    mark_send_back_refused,
     record_pending_send_back,
     refusal_event,
     refusal_note,
@@ -83,7 +86,10 @@ __all__ = [
     "WakeWatcher",
     "parse_duration",
     "PENDING_KEY",
+    "REFUSED_AT_KEY",
+    "REFUSED_GATE_KEY",
     "clear_pending_send_back",
+    "mark_send_back_refused",
     "record_pending_send_back",
     "refusal_event",
     "refusal_note",

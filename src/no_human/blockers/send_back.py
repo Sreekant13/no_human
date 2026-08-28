@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 #: The one context key this module owns.
 PENDING_KEY = "pending_send_back"
 
+#: The two fields `mark_send_back_refused` owns, nested under `PENDING_KEY`.
+#: Stamped once a refusal has already been reported for the CURRENT pending
+#: send-back, so `_refuse_round` emits `send_back_refused` at most once per
+#: marker instead of once per resume.
+REFUSED_AT_KEY = "refused_at"
+REFUSED_GATE_KEY = "refused_gate"
+
 #: `refusal_note`'s excerpt is capped so a huge send-back doesn't bloat the
 #: blocker's `root_cause_hypothesis` / `evidence` text.
 _EXCERPT_CHARS = 300
@@ -71,7 +78,20 @@ async def record_pending_send_back(
         "pr_comment_ref": pr_ref or "",
     }
     try:
-        merged = await store.merge_context(task.id, {PENDING_KEY: entry})
+        # RFC 7396 recursive-merge hazard: `merge_context` merges nested
+        # dicts key-by-key, so a bare `{PENDING_KEY: entry}` patch over an
+        # ALREADY-refused marker would preserve its stale `refused_at`/
+        # `refused_gate` — this new send-back would then be silently
+        # suppressed by `_refuse_round`'s "already stamped" check forever.
+        # Explicitly deleting (RFC 7396: `None` value) both fields in the
+        # same patch makes a fresh send-back always eligible to refuse-and-
+        # emit again.
+        patch = {
+            **entry,
+            REFUSED_AT_KEY: None,
+            REFUSED_GATE_KEY: None,
+        }
+        merged = await store.merge_context(task.id, {PENDING_KEY: patch})
         if merged is not None:
             task.context = merged
         return entry
@@ -99,6 +119,37 @@ async def clear_pending_send_back(store: Any, task: Any) -> None:
             "clear_pending_send_back: failed to clear marker for task %s",
             getattr(task, "id", "?"),
         )
+
+
+async def mark_send_back_refused(
+    store: Any, task: Any, *, gate: str, at: str | None = None,
+) -> dict[str, Any] | None:
+    """Stamp the CURRENT pending marker as already-refused, so a later
+    resume with no new human action does not emit `send_back_refused`
+    again. The single writer of `REFUSED_AT_KEY` / `REFUSED_GATE_KEY`.
+
+    Merges `{PENDING_KEY: {REFUSED_AT_KEY: ..., REFUSED_GATE_KEY: ...}}`
+    through `merge_context` (RFC 7396: nested dicts merge recursively), so
+    the existing `at`/`source`/`actor`/`excerpt`/`pr_comment_ref` fields on
+    the marker are left byte-identical — this is a stamp, not a rewrite.
+
+    Never raises: identical fail-open posture to `record_pending_send_back`.
+    On failure the marker stays unstamped and the worst case is one more
+    duplicate `send_back_refused` event next wake — never worse than the
+    pre-fix behaviour.
+    """
+    patch = {REFUSED_AT_KEY: at or _now(), REFUSED_GATE_KEY: gate}
+    try:
+        merged = await store.merge_context(task.id, {PENDING_KEY: patch})
+        if merged is not None:
+            task.context = merged
+        return patch
+    except Exception:
+        logger.exception(
+            "mark_send_back_refused: failed to stamp marker for task %s "
+            "(gate=%s)", getattr(task, "id", "?"), gate,
+        )
+        return None
 
 
 def refusal_note(pending: dict[str, Any], *, gate: str, remedy: str) -> str:
@@ -158,7 +209,12 @@ def remedy_text(blocker: Any) -> str:
     blocker has neither (should not happen for a loop-head refusal, but this
     stays a lookup, not a generator)."""
     if blocker.wake_condition:
-        return blocker.wake_condition
+        # `wake_condition` is a noun-phrase fragment written to complete the
+        # UI drawer's "Was waiting for" label (see
+        # `_budget_revival_condition`'s docstring) — prefixed here so the
+        # refusal sentence ("remedy: ...") scans as a sentence too, without
+        # changing the command text the fragment carries.
+        return f"waiting on {blocker.wake_condition}"
     for option in blocker.options or []:
         action = getattr(option, "action", None) or {}
         if "set_task_config" in action:
