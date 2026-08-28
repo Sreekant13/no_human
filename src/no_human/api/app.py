@@ -4877,12 +4877,22 @@ async def _gather_history(
     ``repo_paths`` scopes the Claude Code scan to the selected repos (spec §3
     B5) — None/empty keeps every project, as before."""
     from ..history.extractor import extract_transcripts, IDENotRunningError
-    from ..history.claude_code import extract_claude_code_transcripts
+    from ..history.claude_code import extract_claude_code_transcripts, _cwd_under
+    from ..history.analyzer import _project_from_workspaces
 
     transcripts: list = []
     sources: dict[str, int] = {}
     try:
         ws = await asyncio.to_thread(extract_transcripts, days=days)
+        if repo_paths:
+            # The IDE extractor is machine-wide (every workspace); the CC scan is
+            # already repo-scoped. Without this a repo-focused onboarding pulled
+            # conversations from EVERY workspace (feedback I4). Keep a transcript
+            # only if its workspace project sits under a selected repo. A
+            # transcript with no derivable project is DROPPED here — it can't be
+            # shown to belong to the focused repo. repo_paths empty => unchanged.
+            ws = [t for t in ws
+                  if _cwd_under(_project_from_workspaces(t.workspaces), repo_paths)]
         transcripts += ws
         sources["windsurf"] = len(ws)  # term-ok: internal source tag names the real IDE
     except IDENotRunningError:

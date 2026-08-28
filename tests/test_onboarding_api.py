@@ -578,3 +578,48 @@ async def test_docs_detect_lists_existing_docs(client, tmp_path):
 async def test_docs_job_missing_is_404(client):
     r = await client.get("/api/onboarding/docs/jobs/nope")
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_gather_history_scopes_ide_transcripts_to_selected_repos(monkeypatch):
+    """Feedback I4: the IDE (Windsurf) extractor is machine-wide and used to
+    pull conversations from EVERY workspace even when onboarding was focused on
+    one repo. _gather_history must drop IDE transcripts whose workspace is
+    outside the selected repos, keep those inside, and drop unscopable ones
+    (no derivable project). The CC source is patched to empty to isolate."""
+    import sys
+    # `no_human.api.app` the NAME is the FastAPI instance; reach the module.
+    app_module = sys.modules["no_human.api.app"]
+    from no_human.history.extractor import Transcript, Message
+
+    inside = Transcript(cascade_id="w:in", title="in", created="2026-07-01",
+                        workspaces=["file:///Users/u/mine"],
+                        messages=[Message(role="user", content="x", step_type="user")])
+    outside = Transcript(cascade_id="w:out", title="out", created="2026-07-01",
+                        workspaces=["file:///Users/u/other"],
+                        messages=[Message(role="user", content="y", step_type="user")])
+    sibling = Transcript(cascade_id="w:sib", title="sib", created="2026-07-01",
+                        workspaces=["file:///Users/u/mine-two"],  # sibling, NOT under mine
+                        messages=[Message(role="user", content="z", step_type="user")])
+    noproject = Transcript(cascade_id="w:none", title="none", created="2026-07-01",
+                        workspaces=[],  # unscopable
+                        messages=[Message(role="user", content="q", step_type="user")])
+
+    def fake_extract(*, days, client=None):
+        return [inside, outside, sibling, noproject]
+
+    monkeypatch.setattr("no_human.history.extractor.extract_transcripts", fake_extract)
+    monkeypatch.setattr(
+        "no_human.history.claude_code.extract_claude_code_transcripts",
+        lambda *, days, repo_paths=None: [])
+
+    transcripts, sources = await app_module._gather_history(
+        30, repo_paths=["/Users/u/mine"])
+    ids = {t.cascade_id for t in transcripts}
+    assert ids == {"w:in"}, f"only the in-repo IDE transcript should survive, got {ids}"
+    assert sources["windsurf"] == 1
+
+    # Positive control: no repo scope keeps every IDE transcript (unchanged CLI path).
+    all_transcripts, all_sources = await app_module._gather_history(30, repo_paths=None)
+    assert {t.cascade_id for t in all_transcripts} == {"w:in", "w:out", "w:sib", "w:none"}
+    assert all_sources["windsurf"] == 4
