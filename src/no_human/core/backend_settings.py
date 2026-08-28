@@ -53,6 +53,12 @@ class BackendSettingsError(ValueError):
 #: feed / ``nh logs`` (``task_events`` has no real task row for either).
 CONFIG_AUDIT_TASK_ID = "__config__"
 
+#: The one backend whose config fields (``llm.local_model`` /
+#: ``llm.local_base_url``) the Settings row can set. Named once here — the GET
+#: payload hands it to the frontend so the view-model never hardcodes a backend
+#: id, matching how the option list already flows from ``SUPPORTED_BACKENDS``.
+_LOCAL_BACKEND = "local"
+
 
 def describe_backend(name: str, config_data: dict[str, Any] | None) -> dict[str, Any]:
     """Whether *config_data* (this install's config) can run *name* as the
@@ -93,9 +99,12 @@ def backend_payload(running_cfg_data: dict[str, Any], config_path: Path) -> dict
     server loaded at start), so a write here needs the same restart.
     """
     running_current = resolve_backend_name(running_cfg_data, role="coder")
-    on_disk_current = resolve_backend_name(
-        _config.load_config(config_path).data, role="coder"
-    )
+    on_disk_data = _config.load_config(config_path).data
+    on_disk_current = resolve_backend_name(on_disk_data, role="coder")
+    # The editable fields prefill with what is ON DISK — what the operator just
+    # saved and what the NEXT run will use — not the running process's stale
+    # copy (which `current`/`restart_required` above already speak for).
+    llm = (on_disk_data.get("llm") or {})
     return {
         "current": running_current,
         "default": "claude",
@@ -103,6 +112,30 @@ def backend_payload(running_cfg_data: dict[str, Any], config_path: Path) -> dict
             describe_backend(name, running_cfg_data) for name in SUPPORTED_BACKENDS
         ],
         "restart_required": on_disk_current != running_current,
+        # The local backend's two non-secret config fields, so the Settings row
+        # can prefill and edit them. The server owns everything the row needs —
+        # the backend id they belong to, each field's config key, label,
+        # placeholder and current value — so the frontend view-model hardcodes
+        # no backend id or config key of its own. Both values are safe to echo
+        # (a model id + a loopback URL; no credential ever reaches config —
+        # `config._reject_api_key_in_config`).
+        "local_fields": {
+            "backend": _LOCAL_BACKEND,
+            "fields": [
+                {
+                    "key": "local_model",
+                    "value": str(llm.get("local_model") or ""),
+                    "label": "Local model",
+                    "placeholder": "the model id the local server exposes",
+                },
+                {
+                    "key": "local_base_url",
+                    "value": str(llm.get("local_base_url") or ""),
+                    "label": "Local base URL",
+                    "placeholder": "http://localhost:8000",
+                },
+            ],
+        },
     }
 
 
@@ -123,29 +156,59 @@ def apply_backend_change(
     if not isinstance(body, dict):
         raise BackendSettingsError('expected a JSON object of {"backend": <name>}')
 
-    value = body.get("backend")
-    if not isinstance(value, str) or not value.strip():
-        raise BackendSettingsError('"backend" must be a non-empty string')
-    value = value.strip().lower()
+    changes: dict[str, dict[str, str]] = {}
 
-    if value not in SUPPORTED_BACKENDS:
+    # 1) Optional local-backend field writes FIRST, so that when the same
+    #    request also switches to 'local', the availability check below sees the
+    #    just-written base_url/model instead of refusing on the stale on-disk
+    #    values. Only changed values are written (idempotent, same convention as
+    #    the backend switch); a bad URL is refused here with nothing on disk.
+    on_disk_cfg = _config.load_config(config_path).data
+    local_updates: dict[str, str] = {}
+    for key in ("local_model", "local_base_url"):
+        if key in body:
+            raw = body[key]
+            if not isinstance(raw, str):
+                raise BackendSettingsError(f'"{key}" must be a string')
+            local_updates[key] = raw.strip()
+    if local_updates:
+        cur_llm = on_disk_cfg.get("llm") or {}
+        to_write = {
+            k: v for k, v in local_updates.items() if str(cur_llm.get(k) or "") != v
+        }
+        if to_write:
+            try:
+                _config.set_local_backend_fields(to_write, config_path)
+            except (ValueError, _config.AuthError) as exc:
+                raise BackendSettingsError(str(exc)) from exc
+            for k, v in to_write.items():
+                changes[k] = {"old": str(cur_llm.get(k) or ""), "new": v}
+            on_disk_cfg = _config.load_config(config_path).data
+
+    # 2) Optional backend switch. Absent when the request only edits the local
+    #    fields (e.g. the coder is already 'local' and the operator retunes it).
+    value = body.get("backend")
+    if value is not None:
+        if not isinstance(value, str) or not value.strip():
+            raise BackendSettingsError('"backend" must be a non-empty string')
+        value = value.strip().lower()
+        if value not in SUPPORTED_BACKENDS:
+            raise BackendSettingsError(
+                f"{value!r} is not a supported coder backend; must be one of "
+                f"{sorted(SUPPORTED_BACKENDS)!r}"
+            )
+        on_disk_current = resolve_backend_name(on_disk_cfg, role="coder")
+        availability = describe_backend(value, on_disk_cfg)
+        if not availability["available"]:
+            raise BackendSettingsError(availability["reason"])
+        if value != on_disk_current:
+            _config.set_worker_backend(value, config_path)
+            changes["backend"] = {"old": on_disk_current, "new": value}
+    elif not local_updates:
         raise BackendSettingsError(
-            f"{value!r} is not a supported coder backend; must be one of "
-            f"{sorted(SUPPORTED_BACKENDS)!r}"
+            'expected a JSON object with "backend" and/or local backend fields'
         )
 
-    on_disk_cfg = _config.load_config(config_path).data
-    on_disk_current = resolve_backend_name(on_disk_cfg, role="coder")
-
-    availability = describe_backend(value, on_disk_cfg)
-    if not availability["available"]:
-        raise BackendSettingsError(availability["reason"])
-
-    if value == on_disk_current:
-        return backend_payload(running_cfg_data, config_path), {}
-
-    _config.set_worker_backend(value, config_path)
-    changes = {"backend": {"old": on_disk_current, "new": value}}
     return backend_payload(running_cfg_data, config_path), changes
 
 

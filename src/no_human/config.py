@@ -703,6 +703,19 @@ def assert_codex_mode(mode: str, *, cli_path: str | None = None,
     return assert_codex_api_key_mode(env_path)
 
 
+# The literal RFC1918 IPv4 ranges — the ONLY non-loopback hosts local mode
+# trusts. is_private is deliberately NOT used here: it also admits IPv4
+# link-local 169.254.0.0/16 (cloud IMDS 169.254.169.254), 0.0.0.0/8, TEST-NET,
+# and — for IPv6 — the fc00::/7 ULA block that carries the IPv6 IMDS endpoint
+# fd00:ec2::254. Gating on membership in these three nets keeps the boundary at
+# exactly what constraint #6c says ("loopback/RFC1918") and no wider.
+_RFC1918_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
 def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
     """Enforce the local-model coding backend's safety boundary.
 
@@ -782,11 +795,12 @@ def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
                 "is a rebinding surface — use 'localhost' or a literal "
                 "loopback/RFC1918 IP address instead."
             ) from None
-        if not (ip.is_loopback or ip.is_private):
+        if not (ip.is_loopback or any(ip in net for net in _RFC1918_NETS)):
             raise AuthError(
                 f"llm.local_base_url host {host!r} is a public/routable "
-                "address. Local mode must not leave the machine — use "
-                "'localhost' or a literal loopback/RFC1918 IP address."
+                "address (or a link-local metadata endpoint). Local mode must "
+                "not leave the machine — use 'localhost' or a literal "
+                "loopback/RFC1918 IP address."
             )
 
     return scrub_metered_auth(keep=())
@@ -2805,6 +2819,77 @@ def set_worker_backend(backend: str, config_path: Path = CONFIG_PATH) -> str:
             "been restored."
         )
     return backend
+
+
+#: The two ``llm.*`` scalars the local coder backend needs, set together by
+#: the Settings pane's coder-backend row
+#: (``core.backend_settings.apply_backend_change``). NOT credentials — a model
+#: id and a loopback URL — so they live in config.yaml like every other
+#: ``llm.*`` value; the URL's safety boundary (loopback/RFC1918 only, no
+#: userinfo) is enforced by :func:`assert_local_backend_mode` at write time
+#: here and again at ``make_backend`` time.
+_LOCAL_BACKEND_KEYS = ("local_model", "local_base_url")
+
+
+def set_local_backend_fields(
+    updates: dict[str, str], config_path: Path = CONFIG_PATH
+) -> dict[str, str]:
+    """Splice ``llm.local_model`` / ``llm.local_base_url`` into config.yaml,
+    one atomic write, preserving comments — the ``set_model_ids`` twin for the
+    local backend's two non-secret config fields.
+
+    ``local_base_url`` is validated through :func:`assert_local_backend_mode`
+    BEFORE the file is touched, so a public/DNS/userinfo URL is refused with
+    nothing on disk rather than left for ``make_backend`` to catch later. Same
+    write-then-reload-then-restore-on-any-failure discipline as
+    ``set_model_ids``; values are YAML-quoted so a URL's ``:`` / ``/`` cannot
+    break the splice.
+    """
+    unknown = set(updates) - set(_LOCAL_BACKEND_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unrecognised config key(s) {sorted(unknown)!r}; must be a "
+            f"subset of {sorted(_LOCAL_BACKEND_KEYS)!r}"
+        )
+    for key, value in updates.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{key} value {value!r} must be a string")
+    base_url = updates.get("local_base_url", "").strip()
+    if base_url:
+        assert_local_backend_mode(base_url)  # raises AuthError on a bad URL
+
+    load_config(config_path)  # materialize a default file if there is none
+    original = config_path.read_text()
+    lines = original.splitlines()
+    for key, value in updates.items():
+        quoted = "'" + value.replace("'", "''") + "'"
+        _splice_llm_scalar(lines, key, quoted)
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(
+        config_path, original, f"set local backend field(s) {sorted(updates)!r}"
+    )
+
+    try:
+        resolved_cfg = load_config(config_path)
+    except Exception as exc:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set local backend field(s) {sorted(updates)!r}: "
+            f"{config_path} failed to reload after the edit ({exc}). The file "
+            "has been restored."
+        ) from exc
+
+    llm = resolved_cfg.data.get("llm", {})
+    resolved = {key: (llm.get(key) or "") for key in updates}
+    mismatched = {k: v for k, v in resolved.items() if v != updates[k]}
+    if mismatched:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set local backend field(s): {config_path} resolved to "
+            f"{mismatched!r} after the edit, not the requested values. The "
+            "file has been restored."
+        )
+    return resolved
 
 
 #: Query-param names, matched case-insensitively as a substring, that mark a

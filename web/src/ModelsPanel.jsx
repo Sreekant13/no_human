@@ -3,8 +3,9 @@ import { fetchModels, saveModels, fetchCoderBackend, saveCoderBackend } from "./
 import { modelsPanelView, pendingBody, resetBody, applyError } from "./modelsPanelView.js";
 import {
   backendPanelView,
-  pendingBody as pendingBackendBody,
-  isSubmittable as backendIsSubmittable,
+  submitBody as backendSubmitBody,
+  canSubmit as backendCanSubmit,
+  showLocalFields as backendShowLocalFields,
   applyError as applyBackendError,
 } from "./backendPanelView.js";
 
@@ -18,6 +19,10 @@ import {
 function CoderBackendRow() {
   const [payload, setPayload] = useState(undefined); // undefined = loading, null = unavailable
   const [pending, setPending] = useState(null);
+  // Edited local-field values, keyed by config key (null entries = "unedited,
+  // use the server's value"). Kept separate from `pending` so switching the
+  // backend dropdown never discards a half-typed URL.
+  const [localEdits, setLocalEdits] = useState({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
 
@@ -39,14 +44,28 @@ function CoderBackendRow() {
   }
 
   const selected = pending !== null ? pending : view.current;
+  const lf = view.localFields;
+  const showLocal = backendShowLocalFields(payload, pending);
+  // Effective input values: an unedited field falls back to the server's
+  // current value, so the inputs prefill and a Save with no field edits sends
+  // nothing for them.
+  const values = {};
+  if (lf) for (const f of lf.fields) {
+    values[f.key] = localEdits[f.key] !== undefined ? localEdits[f.key] : f.value;
+  }
 
   function handleChange(value) {
     setPending(value);
     setError(null);
   }
 
+  function handleFieldChange(key, value) {
+    setLocalEdits((e) => ({ ...e, [key]: value }));
+    setError(null);
+  }
+
   async function commit() {
-    const body = pendingBackendBody(payload, pending);
+    const body = backendSubmitBody(payload, pending, values);
     if (!body) return;
     setSaving(true);
     setError(null);
@@ -54,6 +73,7 @@ function CoderBackendRow() {
       const refreshed = await saveCoderBackend(body);
       setPayload(refreshed);
       setPending(null);
+      setLocalEdits({});
     } catch (e) {
       const reverted = applyBackendError(e.message);
       setPending(reverted.pending);
@@ -63,13 +83,11 @@ function CoderBackendRow() {
     }
   }
 
-  const dirty = pendingBackendBody(payload, pending);
-  const hasChanges = !!dirty;
-  // Belt-and-braces on top of the <option disabled> the <select> already
-  // renders: refuse to submit a pending value the SAME availability check
-  // (backendPanelView.js's isSubmittable, sourced from the payload's own
-  // per-option `available`) says this install cannot run right now.
-  const selectedSubmittable = pending === null || backendIsSubmittable(payload, pending);
+  const hasChanges = !!backendSubmitBody(payload, pending, values);
+  // Belt-and-braces on top of the <option disabled> the <select> renders:
+  // refuse a Save the same view-model (canSubmit) says isn't valid — an
+  // unavailable non-local backend, or the local backend with a blank field.
+  const selectedSubmittable = backendCanSubmit(payload, pending, values);
 
   return (
     <div className="models-row coder-backend-row">
@@ -81,16 +99,45 @@ function CoderBackendRow() {
           value={selected}
           onChange={(e) => handleChange(e.target.value)}
         >
-          {view.options.map((o) => (
-            <option key={o.id} value={o.id} disabled={o.disabled} title={o.reason || undefined}>
-              {o.label}{o.disabled ? ` — ${o.reason}` : ""}
-            </option>
-          ))}
+          {view.options.map((o) => {
+            // The local backend stays selectable even when currently
+            // unavailable — the operator picks it to reveal the two fields that
+            // MAKE it available. Every other unavailable backend stays disabled.
+            const configurable = !!lf && o.id === lf.backend;
+            const disabled = o.disabled && !configurable;
+            return (
+              <option key={o.id} value={o.id} disabled={disabled} title={o.reason || undefined}>
+                {o.label}{disabled ? ` — ${o.reason}` : ""}
+              </option>
+            );
+          })}
         </select>
       </label>
       <span className="models-default">
         default: <code>{view.default}</code>
       </span>
+      {showLocal && (
+        <div className="local-backend-fields">
+          {lf.fields.map((f) => (
+            <label className="auth-label" key={f.key}>
+              {f.label}
+              <input
+                type="text"
+                className="new-task-input"
+                aria-label={f.label}
+                placeholder={f.placeholder}
+                value={values[f.key]}
+                onChange={(e) => handleFieldChange(f.key, e.target.value)}
+              />
+            </label>
+          ))}
+          {!selectedSubmittable && (
+            <div className="ntm-hint">
+              Set both the local model id and base URL to enable Save.
+            </div>
+          )}
+        </div>
+      )}
       {view.showRestartBanner && (
         <div className="nh-alarm auth-alarm" role="alert">
           Restart required — the coder backend change is saved to{" "}

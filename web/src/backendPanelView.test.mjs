@@ -2,7 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { backendPanelView, pendingBody, isSubmittable, applyError } from "./backendPanelView.js";
+import {
+  backendPanelView,
+  pendingBody,
+  isSubmittable,
+  applyError,
+  localFields,
+  showLocalFields,
+  submitBody,
+  canSubmit,
+} from "./backendPanelView.js";
 
 // One fixture payload shared by every test below — the shape GET
 // /api/coder-backend actually returns (see
@@ -135,6 +144,103 @@ test("applyError clears the pending edit and surfaces the server's verbatim mess
 });
 
 // ── mutation controls — the RED proof that the above isn't vacuous ────────
+
+// ── local backend config fields ──────────────────────────────────────────
+//
+// The row can set the local backend's two config values (llm.local_model /
+// llm.local_base_url) inline. Everything — the backend id, each field's config
+// key, label, placeholder and current value — is read out of the payload's
+// `local_fields`, mirroring how the option list flows from the payload; the
+// fixture below is the exact shape backend_settings.backend_payload sends.
+function withLocalFields(overrides = {}, localOverrides = {}) {
+  return payload({
+    local_fields: {
+      backend: "local",
+      fields: [
+        { key: "local_model", value: "", label: "Local model", placeholder: "the model id" },
+        { key: "local_base_url", value: "", label: "Local base URL", placeholder: "http://localhost:8000" },
+      ],
+      ...localOverrides,
+    },
+    ...overrides,
+  });
+}
+
+test("localFields is null for a payload without local_fields (older server)", () => {
+  assert.equal(localFields(payload()), null);
+  assert.equal(localFields(null), null);
+  assert.equal(localFields({ local_fields: { backend: "local" } }), null, "no fields array");
+});
+
+test("localFields copies backend id, key, label, placeholder and value from the payload", () => {
+  const lf = localFields(withLocalFields({}, {
+    fields: [{ key: "local_model", value: "m1", label: "Local model", placeholder: "hint" }],
+  }));
+  assert.equal(lf.backend, "local");
+  assert.deepEqual(lf.fields, [{ key: "local_model", value: "m1", label: "Local model", placeholder: "hint" }]);
+});
+
+test("showLocalFields is true only when the selected backend is the local one", () => {
+  const p = withLocalFields();
+  assert.equal(showLocalFields(p, null), false, "current is claude");
+  assert.equal(showLocalFields(p, "codex"), false);
+  assert.equal(showLocalFields(p, "local"), true, "pending local reveals the fields");
+  assert.equal(showLocalFields(withLocalFields({ current: "local" }), null), true, "already on local");
+  assert.equal(showLocalFields(payload(), "local"), false, "no local_fields -> never shown");
+});
+
+test("submitBody carries only changed local fields, and only when local is selected", () => {
+  const p = withLocalFields();
+  // Not local: local field values are ignored entirely.
+  assert.deepEqual(submitBody(p, "codex", { local_model: "x", local_base_url: "y" }), { backend: "codex" });
+  // Switching to local with both fields filled: backend + both fields.
+  assert.deepEqual(
+    submitBody(p, "local", { local_model: "m", local_base_url: "http://localhost:8000" }),
+    { backend: "local", local_model: "m", local_base_url: "http://localhost:8000" },
+  );
+  // Editing one field while already on local (no backend change): only that field.
+  const onLocal = withLocalFields({ current: "local" }, {
+    fields: [
+      { key: "local_model", value: "old", label: "Local model", placeholder: "" },
+      { key: "local_base_url", value: "http://localhost:8000", label: "Local base URL", placeholder: "" },
+    ],
+  });
+  assert.deepEqual(
+    submitBody(onLocal, null, { local_model: "new", local_base_url: "http://localhost:8000" }),
+    { local_model: "new" },
+  );
+  // Nothing changed -> null (Save disabled), even with the fields prefilled.
+  assert.equal(submitBody(onLocal, null, { local_model: "old", local_base_url: "http://localhost:8000" }), null);
+  // A blank edit that differs from the server value still forms a body (the
+  // gate below is what refuses it, not submitBody).
+  assert.deepEqual(submitBody(onLocal, null, { local_model: "", local_base_url: "http://localhost:8000" }), { local_model: "" });
+});
+
+test("canSubmit requires every local field non-blank when local is selected, and bypasses the availability gate for it", () => {
+  const p = withLocalFields(); // 'local' is unavailable in the base fixture
+  assert.equal(isSubmittable(p, "local"), false, "precondition: local greyed out for availability");
+  // Blank fields: refused.
+  assert.equal(canSubmit(p, "local", { local_model: "", local_base_url: "" }), false);
+  assert.equal(canSubmit(p, "local", { local_model: "m", local_base_url: "" }), false, "one blank still refused");
+  // Both filled: allowed DESPITE local being unavailable — configuring it now.
+  assert.equal(canSubmit(p, "local", { local_model: "m", local_base_url: "http://localhost:8000" }), true);
+  // Non-local pending keeps the existing availability gate untouched.
+  assert.equal(canSubmit(p, "codex", {}), true);
+  assert.equal(
+    canSubmit(payload({ options: [
+      { id: "claude", available: true, reason: "" },
+      { id: "codex", available: false, reason: "not logged in" },
+      { id: "local", available: false, reason: "x" },
+    ] }), "codex", {}),
+    false,
+    "an unavailable non-local backend stays blocked",
+  );
+});
+
+test("backendPanelView surfaces localFields (null when the payload omits them)", () => {
+  assert.equal(backendPanelView(payload()).localFields, null);
+  assert.equal(backendPanelView(withLocalFields()).localFields.backend, "local");
+});
 
 test("MUTATION CONTROL: an isSubmittable that ignores availability would pass a bad selection", () => {
   // Demonstrates what criterion 2 forbids: a frontend heuristic that always

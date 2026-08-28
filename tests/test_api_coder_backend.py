@@ -75,6 +75,41 @@ async def test_get_coder_backend_lists_every_supported_backend_with_availability
 
 
 @pytest.mark.asyncio
+async def test_get_exposes_local_fields_for_the_settings_row_to_prefill(client):
+    r = await client.get("/api/coder-backend")
+    assert r.status_code == 200
+    lf = r.json()["local_fields"]
+    assert lf["backend"] == "local"
+    by_key = {f["key"]: f for f in lf["fields"]}
+    assert set(by_key) == {"local_model", "local_base_url"}
+    # No values on disk yet -> blank, so the inputs render empty.
+    assert by_key["local_model"]["value"] == ""
+    assert by_key["local_base_url"]["value"] == ""
+    # Each field carries a human label the row shows without inventing one.
+    assert by_key["local_base_url"]["label"]
+
+
+@pytest.mark.asyncio
+async def test_put_backend_and_local_fields_together_bootstraps_local_over_http(client):
+    r = await client.put(
+        "/api/config/coder-backend",
+        json={
+            "backend": "local",
+            "local_model": "my-local-model",
+            "local_base_url": "http://127.0.0.1:1234/v1",
+        },
+    )
+    assert r.status_code == 200
+    reloaded = nh_config.load_config(nh_config.CONFIG_PATH)
+    assert reloaded.data["worker"]["backend"] == "local"
+    assert reloaded.data["llm"]["local_model"] == "my-local-model"
+    assert reloaded.data["llm"]["local_base_url"] == "http://127.0.0.1:1234/v1"
+    # The returned payload prefills the fields with the just-written values.
+    by_key = {f["key"]: f["value"] for f in r.json()["local_fields"]["fields"]}
+    assert by_key["local_model"] == "my-local-model"
+
+
+@pytest.mark.asyncio
 async def test_put_local_with_local_base_url_unset_is_refused_over_http(client):
     r = await client.put("/api/config/coder-backend", json={"backend": "local"})
     assert r.status_code == 422

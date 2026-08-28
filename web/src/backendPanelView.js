@@ -31,6 +31,7 @@ export function backendPanelView(payload) {
     showRestartBanner: !!payload.restart_required,
     current: payload.current,
     default: payload.default,
+    localFields: localFields(payload),
     options: options.map((o) => ({
       id: o.id,
       label: titleCase(String(o.id || "")),
@@ -39,6 +40,80 @@ export function backendPanelView(payload) {
       isCurrent: o.id === payload.current,
     })),
   };
+}
+
+// The backend whose config fields the row can set inline (a model id + a
+// loopback URL), and the fields themselves. Everything — the backend id, the
+// config-key each field PUTs under, its label/placeholder and current value —
+// comes from the payload, so this file names no backend id or config key of
+// its own (same rule the option list follows). Returns null for a server build
+// that does not send them, so the row renders no extra fields.
+//
+// Shape (server-owned, backend_settings.backend_payload):
+//   {backend, fields: [{key, value, label, placeholder}]}
+export function localFields(payload) {
+  const lf = payload && payload.local_fields;
+  if (!lf || typeof lf.backend !== "string" || !Array.isArray(lf.fields)) return null;
+  return {
+    backend: lf.backend,
+    fields: lf.fields.map((f) => ({
+      key: f.key,
+      value: f.value || "",
+      label: f.label || f.key,
+      placeholder: f.placeholder || "",
+    })),
+  };
+}
+
+// Which backend the dropdown currently points at (the pending edit if any,
+// else the payload's current). One definition, reused by the show/submit/gate
+// helpers so they can never disagree on what "selected" means.
+function selectedBackend(payload, pending) {
+  return pending === null || pending === undefined ? (payload && payload.current) : pending;
+}
+
+// Whether the row should show the local config fields: the selected backend is
+// the one `localFields` names.
+export function showLocalFields(payload, pending) {
+  const lf = localFields(payload);
+  return !!lf && selectedBackend(payload, pending) === lf.backend;
+}
+
+// The full PUT body for a Save: the backend change (via `pendingBody`) PLUS any
+// local field that differs from what the server reported, but only when the
+// selected backend is the local one. `values` maps a field key -> the current
+// input string. Returns null when there is nothing to send (Save disabled),
+// matching the server's own no-op-write behaviour for a repeat PUT.
+export function submitBody(payload, pending, values) {
+  if (!payload) return null;
+  const body = {};
+  const backendPart = pendingBody(payload, pending);
+  if (backendPart) Object.assign(body, backendPart);
+  const lf = localFields(payload);
+  if (lf && selectedBackend(payload, pending) === lf.backend) {
+    for (const f of lf.fields) {
+      const v = String((values && values[f.key]) ?? f.value).trim();
+      if (v !== f.value) body[f.key] = v;
+    }
+  }
+  return Object.keys(body).length ? body : null;
+}
+
+// Whether Save may fire. Extends `isSubmittable` (backend availability) with
+// the local-fields rule: when the selected backend is the local one, EVERY
+// field must be non-blank, and its own availability is NOT required — the
+// operator is configuring it right now, and the server runs the real
+// post-write preflight. For any other pending backend the availability gate is
+// unchanged.
+export function canSubmit(payload, pending, values) {
+  if (!submitBody(payload, pending, values)) return false;
+  const lf = localFields(payload);
+  if (lf && selectedBackend(payload, pending) === lf.backend) {
+    return lf.fields.every(
+      (f) => String((values && values[f.key]) ?? f.value).trim() !== "",
+    );
+  }
+  return pending === null || pending === undefined || isSubmittable(payload, pending);
 }
 
 // The PUT body for a Save click: `{backend: pending}` when `pending` differs

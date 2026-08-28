@@ -801,6 +801,26 @@ def test_local_mode_refuses_a_public_ip(url):
 
 
 @pytest.mark.parametrize("url", [
+    # IPv4 cloud IMDS (link-local 169.254.0.0/16) — the SSRF target. Python's
+    # is_private admits it, so is_private alone was NOT a safe gate.
+    "http://169.254.169.254",
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "http://169.254.170.2:80",              # ECS task-metadata endpoint
+    # IPv6 cloud IMDS (fd00:ec2::254) lives in the fc00::/7 ULA block, which is
+    # is_private but NOT is_link_local — the case the minimal fix could not see.
+    "http://[fd00:ec2::254]:80",
+    "http://[fe80::1]:8000",                # IPv6 link-local
+    "http://0.0.0.0:8000",                  # unspecified / this-host
+    "http://192.0.2.10:8000",               # TEST-NET-1 (documentation)
+])
+def test_local_mode_refuses_link_local_and_metadata_addresses(url):
+    """SSRF regression: local mode must reject the cloud metadata endpoints and
+    every non-RFC1918 private range, not just publicly-routable IPs."""
+    with pytest.raises(AuthError, match="loopback/RFC1918"):
+        assert_local_backend_mode(url)
+
+
+@pytest.mark.parametrize("url", [
     "http://user:pass@localhost:8000",
     "http://tok@127.0.0.1:8000",
 ])
@@ -878,6 +898,44 @@ def test_load_config_accepts_a_local_base_url_with_a_harmless_query_param(tmp_pa
     cfg_path.write_text('llm:\n  local_base_url: "http://localhost:8000/v1?stream=true"\n')
     cfg = load_config(cfg_path)
     assert cfg.data["llm"]["local_base_url"] == "http://localhost:8000/v1?stream=true"
+
+
+def test_set_local_backend_fields_writes_both_values_and_preserves_comments(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("llm:  # which subscription pays\n  auth_profile: default\n")
+    resolved = config.set_local_backend_fields(
+        {"local_model": "my-model", "local_base_url": "http://localhost:8000/v1"},
+        cfg_path,
+    )
+    assert resolved == {
+        "local_model": "my-model",
+        "local_base_url": "http://localhost:8000/v1",
+    }
+    reloaded = load_config(cfg_path)
+    assert reloaded.data["llm"]["local_model"] == "my-model"
+    assert reloaded.data["llm"]["local_base_url"] == "http://localhost:8000/v1"
+    # The inline comment on the header and the sibling scalar are untouched.
+    text = cfg_path.read_text()
+    assert "# which subscription pays" in text
+    assert "auth_profile: default" in text
+
+
+def test_set_local_backend_fields_refuses_a_public_url_leaving_the_file_untouched(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    original = "llm:\n  auth_profile: default\n"
+    cfg_path.write_text(original)
+    with pytest.raises(AuthError, match="public/routable"):
+        config.set_local_backend_fields(
+            {"local_base_url": "http://8.8.8.8:8000"}, cfg_path,
+        )
+    assert cfg_path.read_text() == original
+
+
+def test_set_local_backend_fields_refuses_an_unknown_key(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("llm:\n  auth_profile: default\n")
+    with pytest.raises(ValueError, match="unrecognised config key"):
+        config.set_local_backend_fields({"api_key_model": "x"}, cfg_path)
 
 
 def test_the_claude_pinned_roles_and_backend_resolution_are_untouched():

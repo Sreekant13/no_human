@@ -127,6 +127,85 @@ async def test_the_settings_written_config_still_pins_every_non_coder_role(tmp_p
         assert resolve_backend_name(reloaded.data, role=role) == "claude", role
 
 
+async def test_setting_local_fields_and_switching_in_one_request_bootstraps_local(tmp_path):
+    """The gap this feature closes: a fresh install has no llm.local_base_url,
+    so 'local' is unavailable and cannot be switched to. Sending the two fields
+    ALONGSIDE the backend in one PUT must write them FIRST, so the availability
+    check then passes and the switch lands — no hand-edit of config.yaml."""
+    config_path = _write_config(tmp_path)  # nothing on disk
+    cfg = load_config(config_path)
+
+    payload, changes = apply_backend_change(
+        {
+            "backend": "local",
+            "local_model": "my-local-model",
+            "local_base_url": "http://localhost:8000",
+        },
+        running_cfg_data=cfg.data,
+        config_path=config_path,
+    )
+    assert changes == {
+        "local_model": {"old": "", "new": "my-local-model"},
+        "local_base_url": {"old": "", "new": "http://localhost:8000"},
+        "backend": {"old": "claude", "new": "local"},
+    }
+    reloaded = load_config(config_path)
+    assert reloaded.data["worker"]["backend"] == "local"
+    assert reloaded.data["llm"]["local_model"] == "my-local-model"
+    assert reloaded.data["llm"]["local_base_url"] == "http://localhost:8000"
+    # The GET payload now prefills the fields with those values.
+    assert payload["local_fields"]["backend"] == "local"
+    by_key = {f["key"]: f["value"] for f in payload["local_fields"]["fields"]}
+    assert by_key == {
+        "local_model": "my-local-model",
+        "local_base_url": "http://localhost:8000",
+    }
+
+
+async def test_editing_only_the_local_fields_needs_no_backend_key(tmp_path):
+    """Already on 'local', retuning the model id alone: a body with just the
+    changed field (no "backend") is accepted and writes only that field."""
+    config_path = _write_config(
+        tmp_path, local_base_url="http://localhost:8000", local_model="old-model",
+    )
+    cfg = load_config(config_path)
+    payload, changes = apply_backend_change(
+        {"local_model": "new-model"},
+        running_cfg_data=cfg.data,
+        config_path=config_path,
+    )
+    assert changes == {"local_model": {"old": "old-model", "new": "new-model"}}
+    reloaded = load_config(config_path)
+    assert reloaded.data["llm"]["local_model"] == "new-model"
+    assert reloaded.data["llm"]["local_base_url"] == "http://localhost:8000"
+
+
+async def test_a_public_local_base_url_is_refused_with_nothing_written(tmp_path):
+    """The URL safety boundary (loopback/RFC1918 only) is enforced BEFORE any
+    write — a public host is refused and config.yaml is left untouched."""
+    config_path = _write_config(tmp_path)
+    cfg = load_config(config_path)
+    with pytest.raises(BackendSettingsError, match="public/routable"):
+        apply_backend_change(
+            {"backend": "local", "local_base_url": "http://8.8.8.8:8000",
+             "local_model": "m"},
+            running_cfg_data=cfg.data,
+            config_path=config_path,
+        )
+    # Nothing landed: no worker.backend, no llm.local_base_url.
+    reloaded = load_config(config_path)
+    assert resolve_backend_name(reloaded.data, role="coder") == "claude"
+    assert not (reloaded.data.get("llm") or {}).get("local_base_url")
+
+
+async def test_empty_body_is_refused(tmp_path):
+    """Neither a backend nor a local field: one operator-facing sentence."""
+    config_path = _write_config(tmp_path)
+    cfg = load_config(config_path)
+    with pytest.raises(BackendSettingsError, match="backend"):
+        apply_backend_change({}, running_cfg_data=cfg.data, config_path=config_path)
+
+
 def test_a_fourth_supported_backends_entry_shows_up_in_the_options_with_no_code_change(
     monkeypatch, tmp_path,
 ):
