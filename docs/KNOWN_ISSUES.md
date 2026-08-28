@@ -19,7 +19,7 @@ are from BEFORE it. Re-measure, then re-enable or close.
 
 ```
 sqlite3.OperationalError: cannot commit transaction - SQL statements in progress
-  src/no_human/core/db.py:1832 in update_attempt   (await self.db.commit())
+  src/no_human/core/db.py:1842 in update_attempt   (await self.db.commit())
   <- src/no_human/core/orchestrator.py:4067 in _run_attempt
 ```
 

@@ -1553,6 +1553,16 @@ class Store:
             return None
         task.status = new_status
         task.updated_at = now
+        # D1.2: record the per-phase timeline the drawer's "ran" chip reads
+        # (active_seconds = Σ phase durations). set_status is the ONE writer of
+        # task.status — every orchestrator/watcher/scheduler transition routes
+        # here — so recording the phase boundary here is the whole "orchestrator
+        # writes rows" instrumentation in one place, correct on resume/park by
+        # construction. Best-effort and AFTER the status commit: a telemetry
+        # failure must never fail or slow a real transition. `already_there`
+        # skips an idempotent rewrite (rowcount=1 but no boundary crossed).
+        if not already_there:
+            await self._record_phase(task, new_status)
         return task
 
     @serialized_write
@@ -1838,8 +1848,49 @@ class Store:
     # `active_seconds` sums (ended_at - started_at) over closed rows plus
     # (now - started_at) for the open one — parked time is never inside a row
     # because parking closes the phase (D1.2), so it is excluded by construction.
-    # The orchestrator writes these rows (D1.2, a later PR); until then the
-    # table is empty and `phases_for` returns [] / `active_seconds` returns 0.0.
+    # `set_status` writes these rows (D1.2): a real transition into an active
+    # working state opens the matching phase; every other state closes the open
+    # one. `_STATUS_PHASE` is that map (the CHECK constraint's phase names). Only
+    # the five active states have a phase — awaiting_approval/blocked/paused/
+    # escalated/done/failed close it, so human-wait and parked time never land
+    # inside a row. There is deliberately NO 'pr' phase writer: PR-open work
+    # happens under the code/test states, and a separate 'pr' phase would only
+    # split the timeline finer than the "ran vs wall" chip needs.
+    _STATUS_PHASE: dict["TaskStatus", str] = {
+        TaskStatus.CONTEXT: "intake",
+        TaskStatus.PLANNING: "plan",
+        TaskStatus.IMPLEMENTING: "code",
+        TaskStatus.REVIEWING: "review",
+        TaskStatus.TESTING: "test",
+    }
+
+    async def _record_phase(self, task: "Task", new_status: "TaskStatus") -> None:
+        """Best-effort phase-boundary write for a task that just transitioned.
+
+        Called from `set_status` AFTER the status commit. Any failure here is
+        swallowed — the per-phase timeline is telemetry and must never fail or
+        slow a real status transition. Re-entrant on the write lock (same task,
+        same Store) via `Store._critical`, so nesting inside `set_status`'s
+        serialized write is safe."""
+        try:
+            phase = self._STATUS_PHASE.get(new_status)
+            if phase is None:
+                # park / terminal / awaiting-approval: close the open phase (if
+                # any). A crash between transitions leaves a phase open; the next
+                # transition — or the orphan sweep's FAILED write — closes it, so
+                # active_seconds counts it to `now` only while genuinely live.
+                await self.close_phase(task.id, new_status.value)
+                return
+            row = await self._fetchone(
+                "SELECT COALESCE(MAX(attempt_number), 0) AS n "
+                "FROM attempts WHERE task_id = ?",
+                (task.id,),
+            )
+            attempt = int(row["n"]) if row else 0
+            await self.open_phase(task.id, attempt, phase)
+        except Exception:  # noqa: BLE001 — telemetry must not break a transition
+            log.debug("phase recording failed: %s -> %s",
+                      task.id, new_status, exc_info=True)
 
     @serialized_write
     async def open_phase(self, task_id: str, attempt: int, phase: str) -> int:

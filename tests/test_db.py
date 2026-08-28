@@ -742,3 +742,43 @@ async def test_active_seconds_sums_closed_and_open_phases(store, task, freeze_ti
     await store.open_phase(task.id, 2, "code")
     freeze_time.tick(30)
     assert abs(await store.active_seconds(task.id) - 90) < 1
+
+
+async def test_set_status_records_phase_timeline(store, task, freeze_time):
+    # D1.2: set_status is the ONE writer of task.status and now the writer of
+    # the phase timeline. Drive a task through the happy-path spine and assert
+    # each active state opened its phase, that they nest (each closed by the
+    # next, no overlap), and that active_seconds is Σ of their durations with
+    # the human-approval wait EXCLUDED — the exact "ran vs wall" the chip shows.
+    await store.set_status(task, TaskStatus.CONTEXT)       # -> intake
+    freeze_time.tick(10)
+    await store.set_status(task, TaskStatus.PLANNING)      # -> plan
+    freeze_time.tick(20)
+    await store.set_status(task, TaskStatus.IMPLEMENTING)  # -> code
+    freeze_time.tick(30)
+    await store.set_status(task, TaskStatus.REVIEWING)     # -> review
+    freeze_time.tick(40)
+    await store.set_status(task, TaskStatus.TESTING)       # -> test
+    freeze_time.tick(50)
+    # awaiting_approval carries no phase: it CLOSES the open 'test' row so the
+    # human-approval wait (the tick below) is not counted as active time.
+    await store.set_status(task, TaskStatus.AWAITING_APPROVAL)
+    freeze_time.tick(9999)  # human-approval wait — must NOT count
+
+    rows = await store.phases_for(task.id)
+    assert [r["phase"] for r in rows] == ["intake", "plan", "code", "review", "test"]
+    for r in rows:
+        assert r["ended_at"] is not None            # each closed by the next move
+        assert r["started_at"] <= r["ended_at"]     # never negative/absurd
+    # 10 + 20 + 30 + 40 + 50 = 150; the 9999s approval wait is excluded.
+    assert abs(await store.active_seconds(task.id) - 150) < 1
+
+
+async def test_set_status_idempotent_rewrite_records_no_phase(store, task):
+    # A no-op rewrite (rowcount=1 but no boundary crossed) must NOT reset the
+    # open phase's started_at — otherwise a re-asserted status would zero the
+    # accrued active time. Guarded by `already_there` in set_status.
+    await store.set_status(task, TaskStatus.CONTEXT)
+    await store.set_status(task, TaskStatus.CONTEXT)  # idempotent
+    rows = await store.phases_for(task.id)
+    assert [r["phase"] for r in rows] == ["intake"]  # one row, not two
