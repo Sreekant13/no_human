@@ -7,7 +7,7 @@
 // a blank window is the one unacceptable failure mode.
 
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, nativeTheme, shell, Tray } from "electron";
-import { hasCredential, setAuthMode, writeCredential } from "./tokenStore.mjs";
+import { hasCredential, setAuthMode, validateOpenAiKey, writeCredential, writeOpenAiKey } from "./tokenStore.mjs";
 import { isSetupUrl } from "./setupGate.mjs";
 import { restartFailedMessage } from "./setupUi.mjs";
 import {
@@ -684,14 +684,28 @@ function fromSetupScreen(event) {
 // and never logged. `mode` is the credential type the operator selected —
 // anything but the explicit "api_key" opt-in is treated as the default, so a
 // stale renderer that omits it keeps today's behaviour.
-ipcMain.handle("nh:save-token", async (event, value, mode) => {
+ipcMain.handle("nh:save-token", async (event, value, mode, openaiKey) => {
   if (!fromSetupScreen(event)) return { ok: false, error: "not permitted" };
   const m = mode === "api_key" ? "api_key" : "subscription";
+  // The OPTIONAL codex api_key credential. "" (or omitted) means the codex
+  // section was skipped or set to subscription — which stores NOTHING (#6b), so
+  // writeOpenAiKey is never reached on that path.
+  const oaiKey = typeof openaiKey === "string" ? openaiKey.trim() : "";
   try {
+    // Validate the OpenAI key BEFORE writing anything: an invalid optional key
+    // must not leave the required Claude credential half-saved. Nothing is
+    // written for OpenAI unless a non-empty key was supplied.
+    if (oaiKey) {
+      const oaiErr = validateOpenAiKey(oaiKey);
+      if (oaiErr) return { ok: false, error: oaiErr };
+    }
     // Credential first: if it fails validation, the configured mode is
     // untouched and the screen still matches config.yaml.
     writeCredential(value, m);
     setAuthMode(m);
+    // Claude is required and now saved; write the optional OpenAI key too. Its
+    // preserving write leaves the Claude token and every other .env line alone.
+    if (oaiKey) writeOpenAiKey(oaiKey);
   } catch (err) {
     return { ok: false, error: err.message };
   }

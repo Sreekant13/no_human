@@ -63,6 +63,12 @@ fresh-context review. Themed highlights below; the git range is the full record.
   `~/.no_human/.env`. The local base-URL validator was hardened to loopback or
   literal RFC1918 only, closing a metadata-endpoint (cloud IMDS) SSRF surface
   that the new write path would otherwise have exposed.
+- **The first-run setup screen can also connect the OpenAI (codex) coder** — an
+  optional, skippable section below the required Claude credential. ChatGPT
+  subscription is instructions-only (you run `codex login`; no_human stores no
+  OpenAI credential, per the codex auth constraint); the API-key path writes
+  `OPENAI_API_KEY` to `~/.no_human/.env` only (never config.yaml). Claude stays
+  required — it still pays for the pinned review/plan/supervisor roles.
 
 ## [0.1.5] — 2026-08-27
 

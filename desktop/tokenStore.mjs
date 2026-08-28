@@ -13,6 +13,12 @@ import path from "node:path";
 
 export const TOKEN_KEY = "CLAUDE_CODE_OAUTH_TOKEN";
 export const API_KEY_VAR = "ANTHROPIC_API_KEY";
+// The OPTIONAL codex-backend credential, in `llm.codex_auth_mode: api_key` only.
+// codex SUBSCRIPTION mode stores NOTHING (constraint #6b): no_human holds no
+// OpenAI credential, the user runs `codex login` themselves, and nothing here is
+// ever called on that path — writeOpenAiKey is the sole writer and exists for
+// the api_key mode alone.
+export const OPENAI_KEY_VAR = "OPENAI_API_KEY";
 
 /**
  * Read the platform at CALL time, not at module load.
@@ -322,6 +328,42 @@ export function writeCredential(value, mode, home = os.homedir()) {
   const err = validateCredential(value, "api_key");
   if (err) throw new Error(err);
   return writeEnvVar(API_KEY_VAR, value.trim(), home);
+}
+
+/**
+ * Validate an OpenAI API key before it can touch disk — the codex backend's
+ * OPTIONAL api_key credential. Empty and whitespace-bearing values are rejected
+ * exactly as the Claude paths reject them; an Anthropic key (sk-ant-…) is
+ * redirected to the Claude field above, since that is the likely mispaste;
+ * anything else must have the OpenAI shape, which is `sk-` (covering both `sk-`
+ * and `sk-proj-`).
+ */
+export function validateOpenAiKey(value) {
+  const v = (value ?? "").trim();
+  if (!v) return "Paste the key to continue.";
+  if (/\s/.test(v)) return "That value contains a space — check the paste.";
+  if (/^sk-ant-/i.test(v)) {
+    return "That's an Anthropic key — use the Claude credential above; this " +
+           "field takes an OpenAI key (sk-…).";
+  }
+  if (!/^sk-/i.test(v)) {
+    return "An OpenAI API key starts with sk-… — check the paste.";
+  }
+  return "";
+}
+
+/**
+ * Write OPENAI_API_KEY, PRESERVING every other .env line — modelled exactly on
+ * writeCredential's api_key branch (validate first, then the same owner-only
+ * writeEnvVar). An invalid key never touches disk. This is the SOLE writer of an
+ * OpenAI credential; it is reached only for codex's api_key mode. In codex
+ * SUBSCRIPTION mode no_human stores no OpenAI credential (constraint #6b), so
+ * this function is simply never called on that path.
+ */
+export function writeOpenAiKey(value, home = os.homedir()) {
+  const err = validateOpenAiKey(value);
+  if (err) throw new Error(err);
+  return writeEnvVar(OPENAI_KEY_VAR, value.trim(), home);
 }
 
 function writeEnvVar(key, value, home) {

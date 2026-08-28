@@ -274,6 +274,7 @@ test("writeToken: refuses to persist an invalid value", () => {
 import {
   API_KEY_VAR, configuredAuthMode, hasCredential, setAuthMode,
   validateCredential, writeCredential,
+  OPENAI_KEY_VAR, validateOpenAiKey, writeOpenAiKey,
 } from "./tokenStore.mjs";
 
 test("validateCredential: api_key mode requires the sk-ant-api shape", () => {
@@ -371,4 +372,59 @@ test("hasCredential: follows the configured mode", () => {
   writeToken("sk-ant-oat-x", h);
   assert.equal(hasCredential({}, h), false,
     "api_key mode must not be satisfied by an OAuth token");
+});
+
+// --- OPTIONAL codex OpenAI credential (constraint #6b) --------------------- //
+
+test("validateOpenAiKey: accepts the OpenAI shapes, rejects empty/space/Anthropic", () => {
+  assert.equal(validateOpenAiKey("sk-abc123"), "", "sk- is a valid OpenAI key");
+  assert.equal(validateOpenAiKey("sk-proj-abc123"), "", "sk-proj- is valid");
+  assert.equal(validateOpenAiKey("SK-PROJ-ABC"), "", "case-insensitive prefix");
+  assert.match(validateOpenAiKey(""), /Paste the key/);
+  assert.match(validateOpenAiKey("   "), /Paste the key/, "whitespace-only is empty");
+  assert.match(validateOpenAiKey("sk-abc def"), /space/, "an internal space is caught");
+  assert.match(validateOpenAiKey("sk-ant-api03-abc"), /Anthropic key/,
+    "an Anthropic key is redirected to the Claude field, never accepted");
+  assert.match(validateOpenAiKey("nope"), /starts with sk-/,
+    "a value without the sk- shape is rejected");
+});
+
+test("writeOpenAiKey: writes OPENAI_API_KEY and PRESERVES the Claude token + Jira line", () => {
+  const h = home();
+  fs.mkdirSync(join(h, ".no_human"), { recursive: true });
+  fs.writeFileSync(envPath(h),
+    `${TOKEN_KEY}=sk-ant-oat-keepme\nJIRA_API_TOKEN=jirakeep\n`);
+  const p = writeOpenAiKey("sk-proj-openaivalue", h);
+  const text = fs.readFileSync(p, "utf8");
+  assert.equal(parseEnv(text)[OPENAI_KEY_VAR], "sk-proj-openaivalue");
+  assert.equal(parseEnv(text)[TOKEN_KEY], "sk-ant-oat-keepme",
+    "the required Claude token must survive an optional OpenAI write");
+  assert.match(text, /JIRA_API_TOKEN=jirakeep/, "other secrets untouched");
+  assertOwnerOnly(p);
+});
+
+test("writeOpenAiKey: an invalid key NEVER touches disk", () => {
+  const h = home();
+  fs.mkdirSync(join(h, ".no_human"), { recursive: true });
+  fs.writeFileSync(envPath(h), `${TOKEN_KEY}=sk-ant-oat-x\n`);
+  const before = fs.readFileSync(envPath(h), "utf8");
+  assert.throws(() => writeOpenAiKey("sk-ant-api03-anthropic", h), /Anthropic key/);
+  assert.throws(() => writeOpenAiKey("", h), /Paste the key/);
+  assert.throws(() => writeOpenAiKey("garbage", h), /starts with sk-/);
+  assert.equal(fs.readFileSync(envPath(h), "utf8"), before,
+    "a rejected OpenAI key must not reach the .env");
+});
+
+// The #6b invariant at the storage layer: nothing this module writes for the
+// REQUIRED Claude credential ever emits an OPENAI_API_KEY line. codex
+// subscription mode is exactly "the OpenAI writer is never called", so a
+// Claude-only save must leave the .env free of any OpenAI credential.
+test("codex subscription writes NOTHING: no OPENAI_API_KEY from a Claude-only save", () => {
+  const h = home();
+  writeCredential("sk-ant-oat-claudeonly", "subscription", h);   // the whole save
+  const text = fs.readFileSync(envPath(h), "utf8");
+  assert.equal(parseEnv(text)[TOKEN_KEY], "sk-ant-oat-claudeonly");
+  assert.equal(parseEnv(text)[OPENAI_KEY_VAR], undefined,
+    "no OpenAI credential may appear when the codex section is subscription/skipped");
+  assert.ok(!/OPENAI/.test(text), "not even an OPENAI-prefixed line is written");
 });

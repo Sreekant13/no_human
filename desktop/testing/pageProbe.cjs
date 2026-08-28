@@ -59,6 +59,33 @@ app.whenReady().then(async () => {
       };
     })()`);
 
+    // The OPTIONAL codex section: it must render, must NOT make the OpenAI key
+    // required, must reveal the key input ONLY for api_key, and must show
+    // subscription as instructions with NO input.
+    out.codex = await tok.webContents.executeJavaScript(`(() => {
+      const $ = (id) => document.getElementById(id);
+      const hidden = (id) => $(id).hidden;
+      const oai = $("openai-key");
+      const pick = (v) => {
+        const r = document.querySelector('input[name="codex-mode"][value="' + v + '"]');
+        r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      const initialKeyRowHidden = hidden("codex-key-row");
+      pick("subscription");
+      const sub = { keyRowHidden: hidden("codex-key-row"),
+                    instructionsShown: !hidden("codex-instructions") };
+      pick("api_key");
+      const key = { keyRowHidden: hidden("codex-key-row"),
+                    instructionsShown: !hidden("codex-instructions") };
+      return {
+        fieldsetPresent: !!$("codex"),
+        openaiRequired: oai.hasAttribute("required") || oai.required,
+        openaiType: oai.type,
+        initialKeyRowHidden,
+        sub, key,
+      };
+    })()`);
+
     const errAt = async (query) => {
       const w = await open("error.html", query);
       return w.webContents.executeJavaScript(`(() => {

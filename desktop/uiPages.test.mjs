@@ -63,10 +63,28 @@ test("a rejected save marks the field invalid and announces it", () => {
   assert.ok(probe.token.msgText.length > 0, "the alert region was left empty");
   assert.equal(probe.token.labelFor, "token", "the field has no programmatic label");
   assert.deepEqual(probe.token.tabOrder,
-    ["mode-subscription", "mode-api-key", "token", "reveal", "save", "secondary"],
-    "tab order no longer follows reading order");
+    ["mode-subscription", "mode-api-key", "token", "reveal",
+     "codex-subscription", "codex-api-key", "openai-key", "codex-reveal",
+     "save", "secondary"],
+    "tab order no longer follows reading order (required Claude, then optional codex, then actions)");
   assert.ok(probe.token.saveMinHeight >= 44,
     `primary action is ${probe.token.saveMinHeight}px; below a 44px touch target`);
+});
+
+test("the optional codex section renders, never makes OpenAI required, and reveals the key only for api_key", () => {
+  const c = probe.codex;
+  assert.ok(c.fieldsetPresent, "the optional codex section did not render");
+  assert.equal(c.openaiRequired, false,
+    "the OpenAI key must be optional — it must never block Save and start");
+  assert.equal(c.openaiType, "password", "the OpenAI key must be masked");
+  assert.equal(c.initialKeyRowHidden, true,
+    "no codex mode is chosen on open, so the key input must be hidden (skippable)");
+  // Subscription = instructions only, NO input (constraint #6b).
+  assert.equal(c.sub.keyRowHidden, true, "subscription must expose no key input");
+  assert.equal(c.sub.instructionsShown, true, "subscription must show the codex login instructions");
+  // api_key reveals the one input and drops the instructions.
+  assert.equal(c.key.keyRowHidden, false, "api_key must reveal the key input");
+  assert.equal(c.key.instructionsShown, false, "api_key is not the instructions path");
 });
 
 test("error.html routes each reason to the right guidance", () => {

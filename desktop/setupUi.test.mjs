@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dismissTarget, labels, parseCanReturn, restartFailedMessage, saveProgress } from "./setupUi.mjs";
+import { codexKeyToSend, dismissTarget, labels, parseCanReturn, restartFailedMessage, saveProgress } from "./setupUi.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -101,4 +101,17 @@ test("the first-run screen's copy is platform-neutral — it ships on macOS, Win
   const html = fs.readFileSync(path.join(here, "token.html"), "utf8");
   assert.doesNotMatch(html, /this Mac\b/,
     "token.html says 'this Mac' — a Linux/Windows user reads that on first run (seen on Ubuntu 24.04, 2026-08-18)");
+});
+
+test("codexKeyToSend: sends a key ONLY for api_key; subscription/skip send nothing (#6b)", () => {
+  // The whole of constraint #6b at the UI layer: subscription and a skipped
+  // section (no radio chosen) must never produce an OpenAI credential to write.
+  assert.equal(codexKeyToSend("subscription", "sk-proj-typedanyway"), "",
+    "subscription must send nothing even if a value is somehow present");
+  assert.equal(codexKeyToSend("", "sk-proj-typedanyway"), "",
+    "a skipped section sends nothing");
+  assert.equal(codexKeyToSend("api_key", ""), "", "api_key with an empty field sends nothing");
+  assert.equal(codexKeyToSend("api_key", "   "), "", "a whitespace-only field sends nothing");
+  assert.equal(codexKeyToSend("api_key", "  sk-proj-real  "), "sk-proj-real",
+    "api_key with a value sends the trimmed key");
 });

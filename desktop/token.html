@@ -89,6 +89,14 @@
   .mode-option input { flex: none; }
   .mode-option label { font-weight: 500; color: var(--text-hi); margin: 0; }
   .mode-option .mode-sub { font-size: .85em; color: var(--text-muted); }
+  /* The OPTIONAL codex section is deliberately secondary: a top rule and muted
+     surface set it apart from the required Claude credential above it. */
+  fieldset.optional {
+    margin-top: 1.25rem; border-top: 2px solid var(--border-hi);
+    background: color-mix(in srgb, var(--bg-raised) 45%, transparent);
+  }
+  fieldset.optional legend { color: var(--text); font-weight: 500; }
+  fieldset.optional > .mode-sub { margin: .1rem 0 .6rem; font-size: .85em; }
 </style>
 <main>
   <h1>Connect Claude</h1>
@@ -145,6 +153,50 @@
     <!-- role=alert announces validation without stealing focus. Deliberately
          NOT also aria-live=polite: alert implies assertive, and the pair conflicts. -->
     <div class="msg" id="msg" role="alert"></div>
+
+    <!-- OPTIONAL, secondary: the coder can run on OpenAI's codex instead of
+         Claude. Claude stays REQUIRED above (it still gates review/planning);
+         this section is skippable and, in subscription mode, writes NOTHING. -->
+    <fieldset id="codex" class="optional">
+      <legend>Optional: coding with the OpenAI (codex) backend</legend>
+      <p class="mode-sub">
+        no_human's coder can run on OpenAI's codex instead of Claude — Claude is
+        still used for review and planning, so this is additional, not a
+        replacement. Two ways to connect it, or skip and code with Claude.
+      </p>
+      <div class="mode-option">
+        <input type="radio" id="codex-subscription" name="codex-mode" value="subscription" />
+        <label for="codex-subscription">ChatGPT subscription
+          <span class="mode-sub">— you run <code>codex login</code> yourself</span>
+        </label>
+      </div>
+      <div class="mode-option">
+        <input type="radio" id="codex-api-key" name="codex-mode" value="api_key" />
+        <label for="codex-api-key">OpenAI API key
+          <span class="mode-sub">— bills your OpenAI platform account</span>
+        </label>
+      </div>
+      <!-- Subscription = instructions ONLY, no input, nothing written to disk. -->
+      <p id="codex-instructions" class="hint" hidden>
+        Run <code>codex login</code> in a terminal — no_human never stores your
+        OpenAI login.
+      </p>
+      <!-- api_key: the ONE codex input. Hidden until api_key is chosen. -->
+      <div id="codex-key-row" hidden>
+        <label for="openai-key">OpenAI API key</label>
+        <div class="row">
+          <input id="openai-key" name="openai-key" type="password" autocomplete="off"
+                 spellcheck="false" autocapitalize="off" placeholder="sk-…"
+                 aria-describedby="codex-note" />
+          <button type="button" id="codex-reveal" aria-pressed="false">Show</button>
+        </div>
+        <p id="codex-note" class="hint">
+          Bills your OpenAI platform account (platform.openai.com). Stored only on
+          this computer, in <code>~/.no_human/.env</code> — never in config.yaml.
+        </p>
+      </div>
+    </fieldset>
+
     <div class="actions">
       <button type="submit" class="primary" id="save">Save and start</button>
       <button type="button" id="secondary">Quit</button>
@@ -156,10 +208,11 @@
   </p>
 </main>
 <script type="module">
-  import { dismissTarget, labels, parseCanReturn, saveProgress } from "./setupUi.mjs";
+  import { codexKeyToSend, dismissTarget, labels, parseCanReturn, saveProgress } from "./setupUi.mjs";
 
   const $ = (id) => document.getElementById(id);
   const input = $("token"), msg = $("msg"), save = $("save"), reveal = $("reveal");
+  const openaiInput = $("openai-key");
 
   function setMsg(text, kind) {
     msg.textContent = text;
@@ -199,6 +252,31 @@
     r.addEventListener("change", renderMode);
   }
   renderMode();
+
+  // The OPTIONAL codex section. `codexMode()` is "" until a radio is picked
+  // (skipped). Only the api_key choice reveals the key input; subscription
+  // shows instructions and NO input, so nothing can be typed to write.
+  const codexMode = () => {
+    const c = document.querySelector('input[name="codex-mode"]:checked');
+    return c ? c.value : "";
+  };
+  function renderCodex() {
+    const m = codexMode();
+    $("codex-key-row").hidden = m !== "api_key";
+    $("codex-instructions").hidden = m !== "subscription";
+  }
+  for (const r of document.querySelectorAll('input[name="codex-mode"]')) {
+    r.addEventListener("change", renderCodex);
+  }
+  renderCodex();
+
+  $("codex-reveal").addEventListener("click", () => {
+    const shown = openaiInput.type === "text";
+    openaiInput.type = shown ? "password" : "text";
+    $("codex-reveal").setAttribute("aria-pressed", String(!shown));
+    $("codex-reveal").textContent = shown ? "Show" : "Hide";
+    openaiInput.focus();
+  });
 
   // A save holds the server lifecycle; dismissing mid-flight started a second,
   // concurrent navigation that could double-spawn.
@@ -260,7 +338,10 @@
     }, 1000);
     let res;
     try {
-      res = await window.nhSetup.saveToken(input.value, mode());
+      // codexKeyToSend returns "" for the skipped and subscription paths, so
+      // NOTHING is written for OpenAI unless api_key is chosen with a value.
+      const openaiKey = codexKeyToSend(codexMode(), openaiInput.value);
+      res = await window.nhSetup.saveToken(input.value, mode(), openaiKey);
     } catch (err) {
       // A rejected invoke must not strand the button disabled with the
       // "Saving…" message and no way forward.

@@ -7,9 +7,12 @@ const { contextBridge, ipcRenderer } = require("electron");
 // First-run credential screen (token.html) only. Deliberately separate from
 // nhDesktop: the board never needs these, and the credential never crosses
 // back — saveToken returns {ok} or {error}, never the value. `mode` selects
-// the billing path: "subscription" (default) or "api_key" (BYO Anthropic key).
+// the Claude billing path: "subscription" (default) or "api_key" (BYO Anthropic
+// key). `openaiKey` is the OPTIONAL codex api_key credential — "" / omitted when
+// the codex section is skipped or set to subscription (which stores nothing).
 contextBridge.exposeInMainWorld("nhSetup", {
-  saveToken: (value, mode) => ipcRenderer.invoke("nh:save-token", value, mode),
+  saveToken: (value, mode, openaiKey) =>
+    ipcRenderer.invoke("nh:save-token", value, mode, openaiKey),
   dismiss: () => ipcRenderer.invoke("nh:dismiss"),
   quit: () => ipcRenderer.invoke("nh:quit"),
 });

@@ -42,6 +42,19 @@ export function labels(canReturn, mode = "subscription") {
 }
 
 /**
+ * The OPTIONAL codex OpenAI key to hand the main process, given the selected
+ * codex mode and the field's contents. Returns "" — meaning "write nothing for
+ * OpenAI" — for EVERY path except an explicit api_key choice with a non-empty
+ * field. So a skipped section (no codex radio chosen) and codex SUBSCRIPTION
+ * both send nothing, which is the whole of constraint #6b at the UI layer: in
+ * subscription mode no_human stores no OpenAI credential. The Claude credential
+ * is unaffected — it is sent separately and stays required.
+ */
+export function codexKeyToSend(codexMode, fieldValue) {
+  return codexMode === "api_key" ? (fieldValue || "").trim() : "";
+}
+
+/**
  * What to say while a save is in flight, by elapsed time.
  *
  * The save path can legitimately take ~43s: stopping the old server is capped

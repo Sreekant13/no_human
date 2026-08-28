@@ -229,3 +229,31 @@ test("nh:save-token in api_key mode writes the key and flips config.yaml", async
   assert.match(fs.readFileSync(path.join(home, ".no_human", "config.yaml"), "utf8"),
     /auth_mode: subscription/, "saving a token must configure subscription mode");
 });
+
+test("nh:save-token writes the OPTIONAL OpenAI key only when one is supplied (#6b)", async () => {
+  const handler = stub.calls.ipc.get("nh:save-token");
+
+  // A subscription-codex / skipped save omits the 4th arg → NOTHING for OpenAI.
+  await handler(from(SETUP_URL), "sk-ant-oat-nocodex");
+  assert.doesNotMatch(envText(), /OPENAI_API_KEY/,
+    "codex subscription/skip must write no OpenAI credential (constraint #6b)");
+
+  // An empty codex field (api_key chosen but nothing typed) also writes nothing.
+  await handler(from(SETUP_URL), "sk-ant-oat-emptycodex", "subscription", "   ");
+  assert.doesNotMatch(envText(), /OPENAI_API_KEY/, "an empty OpenAI field writes nothing");
+
+  // api_key codex WITH a value writes OPENAI_API_KEY alongside the Claude token.
+  await handler(from(SETUP_URL), "sk-ant-oat-withcodex", "subscription", "sk-proj-openaireal");
+  assert.match(envText(), /OPENAI_API_KEY=sk-proj-openaireal/,
+    "a supplied OpenAI key must land in .env under OPENAI_API_KEY");
+  assert.match(envText(), /CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-withcodex/,
+    "the required Claude token is written and untouched by the OpenAI write");
+
+  // An Anthropic key in the OpenAI field is refused BEFORE anything is written.
+  const before = envText();
+  const bad = await handler(from(SETUP_URL), "sk-ant-oat-x", "subscription", "sk-ant-api03-wrong");
+  assert.equal(bad.ok, false, "an Anthropic key in the OpenAI field must be rejected");
+  assert.match(bad.error, /Anthropic key/);
+  assert.equal(envText(), before,
+    "a rejected optional key must leave both credentials on disk untouched");
+});
