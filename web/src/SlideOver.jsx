@@ -353,10 +353,14 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     if (!sbMsg.trim() || busy) return;
     setBusy(true);
     try {
-      await sendBack(taskId, sbMsg.trim());
+      const res = await sendBack(taskId, sbMsg.trim());
       setSbOpen(false);
       setSbMsg("");
-      setFlash("Feedback stored. Task returned to queue.");
+      setFlash(
+        res?.budget_warning
+          ? `⚠ ${res.budget_warning.message}`
+          : "Feedback stored. Task returned to queue."
+      );
       const updated = await fetchTask(taskId);
       setTask(updated);
     } catch (e) {
@@ -373,7 +377,11 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
       const res = await replyTask(taskId, replyMsg.trim());
       setReplyOpen(false);
       setReplyMsg("");
-      setFlash(res.message || "Reply stored. Run `nh watch` to resume.");
+      setFlash(
+        res?.budget_warning
+          ? `⚠ ${res.budget_warning.message}`
+          : res.message || "Reply stored. Run `nh watch` to resume."
+      );
       const updated = await fetchTask(taskId);
       setTask(updated);
     } catch (e) {

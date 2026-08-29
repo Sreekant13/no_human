@@ -1505,12 +1505,18 @@ async def send_back(
     task_id: str, body: SendBackRequest, request: Request
 ) -> dict[str, Any]:
     """Return the task to IMPLEMENTING for the next daemon run."""
+    from ..core.budget_floor import check_budget_floor
+
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status == TaskStatus.DONE:
         raise HTTPException(status_code=409, detail="task is already done")
     if task.status == TaskStatus.FAILED and (task.context or {}).get("cancel_reason"):
         raise HTTPException(status_code=409, detail="task is cancelled")
+    budget_warning = await check_budget_floor(
+        store, task,
+        bounds=Bounds.from_config(
+            (getattr(request.app.state, "config", None) or {}).get("bounds")))
     prior_status = task.status
     prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     _sent_back_at = _now()
@@ -1563,6 +1569,7 @@ async def send_back(
     return {
         "ok": True,
         "message": "Feedback stored. Run `nh watch <id>` to retry.",
+        "budget_warning": budget_warning.as_dict() if budget_warning else None,
     }
 
 
@@ -3456,6 +3463,7 @@ async def reply_task(
     )
     from ..core import plan_gate
     from ..core.bounds import Bounds
+    from ..core.budget_floor import check_budget_floor
 
     store = _store(request)
     task = await _require_task(store, task_id)
@@ -3464,6 +3472,11 @@ async def reply_task(
             status_code=409,
             detail=f"task is {task.status.value!r}, not a parked state — no question to answer",
         )
+    # The install's effective bounds, so a stamped cap is the one the gate
+    # will enforce (see `actions._normalised`) — computed once and reused
+    # below for both the pre-dispatch budget-floor warning and apply_action.
+    _bounds = Bounds.from_config((getattr(request.app.state, "config", None) or {}).get("bounds"))
+    budget_warning = await check_budget_floor(store, task, bounds=_bounds)
     prior_status = task.status
     prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     ctx = task.context or {}
@@ -3485,13 +3498,7 @@ async def reply_task(
         terminal = is_terminal_action(option.action)
         approves_plan = is_plan_approval_action(option.action)
         try:
-            applied = apply_action(
-                task, option.action,
-                # The install's effective bounds, so a stamped cap is the one
-                # the gate will enforce (see `actions._normalised`).
-                bounds=Bounds.from_config(
-                    (getattr(request.app.state, "config", None)
-                     or {}).get("bounds")))
+            applied = apply_action(task, option.action, bounds=_bounds)
         except ActionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3567,6 +3574,7 @@ async def reply_task(
     return {
         "ok": True,
         "message": f"Reply stored. Run `nh watch {task_id[:8]}` to resume.",
+        "budget_warning": budget_warning.as_dict() if budget_warning else None,
     }
 
 

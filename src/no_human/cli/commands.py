@@ -3379,6 +3379,7 @@ def reply(task_id, answer, choose, run):
         resume_provenance,
     )
     from ..core.bounds import Bounds
+    from ..core.budget_floor import check_budget_floor
     from ..core import plan_gate
 
     async def _go():
@@ -3393,6 +3394,10 @@ def reply(task_id, answer, choose, run):
                     f"[yellow]task is {t.status.value}, not blocked[/] — nothing to resume"
                 )
                 return
+            warning = await check_budget_floor(
+                store, t, bounds=Bounds.from_config(config.get("bounds")))
+            if warning is not None:
+                Console(stderr=True).print(f"[yellow]{warning.message()}[/]")
             prior_status = t.status
             prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
             b = Blocker.from_dict(t.blocker) if t.blocker else None
@@ -5163,6 +5168,8 @@ def review_comments(task_id, post_spec):
 def reject(task_id, reason):
     """Send a task back with feedback; agent retries on next run."""
     config, _ = _bootstrap(require_auth=False)
+    from ..core.bounds import Bounds
+    from ..core.budget_floor import check_budget_floor
 
     async def _go():
         async with Store(config.db_path) as store:
@@ -5176,6 +5183,10 @@ def reject(task_id, reason):
             if t.status == TaskStatus.FAILED and (t.context or {}).get("cancel_reason"):
                 console.print(f"[red]task is cancelled[/] — cannot reject {t.id[:8]}")
                 sys.exit(1)
+            warning = await check_budget_floor(
+                store, t, bounds=Bounds.from_config(config.get("bounds")))
+            if warning is not None:
+                Console(stderr=True).print(f"[yellow]{warning.message()}[/]")
             _sent_back_at = _now_iso()
             await store.append_context_list(t.id, "send_back_feedback",
                                             {"at": _sent_back_at, "message": reason})

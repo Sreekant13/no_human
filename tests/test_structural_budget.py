@@ -145,8 +145,24 @@ FROZEN_FILE_LINES = {
     # _approve_go_single / _ready_batch_non_merge_message). Measured via
     # `len(Path(...).read_text().splitlines())` (the scanner's own metric) on
     # the combined tree.
-    "cli/commands.py": 8111,
-    "api/app.py": 5338,
+    # cli/commands.py 8111 -> 8122 (+11): the reject/reply-dispatch budget-
+    # floor warning (`check_budget_floor`) — a pre-dispatch advisory so a
+    # reject/reply that would burn the rest of a task's lifetime budget and
+    # die mid-attempt on BUDGET_EXHAUSTED warns instead of silently losing
+    # the human's feedback. Each of `reject`/`reply` gets its own 2-import +
+    # 4-line block, matching this file's existing per-command local-import
+    # convention; a shared helper was evaluated and rejected — with only two
+    # call sites, the helper's own def+docstring line cost exceeds what
+    # de-duplicating the 4-line block would save.
+    "cli/commands.py": 8122,
+    # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
+    # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
+    # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
+    # once in `reply_task` and reusing it for both the new warning check and
+    # the pre-existing `apply_action` bounds argument (previously recomputed
+    # inline), and by dropping a redundant function-local `Bounds` re-import
+    # in `send_back` — `Bounds` is already imported at module level (line 53).
+    "api/app.py": 5346,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
