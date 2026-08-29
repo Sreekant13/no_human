@@ -33,3 +33,7 @@ def test_byte_cap_fails(tmp_path):
 def test_claude_md_line_cap(tmp_path):
     c = tmp_path / "CLAUDE.md"; c.write_text("\n" * 201)
     r = run("--claude", str(c)); assert r.returncode == 1 and "201 lines" in r.stdout
+
+def test_absent_claude_is_skipped_not_crash(tmp_path):
+    # public export ships the CI step but no CLAUDE.md — must pass, not FileNotFoundError-crash
+    r = run("--claude", str(tmp_path / "CLAUDE.md")); assert r.returncode == 0 and "absent" in r.stdout

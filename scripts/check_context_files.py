@@ -8,6 +8,8 @@ from pathlib import Path
 LINK = re.compile(r"\]\(([^)]+)\)")
 
 def check_claude(path: Path, max_lines: int) -> list[str]:
+    if not path.exists():  # public export ships the workflow but not CLAUDE.md — nothing loaded, nothing to size-check
+        print(f"note: {path} absent — skipping size check"); return []
     n = len(path.read_text().splitlines())
     return [f"{path}: {n} lines > {max_lines}"] if n > max_lines else []
 
