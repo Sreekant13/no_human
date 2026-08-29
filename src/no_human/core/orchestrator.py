@@ -16332,6 +16332,14 @@ class Orchestrator:
         repo_path = kwargs["repo_path"]
         timeout = reviewer_worktree.guard_config(self.config)
 
+        # Audit (reviewer-worktree-returncode-audit): the reviewer has NOT run
+        # yet at this point, so there is no verdict in scope to leak — a bare
+        # `ReviewerUnavailable` is enough (no usage to carry). Routed to
+        # escalation like the other two sites below, never charged as a
+        # bounded coder attempt. See
+        # `tests/test_reviewer_worktree_wiring.py::
+        # test_an_unestablishable_integrity_check_never_returns_the_verdict`
+        # (the "snapshot" case) for the pin.
         try:
             before = reviewer_worktree.snapshot(repo_path, timeout=timeout)
         except reviewer_worktree.WorktreeCheckFailed as exc:
@@ -16347,6 +16355,21 @@ class Orchestrator:
             **kwargs,
         )
 
+        # Audit (reviewer-worktree-returncode-audit): a `decision` from the
+        # reviewer DOES exist here and is deliberately DISCARDED —
+        # `_reviewer_worktree_unavailable` copies only the four usage/
+        # accounting fields (`_carry_reviewer_usage`) onto the raised
+        # exception, never `decision.passed`/`decision.checklist`. This is
+        # the site the module's returncode check (`_run_git`, `_config_
+        # effective`'s own None handling) most directly protects: a `git
+        # status` that failed here without raising would make `compare()`
+        # look clean and this `except` would never fire, handing `decision`
+        # straight back as the verdict. See
+        # `tests/test_reviewer_worktree_wiring.py::
+        # test_a_failing_git_status_after_the_review_is_never_read_as_a_
+        # clean_tree` for the end-to-end ablation pin and the "compare" case
+        # of `test_an_unestablishable_integrity_check_never_returns_the_
+        # verdict` for the wiring pin.
         try:
             delta = reviewer_worktree.compare(repo_path, before, timeout=timeout)
         except reviewer_worktree.WorktreeCheckFailed as exc:
@@ -16372,6 +16395,14 @@ class Orchestrator:
             baseline_commit=before.head,
         )
 
+        # Audit (reviewer-worktree-returncode-audit): reached only once
+        # `compare()` has already proven the reviewer wrote something, so a
+        # revert failure here means the tree may be left PARTIALLY reverted —
+        # same discard-and-escalate helper as the "compare" site above,
+        # `decision` again never surfaces. An unanswerable revert is
+        # unavailable/infra, never a pass, exactly like its siblings. See the
+        # "revert" case of `tests/test_reviewer_worktree_wiring.py::
+        # test_an_unestablishable_integrity_check_never_returns_the_verdict`.
         try:
             reviewer_worktree.revert(repo_path, before, delta, timeout=timeout)
         except reviewer_worktree.WorktreeCheckFailed as exc:

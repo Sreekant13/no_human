@@ -87,6 +87,44 @@ class Delta:
         return not (self.added or self.modified or self.deleted)
 
 
+#: Audit trail for every ``subprocess.run`` call site in this module (task
+#: reviewer-worktree-returncode-audit). Each entry names whether that call's
+#: exit status is checked and, for the one that is not, why an unraised
+#: failure still fails closed downstream. `tests/test_reviewer_worktree.py
+#: ::test_every_subprocess_run_call_site_is_captured_in_the_audit` parses this
+#: module's AST and asserts the two sets are exactly equal, so a future
+#: subprocess call added here without an entry — or an entry left stale after
+#: a call site is removed — goes red rather than shipping silently unaudited.
+SUBPROCESS_CALL_AUDIT: dict[str, str] = {
+    "_run_git": (
+        "checked — `if proc.returncode != 0: raise WorktreeCheckFailed(...)` "
+        "below. This is LOAD-BEARING, not defensive: a failed `git status "
+        "--porcelain -z` that was allowed to return would give back an EMPTY "
+        "stdout (see the `except` clauses above, which already convert "
+        "timeout/OSError to the same raise); `_parse_porcelain_z(\"\")` reads "
+        "that as no entries; `compare()` reads no entries as an empty "
+        "`Delta`; and `_run_reviewer` takes the `delta.is_empty(): return "
+        "decision` branch, handing back the reviewer's own PASS untouched. "
+        "That is the exact 'could not tell, read as nothing happened' "
+        "failure this module's docstring says it replaces. Ablating this "
+        "check (`if False and proc.returncode != 0:`) is what "
+        "`test_run_git_raises_on_a_nonzero_exit_and_never_returns_its_empty_"
+        "stdout` and `test_a_failing_git_status_after_the_review_is_never_"
+        "read_as_a_clean_tree` (wiring test) pin red."
+    ),
+    "_config_effective": (
+        "deliberately UNCHECKED — returns None on a non-zero exit (or "
+        "TimeoutExpired/OSError), instead of raising. Safe only because "
+        "`compare()` never treats None as a match: it excuses a config "
+        "file's byte-level re-serialization solely when `bn is not None and "
+        "an is not None and bn == an` (see the `bn`/`an` comparison in "
+        "`compare()`), so a config read that failed on either side of the "
+        "diff keeps the byte-level violation and fails closed rather than "
+        "silently excusing a real key change."
+    ),
+}
+
+
 def _run_git(repo_path: Path, *args: str, timeout: float) -> str:
     # Variadic, matching `vcs/push_hook.py:_git` / `vcs/pr_watcher.py:_git_rc`
     # / `vcs/git.py:GitRepo._run` — not a `list[str]` parameter. The
@@ -114,6 +152,19 @@ def _run_git(repo_path: Path, *args: str, timeout: float) -> str:
     except (FileNotFoundError, PermissionError, OSError, TypeError) as exc:
         raise WorktreeCheckFailed(
             f"git {' '.join(args)} could not run: {exc}") from exc
+    # LOAD-BEARING, see `SUBPROCESS_CALL_AUDIT["_run_git"]` above: without
+    # this raise, a failed `git status` returns "" (git writes nothing to
+    # stdout on a hard failure), `_parse_porcelain_z("")` parses that to no
+    # entries, `compare()` reads no entries as a clean `Delta`, and
+    # `_run_reviewer` hands back the reviewer's own PASS as if the tree had
+    # never been touched. Deleting or disabling this check (`if False and
+    # proc.returncode != 0:`) is a silent mutant today — the whole suite
+    # stays green — which is exactly what
+    # `test_every_subprocess_run_call_site_is_captured_in_the_audit`,
+    # `test_run_git_raises_on_a_nonzero_exit_and_never_returns_its_empty_stdout`
+    # and the wiring test
+    # `test_a_failing_git_status_after_the_review_is_never_read_as_a_clean_tree`
+    # exist to pin.
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip().replace("\n", " ")[:400]
         raise WorktreeCheckFailed(
@@ -400,6 +451,8 @@ def _config_effective(path: Path, *, timeout: float) -> str | None:
     None (unreadable, syntactically broken, or git absent) is deliberately not
     an empty set: `compare` treats it as "could not establish equality" and
     keeps the byte-level violation, so garbage written over config fails closed.
+    See `SUBPROCESS_CALL_AUDIT["_config_effective"]` for why this call site is
+    the one deliberately-unchecked exception to `_run_git`'s pattern.
     """
     if not path.is_file():
         return None

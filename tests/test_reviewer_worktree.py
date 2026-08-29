@@ -23,6 +23,7 @@ assume away):
 
 from __future__ import annotations
 
+import ast
 import stat
 import subprocess
 from pathlib import Path
@@ -539,3 +540,82 @@ def test_new_loose_object_and_unrelated_ref_do_not_trigger_reviewer_wrote(worktr
         f"as a write: added={delta.added} modified={delta.modified} "
         f"deleted={delta.deleted}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# `_run_git`'s returncode check (task reviewer-worktree-returncode-audit)
+# --------------------------------------------------------------------------- #
+
+def test_every_subprocess_run_call_site_is_captured_in_the_audit():
+    """`rw.SUBPROCESS_CALL_AUDIT` must name every `subprocess.run` call site in
+    this module, by parsing the module's own source rather than re-listing the
+    names by hand — a hand-kept list would go stale the moment a new call site
+    was added and nobody remembered to also add its entry. This is the
+    mechanical guarantee that the returncode check on `_run_git` (and the
+    deliberate absence of one on `_config_effective`) stays documented as the
+    module grows: an undocumented new call site, or a stale entry for a
+    removed one, goes red here before anyone has to notice by reading diffs.
+    """
+    source = Path(rw.__file__).read_text()
+    tree = ast.parse(source)
+    call_sites = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "run"
+                    and isinstance(inner.func.value, ast.Name)
+                    and inner.func.value.id == "subprocess"):
+                call_sites.add(node.name)
+    assert call_sites, "no subprocess.run call site found in reviewer_worktree.py"
+    assert call_sites == set(rw.SUBPROCESS_CALL_AUDIT), (
+        f"subprocess.run call sites in the module ({sorted(call_sites)}) do "
+        f"not match SUBPROCESS_CALL_AUDIT ({sorted(rw.SUBPROCESS_CALL_AUDIT)}) "
+        "-- a call site was added without documenting its exit-status "
+        "handling, or a stale entry survives a removed call site")
+
+
+def test_run_git_raises_on_a_nonzero_exit_and_never_returns_its_empty_stdout(
+    tmp_path, monkeypatch,
+):
+    """The returncode check `_run_git` performs after the timeout/OSError
+    `except` clauses (reviewer_worktree.py, `if proc.returncode != 0:`) is
+    exercised nowhere else in this file: the neighbouring timeout test above
+    only drives `subprocess.TimeoutExpired`, never a plain non-zero exit. That
+    left the branch itself a silent mutant — disable it
+    (`if False and proc.returncode != 0:`) and the whole suite (10k+ tests)
+    stays green, because nothing forces a REAL non-zero-exit git call through
+    `_run_git` and checks the outcome.
+
+    A failed `git status`/`git rev-parse` prints nothing useful to stdout;
+    without the check, `_run_git` would return that empty string as if it
+    were a legitimate (empty) answer. `_parse_porcelain_z("")` reads that as
+    "no entries", which is indistinguishable from an actually-clean tree —
+    the exact inversion `SUBPROCESS_CALL_AUDIT["_run_git"]` documents.
+    """
+    repo = _seeded_repo(tmp_path)
+    # Control: unpatched, `_run_git` and `snapshot` both work normally.
+    assert rw.snapshot(repo, timeout=_TIMEOUT).head
+
+    real_run = subprocess.run
+
+    def _fail_status(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        if argv and "status" in argv:
+            return subprocess.CompletedProcess(
+                argv, returncode=128, stdout="",
+                stderr="fatal: not a git repository (or any parent)")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(rw.subprocess, "run", _fail_status)
+
+    with pytest.raises(rw.WorktreeCheckFailed, match="exit 128"):
+        rw._run_git(repo, "status", "--porcelain=v1", "-z", timeout=_TIMEOUT)
+
+    # `snapshot()` calls `_run_git(..., "status", ...)` internally; it must
+    # raise rather than come back with a `Snapshot` whose `entries` is just
+    # empty because the failed status call's "" was accepted as real output.
+    with pytest.raises(rw.WorktreeCheckFailed, match="exit 128"):
+        rw.snapshot(repo, timeout=_TIMEOUT)
