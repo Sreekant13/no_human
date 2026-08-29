@@ -464,6 +464,14 @@ RETIRED_CLAIMS = [
      "src/no_human/config.py); the honest claim is that no code path acts on it"),
     ("reproduction gate is pytest-only", "understated — repro_gate.py routes "
      "non-Python ecosystems through the profile's test_cmd (repro_gate.py:157-169)"),
+    ("glab mr accept` (glab's own alias for `merge`) is still allowed",
+     "false since 008bd04d6 — ('mr','accept') is in _FORGE_MERGE_PAIRS "
+     "(recheck: grep -n _FORGE_MERGE_PAIRS src/no_human/agent/guard.py); "
+     "guard.evaluate denies `glab mr accept 12` in both session modes"),
+    ("are both still allowed in a review session",
+     "false — the argv-shaped read-only check in guard.py denies "
+     "`git -C . commit` and `git -C . push origin <branch>` at readonly=True "
+     "(reviewer.py:2088); recheck with guard.evaluate(..., readonly=True)"),
 ]
 
 

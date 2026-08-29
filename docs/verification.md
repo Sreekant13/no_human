@@ -42,9 +42,13 @@ whether to rely on it. Bash is not refused, so a shell redirection can still
 write a file, and [`review/reviewer.py`](../src/no_human/review/reviewer.py)'s
 own module docstring says so rather than implying otherwise. The refusal happens **at the tool call**, in a PreToolUse
 guard that reads a command line — so it is a cost, not a proof, and a spelling
-it does not model gets through. A global option before the subcommand is one
-such spelling and, measured on 2026-08-22, `git -C . commit` and
-`git -C . push origin <branch>` are both still allowed in a review session.
+it does not model gets through. A global option before the subcommand *was*
+one such spelling — measured 2026-08-22, `git -C . commit` and
+`git -C . push origin <branch>` were both allowed in a review session; both
+are now denied by the argv-shaped read-only check in
+[`agent/guard.py`](../src/no_human/agent/guard.py), which resolves the
+subcommand past global options rather than matching the literal. That closes
+the spellings it models and no more: the modelled set is not closed.
 Staging is not a global-option case at all: `git add` is absent from the
 write-verb list, so plain `git add -A` is allowed too. And nothing re-reads the tree after the reviewer runs, so a write
 that did get through would be what the test gate then scores.
@@ -332,8 +336,12 @@ to two levels deep — the same bound `_git_invocations` already used — so
 spelling (`tests/test_guard.py::test_a_shell_runner_wrapper_does_not_hide_the_forge_merge`).
 That is a raise in the cost of the obvious wrapped spellings, not a closed
 door — see security.md's "WHAT THIS RULE IS" for what a command-line guard
-structurally cannot see, including nesting past two levels, and note that
-`glab mr accept` (glab's own alias for `merge`) is still allowed today. Treat
+structurally cannot see, including nesting past two levels. `glab mr accept`
+— glab's own alias for `merge` — is denied too: `("mr", "accept")` is in
+`_FORGE_MERGE_PAIRS` in [`agent/guard.py`](../src/no_human/agent/guard.py),
+alongside `("pr", "merge")` and `("mr", "merge")`, and the lexical
+`_FORGE_MERGE` carries the same alternation. That is one more spelling
+modelled, not a closed door — the modelled set is not closed. Treat
 the matcher as a cost on the obvious spellings, not as the door: the control
 that closes it is a check at the act, not a longer pattern.
 
