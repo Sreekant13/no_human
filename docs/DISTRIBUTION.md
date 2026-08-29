@@ -260,12 +260,19 @@ the first.
 |---|---|
 | **1 (recommended)** | `APPLE_API_KEY` (path to the `.p8`), `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` |
 | 2 | `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` |
-| 3 | `APPLE_KEYCHAIN`, `APPLE_KEYCHAIN_PROFILE` |
+| 3 | `APPLE_KEYCHAIN_PROFILE` (and optionally `APPLE_KEYCHAIN`, a keychain **path**) |
 
-A **partially** filled set counts as no credentials at all — the build will
-sign but not notarize, and will name the artifact `-UNNOTARIZED` rather than
-pretend. Empty-string values (how CI exports unset secrets) also count as
-absent.
+A profile stored by `notarytool store-credentials` resolves through
+notarytool's **default keychain search only**. Set `APPLE_KEYCHAIN`
+alongside it (pointing at the login keychain) and notarization fails with
+`No Keychain password item found for profile`, because `--keychain <path>`
+does not see what the default search resolves. Set `APPLE_KEYCHAIN` only
+when the profile actually lives in a **non-default** keychain.
+
+A **partially** filled set counts as no credentials at all (for sets 1 and
+2, every listed variable is required) — the build will sign but not
+notarize, and will name the artifact `-UNNOTARIZED` rather than pretend.
+Empty-string values (how CI exports unset secrets) also count as absent.
 
 Your **Team ID** and **Apple ID** are not known until you enrol, so nothing in
 this repo hardcodes them. Do not add placeholder values — supply them only as

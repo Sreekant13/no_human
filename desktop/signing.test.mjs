@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   NOTARY_CREDENTIAL_SETS, SIGNED, SIGNED_NOT_NOTARIZED, UNSIGNED,
-  notaryCredentialSet, signingBanner, signingPlan,
+  notaryCredentialSet, notarizeCredentials, signingBanner, signingPlan,
 } from "./signing.cjs";
 
 const NOTARY = { APPLE_API_KEY: "k", APPLE_API_KEY_ID: "id", APPLE_API_ISSUER: "iss" };
@@ -41,6 +41,16 @@ test("cert but no notarization credentials: refuses the clean name", () => {
   assert.match(p.reason, /notarization credentials/i);
 });
 
+test("a bare APPLE_KEYCHAIN path with no profile is not a credential", () => {
+  // A keychain PATH alone identifies nowhere to look up a password item —
+  // notarytool needs the PROFILE. Must never be mistaken for set 3.
+  const p = signingPlan({ ...CERT, APPLE_KEYCHAIN: "/k.keychain-db" });
+  assert.equal(p.mode, SIGNED_NOT_NOTARIZED);
+  assert.equal(p.notarize, false);
+  assert.equal(p.artifactTag, "-UNNOTARIZED");
+  assert.equal(notarizeCredentials({ APPLE_KEYCHAIN: "/k.keychain-db" }), null);
+});
+
 test("cert + notarization credentials: the only combination that ships clean", () => {
   const p = signingPlan({ ...CERT, ...NOTARY });
   assert.equal(p.mode, SIGNED);
@@ -64,7 +74,7 @@ test("all three of Apple's credential sets are honoured", () => {
   const sets = [
     { APPLE_API_KEY: "a", APPLE_API_KEY_ID: "b", APPLE_API_ISSUER: "c" },
     { APPLE_ID: "a", APPLE_APP_SPECIFIC_PASSWORD: "b", APPLE_TEAM_ID: "c" },
-    { APPLE_KEYCHAIN: "a", APPLE_KEYCHAIN_PROFILE: "b" },
+    { APPLE_KEYCHAIN_PROFILE: "b" },
   ];
   for (const env of sets) {
     assert.ok(notaryCredentialSet(env), `unrecognised set: ${Object.keys(env)}`);
@@ -78,6 +88,58 @@ test("a partially-filled credential set does not count as credentials", () => {
   const p = signingPlan({ ...CERT, APPLE_ID: "a", APPLE_TEAM_ID: "c" });
   assert.equal(p.mode, SIGNED_NOT_NOTARIZED);
   assert.equal(notaryCredentialSet({ APPLE_ID: "a", APPLE_TEAM_ID: "c" }), null);
+  // Pins that only set 3 was relaxed — sets 1 and 2 still require every var.
+  assert.equal(notaryCredentialSet({ APPLE_API_KEY: "a", APPLE_API_KEY_ID: "b" }), null);
+});
+
+test("APPLE_KEYCHAIN_PROFILE alone is a complete notarization credential", () => {
+  // The regression: notarytool resolves a profile through its DEFAULT
+  // keychain search. Requiring APPLE_KEYCHAIN alongside it broke that
+  // resolution (`--keychain <path>` cannot see what the default search
+  // finds), forcing a signed-but-unnotarized release. This must be SIGNED.
+  const p = signingPlan({ ...CERT, APPLE_KEYCHAIN_PROFILE: "nh-notary" });
+  assert.equal(p.mode, SIGNED);
+  assert.equal(p.notarize, true);
+  assert.equal(p.artifactTag, "");
+  assert.equal(p.canAutoUpdate, true);
+});
+
+test("the keychain PATH is optional and forwarded only when set", () => {
+  const profileOnly = notarizeCredentials({ APPLE_KEYCHAIN_PROFILE: "p" });
+  assert.equal(profileOnly.keychainProfile, "p");
+  // Absence of the KEY, not an undefined value — `--keychain undefined` is
+  // the bug this guards against.
+  assert.ok(!("keychain" in profileOnly));
+
+  const both = notarizeCredentials({ APPLE_KEYCHAIN: "/k.keychain-db", APPLE_KEYCHAIN_PROFILE: "p" });
+  assert.equal(both.keychain, "/k.keychain-db");
+  assert.equal(both.keychainProfile, "p");
+
+  const whitespaceKeychain = notarizeCredentials({ APPLE_KEYCHAIN: "   ", APPLE_KEYCHAIN_PROFILE: "p" });
+  assert.ok(!("keychain" in whitespaceKeychain),
+    "a whitespace-only APPLE_KEYCHAIN must count as absent, like everywhere else");
+});
+
+test("the banner names credential VARIABLES, never their values", () => {
+  const sentinelSets = [
+    { APPLE_API_KEY: "SEKRIT-KEY", APPLE_API_KEY_ID: "SEKRIT-KEYID", APPLE_API_ISSUER: "SEKRIT-ISSUER" },
+    { APPLE_ID: "SEKRIT-ID", APPLE_APP_SPECIFIC_PASSWORD: "SEKRIT-PASSWORD", APPLE_TEAM_ID: "SEKRIT-TEAM" },
+    { APPLE_KEYCHAIN_PROFILE: "SEKRIT-PROFILE-VALUE" },
+  ];
+  const secretValues = ["SEKRIT-KEY", "SEKRIT-KEYID", "SEKRIT-ISSUER", "SEKRIT-ID",
+    "SEKRIT-PASSWORD", "SEKRIT-TEAM", "SEKRIT-PROFILE-VALUE", "SEKRIT-CERT"];
+  for (const notary of sentinelSets) {
+    const plan = signingPlan({ CSC_LINK: "SEKRIT-CERT", ...notary });
+    const banner = signingBanner(plan);
+    for (const secret of secretValues) {
+      assert.ok(!banner.includes(secret), `banner leaked ${secret}`);
+      assert.ok(!plan.reason.includes(secret), `reason leaked ${secret}`);
+    }
+  }
+  assert.match(
+    signingBanner(signingPlan({ CSC_LINK: "SEKRIT-CERT", APPLE_KEYCHAIN_PROFILE: "SEKRIT-PROFILE-VALUE" })),
+    /APPLE_KEYCHAIN_PROFILE/,
+  );
 });
 
 test("empty and whitespace-only vars are absent, not present", () => {

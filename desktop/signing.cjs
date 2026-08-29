@@ -36,7 +36,15 @@ const UNSIGNED = "unsigned";
 const NOTARY_CREDENTIAL_SETS = [
   ["APPLE_API_KEY", "APPLE_API_KEY_ID", "APPLE_API_ISSUER"],
   ["APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_TEAM_ID"],
-  ["APPLE_KEYCHAIN", "APPLE_KEYCHAIN_PROFILE"],
+  // A keychain PROFILE (created via `notarytool store-credentials`) resolves
+  // through notarytool's DEFAULT keychain search — it is a complete
+  // credential on its own. APPLE_KEYCHAIN (a keychain PATH) is therefore
+  // optional, and requiring it is actively hostile: passing
+  // `--keychain <path> --keychain-profile <p>` makes notarytool fail with
+  // "No Keychain password item found for profile", because the path search
+  // does not see what the default search resolves. Measured on the
+  // operator's Mac 2026-08-23.
+  ["APPLE_KEYCHAIN_PROFILE"],
 ];
 
 /** A var counts as absent when unset, empty, or whitespace-only. */
@@ -50,6 +58,29 @@ function notaryCredentialSet(env = {}) {
     if (set.every((name) => present(env, name))) return set;
   }
   return null;
+}
+
+/**
+ * What would actually be forwarded to notarytool for the satisfied
+ * credential set, or null if none is satisfied. Keeps "what reaches
+ * notarytool" testable without importing electron-builder.
+ *
+ * For set 3, APPLE_KEYCHAIN is forwarded ONLY when present — an absent
+ * `keychain` key (not an `undefined` value) is the point: electron-builder
+ * only appends `--keychain <path>` when the option key exists.
+ */
+function notarizeCredentials(env = {}) {
+  const set = notaryCredentialSet(env);
+  if (!set) return null;
+  if (set === NOTARY_CREDENTIAL_SETS[0]) {
+    return { key: env.APPLE_API_KEY, keyId: env.APPLE_API_KEY_ID, issuer: env.APPLE_API_ISSUER };
+  }
+  if (set === NOTARY_CREDENTIAL_SETS[1]) {
+    return { appleId: env.APPLE_ID, appleIdPassword: env.APPLE_APP_SPECIFIC_PASSWORD, teamId: env.APPLE_TEAM_ID };
+  }
+  const opts = { keychainProfile: env.APPLE_KEYCHAIN_PROFILE };
+  if (present(env, "APPLE_KEYCHAIN")) opts.keychain = env.APPLE_KEYCHAIN;
+  return opts;
 }
 
 /**
@@ -148,6 +179,7 @@ module.exports = {
   UNSIGNED,
   NOTARY_CREDENTIAL_SETS,
   notaryCredentialSet,
+  notarizeCredentials,
   signingPlan,
   signingBanner,
 };
