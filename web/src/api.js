@@ -71,6 +71,18 @@ export async function uploadAttachment(taskId, file) {
   return r.json();
 }
 
+// approve_task lands the PR synchronously — a squash + push the sibling
+// merge-progress feature documents as a normal 2-4 minute server call (see
+// SlideOver.jsx's `merging` state and slideOverSummary.js's
+// approveButtonState). An earlier version of this function raced that with a
+// 30s client-side AbortController: on any land past 30s (the common case)
+// the fetch aborted while the server kept merging, and the UI told the
+// operator "Nothing was merged" while it in fact had — a false claim, and
+// aborting the client fetch cannot cancel server-side work anyway. No
+// client-side timeout here; the button's in-flight state (driven by
+// `merging`, independent of this fetch) is what tells the operator it is
+// still working, and the WS task-event stream (connectTaskProgress) shows
+// live step progress for however long the land actually takes.
 export async function approveTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/approve`, { method: "POST" });
   if (!r.ok) {

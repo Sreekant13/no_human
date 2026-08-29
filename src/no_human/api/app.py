@@ -554,6 +554,20 @@ async def _emit_task_event(
     await _mgr.broadcast({"type": "task_event", "task_id": task_id, "event": ev})
 
 
+async def _refuse_approve(
+    store: Store, task_id: str, reason: str, status: int, *, detail: Any = None,
+) -> None:
+    """Record the refusal so the drawer's history shows it, then raise.
+
+    The board's approve button was failing silently (operator on task
+    e24cee25/PR #643 saw nothing when containment refused the merge) because
+    no refusal path wrote anything the UI could render or replay — this
+    writes an `approve_refused` event with the exact refusal text before
+    raising, so it survives closing/reopening the drawer."""
+    await _emit_task_event(store, task_id, "approve_refused", reason)
+    raise HTTPException(status_code=status, detail=detail if detail is not None else reason)
+
+
 def _latest_pr_url(attempts: list[dict]) -> str | None:
     for a in reversed(attempts):
         if a.get("pr_url"):
@@ -1136,9 +1150,10 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status != TaskStatus.AWAITING_APPROVAL:
-        raise HTTPException(
-            status_code=409,
-            detail=f"task is {task.status.value!r}, not awaiting_approval",
+        await _refuse_approve(
+            store, task_id,
+            f"task is {task.status.value!r}, not awaiting_approval",
+            409,
         )
     # Idempotency guard (409, not the button's disabled state alone): a
     # second approve for the same task — a raced double-click that beat the
@@ -1147,7 +1162,7 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     # `context.merge_in_progress` so this holds across server instances, not
     # just in-process.
     if not await store.claim_merge(task.id):
-        raise HTTPException(status_code=409, detail="Merge already in progress")
+        await _refuse_approve(store, task_id, "Merge already in progress", 409)
     # Opt-in telemetry: the click itself, nothing about WHAT was approved.
     try:
         from .. import telemetry as _telemetry
@@ -1183,6 +1198,16 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             await _emit_task_event(store, task.id, "merge_started", "merge started")
             return await _merge_task_pr(request, store, task, pr_url, on_step=on_step)
 
+        async def _fail_merge(error_detail: dict[str, str]) -> None:
+            # `detail` keeps its `{step, stderr}` shape for `landFailureFeedback`
+            # (frozen response contract); the event gets a readable one-liner.
+            step = error_detail.get("step", "?")
+            stderr = str(error_detail.get("stderr", ""))[:500]
+            await _refuse_approve(
+                store, task.id, f"merge failed at {step}: {stderr}", 500,
+                detail=error_detail,
+            )
+
         if (task.context or {}).get("already_satisfied_report"):
             # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
             # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
@@ -1202,7 +1227,7 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             else:
                 landed_sha, error_detail = await _merge(pr_url)
                 if error_detail:
-                    raise HTTPException(status_code=500, detail=error_detail)
+                    await _fail_merge(error_detail)
                 if landed_sha:
                     message = _merge_outcome_message(landed_sha)
                 else:
@@ -1213,7 +1238,7 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             if pr_url:
                 landed_sha, error_detail = await _merge(pr_url)
                 if error_detail:
-                    raise HTTPException(status_code=500, detail=error_detail)
+                    await _fail_merge(error_detail)
                 if landed_sha:
                     message = _merge_outcome_message(landed_sha)
                 else:
@@ -1291,19 +1316,20 @@ async def approve_landed(
         TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED, TaskStatus.PENDING,
         TaskStatus.DONE,
     ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        await _refuse_approve(
+            store, task_id,
+            (
                 f"task is {task.status.value!r}, not awaiting_approval, "
                 "a pre-PR failed task, a never-dispatched pending task, or "
                 "a done task with no completion evidence on record"
             ),
+            409,
         )
     try:
         result = await approve_landed_override(
             store, task, body.sha, body.justification, base=body.base)
     except OverrideRefused as exc:
-        raise HTTPException(status_code=400, detail=exc.reason)
+        await _refuse_approve(store, task_id, exc.reason, 400)
 
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({

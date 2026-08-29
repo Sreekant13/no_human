@@ -8,6 +8,7 @@ import {
 import Markdown from "./Markdown.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { eventLabel } from "./eventLabels.js";
+import { classifyApproveError } from "./approveRefusal.js";
 import {
   CANCEL_TITLE, CANCEL_BODY, CANCEL_CONFIRM_LABEL, CANCEL_KEEP_LABEL,
   CANCEL_REASON_PLACEHOLDER, REASON_MAX, submitCancel,
@@ -50,7 +51,7 @@ const IconInfo = ({ size = 14 }) => (
 );
 
 export default function SlideOver({ taskId, onClose, refreshKey = 0,
-                                    reviewQueue = [], onJump = null }) {
+                                    reviewQueue = [], onJump = null, onApproveRefused = null }) {
   // W2.5: the review queue — the next awaiting-approval task after this one,
   // so five reviews feel like one pass instead of five board round-trips.
   const nextInQueue = reviewQueue.find((id) => id !== taskId) || null;
@@ -306,10 +307,16 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
       // A genuine land failure carries {step, stderr} as `detail` (see
       // api.js's approveTask) — the persistent inline alert names the step
       // and the first 200 chars of stderr. Anything else (a plain 409/500
-      // string detail) falls back to the existing banner text.
+      // string detail, a client timeout, a network error) falls back to the
+      // classifier's text so the refusal is never silent (task e24cee25/PR
+      // #643 — the operator saw nothing at all on an ancestry refusal).
       const detail = e && typeof e.detail === "object" && e.detail && e.detail.step
         ? e.detail : null;
-      setFlash(detail ? landFailureFeedback(detail) : approvalFeedback({ ok: false, error: e.message }));
+      const cls = classifyApproveError(e);
+      setFlash(detail ? landFailureFeedback(detail) : approvalFeedback({ ok: false, error: cls.text }));
+      // Bubble the classified refusal up to Board so it survives this drawer
+      // closing — a toast + a persistent card banner, not just this inline flash.
+      onApproveRefused?.(taskId, cls);
     } finally {
       setBusy(false);
       setMerging(false);

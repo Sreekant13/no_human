@@ -608,6 +608,94 @@ async def test_approve_wrong_status_409(client, store):
 
 
 @pytest.mark.asyncio
+async def test_approve_wrong_status_writes_approve_refused_event(client, store):
+    """The board's approve button was failing silently (task e24cee25/PR #643:
+    the operator saw nothing when the merge was refused) because no refusal
+    path wrote anything the drawer could show. Every refusal must now leave
+    an `approve_refused` event carrying the exact text the response returned."""
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    events = await store.list_events(t.id)
+    assert any(
+        e["kind"] == "approve_refused" and detail in e["text"] for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_approve_merge_in_progress_writes_approve_refused_event(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    assert await store.claim_merge(t.id)  # simulate an in-flight merge claim
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Merge already in progress"
+    events = await store.list_events(t.id)
+    assert any(
+        e["kind"] == "approve_refused" and "Merge already in progress" in e["text"]
+        for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_approve_land_failure_writes_approve_refused_event(client, store, monkeypatch):
+    app_module = importlib.import_module("no_human.api.app")
+
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, pr_url="https://github.com/o/r/pull/7")
+
+    async def _fake_merge_task_pr(*args, **kwargs):
+        return "", {"step": "push", "stderr": "boom"}
+
+    monkeypatch.setattr(app_module, "_merge_task_pr", _fake_merge_task_pr)
+
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 500
+    # Response shape is frozen: still the {step, stderr} dict, not a string.
+    assert r.json()["detail"] == {"step": "push", "stderr": "boom"}
+    events = await store.list_events(t.id)
+    assert any(
+        e["kind"] == "approve_refused" and "push" in e["text"] for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_approve_landed_refusal_writes_approve_refused_event(client, store, monkeypatch):
+    from no_human.blockers import landed_override as landed_override_module
+
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    reason = "0936e40a3 is not an ancestor of fix/global-flags-defeat-the-merge-rules — refusing."
+
+    async def _fake_approve_landed_override(*args, **kwargs):
+        raise landed_override_module.OverrideRefused(reason)
+
+    monkeypatch.setattr(
+        landed_override_module, "approve_landed_override", _fake_approve_landed_override,
+    )
+
+    r = await client.post(
+        f"/api/tasks/{t.id}/approve-landed",
+        json={"sha": "0936e40a3", "justification": "asserting anyway"},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == reason
+    events = await store.list_events(t.id)
+    assert any(
+        e["kind"] == "approve_refused" and reason in e["text"] for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_approve_writes_no_approve_refused_event(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    events = await store.list_events(t.id)
+    assert not any(e["kind"] == "approve_refused" for e in events)
+
+
+@pytest.mark.asyncio
 async def test_approve_records_timestamp(client, store):
     t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
     await client.post(f"/api/tasks/{t.id}/approve")

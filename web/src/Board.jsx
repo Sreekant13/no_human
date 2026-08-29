@@ -10,6 +10,15 @@ import { cardBlockerLine } from "./cardBlockerLine.js";
 import { escalationLatencyLine } from "./escalationLatency.js";
 import { httpPrUrl } from "./prUrl.js";
 import { mergeReadyChip } from "./slideOverSummary.js";
+import {
+  approveRefusalToast, setApproveError, dismissApproveError, pruneApproveErrors,
+} from "./approveRefusal.js";
+
+// Toast lifetime — long enough to read a refusal sentence, short enough not
+// to pile up. The persistent source of truth is the card banner (dismissed
+// explicitly, or cleared once the task leaves awaiting_approval); the toast
+// is just the "notice me now" nudge.
+const APPROVE_TOAST_MS = 8_000;
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -21,6 +30,29 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const triggerRef = useRef(null);
   const prevUpdatedAtRef = useRef(null);
+  // Per-task approve refusal state — the board's approve button used to fail
+  // silently (task e24cee25/PR #643: an ancestry refusal reached the operator
+  // nowhere at all). This is the persistent half; the toast below is the
+  // "notice me now" half. Both read the same classified `{cause, text}`.
+  const [approveErrors, setApproveErrors] = useState({});
+  const [toast, setToast] = useState(null);
+
+  const handleApproveRefused = (id, cls) => {
+    setApproveErrors((m) => setApproveError(m, id, cls));
+    setToast(approveRefusalToast(id, cls));
+  };
+
+  useEffect(() => {
+    if (!toast) return undefined;
+    const t = setTimeout(() => setToast((cur) => (cur?.id === toast.id ? null : cur)), APPROVE_TOAST_MS);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // A refusal error is stale once its task has left awaiting_approval — the
+  // approve either landed on a retry or the task moved on some other way.
+  useEffect(() => {
+    setApproveErrors((m) => pruneApproveErrors(m, tasks));
+  }, [tasks]);
 
   // Re-fetch the SlideOver whenever the selected task's updated_at changes via WS
   useEffect(() => {
@@ -68,6 +100,8 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
             lane={lane}
             tasks={tasks.filter((t) => routeTask(t) === lane.key)}
             onSelect={openTask}
+            approveErrors={approveErrors}
+            onDismissApproveError={(id) => setApproveErrors((m) => dismissApproveError(m, id))}
           />
         ))}
       </div>
@@ -90,7 +124,19 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
             prevUpdatedAtRef.current = null;
             setSelectedId(id);
           }}
+          onApproveRefused={handleApproveRefused}
         />
+      )}
+      {toast && (
+        <div className="nh-toast nh-toast-error" role="alert">
+          <span className="nh-toast-text">{toast.text}</span>
+          <button
+            type="button"
+            className="nh-toast-dismiss"
+            aria-label="Dismiss notification"
+            onClick={() => setToast(null)}
+          >×</button>
+        </div>
       )}
     </>
   );
@@ -116,7 +162,7 @@ function workingBreakdown(tasks) {
   return waiting > 0 ? `${base} · ${waiting} waiting` : base;
 }
 
-function Lane({ lane, tasks, onSelect }) {
+function Lane({ lane, tasks, onSelect, approveErrors, onDismissApproveError }) {
   const [expanded, setExpanded] = useState(false);
   // SCRUM-19: the Needs-Answer lane's OWN collapse — stale escalations (>24h,
   // by escalation recency) sink behind an expandable divider instead of
@@ -189,6 +235,8 @@ function Lane({ lane, tasks, onSelect }) {
                 isAwaiting={!!lane.needsYou}
                 showSubStatus={lane.showSubStatus}
                 onClick={(e) => onSelect(task.id, e.currentTarget)}
+                approveError={approveErrors?.[task.id]}
+                onDismissApproveError={onDismissApproveError}
               />
             ))}
             {stale.length > 0 && (
@@ -214,6 +262,8 @@ function Lane({ lane, tasks, onSelect }) {
                 showSubStatus={lane.showSubStatus}
                 staleAnswer
                 onClick={(e) => onSelect(task.id, e.currentTarget)}
+                approveError={approveErrors?.[task.id]}
+                onDismissApproveError={onDismissApproveError}
               />
             ))}
           </>
@@ -226,6 +276,8 @@ function Lane({ lane, tasks, onSelect }) {
               isAwaiting={!!lane.needsYou}
               showSubStatus={lane.showSubStatus}
               onClick={(e) => onSelect(task.id, e.currentTarget)}
+              approveError={approveErrors?.[task.id]}
+              onDismissApproveError={onDismissApproveError}
             />
           ))
         )}
@@ -267,7 +319,7 @@ function actionHint(task) {
   return null;
 }
 
-function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClick }) {
+function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClick, approveError, onDismissApproveError }) {
   const activityTs = task.last_activity || task.updated_at || task.created_at;
   const ageMs = Date.now() - new Date(activityTs).getTime();
   const ageSec = ageMs / 1000;
@@ -334,6 +386,20 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         <div className="card-title">{task.title}</div>
         <div className="card-id" title="task id — use it with `nh <id>`">{task.id.slice(0, 8)}</div>
       </div>
+      {approveError && (
+        // Persists until dismissed or the task leaves awaiting_approval
+        // (pruneApproveErrors, above) — the toast fades on its own, but a
+        // refusal must not be discoverable-only-if-you-were-looking.
+        <div className="card-approve-error" role="alert">
+          <span className="card-approve-error-text">{approveError.text}</span>
+          <button
+            type="button"
+            className="card-approve-error-dismiss"
+            aria-label="Dismiss approve error"
+            onClick={(e) => { e.stopPropagation(); onDismissApproveError?.(task.id); }}
+          >×</button>
+        </div>
+      )}
       {task.live_status && isRunningNow && (
         <div className="card-live-status">{task.live_status}</div>
       )}

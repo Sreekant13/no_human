@@ -79,7 +79,9 @@ async function pushWSFrame(page, frame) {
   }, frame);
 }
 
-function mockApi(page, { approveDelayMs = 0, approveStatus = 200, approveBody = null } = {}) {
+function mockApi(page, {
+  approveDelayMs = 0, approveStatus = 200, approveBody = null, eventsBody = null,
+} = {}) {
   let approveCount = 0;
   const getApproveCount = () => approveCount;
   const handler = async (route) => {
@@ -100,7 +102,10 @@ function mockApi(page, { approveDelayMs = 0, approveStatus = 200, approveBody = 
     if (u.includes("/api/onboarding")) return j({ completed: true });
     if (u.includes("/api/projects")) return j([]);
     if (u.match(/\/api\/tasks\/[^/]+\/diff/)) return j({ diff: "" });
-    if (u.match(/\/api\/tasks\/[^/]+\/events/)) return j([]);
+    // `eventsBody`: lets AC2's drawer-row test seed the task's event history
+    // (an `approve_refused` row) without needing a real backend — the
+    // default `[]` is unchanged for every scenario that doesn't pass it.
+    if (u.match(/\/api\/tasks\/[^/]+\/events/)) return j(eventsBody ?? []);
     if (u.match(/\/api\/tasks\/[^/]+$/)) return j(TASK);
     if (u.includes("/api/tasks")) return j([TASK]);
     return j({});
@@ -246,6 +251,108 @@ async function openDrawer(opts = {}) {
   await page.locator(".flash-banner-dismiss").click();
   const stillVisible = await banner.isVisible().catch(() => false);
   check("[failure] banner disappears only after the dismiss click", !stillVisible);
+  await ctx.close();
+}
+
+// 13 — refusal (task e24cee25/PR #643): a 409 refusal must render the exact
+// server text, both as the inline drawer banner AND as a toast — the bug was
+// that neither appeared and the click looked dead.
+{
+  const REFUSAL = "0936e40a3 is not an ancestor of fix/global-flags-defeat-the-merge-rules — refusing.";
+  const { ctx, page } = await openDrawer({ approveStatus: 409, approveBody: { detail: REFUSAL } });
+  await page.locator(".btn-approve").click();
+  const banner = page.locator(".flash-banner");
+  await banner.waitFor({ state: "visible", timeout: 3000 });
+  const bannerText = await banner.innerText();
+  check("[refusal] drawer banner contains the exact refusal text", bannerText.includes(REFUSAL), bannerText);
+
+  const toast = page.locator(".nh-toast");
+  await toast.waitFor({ state: "visible", timeout: 3000 });
+  const toastText = await toast.innerText();
+  check("[refusal] toast contains the exact refusal text", toastText.includes(REFUSAL), toastText);
+  await ctx.close();
+}
+
+// 14 — the refusal survives closing the drawer: the card carries a
+// persistent banner with the same text, dismissible via its own X.
+{
+  const REFUSAL = "Merge already in progress";
+  const { ctx, page } = await openDrawer({ approveStatus: 409, approveBody: { detail: REFUSAL } });
+  await page.locator(".btn-approve").click();
+  await page.locator(".flash-banner").waitFor({ state: "visible", timeout: 3000 });
+
+  await page.locator(".so-close").click();
+  await page.locator(".slideover").waitFor({ state: "hidden", timeout: 3000 });
+
+  const cardBanner = page.locator(".card-approve-error");
+  await cardBanner.waitFor({ state: "visible", timeout: 3000 });
+  const cardText = await cardBanner.innerText();
+  check("[refusal] card banner survives closing the drawer with the same text",
+    cardText.includes(REFUSAL), cardText);
+
+  await page.locator(".card-approve-error-dismiss").click();
+  const stillVisible = await cardBanner.isVisible().catch(() => false);
+  check("[refusal] card banner disappears only after its own dismiss click", !stillVisible);
+  await ctx.close();
+}
+
+// 15 — success path unchanged: a plain 200 approve must render neither a
+// toast nor a card banner (the refusal-only UI must not leak into the happy
+// path this bug never affected).
+{
+  const { ctx, page } = await openDrawer({ approveDelayMs: 50 });
+  await page.locator(".btn-approve").click();
+  await page.waitForTimeout(600);
+  const toastVisible = await page.locator(".nh-toast").isVisible().catch(() => false);
+  check("[success] no toast on a successful approve", !toastVisible);
+  await page.locator(".so-close").click();
+  await page.locator(".slideover").waitFor({ state: "hidden", timeout: 3000 });
+  const cardBannerVisible = await page.locator(".card-approve-error").isVisible().catch(() => false);
+  check("[success] no card banner on a successful approve", !cardBannerVisible);
+  await ctx.close();
+}
+
+// 16 — drawer history: an `approve_refused` task event (as written by the
+// backend on every refusal) renders as a labelled "Approve refused" row in
+// the drawer's activity timeline, carrying the refusal text.
+{
+  const REFUSAL = "0936e40a3 is not an ancestor of fix/global-flags-defeat-the-merge-rules — refusing.";
+  const { ctx, page } = await openDrawer({
+    eventsBody: [{ source: "worker", kind: "approve_refused", text: REFUSAL, ts: 1 }],
+  });
+  // awaiting_approval tasks default-open on the Review section (defaultOpenSection),
+  // and each accordion section only mounts (and fetches) its body while open — so
+  // the Activity tab's poll-fetch of /events doesn't even fire until it's opened.
+  await page.getByRole("button", { name: /^Activity/ }).click();
+  const row = page.locator(".rich-kind.ak-approve_refused");
+  await row.waitFor({ state: "visible", timeout: 3000 });
+  const rowText = await row.innerText();
+  check("[history] drawer event row is labelled Approve refused", /Approve refused/i.test(rowText), rowText);
+  const body = page.locator(".rich-body", { hasText: "not an ancestor" });
+  check("[history] drawer event row carries the refusal text", await body.isVisible().catch(() => false));
+  await ctx.close();
+}
+
+// 17 — in-flight state (AC3): while a slow refusal is pending, the button is
+// disabled and shows the busy label; once the refusal resolves, it flips to
+// the retry label rather than sitting dead.
+{
+  const { ctx, page } = await openDrawer({
+    approveDelayMs: 600, approveStatus: 409, approveBody: { detail: "Merge already in progress" },
+  });
+  const btn = page.locator(".btn-approve");
+  await btn.click();
+  await page.waitForTimeout(150);
+  const midText = await btn.innerText();
+  check("[in-flight] button is disabled while the refusal is pending", await btn.isDisabled(), midText);
+  check("[in-flight] button shows a busy label while pending",
+    /Approving…|Merging/i.test(midText), midText);
+
+  await page.locator(".flash-banner").waitFor({ state: "visible", timeout: 3000 });
+  const afterText = await btn.innerText();
+  check("[in-flight] button reads Retry approve and merge once refused",
+    /Retry approve and merge/i.test(afterText), afterText);
+  check("[in-flight] button is re-enabled once refused", await btn.isEnabled());
   await ctx.close();
 }
 

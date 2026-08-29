@@ -83,6 +83,9 @@ export const EVENT_LABELS = {
   ci_gate_fail: "Enterprise CI failed",
   ci_gate_blocked: "Enterprise CI blocked",
   ci_gate_refused: "Enterprise CI refused",
+  // the board's approve button, refused (task e24cee25/PR #643: a refusal
+  // used to reach the operator nowhere at all)
+  approve_refused: "Approve refused",
 };
 
 export function eventLabel(kind) {
