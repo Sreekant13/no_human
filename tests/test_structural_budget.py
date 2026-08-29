@@ -162,7 +162,14 @@ FROZEN_FILE_LINES = {
     # the pre-existing `apply_action` bounds argument (previously recomputed
     # inline), and by dropping a redundant function-local `Bounds` re-import
     # in `send_back` — `Bounds` is already imported at module level (line 53).
-    "api/app.py": 5346,
+    # Grew to 5372 (+26) when the approve-refusal surfacing landed
+    # (ee101fc460: every `nh approve` refusal path must surface its exact
+    # refusal text in the UI, loudly — new refusal-detail plumbing in the
+    # approve endpoints). Reviewed on its merits by that task's independent
+    # review; the landing omitted this re-anchor, which turned main red at
+    # the next full-suite run (2026-08-30). Frozen at its landing baseline;
+    # growth from here fails.
+    "api/app.py": 5372,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
