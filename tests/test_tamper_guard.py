@@ -338,6 +338,82 @@ def test_real_tautology_forms_all_still_counted():
         assert tamper_guard.count_tautologies(src) >= 1, src
 
 
+def test_self_equality_tautology_still_matches_with_trailer():
+    """`assert x == x` must still match with a trailing message, comment, or
+    extra whitespace — the fix only needs to reject a DERIVED-value RHS, not
+    every non-identifier character after it."""
+    for src in (
+        "def t():\n    assert x == x\n",
+        'def t():\n    assert x == x, "msg"\n',
+        "def t():\n    assert x == x  # comment\n",
+        "def t():\n    assert x  ==  x\n",
+    ):
+        assert tamper_guard.count_tautologies(src) >= 1, src
+
+
+def test_comparison_to_derived_value_is_not_a_tautology():
+    """`assert x == x.<anything>` compares x to a DERIVED value, not itself —
+    it is a real assertion and must not be counted as a tautology. This was
+    the live false positive: `assert home == home.resolve()` (the strongest
+    assertion available for its subject, that the function returns a
+    RESOLVED path) was miscounted, and a tamper adjudication returned
+    CANNOT_DECIDE citing it."""
+    for src in (
+        'def t():\n    assert home == home.resolve(), "unresolved path"\n',
+        "def t():\n    assert p == p.parent\n",
+        "def t():\n    assert xs == xs[0]\n",
+        "def t():\n    assert obj == obj.method()\n",
+        "def t():\n    assert x == len(x)\n",
+        "def t():\n    assert x == x_2\n",
+    ):
+        assert tamper_guard.count_tautologies(src) == 0, src
+
+
+def test_real_codex_backend_file_has_no_tautologies():
+    """The exact line that cost task 3aed70f9: read the REAL file (not a copied
+    string) and confirm it scores zero tautologies under the fixed rule."""
+    path = Path(__file__).resolve().parent / "test_codex_backend.py"
+    text = path.read_text()
+    assert "assert home == home.resolve()" in text, (
+        "the line this regression guards against moved or was renamed; "
+        "update this test to the new location before trusting the count below"
+    )
+    assert tamper_guard.count_tautologies(text) == 0
+
+
+def test_every_tautology_alternative_still_matches():
+    """Redundant with test_real_tautology_forms_all_still_counted on purpose:
+    a future narrowing of `_TAUTOLOGY` (e.g. to fix another false positive)
+    must not silently drop one of these forms just because only one list of
+    cases was updated."""
+    for src in (
+        "def t():\n    assert True\n",
+        "def t():\n    assert not False\n",
+        "def t():\n    assert 1\n",
+        'def t():\n    assert 1, "msg"\n',
+        "def t():\n    assert x == x\n",
+        "it('x', () => { expect(true).toBe(true); })\n",
+        "it('x', () => { expect(true).toBeTruthy(); })\n",
+        "def t(self):\n    self.assertTrue(True)\n",
+    ):
+        assert tamper_guard.count_tautologies(src) >= 1, src
+
+
+def test_adding_derived_value_assertion_is_not_tampering():
+    """End-to-end shape that actually cost task 3aed70f9: adding a real,
+    derived-value assertion to a test file must not be flagged as tampering."""
+    before = {"tests/test_x.py": "def test_a():\n    assert f() == 1\n"}
+    after = {
+        "tests/test_x.py": (
+            "def test_a():\n    assert f() == 1\n"
+            "def test_b():\n    assert home == home.resolve()\n"
+        )
+    }
+    report = tamper_guard.check(before, after)
+    assert report.tampered is False, report.reasons
+    assert report.tautologies_after == report.tautologies_before, report.summary
+
+
 def test_tautology_masking_is_byte_correct_on_non_ascii():
     """ast column offsets are UTF-8 byte offsets: a non-ASCII char before a real
     tautology must not shift the mask and drop it; a fake one inside a non-ASCII

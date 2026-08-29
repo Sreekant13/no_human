@@ -126,7 +126,16 @@ _TAUTOLOGY = re.compile(
     r"\bassert\s+True\b"
     r"|\bassert\s+(?:not\s+False)\b"
     r"|\bassert\s+[0-9]+\s*(?:#|$|,)"          # assert 1  /  assert 1, "msg"
-    r"|\bassert\s+(\w+)\s*==\s*\1\b"            # assert x == x
+    # `assert x == x` — the RHS must END at the identifier. A trailing `\b` did
+    # NOT do that: the word→`.` boundary matched, so `assert home == home.resolve()`
+    # (tests/test_codex_backend.py — the strongest assertion for its subject, that
+    # the function returns a RESOLVED path) counted as a tautology and a tamper
+    # adjudication returned CANNOT_DECIDE on it. Measured against the positive
+    # control `assert home == home`, which must and does still match. The
+    # negative lookahead rejects any continuation that would make the RHS a
+    # DERIVED value: a further identifier char, `.` (attribute), `[`
+    # (subscript), or `(` (call).
+    r"|\bassert\s+(\w+)\s*==\s*\1\s*(?![\w.(\[])"   # assert x == x
     r"|\bexpect\s*\(\s*true\s*\)\s*\.\s*(?:toBe\s*\(\s*true\s*\)|toBeTruthy)"
     r"|\bassertTrue\s*\(\s*True\s*\)",
 )
