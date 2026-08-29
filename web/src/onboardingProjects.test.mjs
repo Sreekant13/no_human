@@ -301,3 +301,18 @@ test("the Launch card renders launchReadiness rows with a Fix button that jumps"
   assert.match(onboarding, /onClick=\{\(\) => setI\(r\.jumpTo\)\}>Fix →<\/button>/,
     "each unmet step must offer a Fix that jumps to it, not prose telling the user to go Back");
 });
+
+test("the Projects empty state offers an Add-repositories button that jumps to the repos step (N2)", () => {
+  // Feedback N2: from the Projects step it wasn't clear how to add a repo; the
+  // empty state must be a button that jumps back, not prose telling the user to
+  // click Back many times.
+  assert.match(onboarding, /ob-add-repos-jump/);
+  assert.match(onboarding, /setI\(STEPS\.findIndex\(\(s\) => s\.key === "repos"\)\)/);
+});
+
+test("the repo folder-search shows the N6 discovery hint (Documents/Desktop skipped)", () => {
+  // Feedback N6: repos under Documents/Desktop or deep subdirs don't auto-appear;
+  // the hint tells the user why and that typing the path finds them.
+  assert.match(onboarding, /ob-scan-hint/);
+  assert.match(onboarding, /Documents, Desktop and Downloads/);
+});

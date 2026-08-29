@@ -1989,12 +1989,25 @@ function SpecTab({ task, onRefresh }) {
   const [specBusy, setSpecBusy] = useState(false);
   if (!task) return <div className="so-diff-empty">Loading…</div>;
   const spec = task.context?.spec;
+  const criteria = task.acceptance_criteria || [];
+  // D6: the product plan ("What we understood") and the technical plan ("How
+  // we'll build it") are paired here. The understanding is the enriched
+  // acceptance criteria from intake; the build plan is context.spec.
+  const understood = criteria.length > 0 && (
+    <section data-testid="what-we-understood">
+      <div className="so-section-label">What we understood</div>
+      <ul className="so-criteria">{criteria.map((c, i) => <li key={i}><Markdown>{c}</Markdown></li>)}</ul>
+    </section>
+  );
   const hasSpec = !!(spec && (spec.approach || spec.files_to_change?.length ||
     spec.test_plan || spec.out_of_scope?.length || spec.verification));
   if (!hasSpec) {
     const isEarlyStatus = ["pending", "context", "planning"].includes(task.status);
     return (
+      <div data-testid="spec-tab">
+      {understood}
       <div className="so-diff-empty" data-testid="spec-empty">
+        {understood && <div className="so-section-label" style={{ marginTop: '0.6rem' }}>How we&rsquo;ll build it</div>}
         {["code_review", "investigation", "design_doc", "ci_fix"].includes(task.kind)
           ? `Spec generation doesn't apply to ${task.kind} tasks.`
           : isEarlyStatus
@@ -2008,11 +2021,14 @@ function SpecTab({ task, onRefresh }) {
           <div>Specs are kept for the latest plan only — earlier attempts&rsquo; specs are not retained.</div>
         )}
       </div>
+      </div>
     );
   }
   const planSize = spec.files_to_change?.length || 0;
   return (
     <div data-testid="spec-tab">
+      {understood}
+      {understood && <div className="so-section-label">How we&rsquo;ll build it</div>}
       {spec.files_to_change?.length > 0 && (
         <section>
           <div className="so-section-label">Files to Change</div>

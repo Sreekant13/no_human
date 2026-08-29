@@ -645,6 +645,16 @@ test("SlideOver uses defaultOpenSection (gate-aware) rather than always defaulti
   assert.match(slideOverSrc, /defaultOpenSection/);
 });
 
+test("SpecTab pairs the product understanding with the technical plan (D6/T6)", () => {
+  // The enriched acceptance criteria are surfaced as 'What we understood' beside
+  // the technical spec 'How we'll build it', so the task view is not a black box
+  // that only shows build steps. Both must be present and driven by real data.
+  assert.match(slideOverSrc, /what-we-understood/);
+  assert.match(slideOverSrc, /What we understood/);
+  assert.match(slideOverSrc, /How we&rsquo;ll build it/);
+  assert.match(slideOverSrc, /task\.acceptance_criteria/);
+});
+
 test("new --sp-1..8 spacing tokens are defined (theme-independent, like the font tokens)", () => {
   const expected = { 1: "4px", 2: "8px", 3: "12px", 4: "16px", 5: "24px", 6: "32px", 7: "48px", 8: "64px" };
   for (const [n, px] of Object.entries(expected)) {

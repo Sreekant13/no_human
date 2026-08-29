@@ -826,6 +826,11 @@ export default function Onboarding({ onComplete }) {
                   </button>
                 </div>
               )}
+              {manualScan && (
+                <p className="ob-faint ob-scan-hint" style={{ margin: '0.35rem 0 0', fontSize: '0.8rem' }}>
+                  Don’t see a repo above? The auto-scan skips <strong>Documents, Desktop and Downloads</strong> by default and stops a few folders deep — type its folder here (e.g. <code>~/Documents/my-app</code>) and it will be scanned.
+                </p>
+              )}
               {recentRepos.length > 0 && (
                 <>
                   <p className="ob-recent-label">Recently worked on</p>
@@ -960,7 +965,14 @@ export default function Onboarding({ onComplete }) {
                   Repos for this project <span className="ph-no-capture">({newProjRepos.size} selected)</span>
                 </div>
                 {pickerRepos.length === 0 ? (
-                  <div className="ob-empty">No repositories selected — go back to Repositories to pick some, or add projects later in Settings.</div>
+                  <div className="ob-empty">
+                    No repositories selected yet —{" "}
+                    <button type="button" className="ob-btn-ghost ob-add-repos-jump"
+                            onClick={() => setI(STEPS.findIndex((s) => s.key === "repos"))}>
+                      Add repositories
+                    </button>
+                    {" "}to pick some, or add projects later in Settings.
+                  </div>
                 ) : (
                   <div className="ob-repolist ph-no-capture" style={{ maxHeight: '160px' }}>
                     {pickerRepos.map((rp) => (
