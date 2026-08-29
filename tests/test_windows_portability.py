@@ -751,15 +751,18 @@ def test_env_for_injects_the_windows_scripts_dir(monkeypatch, tmp_path):
 
 def test_popen_kwargs_are_platform_correct():
     """`start_new_session` is POSIX-only; on Windows Popen silently accepts and
-    ignores it, so the group-creating kwargs must come from _NEW_GROUP_KWARGS
-    (CREATE_NEW_PROCESS_GROUP there). This pins the CONSTANT; the wiring of
-    the streaming Popen site to it is pinned by the sibling test below. The
-    same literal still exists in eval/northstar.py and eval/replay.py —
-    pre-existing on main and deliberately out of this branch's scope."""
+    ignores it, so the group-creating kwargs must come from _NEW_GROUP_KWARGS.
+    On Windows that constant is ``hidden_console_kwargs(new_group=True)`` —
+    CREATE_NEW_PROCESS_GROUP **combined with** CREATE_NO_WINDOW, because the
+    streaming child is both in a new group AND console-suppressed (Windows N=0).
+    This pins the CONSTANT (both flags); the wiring of the streaming Popen site
+    to it is pinned by the sibling test below."""
     runner = importlib.import_module("no_human.testing.runner")
 
     if os.name == "nt":  # pragma: no cover - not this host
-        assert runner._NEW_GROUP_KWARGS == {"creationflags": 0x200}
+        from no_human.proc import CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
+        assert runner._NEW_GROUP_KWARGS == {
+            "creationflags": CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW}
     else:
         assert runner._NEW_GROUP_KWARGS == {"start_new_session": True}
 
