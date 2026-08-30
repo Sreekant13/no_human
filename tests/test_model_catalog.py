@@ -201,20 +201,18 @@ def test_the_note_says_vendor_not_tier():
 # --------------------------------------------------------------------------
 
 
-def test_reviewer_cost_note_is_non_empty_and_names_the_measured_numbers():
+def test_reviewer_cost_note_is_a_short_user_facing_sentence_not_the_raw_benchmark():
     note = mc.REVIEWER_COST_NOTE
     assert note != ""
-    # It must cite the actual A/B measurements, not just assert a conclusion —
-    # this is the evidence sentence the Settings pane's reviewer row shows
-    # verbatim (ModelsPanel.jsx's costNote), so a vague restatement would be a
-    # silent regression even though it stays non-empty.
-    assert "2026-08-11" in note
-    assert "claude-opus-5" in note
-    assert "claude-opus-4-8" in note
-    assert "15/16" in note and "2/4" in note
-    assert "14/16" in note and "0/4" in note
-    assert "3x" in note
-    assert "7x" in note
+    # Operator directive 2026-08-30: the Settings model picker must NOT show the
+    # raw A/B benchmark dump ("wtf is this wall of text") — that evidence lives
+    # in config.py's review_model comment + docs/REVIEWER_RECALL_METHOD.md. The
+    # UI note is a short, plain sentence a user can act on.
+    assert len(note) < 200, "the reviewer note must be a short sentence, not a benchmark dump"
+    for raw in ("2026-08-11", "15/16", "2/4", "14/16", "0/4", "tool-call sprawl", "1078s"):
+        assert raw not in note, f"raw benchmark detail {raw!r} belongs in config.py/docs, not the UI note"
+    # It still conveys the honest takeaway (which model, why it's cheaper/better).
+    assert "Opus 4.8" in note
 
 
 # --------------------------------------------------------------------------

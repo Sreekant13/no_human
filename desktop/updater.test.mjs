@@ -15,6 +15,7 @@ function fakeAutoUpdater({ version = "0.2.0", throws = null } = {}) {
   const au = {
     autoDownload: true,              // electron-updater's real defaults, so a
     autoInstallOnAppQuit: true,      // failure to override them is detectable
+    disableDifferentialDownload: false, // default off; configure() must turn it ON
     listeners: new Map(),
     downloadCalls: 0,
     quitAndInstallCalls: 0,
@@ -61,6 +62,10 @@ test("configure turns OFF both of electron-updater's automatic behaviours", () =
   assert.equal(au.autoDownload, false, "a check must never download by itself");
   assert.equal(au.autoInstallOnAppQuit, false,
     "a deferred update must not install itself on quit");
+  // Differential (blockmap-delta) download stalls at 0% on macOS; configure()
+  // must force a full download so an update actually completes.
+  assert.equal(au.disableDifferentialDownload, true,
+    "the macOS blockmap-delta path must be disabled so downloads don't stall at 0%");
 });
 
 test("a check with an update available notifies but downloads NOTHING", () => {

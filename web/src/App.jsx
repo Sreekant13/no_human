@@ -7,6 +7,7 @@ import Backlog from "./Backlog.jsx";
 import SettingsOverlay, { LearningsPanel } from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
+import { isAiConfigDone, markAiConfigDone } from "./aiConfigNudge.js";
 import TaskComposer from "./TaskComposer.jsx";
 import Outcomes from "./Outcomes.jsx";
 import About from "./About.jsx";
@@ -731,6 +732,17 @@ export default function App() {
   // Which Settings pane to open on — set when a Finish-setup item is clicked so
   // the overlay lands on the matching pane; null means "wherever it last was".
   const [settingsTab, setSettingsTab] = useState(null);
+  // The Settings "!" nudge (AI-learnings left onboarding 2026-08-30): shown
+  // until the user first opens Settings. Every entry into Settings clears it.
+  const [aiConfigDone, setAiConfigDone] = useState(() => isAiConfigDone());
+  const openSettings = (tab = null) => {
+    if (tab !== null) setSettingsTab(tab);
+    setSettingsOpen(true);
+    if (!aiConfigDone) { markAiConfigDone(); setAiConfigDone(true); }
+  };
+  // Dismissing the "!" popup without opening Settings still counts as
+  // acknowledged — the nudge is a one-time prompt, not a gate.
+  const dismissAiConfig = () => { markAiConfigDone(); setAiConfigDone(true); };
   // The onboarding steps deferred by the minimal path (spec §3 B1). The board's
   // FinishSetupCard renders them; empty once every step is done.
   const [deferred, setDeferred] = useState([]);
@@ -918,7 +930,7 @@ export default function App() {
   useEffect(() => {
     const off = window.nhDesktop?.onMenu?.((action) => {
       if (action === "new-task") setShowNewTask(true);
-      else if (action === "settings") setSettingsOpen(true);
+      else if (action === "settings") openSettings();
       else if (action === "board" || action === "backlog" || action === "stats" || action === "learnings") setPage(action);
     });
     return off;
@@ -1223,19 +1235,47 @@ export default function App() {
           {deferred.length > 0 && (
             <FinishSetupCard
               deferred={deferred}
-              onNavigate={({ tab }) => { setSettingsTab(tab); setSettingsOpen(true); }}
+              onNavigate={({ tab }) => openSettings(tab)}
               onDone={(step) => markDeferredDone(step).then((r) => setDeferred(r.deferred || [])).catch(() => {})}
             />
           )}
-          <NavRow
-            icon={<IconGear />}
-            label="Settings"
-            active={settingsOpen}
-            haspopup="dialog"
-            expanded={settingsOpen}
-            onClick={() => setSettingsOpen(true)}
-            className="nh-settings-row"
-          />
+          <div className="nh-settings-navwrap">
+            <NavRow
+              icon={<IconGear />}
+              label="Settings"
+              active={settingsOpen}
+              haspopup="dialog"
+              expanded={settingsOpen}
+              badge={aiConfigDone ? null : "!"}
+              badgeVariant="warn"
+              title={aiConfigDone ? undefined : "Complete AI configuration"}
+              onClick={() => openSettings()}
+              className="nh-settings-row"
+            />
+            {/* One-time nudge from the "!" — shown after onboarding until the
+                user opens Settings or dismisses it. Not while onboarding is
+                still checking (null) or in progress (false). */}
+            {!aiConfigDone && onboarded === true && !settingsOpen && (
+              <div className="nh-aiconfig-nudge" role="dialog" aria-label="Complete AI configuration">
+                <button
+                  type="button"
+                  className="nh-aiconfig-nudge-x"
+                  aria-label="Dismiss"
+                  onClick={dismissAiConfig}
+                >×</button>
+                <div className="nh-aiconfig-nudge-title">Complete AI configuration</div>
+                <div className="nh-aiconfig-nudge-body">
+                  Review your rules, pick the model for each role, and seed your
+                  second brain — all in Settings.
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-approve nh-aiconfig-nudge-cta"
+                  onClick={() => openSettings("models")}
+                >Open Settings</button>
+              </div>
+            )}
+          </div>
         </div>
       </aside>
       <main className="nh-main">

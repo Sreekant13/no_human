@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  narrativeFor, chipsFor, milestonesFor, sectionSummary, defaultOpenSection,
+  narrativeFor, chipsFor, milestonesFor, artifactsFor, sectionSummary, defaultOpenSection,
   diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
   isHumanStopped, questionState, lastReviewedAttempt,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
@@ -262,6 +262,82 @@ test("a non-http pr_url (demo local-pr://) yields a text chip with NO href", () 
   assert.ok(pr, "the PR chip still appears (the branch/PR exists)");
   assert.equal(pr.href, undefined, "a local-pr:// href would be a dead link");
   assert.equal(pr.sub, "pull request");
+});
+
+// ── artifactsFor — the running-task digest's "what came out of this" block ──
+// The redesigned primary pane shows PR + files changed + review verdict instead
+// of a wall of logs. Pure over (task, diff).
+test("artifactsFor is empty when the task has produced nothing yet", () => {
+  assert.deepEqual(artifactsFor(null, ""), []);
+  assert.deepEqual(artifactsFor({ status: "planning", attempts: [] }, ""), []);
+});
+
+test("artifactsFor surfaces the PR (linked), the diff stat, and a passing review", () => {
+  const diff =
+    "diff --git a/src/a.py b/src/a.py\n+added line\n-removed line\n" +
+    "diff --git a/src/b.py b/src/b.py\n+another add\n";
+  const task = {
+    status: "awaiting_approval",
+    attempts: [{
+      branch_name: "nh/task-42",
+      pr_url: "https://example.com/pr/42",
+      review_checklist: { passed: true, items: [{ passed: true }, { passed: true }] },
+    }],
+  };
+  const arts = artifactsFor(task, diff);
+  const pr = arts.find((a) => a.key === "pr");
+  assert.ok(pr, "a PR must appear");
+  assert.equal(pr.href, "https://example.com/pr/42");
+  assert.equal(pr.value, "nh/task-42");
+  const files = arts.find((a) => a.key === "files");
+  assert.ok(files, "a files-changed line must appear when the diff is non-empty");
+  assert.match(files.value, /2 files/);
+  assert.match(files.value, /\+2/);   // two additions across the two files
+  assert.match(files.value, /−1/);    // one removal (U+2212 minus, matches source)
+  const review = arts.find((a) => a.key === "review");
+  assert.ok(review, "a review verdict must appear once the reviewer has run");
+  assert.equal(review.tone, "pass");
+  assert.match(review.value, /passed/);
+});
+
+test("artifactsFor reports findings-to-address for a failed review, tone fail", () => {
+  const task = {
+    status: "reviewing",
+    attempts: [{
+      review_checklist: { passed: false, items: [{ passed: false }, { passed: true }] },
+    }],
+  };
+  const arts = artifactsFor(task, "");
+  const review = arts.find((a) => a.key === "review");
+  assert.ok(review);
+  assert.equal(review.tone, "fail");
+  assert.match(review.value, /1 finding to address/);
+  // No PR and an empty diff → only the review line, nothing fabricated.
+  assert.equal(arts.find((a) => a.key === "pr"), undefined);
+  assert.equal(arts.find((a) => a.key === "files"), undefined);
+});
+
+test("artifactsFor omits the review line for a mid-review checklist with no verdict yet", () => {
+  // items present, not passed, nothing failed → review still running. Showing
+  // "0 findings to address" in red would be a lie, so no review artifact.
+  const task = {
+    status: "reviewing",
+    attempts: [{ review_checklist: { passed: false, items: [{ passed: true }] } }],
+  };
+  const arts = artifactsFor(task, "");
+  assert.equal(arts.find((a) => a.key === "review"), undefined,
+    "an in-progress review (0 findings, not passed) must not render a verdict line");
+});
+
+test("artifactsFor degrades a local-pr:// url to an unlinked value", () => {
+  const task = {
+    status: "done",
+    attempts: [{ branch_name: "nh/task-9", pr_url: "local-pr://tasks/9" }],
+  };
+  const pr = artifactsFor(task, "").find((a) => a.key === "pr");
+  assert.ok(pr);
+  assert.equal(pr.href, null, "a local-pr:// href would be a dead link");
+  assert.equal(pr.value, "nh/task-9");
 });
 
 // Operator finding (E2E walk part A): "open pull request" reads as the PR's
@@ -646,13 +722,26 @@ test("SlideOver uses defaultOpenSection (gate-aware) rather than always defaulti
   assert.match(slideOverSrc, /defaultOpenSection/);
 });
 
-test("the narrated activity stream is the PRIMARY pane, not one of the demoted tabs (redesign)", () => {
-  // The live run is promoted to an always-visible primary stream; the old
-  // tabs become a secondary inspector and activity is excluded from it, so it
-  // is never hidden behind a tab the user has to find.
+test("the primary pane is a DIGEST (description + artifacts + status), NOT the raw log (redesign redo)", () => {
+  // Operator feedback: the first redesign shipped the raw event stream as the
+  // always-visible primary — "a ton of logs that is not even collapsible".
+  // The redo makes the primary a tessl-style digest (short task description +
+  // the artifacts it produced + one status line + the run summary), and DEMOTES
+  // the raw event stream into the collapsed "Event log" accordion section.
   assert.match(slideOverSrc, /so-primary-stream/);
-  assert.match(slideOverSrc, /<ActivityTab taskId=\{taskId\} task=\{task\} isActive=\{isLive\} \/>/);
-  assert.match(slideOverSrc, /\.filter\(\(s\) => s\.key !== "activity"\)/);
+  // The primary pane feeds the digest the diff so it can show files-changed.
+  assert.match(slideOverSrc, /<ActivityTab taskId=\{taskId\} task=\{task\} isActive=\{isLive\} diff=\{diff\} \/>/);
+  // The digest renders the produced artifacts, not a wall of events.
+  assert.match(slideOverSrc, /artifactsFor\(task, diff\)/);
+  assert.match(slideOverSrc, /run-artifacts/);
+  // The raw event stream is now a SEPARATE component, rendered by the accordion
+  // (collapsed by default) — NOT in the primary pane.
+  assert.match(slideOverSrc, /function ActivityLog\(/);
+  assert.match(slideOverSrc, /case "activity":\s*return <ActivityLog/);
+  // The old exclusion filter is GONE — "activity" (now labelled Event log) is a
+  // normal collapsed accordion section like System/Diff/Review.
+  assert.doesNotMatch(slideOverSrc, /\.filter\(\(s\) => s\.key !== "activity"\)/);
+  assert.match(slideOverSrc, /\{ key: "activity", label: "Event log" \}/);
 });
 
 test("a coarse status chip renders at the top of the drawer summary (redesign)", () => {

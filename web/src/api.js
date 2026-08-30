@@ -467,6 +467,23 @@ export async function fetchCoderBackend() {
 // dropdown already greyed it out with, never a second message).
 export const saveCoderBackend = (body) => _put("/api/config/coder-backend", body);
 
+// Settings → Models pane's worker-count row (config.set_concurrency ::
+// concurrency.max_workers / .enabled). Same degrade-to-null convention as
+// fetchModels for an older server without the endpoint.
+export async function fetchWorkers() {
+  try {
+    const r = await fetch(`${BASE}/api/config/workers`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+// Write `{max_workers?, enabled?}` to concurrency.*. `_put` throws
+// Error(detail) verbatim on a 422 (out of range, wrong type).
+export const saveWorkers = (body) => _put("/api/config/workers", body);
+
 // C3-G3: the repos the operator knows (for the repo-understanding picker).
 export async function fetchRepos() {
   try {

@@ -66,6 +66,15 @@ export function createUpdater({
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = false;
 
+    // Force a FULL download, never a blockmap delta. On macOS the differential
+    // downloader fetches the new build's .blockmap and diffs it against the
+    // running app; when that computation stalls, electron-updater sits at
+    // "downloading 0%" and never fires download-progress or falls back — the
+    // exact "stuck at 0%, never installs" the operator hit updating to 0.1.7.
+    // The app zip is ~140 MB; a full download is a few seconds and strictly
+    // more reliable than the delta, so we opt out of differential entirely.
+    autoUpdater.disableDifferentialDownload = true;
+
     autoUpdater.on?.("error", (err) => {
       log(`updater error: ${err?.message ?? err}`);
       emit({ mode: FAILED, error: String(err?.message ?? err) });

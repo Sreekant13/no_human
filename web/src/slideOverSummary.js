@@ -320,6 +320,61 @@ export function chipsFor(task) {
   return chips;
 }
 
+// ── Artifacts — the concrete outputs of a run ──────────────────────────────
+// What the task actually PRODUCED, digested for the primary pane: the pull
+// request, the files it changed, and the review verdict. Pure over
+// (task, diff) — the same data the drawer already holds — so the redesigned
+// running-task view can show "what came out of this" at a glance without
+// waiting on the raw event stream. Returns [{ key, label, value, href?, tone? }].
+export function artifactsFor(task, diff) {
+  if (!task) return [];
+  const out = [];
+
+  const pr = prUrlFor(task);
+  if (pr) {
+    out.push({
+      key: "pr",
+      label: "Pull request",
+      value: branchFor(task) || "opened",
+      // A demo-DB local-pr:// anchor is a dead link — same guard as chipsFor.
+      href: httpPrUrl(pr) ? pr : null,
+    });
+  }
+
+  const stats = diffStats(diff);
+  if (stats.files > 0) {
+    out.push({
+      key: "files",
+      label: "Files changed",
+      value: `${stats.files} ${pluralize(stats.files, "file")} · +${stats.added} −${stats.removed}`,
+    });
+  }
+
+  // The latest attempt that carries a review — the verdict the reviewer landed.
+  const attempts = task.attempts || [];
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    const checklist = attempts[i]?.review_checklist;
+    if (checklist?.items?.length) {
+      const v = reviewVerdict(checklist);
+      // A not-yet-passed checklist with zero failed items is a review still in
+      // progress, not a verdict — "0 findings to address" (red) would be a lie.
+      // Only surface the review line once there's an actual verdict to show.
+      if (v.verdict !== "PASSED" && v.findings === 0) break;
+      out.push({
+        key: "review",
+        label: "Review",
+        value: v.verdict === "PASSED"
+          ? (v.detail ? `passed · ${v.detail}` : "passed")
+          : `${v.findings} ${pluralize(v.findings, "finding")} to address`,
+        tone: v.tone,
+      });
+      break;
+    }
+  }
+
+  return out;
+}
+
 // ── Milestone timeline ─────────────────────────────────────────────────────
 // created → planned → attempt N → review → PR → done. Derived from `task`
 // (created_at/status/attempts/context) — no separate event fetch needed, so

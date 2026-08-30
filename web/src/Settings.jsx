@@ -263,6 +263,14 @@ function AuthPanel() {
         <h3 className="memory-title"><span className="panel-title-text">Account</span></h3>
       </div>
 
+      {/* Claude auth as a labeled sub-section, parallel to the Codex one below,
+          so the two providers read as consistent cards under Account rather than
+          one loose block (Claude) and one titled card (Codex). */}
+      <div className="auth-provider auth-claude">
+      <div className="memory-header">
+        <h3 className="memory-title"><span className="panel-title-text">Claude</span></h3>
+      </div>
+
       {view.showMeteredAlarm && (
         <div className="nh-alarm auth-alarm" role="alert">
           An <code>ANTHROPIC_API_KEY</code> is set in no_human&apos;s
@@ -328,6 +336,7 @@ function AuthPanel() {
           </form>
         </>
       )}
+      </div>{/* /auth-claude */}
 
       <CodexSection codex={status.codex} onStatus={setStatus} />
     </div>
@@ -375,7 +384,7 @@ function CodexSection({ codex, onStatus }) {
   }
 
   return (
-    <div className="auth-codex">
+    <div className="auth-provider auth-codex">
       <div className="memory-header">
         <h3 className="memory-title"><span className="panel-title-text">Codex</span></h3>
       </div>
@@ -895,6 +904,10 @@ export function LearningsPanel() {
   const [selected, setSelected] = useState(() => new Set());
   const [bulk, setBulk] = useState(null);   // {done, total} while confirming
   const [quarantined, setQuarantined] = useState(0);
+  // Manual add (operator ask: "they can add stuff there"). A hand-written rule
+  // is confirmed on arrival (POST /api/rules), so it lands straight in Active.
+  const [newRule, setNewRule] = useState("");
+  const [adding, setAdding] = useState(false);
 
   // Memory lifecycle C: the retire? section — stale ACTIVE rules, suggest
   // only. `dismissed` is purely client-side (a page reload forgets it — the
@@ -953,6 +966,26 @@ export function LearningsPanel() {
       load();
     } catch (e) {
       setError(e.message);
+    }
+  }
+
+  async function addBrainRule() {
+    const content = newRule.trim();
+    if (!content || adding) return;
+    setAdding(true);
+    setError(null);
+    try {
+      // Title = the first line, capped; the whole text is the rule body. A
+      // hand-written rule is confirmed on arrival, so switch to Active to show it.
+      const title = content.split("\n")[0].slice(0, 80);
+      await addRule({ title, content });
+      setNewRule("");
+      setView("active");
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setAdding(false);
     }
   }
 
@@ -1029,6 +1062,37 @@ export function LearningsPanel() {
             Active
           </button>
         </div>
+      </div>
+      {/* Answers the operator's two questions — "is it actually used?" and "who
+          maintains it?". Surfacing real behaviour, not a promise: confirmed
+          rules/learnings are loaded into the coder + reviewer prompt on every
+          task (_load_active_memories); HarvestJob mines new ones from your
+          tasks in the background; RetirementSweepJob retires unconfirmed ones
+          after 45 days — so the brain maintains itself without asking you. */}
+      <p className="learning-explainer">
+        Your second brain. <strong>Active</strong> rules and learnings are
+        applied automatically — the coder and reviewer read them on every task.
+        New lessons are harvested from your tasks in the background, and unused
+        ones retire on their own. Nothing acts until you confirm it.
+      </p>
+      {/* Manual add (operator ask: "add stuff there"). */}
+      <div className="learning-add">
+        <textarea
+          className="learning-add-input"
+          rows={2}
+          placeholder="Add a rule the AI should always follow — e.g. &quot;Always run the linter before opening a PR.&quot;"
+          value={newRule}
+          onChange={(e) => setNewRule(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addBrainRule(); }}
+        />
+        <button
+          type="button"
+          className="btn btn-approve btn-sm"
+          disabled={!newRule.trim() || adding}
+          onClick={addBrainRule}
+        >
+          {adding ? "Adding…" : "Add rule"}
+        </button>
       </div>
       {error && <div className="settings-error">{error}</div>}
       {/* 329 pending rows are not triageable one click at a time, and not by

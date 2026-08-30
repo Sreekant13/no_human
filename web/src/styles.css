@@ -393,6 +393,35 @@ html, body, #root {
 [data-theme="light"] .nh-navrow-badge-alert { color: #FFFFFF; }
 .nh-navrow-badge-done  { background: color-mix(in oklab, var(--state-done) 22%, transparent); color: var(--state-done); }
 .nh-navrow-badge-failed{ background: color-mix(in oklab, var(--state-failed) 22%, transparent); color: var(--state-failed); }
+/* The Settings "complete AI configuration" nudge — an attention prompt, so it
+   shares the amber "needs you" tone (--c-answer), same contrast rule as -alert. */
+.nh-navrow-badge-warn  { background: var(--c-answer); color: #1A1D27; }
+[data-theme="light"] .nh-navrow-badge-warn { color: #FFFFFF; }
+
+/* One-time AI-config nudge popup, anchored above the Settings nav row. */
+.nh-settings-navwrap { position: relative; }
+.nh-aiconfig-nudge {
+  position: absolute; bottom: calc(100% + 8px); left: 0; right: 0;
+  z-index: 40;
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-left: 3px solid var(--c-answer);
+  border-radius: var(--r-md); padding: 12px 14px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+.nh-aiconfig-nudge-x {
+  position: absolute; top: 6px; right: 8px;
+  background: none; border: none; color: var(--text-muted);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 2px;
+}
+.nh-aiconfig-nudge-x:hover { color: var(--text-hi); }
+.nh-aiconfig-nudge-title {
+  font-weight: 700; color: var(--text-hi); font-size: 13px;
+  margin-bottom: 4px; padding-right: 14px;
+}
+.nh-aiconfig-nudge-body {
+  font-size: 12px; color: var(--text-body); line-height: 1.5; margin-bottom: 10px;
+}
+.nh-aiconfig-nudge-cta { width: 100%; }
 
 /* Settings, pinned at the very bottom (Claude-app placement) — a hairline
    divider separates it from the status/connection rows above it. */
@@ -1601,6 +1630,56 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
 }
 .plan-file.done { color: var(--green); }
 .plan-file.extra { color: var(--amber); }
+
+/* Redesigned running-task digest — a short task description + the artifacts the
+   run produced, shown flat under the agent legend (no nested card; impeccable:
+   reduction, respect tokens, align the label column). */
+.run-desc {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.run-desc-label {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.run-desc-text { color: var(--text); overflow-wrap: anywhere; }
+
+.run-artifacts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  padding: 8px 14px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.run-artifacts-label {
+  grid-column: 1 / -1;
+  margin-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.run-artifact { display: contents; }
+.run-artifact-key {
+  color: var(--text-muted);
+  font-size: 11px;
+  align-self: baseline;
+}
+.run-artifact-val { min-width: 0; overflow-wrap: anywhere; }
+a.run-artifact-val { color: var(--accent); text-decoration: none; }
+a.run-artifact-val:hover { text-decoration: underline; }
+.run-artifact-val.tone-pass { color: var(--green); }
+.run-artifact-val.tone-fail { color: var(--red); }
 
 /* Sub-tasks tab */
 .subtasks-tab { padding: 14px; }
@@ -4669,6 +4748,15 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* Account panel (settings): auth status + write-only token editor */
 .auth-alarm { margin: 4px 0 14px; }
+/* Claude and Codex render as two consistent provider sub-sections under
+   Account, each a labeled block; a divider separates the second from the first
+   so they read as parallel cards rather than one running into the next. */
+.auth-provider + .auth-provider {
+  margin-top: var(--sp-5, 1.25rem);
+  padding-top: var(--sp-4, 1rem);
+  border-top: 1px solid var(--border);
+}
+
 .auth-status {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -5059,6 +5147,22 @@ a.so-chip-value:hover { color: var(--accent-300); }
   margin-bottom: 12px;
   flex-wrap: wrap;
 }
+/* Second-brain "is it used / auto-maintained" explainer + manual-add row. */
+.learning-explainer {
+  font-size: 13px; color: var(--text-body); line-height: 1.55;
+  margin: 0 0 12px; padding: 10px 12px;
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-left: 3px solid var(--state-done); border-radius: var(--r-md);
+}
+.learning-explainer strong { color: var(--text-hi); }
+.learning-add { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 14px; }
+.learning-add-input {
+  flex: 1; min-width: 0; resize: vertical;
+  font: inherit; font-size: 13px; line-height: 1.5;
+  padding: 8px 10px; border-radius: var(--r-md);
+  background: var(--surface-1); border: 1px solid var(--border); color: var(--text);
+}
+.learning-add .btn { flex-shrink: 0; }
 
 .learning-filter {
   flex: 1 1 220px;

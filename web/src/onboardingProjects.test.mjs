@@ -199,7 +199,7 @@ test("the launch summary counts repo-less projects honestly", () => {
 test("finish() refuses BEFORE it writes anything", () => {
   const body = onboarding.slice(onboarding.indexOf("async function finish()"));
   const refusal = body.indexOf("unboundProjectsMessage");
-  for (const call of ["confirmRules(", "createProject(", "completeOnboarding("]) {
+  for (const call of ["createProject(", "completeOnboarding("]) {
     const at = body.indexOf(call);
     assert.ok(at > refusal && refusal !== -1,
       `${call} must not run before the unbound-project refusal`);

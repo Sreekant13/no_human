@@ -132,14 +132,16 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 const jsx = readFileSync(here + "Onboarding.jsx", "utf8");
 const api = readFileSync(here + "api.js", "utf8");
 
-test("the 8 base steps are untouched and nothing is appended after summary", () => {
+test("the 6 base steps are untouched and nothing is appended after summary", () => {
   const base = jsx.match(/const BASE_STEPS = \[([\s\S]*?)\n\];/);
-  assert.ok(base, "the original 8-step list must still exist as its own array");
+  assert.ok(base, "the base-step list must still exist as its own array");
   const keys = [...base[1].matchAll(/key: "(\w+)"/g)].map((m) => m[1]);
   assert.deepEqual(
     keys,
-    ["welcome", "repos", "projects", "docs", "integrations", "history", "rules", "summary"],
-    "the existing 8 steps must not be reordered or renamed",
+    // "history" + "rules" (the AI-learnings walk) left the wizard 2026-08-30 —
+    // that work now lives in Settings, nudged by the Settings "!" badge.
+    ["welcome", "repos", "projects", "docs", "integrations", "summary"],
+    "the existing steps must not be reordered or renamed",
   );
   assert.match(jsx, /const STEPS = BASE_STEPS;/,
     "STEPS must be exactly BASE_STEPS — no conditional insights append");
@@ -181,4 +183,29 @@ test("finish() completes onboarding without a telemetry_asked field", () => {
   assert.doesNotMatch(body, /telemetry_asked/,
     "no telemetry_asked is written — the wizard never asks, so it never records an answer");
   assert.doesNotMatch(body, /submitConsent/, "finish() must not resolve any consent");
+});
+
+// Regression guard for the AI-learnings step removal (2026-08-30). The build
+// and the .mjs suite BOTH pass on a dangling reference to deleted state — a
+// bare undeclared identifier is a runtime ReferenceError, not a build error,
+// and these tests read source rather than rendering the summary step. A real
+// user hit exactly that: `chosenRules.size` survived in the "Launch" summary
+// after `const [chosenRules] = useState(...)` was deleted, crashing the final
+// step. This asserts none of the removed AI-learnings symbols remain in CODE
+// (comments are stripped first — one mentions two of them by name on purpose).
+test("no removed AI-learnings symbol is still referenced in Onboarding.jsx code", () => {
+  const code = jsx
+    .replace(/\/\*[\s\S]*?\*\//g, "")   // block comments
+    .replace(/^\s*\/\/.*$/gm, "");      // line comments
+  const removed = [
+    "chosenRules", "proposals", "scanHistory", "toggleRule", "scanPhase",
+    "extractHistory", "analyzeHistory", "confirmRules", "scanSummary",
+    "groupProposalsByProject", "historyPromiseRef",
+  ];
+  const survivors = removed.filter((s) => new RegExp(`\\b${s}\\b`).test(code));
+  assert.deepEqual(
+    survivors, [],
+    `these symbols were deleted with the AI-learnings steps but are still `
+    + `referenced in code (a ReferenceError at runtime): ${survivors.join(", ")}`,
+  );
 });

@@ -22,7 +22,7 @@ import { decisionFor } from "./blockerDecision.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import {
-  PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary, coarseStatus,
+  PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, artifactsFor, sectionSummary, coarseStatus,
   defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
@@ -509,26 +509,24 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           />
         )}
 
-        {/* PRIMARY narrated stream — the redesign's answer to "no one
-            understands what's going on": the live, plain-language activity
-            (currently-doing-X status bar, turn counter, plan-file tracker,
-            grouped events) is now the always-visible primary pane, not a tab
-            the user has to find. The structured detail (Diff/Spec/Review/…)
-            drops to the secondary inspector below. */}
+        {/* PRIMARY digest — the redesign's answer to "no one understands what's
+            going on": a tessl-style glance (short task description, the
+            artifacts it produced, one live-status line, the run summary), NOT a
+            wall of logs. The raw event stream is demoted to the collapsed
+            "Event log" accordion section below, alongside System/Diff/Review. */}
         {task && (
           <div className="so-primary-stream" data-testid="primary-stream">
-            <ActivityTab taskId={taskId} task={task} isActive={isLive} />
+            <ActivityTab taskId={taskId} task={task} isActive={isLive} diff={diff} />
           </div>
         )}
 
-        {/* Secondary inspector: the remaining sections as a lazy accordion,
-            one open at a time. Activity is excluded — it is the primary pane
-            above. Each section still mounts (and fetch/SSEs) only when open. */}
+        {/* Secondary inspector: the remaining sections as a lazy accordion, one
+            open at a time — including the raw Event log, collapsed by default.
+            Each section still mounts (and fetch/SSEs) only when open. */}
         <div className="so-body">
           <div className="so-inspector-label">Details &amp; tools</div>
           <div className="so-accordion">
             {SECTION_LIST
-              .filter((s) => s.key !== "activity")
               .filter((s) => s.key !== "subtasks" || task?.parent_id || task?.status === "compound_parent")
               .map((s) => {
                 const isOpen = openSection === s.key;
@@ -927,7 +925,7 @@ function DecisionPanel({ decision, taskId, taskStatus, busy, onAction }) {
 // original tabs exactly (Subtasks is filtered in when the task qualifies).
 const SECTION_LIST = [
   { key: "system",   label: "System" },
-  { key: "activity", label: "Activity" },
+  { key: "activity", label: "Event log" },
   { key: "subtasks", label: "Sub-tasks" },
   { key: "details",  label: "Details" },
   { key: "spec",     label: "Spec" },
@@ -942,7 +940,7 @@ const SECTION_LIST = [
 function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh, onOpenSection }) {
   switch (key) {
     case "system":   return <SystemTab taskId={taskId} task={task} isActive={isActive} />;
-    case "activity": return <ActivityTab taskId={taskId} task={task} isActive={isActive} />;
+    case "activity": return <ActivityLog taskId={taskId} task={task} isActive={isActive} />;
     case "subtasks": return <SubtasksTab taskId={taskId} />;
     case "details":  return <DetailsTab task={task} />;
     case "spec":     return <SpecTab task={task} onRefresh={onSpecRefresh} />;
@@ -1767,15 +1765,14 @@ function SubtasksTab({ taskId }) {
 }
 
 
-function ActivityTab({ taskId, task, isActive }) {
+// One SSE (live) / poll (inactive) / fetch-once (terminal) event feed for a
+// task, with correct teardown. Each consumer that mounts gets its own
+// subscription: the primary digest always holds one; the collapsed "Event log"
+// section opens a second only while it is expanded (it mounts lazily), and both
+// tear down on unmount. Not a shared/deduped feed — if that ever matters, lift
+// it into a Context.
+function useTaskEvents(taskId, task, isActive) {
   const [events, setEvents] = useState([]);
-  // U1: only the newest N events enter the DOM. Rendering a long task's
-  // full history (2015 events on 84251cb2) froze the tab exactly when the
-  // task was interesting; derivations (turn counter, summary, plan tracker)
-  // still see the full array.
-  const [windowSize, setWindowSize] = useState(150);
-  const endRef = useRef(null);
-
   useEffect(() => {
     let cancelled = false;
     // Phase 4a: use SSE for active tasks (real-time), poll for inactive.
@@ -1800,9 +1797,7 @@ function ActivityTab({ taskId, task, isActive }) {
       );
       return () => { cancelled = true; es.close(); };
     }
-    // A terminal task's events never change — fetch once, never poll. The
-    // redesign promoted this stream to always-mounted, so a done/failed drawer
-    // must not poll every 10s for events that can no longer move.
+    // A terminal task's events never change — fetch once, never poll.
     if (isTerminalStatus(task?.status)) {
       fetchTaskEvents(taskId).then((evts) => { if (!cancelled) setEvents(evts); }).catch(() => {});
       return () => { cancelled = true; };
@@ -1820,32 +1815,22 @@ function ActivityTab({ taskId, task, isActive }) {
     poll();
     return () => { cancelled = true; };
   }, [taskId, isActive]);
+  return events;
+}
 
-  useEffect(() => {
-    const el = endRef.current;
-    if (!el) return;
-    // Only follow the live stream when the reader is already near the bottom.
-    // The stream shares one scroll container (.so-scroll) with the Details &
-    // tools inspector now, so an unconditional scroll-to-latest would yank a
-    // user who scrolled down to read Diff/Review back up on every ~10s event.
-    const sc = el.closest(".so-scroll");
-    if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight > 160) return;
-    el.scrollIntoView({ behavior: "smooth" });
-  }, [events.length]);
+// PRIMARY digest — the redesign's answer to "no one understands what's going
+// on". Below the agent legend it shows, tessl-style: a short description of the
+// task, the ARTIFACTS it produced (PR / files / review verdict), ONE compact
+// live-status line, and the digested run summary. The raw event stream is NOT
+// here — it lives in the collapsed "Event log" accordion section below, so the
+// glance is a digest, never a wall of logs.
+function ActivityTab({ taskId, task, isActive, diff }) {
+  const events = useTaskEvents(taskId, task, isActive);
+  const artifacts = useMemo(() => artifactsFor(task, diff), [task, diff]);
 
-  if (events.length === 0) {
-    return (
-      <div className="activity-feed ph-no-capture">
-        <div className="so-diff-empty">
-          {isActive ? "Waiting for events…" : "No events recorded for this task."}
-        </div>
-      </div>
-    );
-  }
-
-  const lastEvent = events[events.length - 1];
-  const isWorking = isActive && lastEvent;
-  const lastRole = eventSource(lastEvent);
+  const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+  const isWorking = isActive && !!lastEvent;
+  const lastRole = lastEvent ? eventSource(lastEvent) : null;
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
 
   // Turn counter: count tool_use events from the agent since the last attempt_start.
@@ -1875,6 +1860,27 @@ function ActivityTab({ taskId, task, isActive }) {
           </span>
         )}
       </div>
+      {task?.title && (
+        <div className="run-desc">
+          <span className="run-desc-label">Task</span>
+          <span className="run-desc-text">{task.title}</span>
+        </div>
+      )}
+      {artifacts.length > 0 && (
+        <div className="run-artifacts" data-testid="run-artifacts">
+          <div className="run-artifacts-label">Artifacts</div>
+          {artifacts.map((a) => (
+            <div className="run-artifact" key={a.key}>
+              <span className="run-artifact-key">{a.label}</span>
+              {a.href ? (
+                <a className="run-artifact-val" href={a.href} target="_blank" rel="noreferrer">{a.value} ↗</a>
+              ) : (
+                <span className={`run-artifact-val${a.tone ? ` tone-${a.tone}` : ""}`}>{a.value}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {isWorking && (
         <div className={`activity-status-bar role-${lastRole}`}>
           <span className="activity-pulse" />
@@ -1918,6 +1924,51 @@ function ActivityTab({ taskId, task, isActive }) {
         );
       })()}
       <SummaryCard summary={taskSummary(events)} />
+      {events.length === 0 && (
+        <div className="so-diff-empty">
+          {isActive ? "Waiting for events…" : "No events recorded for this task yet."}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The raw, chronological event stream — every tool call and message. Demoted
+// out of the primary pane into the collapsed "Event log" accordion section so
+// it is available on demand without burying the digest. Mounts (and streams)
+// only when the section is opened.
+function ActivityLog({ taskId, task, isActive }) {
+  const events = useTaskEvents(taskId, task, isActive);
+  // U1: only the newest N events enter the DOM. Rendering a long task's full
+  // history (2015 events on 84251cb2) froze the tab exactly when the task was
+  // interesting.
+  const [windowSize, setWindowSize] = useState(150);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    const el = endRef.current;
+    if (!el) return;
+    // Only follow the live stream when the reader is already near the bottom.
+    // The section shares one scroll container (.so-scroll) with the rest of the
+    // inspector, so an unconditional scroll-to-latest would yank a reader who
+    // scrolled up on every streamed event.
+    const sc = el.closest(".so-scroll");
+    if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight > 160) return;
+    el.scrollIntoView({ behavior: "smooth" });
+  }, [events.length]);
+
+  if (events.length === 0) {
+    return (
+      <div className="activity-feed ph-no-capture">
+        <div className="so-diff-empty">
+          {isActive ? "Waiting for events…" : "No events recorded for this task."}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="activity-feed ph-no-capture">
       <div className="activity-log">
         {events.length > windowSize && (
           <button

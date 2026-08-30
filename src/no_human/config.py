@@ -2908,6 +2908,39 @@ def _splice_worker_scalar(lines: list[str], key: str, value: str) -> None:
         lines.insert(start + 1, f"  {key}: {value}")
 
 
+_CONCURRENCY_HEADER_RE = re.compile(r"^concurrency:[ \t]*(#.*)?$")
+
+
+def _splice_concurrency_scalar(lines: list[str], key: str, value: str) -> None:
+    """``_splice_worker_scalar``'s twin for the top-level ``concurrency:``
+    block. Same deliberate duplication rationale (a header-specific regex, not
+    a generic selector) — see that function. Only caller: ``set_concurrency``.
+    """
+    try:
+        start = next(
+            i for i, ln in enumerate(lines)
+            if _CONCURRENCY_HEADER_RE.match(ln.rstrip())
+        )
+    except StopIteration:
+        lines.extend(["concurrency:", f"  {key}: {value}"])
+        return
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            end = i
+            break
+    for i in range(start + 1, end):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(f"{key}:"):
+            indent = lines[i][: len(lines[i]) - len(stripped)]
+            lines[i] = f"{indent}{key}: {value}"
+            break
+    else:
+        lines.insert(start + 1, f"  {key}: {value}")
+
+
 #: A bare backend name, as YAML would parse it back unquoted. Reuses the
 #: exact same shape as a model id (letters, digits, '.', '_', '-' only) — no
 #: quotes, no colons, no newlines, nothing that could inject YAML structure.
@@ -2972,6 +3005,86 @@ def set_worker_backend(backend: str, config_path: Path = CONFIG_PATH) -> str:
             "been restored."
         )
     return backend
+
+
+#: Upper bound on ``concurrency.max_workers`` a caller may WRITE. The scheduler
+#: clamps the effective pool further at runtime (``clamp_pool_width`` — CPU and
+#: isolation aware), so this is only a sanity rail against an absurd config
+#: value, not the real ceiling on how many workers actually run.
+_MAX_WORKERS_WRITE_CEILING = 64
+
+
+def set_concurrency(
+    config_path: Path = CONFIG_PATH,
+    *,
+    max_workers: int | None = None,
+    enabled: bool | None = None,
+) -> dict[str, object]:
+    """Splice ``concurrency.max_workers`` and/or ``concurrency.enabled`` into
+    config.yaml in one atomic write, preserving comments — the Settings-pane
+    twin of ``set_worker_backend``/``set_model_ids`` for the worker-count row.
+
+    Only the keys passed non-``None`` are written; the other keeps its file
+    value. Shape is validated before the file is touched, the write is verified
+    by re-loading, and the original file is restored on ANY failure. Returns the
+    reloaded ``{"max_workers", "enabled"}`` so the caller reports what actually
+    landed, not what it asked for.
+
+    Does NOT resize a running pool: ``resolve_max_workers`` is read once at
+    server start (``api.app`` lifespan), so a change here takes effect on the
+    next ``nh serve``. The API layer surfaces that as ``restart_required``.
+    """
+    if max_workers is None and enabled is None:
+        raise ValueError("set_concurrency: nothing to set (both args are None)")
+
+    if max_workers is not None:
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int):
+            raise ValueError(
+                f"max_workers must be an int, got {type(max_workers).__name__}"
+            )
+        if not 1 <= max_workers <= _MAX_WORKERS_WRITE_CEILING:
+            raise ValueError(
+                f"max_workers must be between 1 and {_MAX_WORKERS_WRITE_CEILING}, "
+                f"got {max_workers}"
+            )
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a bool, got {type(enabled).__name__}")
+
+    load_config(config_path)  # materialize a default file if there is none
+    original = config_path.read_text()
+    lines = original.splitlines()
+    if max_workers is not None:
+        _splice_concurrency_scalar(lines, "max_workers", str(max_workers))
+    if enabled is not None:
+        _splice_concurrency_scalar(lines, "enabled", "true" if enabled else "false")
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(config_path, original, "set concurrency")
+
+    try:
+        resolved_cfg = load_config(config_path)
+    except Exception as exc:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set concurrency: {config_path} failed to reload after "
+            f"the edit ({exc}). The file has been restored."
+        ) from exc
+
+    conc = resolved_cfg.data.get("concurrency", {}) or {}
+    if max_workers is not None and conc.get("max_workers") != max_workers:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set concurrency: max_workers resolved to "
+            f"{conc.get('max_workers')!r} after the edit, not {max_workers!r}. "
+            "The file has been restored."
+        )
+    if enabled is not None and conc.get("enabled") != enabled:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set concurrency: enabled resolved to "
+            f"{conc.get('enabled')!r} after the edit, not {enabled!r}. "
+            "The file has been restored."
+        )
+    return {"max_workers": conc.get("max_workers"), "enabled": conc.get("enabled")}
 
 
 #: The two ``llm.*`` scalars the local coder backend needs, set together by

@@ -28,7 +28,7 @@ const CARD = (() => {
 const STEP = (() => {
   const start = src.indexOf('{step.key === "integrations" &&');
   assert.ok(start > 0, "the integrations step must exist");
-  const end = src.indexOf('{step.key === "history" &&', start);
+  const end = src.indexOf('{step.key === "summary" &&', start);
   assert.ok(end > start, "could not bound the integrations step");
   return src.slice(start, end);
 })();

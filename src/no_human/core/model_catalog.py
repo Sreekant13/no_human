@@ -105,19 +105,15 @@ CODER_BACKEND_REASON = (
     "worker.backend, and set llm.codex_model / llm.local_model for those."
 )
 
-# Cost/quality honesty for the reviewer row: the operator's own 2026-08-11 A/B
-# (config.py, next to the `review_model` default) is a comment today, which no
-# payload can read. This constant quotes the same measured numbers rather than
-# re-summarizing them, so a future re-measurement has one place to update in
-# code (config.py's comment) and one place to update in text (here) — neither
-# moves or restates the other. Reviewer-only: no other role has this evidence.
+# Cost/quality honesty for the reviewer row — a SHORT, user-facing sentence.
+# The full measured A/B evidence (recall/specificity scores, round-duration and
+# cost multiples) lives where engineers look for it — config.py next to the
+# `review_model` default, and docs/REVIEWER_RECALL_METHOD.md — NOT in the
+# Settings UI, where a wall of internal benchmark numbers only confuses a user
+# choosing a model. Reviewer-only: no other role carries a cost note.
 REVIEWER_COST_NOTE = (
-    "The operator's 2026-08-11 A/B reverted this role from claude-opus-5 back "
-    "to claude-opus-4-8: 4.8 scored higher on the same review prompt "
-    "(15/16 recall + 2/4 specificity vs. opus-5's 14/16 + 0/4), and opus-5 as "
-    "reviewer measured about 3x the round duration (360s -> ~1078s) and about "
-    "7x the session cost from tool-call sprawl. See config.py's review_model "
-    "default for the full evidence."
+    "Kept on Opus 4.8 rather than Opus 5: on our review benchmark it caught "
+    "more real issues, ran about 3× faster, and cost far less."
 )
 
 # Coarse price-class thresholds, on the INPUT rate ($/MTok). Named constants

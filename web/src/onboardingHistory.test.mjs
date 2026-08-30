@@ -15,8 +15,6 @@ import { scanSummary, groupProposalsByProject } from "./onboardingHistory.js";
 // the number found on disk rather than the number queued, so a re-scan (which
 // dedupes) would have printed the same sixteen beside "0 items to review".
 
-const SRC = dirname(fileURLToPath(import.meta.url));
-const onboarding = readFileSync(join(SRC, "Onboarding.jsx"), "utf8");
 
 test("with no conversations, the count is attributed to what it came from", () => {
   const s = scanSummary({ transcripts: 0, messages: 0, skills: 16, proposals: 16 });
@@ -86,57 +84,3 @@ test("a trailing slash on a selected repo does not change containment", () => {
   assert.equal(other.length, 0);
 });
 
-// ── the step states its scope and sends the selected repos ─────────────────
-
-test("the history scope copy states the selected-repo scope, and the scan sends the repos", () => {
-  assert.match(onboarding, /Scope: conversations from the last <strong>30 days<\/strong> in/);
-  assert.match(onboarding, /selected repo/);
-  assert.match(onboarding, /analyzeHistory\(30, \[\.\.\.selectedRepos\]\)/,
-    "the scan must scope the analyze call to the selected repos");
-});
-
-// ── the step must render the numbers from the pass it is describing ────────
-
-test("the result callout is built from the ANALYZE response, not the extract probe", () => {
-  assert.match(onboarding, /scanPhase === "done" && analysis/,
-    "the callout must be gated on the analyze result it reports");
-  assert.match(onboarding, /scanSummary\(\{[\s\S]*?transcripts: analysis\.transcripts/);
-  assert.match(onboarding, /skills: analysis\.skills/,
-    "skills must be the number QUEUED (analyze), not the number found (extract)");
-  assert.match(onboarding, /proposals: proposals\.length/);
-  assert.doesNotMatch(onboarding, /Scanned <strong>\{history\.transcripts\}/,
-    "the old two-response sentence must not come back");
-});
-
-// ── the unavailable headline states the condition actually detected ────────
-//
-// `unavailable` is reached on exactly one condition: the extract found no
-// transcripts AND no skills. It used to announce that a particular third-party
-// IDE was not running, with the real reason demoted to grey parenthetical text —
-// so a developer who uses Claude Code and simply has no history on this machine
-// was told a product they have never heard of was missing.
-test("the empty-history headline names the missing history, not a missing IDE", () => {
-  const callout = onboarding.match(/scanPhase === "unavailable"[\s\S]*?<\/div>\n/)?.[0];
-  assert.ok(callout, "could not locate the unavailable callout");
-  assert.match(callout, /No past AI conversations or skills found on this machine/);
-  assert.doesNotMatch(callout, /No running .*IDE detected/,
-    "the headline must not claim a detection it did not make");
-  // M5: the server `detail` string leads with third-party IDE names ("no
-  // Windsurf IDE …"), so a Claude Code user was told an unknown product was
-  // missing. The headline says everything needed; the detail is NOT rendered.
-  assert.doesNotMatch(callout, /\{history\.detail\}/,
-    "the third-party-IDE detail must not be shown in the unavailable callout");
-});
-
-// ── the AI-history step names no product but Claude Code ───────────────────
-//
-// The two placeholders checked below were publication-shape scrub leftovers
-// from a redaction pass — not real products, and meaningless to a user.
-test("the AI-history step names no product but Claude Code", () => {
-  assert.doesNotMatch(onboarding, /\bide-agent\b/,
-    "the scrub placeholder must never be shown to a user");
-  assert.doesNotMatch(onboarding, /\bagent-a\b/,
-    "the scrub placeholder must never be shown to a user");
-  assert.match(onboarding, /reads your past <strong>Claude Code<\/strong> conversations/);
-  assert.match(onboarding, /Booting up — reading your Claude Code conversations…/);
-});

@@ -1,13 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  discoverRepos, onboardRepo, extractHistory, analyzeHistory,
-  confirmRules, completeOnboarding, suggestPaths, createProject,
+  discoverRepos, onboardRepo,
+  completeOnboarding, suggestPaths, createProject,
   generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
   testIntegration,
   proveRepoSSE, confirmRepoProfile, fetchReadiness,
 } from "./api.js";
 import { shouldPoll, nextJobState } from "./wikiJobs.js";
 import { repoBadges, discoveryMessage, ambiguousNames, rowName } from "./discoveredRepos.js";
+// onboardingHistory.js (scanSummary/groupProposalsByProject) went with the
+// removed AI-history/rules steps — the mining now happens from Settings.
 import { optionValue } from "./pathSuggest.js";
 import { splitRecent, relativeMtime, debounce } from "./repoRecency.js";
 import { LegionLogo } from "./Logo.jsx";
@@ -23,7 +25,6 @@ import {
   backDisabled, backDisabledReason, forwardDisabled, canJumpTo, stepButtonLabel,
 } from "./onboardingNav.js";
 import { canStartMinimal } from "./onboardingMinimal.js";
-import { scanSummary, groupProposalsByProject } from "./onboardingHistory.js";
 import { summaryRepoCounts } from "./onboardingSummary.js";
 import {
   newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
@@ -77,8 +78,10 @@ const BASE_STEPS = [
   { key: "projects", title: "Projects" },
   { key: "docs",     title: "Docs" },
   { key: "integrations", title: "Integrations" },
-  { key: "history",  title: "AI history" },
-  { key: "rules",    title: "Rules review" },
+  // "AI history" + "Rules review" left the wizard (operator, 2026-08-30): the
+  // AI-learnings walk made onboarding long, and the work already lives in
+  // Settings. The Settings "!" badge nudges the user to complete it there;
+  // second-brain rules/learnings are viewed and added in the Settings panes.
   { key: "summary",  title: "Launch" },
 ];
 
@@ -112,14 +115,6 @@ export default function Onboarding({ onComplete }) {
   // resets. Seeded from the repos selected on the repos step when the step opens,
   // so the common "one project, all my repos" case is one click.
   const [newProjRepos, setNewProjRepos] = useState(() => new Set());
-  const [history, setHistory] = useState(null);     // {available, transcripts}
-  // The ANALYZE response. Separate from `history` (the extract probe) because
-  // the result callout must describe the pass that actually ingested — see
-  // onboardingHistory.js for what printing the two together said.
-  const [analysis, setAnalysis] = useState(null);
-  const [scanPhase, setScanPhase] = useState("idle"); // idle|extracting|analyzing|done|unavailable
-  const [proposals, setProposals] = useState([]);
-  const [chosenRules, setChosenRules] = useState(new Set());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   // Background wiki-generation jobs (B4): repoPath -> {jobId,status,error,files}.
@@ -260,13 +255,6 @@ export default function Onboarding({ onComplete }) {
   // making the user reach for "Search". "Search" stays as the explicit trigger.
   const debouncedScan = useMemo(() => debounce((r) => scanFolder(r), 400), []);
   useEffect(() => () => debouncedScan.cancel(), [debouncedScan]);
-
-  // Phase 3a: preload history scan on mount — kick off _gather_history early
-  // so results are ready by the time the user reaches the history step.
-  const historyPromiseRef = useRef(null);
-  useEffect(() => {
-    historyPromiseRef.current = extractHistory().catch(() => null);
-  }, []);
 
   // Entering the repos step discovers the user's repositories across every
   // conventional clone root, so the first thing they see is their own list -
@@ -517,48 +505,6 @@ export default function Onboarding({ onComplete }) {
     // deps intentionally partial (matches this file's existing convention)
   }, [step.key]);
 
-  async function scanHistory() {
-    setErr(null);
-    try {
-      setScanPhase("extracting");
-      // Phase 3a: use preloaded result if available, else fresh fetch.
-      const ext = (historyPromiseRef.current && await historyPromiseRef.current) || await extractHistory();
-      historyPromiseRef.current = null;  // consumed
-      setHistory(ext);
-      if (ext.available && (ext.transcripts > 0 || ext.skills > 0)) {
-        setScanPhase("analyzing");
-        // Scope the scan to the selected repos (spec §3 B5): a repo-focused
-        // onboarding used to ingest transcripts from EVERY project on the
-        // machine. Empty (no repos ticked) keeps the every-project behaviour.
-        const an = await analyzeHistory(30, [...selectedRepos]);
-        setAnalysis(an);
-        setProposals(an.proposals || []);
-        // Confirmation is OPT-IN per memory. Nothing is pre-ticked: a real user
-        // was shown their own home address and phone number already checked,
-        // one click from becoming standing guidance. The server sends
-        // `selected: false` on every proposal and `default_selected: false`;
-        // honour it rather than deciding here, and default to unticked if an
-        // older server omits the field.
-        setChosenRules(new Set((an.proposals || []).filter((p) => p.selected === true).map((p) => p.id)));
-        setScanPhase("done");
-      } else {
-        setScanPhase("unavailable");
-      }
-    } catch (e) {
-      setErr(e.message);
-      setScanPhase("idle");
-    }
-  }
-  const scanning = scanPhase === "extracting" || scanPhase === "analyzing";
-
-  function toggleRule(id) {
-    setChosenRules((s) => {
-      const n = new Set(s);
-      n.has(id) ? n.delete(id) : n.add(id);
-      return n;
-    });
-  }
-
   // Tick/untick a repo for the project being composed in the add form.
   function toggleNewProjRepo(repoPath) {
     setNewProjRepos((s) => {
@@ -617,7 +563,6 @@ export default function Onboarding({ onComplete }) {
       // is written — so nothing is half-created and the user is told which
       // definition is the problem.
       if (unbound.length) throw new Error(unboundProjectsMessage(unbound));
-      if (chosenRules.size) await confirmRules([...chosenRules]);
       // Create projects via API. primary_repo travels with the payload: it is
       // the project's default repo in the composer, and without it the server
       // falls back to whichever repo was ticked first.
@@ -1133,133 +1078,6 @@ export default function Onboarding({ onComplete }) {
             </Stagger>
           )}
 
-          {step.key === "history" && (
-            <Stagger>
-              <h2 className="ob-h2">Learn from your AI history</h2>
-              <p className="ob-sub">
-                no_human reads your past <strong>Claude Code</strong> conversations,
-                catalogs your <strong>skills</strong>, and distills the
-                corrections you keep repeating — so the Supervisor enforces them for you.
-              </p>
-              {/* m7: the privacy scope+redaction sentence is the most
-                  reassuring copy in the flow — don't dim it below AA. Keep it
-                  slightly smaller (secondary), but at the muted token's full
-                  opacity, not 0.75 on top of it. */}
-              <p className="ob-sub" style={{ fontSize: "0.9em" }}>
-                Scope: conversations from the last <strong>30 days</strong> in {selectedRepos.size > 0
-                  ? <><strong>{selectedRepos.size}</strong> selected repo{selectedRepos.size === 1 ? "" : "s"}</>
-                  : <>every project on this machine (no repos selected)</>}.
-                Recent messages are sent to <strong>Claude</strong> to distill the lessons —
-                personal details (home addresses, phone numbers, payment and ID info) are dropped
-                <strong> before a message is sent or saved</strong>.
-              </p>
-              <button className="ob-btn" disabled={scanning} onClick={scanHistory}>
-                {scanPhase === "extracting" ? "Reading conversations…"
-                  : scanPhase === "analyzing" ? "Distilling rules…"
-                  : scanPhase === "done" ? "Re-scan"
-                  : "Scan my AI history"}
-              </button>
-
-              {/* While the (slow) scan runs, show a neutral spinner + progress
-                  copy so it never looks stuck. (The old T-800 skull avatar read
-                  as a "death robot" to a real user and was removed — F10.) */}
-              {scanning && (
-                <div className="va-build">
-                  <span className="grill-spinner" style={{ width: 32, height: 32, flexShrink: 0 }} />
-                  <div className="va-build-text">
-                    <div className="va-build-title">Claude is building your validator agent…</div>
-                    <div className="va-build-sub">
-                      {scanPhase === "extracting"
-                        ? "Booting up — reading your Claude Code conversations…"
-                        : <>Generalizing the lessons from <strong>{(history?.messages || 0).toLocaleString()}</strong> messages
-                           across <strong>{history?.transcripts || 0}</strong> conversations. This can take up to a minute.</>}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* The headline states the condition actually detected. `unavailable`
-                  is reached on exactly one condition — the extract found no
-                  transcripts AND no skills — and it used to announce instead that
-                  a particular third-party IDE was not running, with the real
-                  reason demoted to grey parenthetical text. A developer who uses
-                  Claude Code and simply has no history on this machine was told a
-                  product they have never heard of was missing. The server's own
-                  `detail` still rides along; it names the sources it looked in. */}
-              {/* M5: the server `detail` string leads with third-party IDE
-                  names ("no Windsurf IDE …") — a Claude Code user was told a
-                  product they've never heard of was missing. The headline
-                  already says everything a user needs; drop the detail. */}
-              {scanPhase === "unavailable" && history && (
-                <div className="ob-callout">No past AI conversations or skills found on this machine — you can skip this and add rules later.</div>
-              )}
-              {scanPhase === "done" && analysis && (
-                <div className="ob-callout ok">
-                  {scanSummary({
-                    transcripts: analysis.transcripts,
-                    messages: analysis.messages,
-                    skills: analysis.skills,
-                    proposals: proposals.length,
-                    claudeCode: analysis.sources?.claude_code,
-                  })}
-                  <div className="ob-faint" style={{ marginTop: 6 }}>
-                    {proposals.length === 0
-                      ? "No durable rules stood out in these conversations — you can add rules anytime in Settings."
-                      : "Rules are generalized from your corrections (not copied verbatim) and labelled by importance. Refine or add more anytime in Settings."}
-                  </div>
-                </div>
-              )}
-            </Stagger>
-          )}
-
-          {step.key === "rules" && (
-            <Stagger>
-              {/* M6: the heading must not assert rules "we found" over an empty
-                  state — for a user with no AI history it read as a
-                  contradiction (and followed an equally-empty History step). */}
-              <h2 className="ob-h2">{proposals.length === 0 ? "No rules to review yet" : "Review the rules we found"}</h2>
-              <p className="ob-sub">{proposals.length === 0
-                ? "Rules are distilled from your AI history — there was none to learn from here. You can write rules anytime in Settings."
-                : "Nothing is ticked and nothing is active. Tick only the ones you want — confirmed rules become standing guidance the Supervisor enforces."}</p>
-              {proposals.length === 0 ? (
-                <div className="ob-empty">No proposals — nothing extracted, or you skipped the scan. You can add rules anytime in Settings.</div>
-              ) : (() => {
-                // Split the proposals by whether they came from the selected
-                // repos or another project (spec §3 B5). In-scope rules render
-                // normally; other projects render collapsed and off by default —
-                // a rule mined from an unrelated repo's chats shouldn't be one
-                // tick from becoming standing guidance for THIS onboarding.
-                const ruleLabel = (p) => (
-                  <label key={p.id} className={`ob-rule${chosenRules.has(p.id) ? " sel" : ""}`}>
-                    <input type="checkbox" checked={chosenRules.has(p.id)} onChange={() => toggleRule(p.id)} />
-                    <div>
-                      <div className="ob-rule-head">
-                        <span className={`ob-rule-cat cat-${p.category}`}>{p.category}</span>
-                        {p.importance && <span className={`ob-rule-imp imp-${p.importance}`}>{p.importance}</span>}
-                      </div>
-                      <div className="ob-rule-text">{p.content}</div>
-                    </div>
-                  </label>
-                );
-                const { inScope, other } = groupProposalsByProject(proposals, [...selectedRepos]);
-                return (
-                  <>
-                    <div className="ob-rules">{inScope.map(ruleLabel)}</div>
-                    {other.map((g) => (
-                      <details key={g.project} className="ob-rules-other">
-                        <summary>
-                          {g.items.length} from <strong>{g.project.split("/").pop() || g.project}</strong>
-                          {" "}<span className="ob-faint">(a different project — off by default)</span>
-                        </summary>
-                        <div className="ob-rules">{g.items.map(ruleLabel)}</div>
-                      </details>
-                    ))}
-                  </>
-                );
-              })()}
-            </Stagger>
-          )}
-
           {step.key === "summary" && (
             <Stagger>
               {/* The headline states what is TRUE, not what we hope. "Ready."
@@ -1289,7 +1107,6 @@ export default function Onboarding({ onComplete }) {
                     </li>
                     <li><span>Repos</span><b>{counts.repos}</b></li>
                     <li><span>Wiki generated</span><b>{Object.values(wikiJobs).filter((j) => j.status === "done").length}</b></li>
-                    <li><span>Rules confirmed</span><b>{chosenRules.size}</b></li>
                     <li>
                       <span>Repos with a proven test command</span>
                       <b>{counts.proven}</b>

@@ -232,7 +232,9 @@ test("SlideOver masks title, spec, diff and activity log", () => {
     assert.ok(src.includes(anchor), `SlideOver.jsx missing masked anchor: ${anchor}`);
   }
   const feeds = src.match(/className="activity-feed ph-no-capture"/g) || [];
-  assert.equal(feeds.length, 2, "both activity-feed containers must be masked");
+  // Three now: the primary digest (ActivityTab) plus the demoted raw-log
+  // component's (ActivityLog) empty-state and main containers — all masked.
+  assert.equal(feeds.length, 3, "every activity-feed container must be masked");
 });
 
 test("Backlog masks the ticket title/assignee block", () => {

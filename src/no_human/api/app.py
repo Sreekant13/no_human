@@ -4271,6 +4271,92 @@ async def api_set_coder_backend(request: Request) -> dict[str, Any]:
     return payload
 
 
+def _workers_payload(file_data: dict, running_data: dict) -> dict[str, Any]:
+    """Settings' worker-count row: the ON-DISK ``concurrency`` values, the
+    EFFECTIVE pool this machine would actually run them at (clamped by
+    ``resolve_max_workers`` — CPU + isolation aware), and whether a restart is
+    needed for a written change to take hold.
+
+    ``restart_required`` compares the file against the RUNNING process config
+    (``resolve_max_workers`` is read once at server start, so a fresh write
+    only takes effect on the next ``nh serve``) — the same file-vs-process
+    signal ``/api/config/models`` and ``/api/coder-backend`` report.
+    """
+    from ..core.scheduler import resolve_max_workers
+    from ..config import _MAX_WORKERS_WRITE_CEILING
+
+    fconc = (file_data.get("concurrency") or {})
+    rconc = (running_data.get("concurrency") or {})
+    file_mw = int(fconc.get("max_workers", 2) or 2)
+    file_en = bool(fconc.get("enabled", False))
+    effective, warning = resolve_max_workers(file_data)
+    restart = (
+        file_mw != int(rconc.get("max_workers", 2) or 2)
+        or file_en != bool(rconc.get("enabled", False))
+    )
+    return {
+        "max_workers": file_mw,
+        "enabled": file_en,
+        "effective_max_workers": effective,
+        "warning": warning,
+        "max_allowed": _MAX_WORKERS_WRITE_CEILING,
+        "restart_required": restart,
+    }
+
+
+@app.get("/api/config/workers")
+async def api_get_config_workers(request: Request) -> dict[str, Any]:
+    """How many tasks run at once — the on-disk value, the effective (clamped)
+    pool, and whether a restart is pending. See :func:`_workers_payload`."""
+    from ..config import CONFIG_PATH, load_config
+
+    _require_local_origin(request)
+    cfg = getattr(request.app.state, "config", None)
+    running_data = getattr(cfg, "data", None) or {}
+    file_cfg = await asyncio.to_thread(load_config, CONFIG_PATH)
+    return _workers_payload(file_cfg.data, running_data)
+
+
+@app.put("/api/config/workers")
+async def api_set_config_workers(request: Request) -> dict[str, Any]:
+    """Change ``concurrency.max_workers`` and/or ``concurrency.enabled``.
+
+    Body (JSON object, parsed by hand for a one-sentence 422 like the other
+    ``/api/config/*`` writers): ``max_workers`` (int 1..64) and/or ``enabled``
+    (bool). Validation and the atomic write both run through
+    ``config.set_concurrency``. Does NOT reload ``app.state.config``: the pool
+    size is bound at server start, so the change takes effect on the next
+    ``nh serve`` — reloading here would make ``restart_required`` lie.
+    """
+    from ..config import CONFIG_PATH, AuthError, load_config, set_concurrency
+
+    _require_local_origin(request, writing=True)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — never surface the raw body
+        raise HTTPException(422, "expected a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected a JSON object")
+
+    kwargs: dict[str, Any] = {}
+    if "max_workers" in body:
+        kwargs["max_workers"] = body["max_workers"]
+    if "enabled" in body:
+        kwargs["enabled"] = body["enabled"]
+    if not kwargs:
+        raise HTTPException(422, "expected 'max_workers' and/or 'enabled'")
+
+    try:
+        await asyncio.to_thread(set_concurrency, CONFIG_PATH, **kwargs)
+    except (ValueError, AuthError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    cfg = getattr(request.app.state, "config", None)
+    running_data = getattr(cfg, "data", None) or {}
+    file_cfg = await asyncio.to_thread(load_config, CONFIG_PATH)
+    return _workers_payload(file_cfg.data, running_data)
+
+
 async def _attach_imported(
     request: Request, source: str, briefs: list[dict[str, Any]]
 ) -> list[TrackerIssueOut]:
