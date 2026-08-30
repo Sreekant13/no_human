@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -866,6 +867,53 @@ async def _read_jsonl_line(reader: asyncio.StreamReader) -> bytes:
             return e.partial
 
 
+_log = logging.getLogger(__name__)
+
+
+def _close_subprocess_transport(proc: Any) -> None:
+    """Explicitly close the child's subprocess TRANSPORT.
+
+    asyncio only tears a subprocess transport down when `proc.wait()`
+    completes (`BaseSubprocessTransport._try_finish` -> `_call_connection_lost`
+    runs from the child-watcher callback that `wait()` is keyed to). On the
+    `_TEARDOWN_WAIT` timeout path in `_kill_and_reap`, `wait()` by definition
+    does NOT complete, so the transport survives until GC, and
+    `BaseSubprocessTransport.__del__` then calls `close()` ->
+    `loop.call_soon()` on a loop that has since closed:
+        RuntimeError: Event loop is closed
+    ...which pytest escalates to `PytestUnraisableExceptionWarning` in
+    whatever unrelated test happens to be running when GC fires (MEASURED
+    2026-08-26: twice, at load 11.18 on 18 CPUs, in
+    tests/test_codex_oversized_jsonl_line.py — a file this ticket's branch
+    never touches).
+
+    THERE IS NO PUBLIC ROUTE. `asyncio.subprocess.Process` exposes no
+    `close()`; the transport lives at `proc._transport`, a private attribute,
+    verified against CPython 3.12 and 3.13 (`Lib/asyncio/subprocess.py`,
+    `Process.__init__`: `self._transport = transport`). That the attribute
+    still exists on this interpreter is NOT left to a silent `getattr`
+    fallback here — it is pinned by
+    `test_process_still_exposes_the_private_transport_attribute` in
+    tests/test_codex_teardown_closes_transport.py, which fails loudly on a
+    CPython that renames or removes it. The `getattr` below exists only so a
+    teardown never raises because of a transport that is already gone
+    (`None` after connection loss, or absent on a mocked `proc` in a test) —
+    it is not the contract's enforcement point.
+
+    Synchronous and idempotent: `BaseSubprocessTransport.close()` does not
+    await anything, and short-circuits if the transport is already closed.
+    """
+    transport = getattr(proc, "_transport", None)
+    if transport is None:
+        return
+    try:
+        transport.close()
+    except Exception:  # noqa: BLE001 — a cleanup failure must never mask
+        # the teardown's real signal (the intake's kill/wait/close ordering
+        # exists precisely so a timeout is still reported as a timeout).
+        _log.debug("codex subprocess transport close failed", exc_info=True)
+
+
 async def _kill_and_reap(proc: Any) -> tuple[int, bytes]:
     """Kill the codex child and reap it within a bound; drain stderr.
 
@@ -982,6 +1030,26 @@ async def _kill_and_reap(proc: Any) -> tuple[int, bytes]:
         # out here reads downstream as a clean success. Making it
         # observable is ticket ec24f443, not this bound.
         with_code = proc.returncode if proc.returncode is not None else -9
+    # Unconditional, not timeout-only — and MEASURED to matter on both
+    # arms, not just the timeout one. An earlier version of this comment
+    # claimed the success arm was a no-op because "wait() completing
+    # already means asyncio closed the transport"; that is REFUTED.
+    # asyncio's own auto-close (`SubprocessStreamProtocol._maybe_close_transport`)
+    # only runs once BOTH `process_exited` has fired AND every piped fd
+    # (stdout/stderr) has reported `pipe_connection_lost` — i.e. been read
+    # to EOF. `stream()` returns as soon as it sees `turn.completed`
+    # without draining stdout/stderr to EOF, so that second condition is
+    # never met and asyncio never auto-closes the transport on the normal
+    # path either. Deleting this call was checked to turn the success-arm
+    # positive-control test (test_a_teardown_that_completes_in_the_bound_is_unchanged
+    # in tests/test_codex_teardown_closes_transport.py) red as well as the
+    # timeout-arm tests — confirming this call does real work on both
+    # arms. `close()` is still idempotent, so one call site covering both
+    # arms remains easier to keep correct than two. kill() already ran
+    # above and stderr is already drained above this point, so closing
+    # here cannot lose output; this is the "close" step of the kill ->
+    # bounded wait -> close teardown order.
+    _close_subprocess_transport(proc)
     return with_code, stderr
 
 
