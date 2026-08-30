@@ -3686,3 +3686,47 @@ async def test_every_board_endpoint_emits_its_shared_human_event(
     assert ev["prior_status"] == seed_status.value, f"{verb}: {ev}"
     if blocker is not None:
         assert ev.get("prior_blocker") == blocker, f"{verb}: {ev}"
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/split — the 1-click split's create path (feature #1)    #
+# --------------------------------------------------------------------------- #
+
+async def test_split_creates_children_with_parent_id_and_cancels_parent(client, store):
+    parent = await _seed_task(store, status=TaskStatus.PENDING, title="Big thing")
+    r = await client.post(f"/api/tasks/{parent.id}/split", json={"drafts": [
+        {"title": "Part A", "description": "do A", "acceptance_criteria": ["A done"]},
+        {"title": "Part B", "description": "do B"},
+    ]})
+    assert r.status_code == 201, r.text
+    children = r.json()
+    assert {c["title"] for c in children} == {"Part A", "Part B"}
+    # Each child is independent, carries parent_id for provenance, and inherits
+    # the parent's repo.
+    for c in children:
+        full = await store.get_task(c["id"])
+        assert full.parent_id == parent.id
+        assert full.repo_path == parent.repo_path
+    # The original is cancelled — its scope now lives in the children.
+    p = await store.get_task(parent.id)
+    assert p.status == TaskStatus.FAILED
+    assert "split into 2 sub-tasks" in (p.context or {}).get("cancel_reason", "")
+
+
+async def test_split_refuses_a_task_that_is_not_pending(client, store):
+    # A running/parked/terminal task has work in flight or done — never silently
+    # replace it.
+    running = await _seed_task(store, status=TaskStatus.IMPLEMENTING, title="running")
+    r = await client.post(f"/api/tasks/{running.id}/split", json={
+        "drafts": [{"title": "A"}, {"title": "B"}]})
+    assert r.status_code == 409
+
+
+async def test_split_requires_between_2_and_8_drafts(client, store):
+    parent = await _seed_task(store, status=TaskStatus.PENDING)
+    r1 = await client.post(f"/api/tasks/{parent.id}/split",
+                           json={"drafts": [{"title": "only one"}]})
+    assert r1.status_code == 422
+    # A parent left un-split by a rejected request is still splittable.
+    p = await store.get_task(parent.id)
+    assert p.status == TaskStatus.PENDING

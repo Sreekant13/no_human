@@ -782,6 +782,22 @@ class CancelRequest(BaseModel):
     reason: str | None = None
 
 
+class SplitDraft(BaseModel):
+    # One proposed sub-task in a 1-click split. `title` is required; the human
+    # may have edited any field in the split-review screen before confirming.
+    title: str
+    description: str | None = None
+    acceptance_criteria: list[str] = []
+
+
+class SplitRequest(BaseModel):
+    # The human-confirmed sub-tasks to create from an over-scope PENDING task.
+    # POST /api/tasks/{id}/split creates each as an independent child (parent_id
+    # set for provenance) and cancels the original. A HUMAN api action only —
+    # never a blocker-option verb, so the agent can never trigger a split.
+    drafts: list[SplitDraft]
+
+
 class LandedOverrideRequest(BaseModel):
     # Unlike ShippedRequest, `sha` here IS verified — commit_is_ancestor
     # against the task's recorded base_branch — and `justification` is

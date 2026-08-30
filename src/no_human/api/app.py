@@ -59,7 +59,7 @@ from .models import (
     AttemptOut, BoardPayload, BudgetOut, CancelRequest, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
     ImportedInfo, LandedOverrideRequest, PhaseOut, ProjectOut, ReplyRequest,
-    SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
+    SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, SplitRequest, TaskOut,
     TaskSummaryOut, TelemetryConsentRequest, TrackerIssueOut, UpdateProjectRequest,
 )
 
@@ -822,6 +822,89 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
         "tasks": [t.model_dump() for t in tasks],
     })
     return summary
+
+
+@app.post("/api/tasks/{task_id}/split", response_model=list[TaskSummaryOut],
+          status_code=201)
+async def split_task(
+    task_id: str, body: SplitRequest, request: Request,
+) -> list[TaskSummaryOut]:
+    """Split a PENDING over-scope task into 2-8 independent child tasks.
+
+    A HUMAN api action (the board's split-review screen) — never a
+    blocker-option verb, so the agent can never trigger a split. Each draft
+    becomes its OWN task with ``parent_id`` set for provenance (the existing
+    Sub-tasks view renders them), inheriting the parent's repo/project/backend/
+    base. The children run independently through every gate — this does NOT
+    revive ``compound_parent`` runtime coordination (removed 2026-08-12 on
+    purpose). The original is cancelled, its scope now living in the children.
+
+    Guarded on PENDING: a task already dispatched, parked or terminal has work
+    in flight or done and must not be silently replaced.
+    """
+    store = _store(request)
+    task = await _require_task(store, task_id)
+    if task.status != TaskStatus.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"can only split a pending task; this one is "
+                    f"{task.status.value!r}"),
+        )
+    drafts = body.drafts
+    if not (2 <= len(drafts) <= 8):
+        raise HTTPException(
+            422, "a split must create between 2 and 8 sub-tasks")
+
+    children: list[Task] = []
+    for d in drafts:
+        title = (d.title or "").strip()
+        if not title:
+            raise HTTPException(422, "each sub-task needs a non-empty title")
+        child = Task.new(
+            title=title,
+            source="board",
+            repo_path=task.repo_path,
+            description=(d.description or "").strip() or None,
+            kind=task.kind,
+            parent_id=task.id,
+        )
+        child.priority = task.priority
+        child.acceptance_criteria = list(d.acceptance_criteria or [])
+        child.linked_repos = list(task.linked_repos or [])
+        # Inherit the parent's task config (coder backend, plan-approval gate…)
+        # and any pinned base branch, so a split child runs exactly as the
+        # parent would have.
+        child.config = dict(task.config or {})
+        base = (task.context or {}).get("base_branch")
+        if base:
+            child.context = {**(child.context or {}), "base_branch": base}
+        await store.create_task(child)
+        children.append(child)
+
+    # Cancel the original — its scope now lives in the children. A PENDING task
+    # has no live orchestrator, so this is a plain status flip (no scheduler
+    # unwind, unlike cancel_task's running-task path).
+    from ..blockers import human_event
+    child_ids = ", ".join(c.id[:8] for c in children)
+    reason = f"split into {len(children)} sub-tasks: {child_ids}"
+    prior_status = task.status
+    task.context = await store.merge_context(task.id, {"cancel_reason": reason})
+    await store.set_status(
+        task, TaskStatus.FAILED, validate=False, human_override=True,
+        event=human_event("cancel", prior_status=prior_status,
+                          prior_blocker=None, reason=reason,
+                          actor="operator:api"),
+    )
+
+    out = [TaskSummaryOut.from_task(c, max_pr_conflict_rounds=_max_pr_conflict_rounds())
+           for c in children]
+    tasks = await _board_tasks(store, scheduler=_sched(request))
+    await _mgr.broadcast({
+        "type": "task_split",
+        "task_id": task.id,
+        "tasks": [t.model_dump() for t in tasks],
+    })
+    return out
 
 
 async def _record_intake_spend(store, site: str, model: str | None, obj) -> None:
