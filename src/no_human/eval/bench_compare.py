@@ -34,6 +34,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from .northstar import BenchScore
 from .northstar_card import score_ran, score_succeeded
 
 # Below this many discordant pairs, McNemar's exact two-sided test CANNOT
@@ -42,6 +43,20 @@ from .northstar_card import score_ran, score_succeeded
 # at n=6. So "p = 0.25, n = 2" is not weak evidence of no change, it is the
 # only answer the test is able to give. Every surface prints the counts.
 MIN_DISCORDANT_FOR_POWER = 6
+
+# Token columns a score row must carry SOME of before it counts as cost data at
+# all. A row with none of these is not "zero cost" — it is a row this module
+# never priced (an older results file, a skipped trial) — see `_row_cost`.
+COST_TOKEN_KEYS = ("nh_tokens", "nh_cache_tokens", "nh_cache_creation_tokens")
+
+# `top_cost_deltas` default — never silently hides data past this: 0 means
+# "show all", never "show nothing".
+DEFAULT_COST_TOP = 10
+
+# `Comparison.cost_flagged`'s default threshold, as a RATIO (cost_new /
+# cost_old), not a percent delta — a spec has to move cost by at least 10% to
+# be worth a human's attention beside a verdict flip.
+DEFAULT_COST_FLIP_RATIO = 1.1
 
 
 # --------------------------------------------------------------------------- #
@@ -65,6 +80,9 @@ class SpecVerdict:
     # may carry different text; the trial counts beside them say how many.
     outcome_status: str
     notes: str
+    # None when the trials that ran carry no cost data at all (see
+    # `_spec_cost`) — absent, never a fabricated zero.
+    cost: "SpecCost | None" = None
 
     @property
     def success(self) -> bool:
@@ -85,6 +103,86 @@ class SpecVerdict:
 
 def _scores(run: dict[str, Any]) -> list[dict[str, Any]]:
     return list(run.get("scores") or [])
+
+
+# --------------------------------------------------------------------------- #
+# Per-spec cost — read, never invented
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class SpecCost:
+    """One spec's cost, read out of the score row(s) that ran — never derived
+    from success/failure, and never a fabricated zero when the row simply
+    carries no cost columns (an older results file, a hand-built fixture).
+
+    ``priced_tokens``/``cost_ratio`` reuse ``BenchScore.nh_priced_tokens`` /
+    ``.cost_ratio`` — the single canonical weighted-cost expression — via a
+    throwaway ``BenchScore`` built from the row; this module does not
+    re-derive pricing.
+    """
+
+    priced_tokens: float | None      # BenchScore.nh_priced_tokens, or None
+    nh_tokens: int | None            # raw fresh-token count, or None
+    cost_ratio: float | None         # BenchScore.cost_ratio, or None
+    basis: str                       # BenchScore.cost_ratio_basis — always set
+    trials_with_cost: int            # of the trials that ran, how many priced
+
+
+def _row_cost(row: dict[str, Any]) -> SpecCost | None:
+    """One score row's cost, or ``None`` if the row carries none of
+    ``COST_TOKEN_KEYS`` at all — a row this module never priced, not a row
+    that cost nothing.
+    """
+    if not any(row.get(k) is not None for k in COST_TOKEN_KEYS):
+        return None
+    score = BenchScore(
+        task_id="", title="", outcome_status="", goal_satisfied=None,
+        escalated_honestly=False, mergeable=None,
+        nh_tokens=int(row.get("nh_tokens") or 0),
+        nh_cache_tokens=int(row.get("nh_cache_tokens") or 0),
+        nh_cache_creation_tokens=int(row.get("nh_cache_creation_tokens") or 0),
+        nh_turns=0, nh_wall_clock_s=0.0,
+        orig_tokens=0, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=0.0, orig_corrections=0,
+        nh_role_tokens=dict(row.get("nh_role_tokens") or {}),
+        nh_role_models=dict(row.get("nh_role_models") or {}),
+    )
+    cost_ratio = row.get("cost_ratio")
+    return SpecCost(
+        priced_tokens=score.nh_priced_tokens,
+        nh_tokens=int(row.get("nh_tokens") or 0) if row.get("nh_tokens") is not None else None,
+        cost_ratio=float(cost_ratio) if cost_ratio is not None else None,
+        basis=score.cost_ratio_basis,
+        trials_with_cost=1,
+    )
+
+
+def _spec_cost(rows: list[dict[str, Any]]) -> SpecCost:
+    """One spec's cost, MEAN over the trials that ran and carry cost data —
+    a sum would let ``--trials N`` inflate apparent cost by N for no reason.
+
+    Rows with no cost data at all are excluded from the mean, not counted as
+    zero; if none of the rows carry cost data the result renders every field
+    absent (``trials_with_cost=0``).
+    """
+    costed = [c for c in (_row_cost(r) for r in rows) if c is not None]
+    if not costed:
+        return SpecCost(priced_tokens=None, nh_tokens=None, cost_ratio=None,
+                        basis="", trials_with_cost=0)
+    n = len(costed)
+    priced = [c.priced_tokens for c in costed if c.priced_tokens is not None]
+    nh_tok = [c.nh_tokens for c in costed if c.nh_tokens is not None]
+    ratios = [c.cost_ratio for c in costed if c.cost_ratio is not None]
+    # basis is a closed-set label, not a number to average — the trials that
+    # ran a spec use the same pricing shape, so the first costed trial's basis
+    # stands for all of them.
+    return SpecCost(
+        priced_tokens=(sum(priced) / len(priced)) if priced else None,
+        nh_tokens=(round(sum(nh_tok) / len(nh_tok))) if nh_tok else None,
+        cost_ratio=(sum(ratios) / len(ratios)) if ratios else None,
+        basis=costed[0].basis,
+        trials_with_cost=n,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +303,7 @@ def spec_verdicts(run: dict[str, Any]) -> tuple[dict[str, SpecVerdict], list[str
             trials=len(ran),
             outcome_status=str(ran[0].get("outcome_status") or ""),
             notes=str(ran[0].get("notes") or ""),
+            cost=_spec_cost(ran),
         )
     return verdicts, unmeasured
 
@@ -271,6 +370,71 @@ def mcnemar_exact_p(b: int, c: int) -> float:
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
+class CostDelta:
+    """One spec's cost movement between two runs — a pure reader over
+    ``SpecCost``, never a scorer. ``a``/``b`` are each ``None`` only when
+    NEITHER run's rows for this spec carried cost data; a spec costed on one
+    side and not the other still gets a ``SpecCost`` with every field
+    ``None`` from ``_spec_cost``, so ``a``/``b`` here are the per-run
+    ``SpecVerdict.cost`` values as-is.
+    """
+
+    task_id: str
+    title: str
+    a: SpecCost | None
+    b: SpecCost | None
+    flipped: bool = False       # this spec's success verdict moved A→B
+
+    @property
+    def token_delta(self) -> float | None:
+        """``b.priced_tokens - a.priced_tokens``, or ``None`` if either side
+        lacks priced tokens."""
+        if self.a is None or self.b is None:
+            return None
+        if self.a.priced_tokens is None or self.b.priced_tokens is None:
+            return None
+        return self.b.priced_tokens - self.a.priced_tokens
+
+    @property
+    def abs_token_delta(self) -> float | None:
+        d = self.token_delta
+        return None if d is None else abs(d)
+
+    @property
+    def cost_ratio_delta(self) -> float | None:
+        """``b.cost_ratio - a.cost_ratio``, or ``None`` if either is absent."""
+        if self.a is None or self.b is None:
+            return None
+        if self.a.cost_ratio is None or self.b.cost_ratio is None:
+            return None
+        return self.b.cost_ratio - self.a.cost_ratio
+
+    @property
+    def movement_ratio(self) -> float | None:
+        """``b.priced_tokens / a.priced_tokens`` — how much B's cost moved
+        relative to A's, as a RATIO (matching the module's ``cost_ratio``
+        convention: new / old). ``None`` when either side lacks priced
+        tokens, or when A's cost is exactly zero (never divide toward
+        infinity)."""
+        if self.a is None or self.b is None:
+            return None
+        if self.a.priced_tokens is None or self.b.priced_tokens is None:
+            return None
+        if self.a.priced_tokens == 0:
+            return None
+        return self.b.priced_tokens / self.a.priced_tokens
+
+    @property
+    def basis_changed(self) -> bool:
+        """Whether the two sides priced this spec under different bases
+        (tier-weighted vs. cache-weighted) — a caveat, not a verdict: a
+        movement_ratio computed across two bases is not apples to apples."""
+        if self.a is None or self.b is None:
+            return False
+        return bool(self.a.basis) and bool(self.b.basis) and self.a.basis != self.b.basis
+
+
+@dataclass(frozen=True)
 class Flip:
     """One spec whose verdict moved between the two runs."""
 
@@ -281,6 +445,7 @@ class Flip:
     b: SpecVerdict
     trial_flips: int = 0        # trials that disagreed, paired on trial index
     trials_paired: int = 0
+    cost: "CostDelta | None" = None
 
 
 @dataclass
@@ -310,6 +475,10 @@ class Comparison:
     unmeasured_a: list[str] = field(default_factory=list)
     unmeasured_b: list[str] = field(default_factory=list)
     p_value: float = 1.0
+    # Every PAIRED spec's cost movement (not just the flips) — sorted by
+    # `abs_token_delta` descending (None deltas last), task_id as tiebreak, so
+    # `top_cost_deltas` needs no further sorting of its own.
+    cost_deltas: list[CostDelta] = field(default_factory=list)
 
     @property
     def paired(self) -> int:
@@ -338,6 +507,49 @@ class Comparison:
         return len(set(self.only_in_a) | set(self.only_in_b)
                    | set(self.unmeasured_a) | set(self.unmeasured_b))
 
+    @property
+    def aggregate_token_delta(self) -> float | None:
+        """SUM of every paired spec's ``token_delta`` — not an average or
+        median: a regression that doubled one expensive spec's cost is not
+        diluted by nine unrelated specs that did not move. ``None`` only when
+        NO paired spec carries a token_delta at all (nothing to sum)."""
+        deltas = [d.token_delta for d in self.cost_deltas if d.token_delta is not None]
+        return sum(deltas) if deltas else None
+
+    @property
+    def specs_costed(self) -> int:
+        """Paired specs where BOTH sides carry a token_delta."""
+        return sum(1 for d in self.cost_deltas if d.token_delta is not None)
+
+    @property
+    def specs_missing_cost(self) -> int:
+        """Paired specs where at least one side carries no cost data at
+        all — named, not silently folded into a delta of zero."""
+        return len(self.cost_deltas) - self.specs_costed
+
+    def cost_flagged(self, threshold: float = DEFAULT_COST_FLIP_RATIO) -> list[CostDelta]:
+        """Specs that FLIPPED success while their cost moved by at least
+        ``threshold`` in either direction (``movement_ratio >= threshold`` or
+        ``movement_ratio <= 1/threshold``) — the case a bare success/fail
+        pairing cannot see: a spec that flipped for free vs. one that flipped
+        and got 3x more expensive read identically as "1 regression"."""
+        out = []
+        for d in self.cost_deltas:
+            if not d.flipped:
+                continue
+            m = d.movement_ratio
+            if m is None:
+                continue
+            if m >= threshold or m <= 1.0 / threshold:
+                out.append(d)
+        return out
+
+    def top_cost_deltas(self, n: int = DEFAULT_COST_TOP) -> list[CostDelta]:
+        """The first ``n`` of ``cost_deltas`` (already sorted by
+        ``abs_token_delta`` descending). ``n <= 0`` returns every entry —
+        never silently hides data."""
+        return list(self.cost_deltas) if n <= 0 else self.cost_deltas[:n]
+
 
 def compare_runs(run_a: dict[str, Any], run_b: dict[str, Any]) -> Comparison:
     """Pair two loaded results dicts spec by spec. Pure — reads no files.
@@ -365,8 +577,12 @@ def compare_runs(run_a: dict[str, Any], run_b: dict[str, Any]) -> Comparison:
         unmeasured_b=sorted(unmeasured_b),
     )
 
+    cost_deltas: list[CostDelta] = []
     for tid in sorted(set(va) & set(vb)):
         a, b = va[tid], vb[tid]
+        flipped = a.success != b.success
+        cost_deltas.append(CostDelta(task_id=tid, title=a.title or b.title,
+                                     a=a.cost, b=b.cost, flipped=flipped))
         if a.success and b.success:
             out.both_pass += 1
             continue
@@ -376,7 +592,8 @@ def compare_runs(run_a: dict[str, Any], run_b: dict[str, Any]) -> Comparison:
         flips, paired = trial_flip_count(rows_a.get(tid, []), rows_b.get(tid, []))
         flip = Flip(task_id=tid, title=a.title or b.title,
                     direction="regressed" if a.success else "fixed",
-                    a=a, b=b, trial_flips=flips, trials_paired=paired)
+                    a=a, b=b, trial_flips=flips, trials_paired=paired,
+                    cost=cost_deltas[-1])
         if a.success:
             out.b_regressed += 1
             out.regressions.append(flip)
@@ -384,6 +601,13 @@ def compare_runs(run_a: dict[str, Any], run_b: dict[str, Any]) -> Comparison:
             out.c_fixed += 1
             out.fixes.append(flip)
 
+    # Sorted by absolute token delta descending — entries with no delta at
+    # all (either side missing cost data) sort last, never hidden, just not
+    # competing for the top of a cost-ordered list they carry no number for.
+    out.cost_deltas = sorted(
+        cost_deltas,
+        key=lambda d: (d.abs_token_delta is None,
+                       -(d.abs_token_delta or 0.0), d.task_id))
     out.p_value = mcnemar_exact_p(out.b_regressed, out.c_fixed)
     return out
 
@@ -401,6 +625,20 @@ def headline_caveat() -> str:
     return ("rates above are MAJORITY-VOTE per spec, over each run's own "
             "measured specs — not the published headline (mean of per-spec "
             "pass fractions); they coincide on single-trial runs")
+
+
+def cost_caveat() -> str:
+    """Why the cost section can be silent, or partial, for a real run.
+
+    Cost is read from ``nh_tokens``/``nh_cache_tokens``/
+    ``nh_cache_creation_tokens`` on the score rows that RAN; a spec whose rows
+    carry none of them contributes no delta, not a zero delta — an absence
+    this module refuses to invent, same as an unmeasured spec's verdict.
+    """
+    return ("cost deltas are read straight off each run's score rows — a "
+            "spec whose rows carry no token columns at all contributes no "
+            "delta, never a fabricated zero; specs missing cost on either "
+            "side are counted, not silently dropped")
 
 
 def interpretation(cmp: Comparison) -> str:

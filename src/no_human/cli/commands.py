@@ -7745,22 +7745,41 @@ def _compare_side(label: str, created: str, rate: float, specs: int) -> str:
                    "created_at, and lists specs whose verdict flipped across "
                    "2+ consecutive run-pairs. Repeatable; needs 3+ files total "
                    "to say anything the flip list does not.")
-def bench_compare(run_a: str, run_b: str, canary_files):
+@click.option("--cost-top", "cost_top", type=int, default=10, show_default=True,
+              # Literal, not `bench_compare.DEFAULT_COST_TOP`: every `..eval`
+              # import in this command is LAZY (inside the function body), to
+              # keep `nh` startup off the eval package's import graph, and a
+              # click option default is evaluated at module load. Kept equal
+              # to `DEFAULT_COST_TOP` by `tests/test_bench_compare.py`.
+              help="How many specs to show in the cost-delta table, ranked by "
+                   "absolute token delta. 0 shows every paired spec — this "
+                   "never silently hides data, it only truncates the table.")
+@click.option("--cost-threshold", "cost_threshold", type=float, default=1.1,
+              show_default=True,
+              # Literal for the same reason; kept equal to
+              # `DEFAULT_COST_FLIP_RATIO` by the same test.
+              help="Flag a flipped spec's cost movement when its "
+                   "new/old token ratio is at or above this, or at or below "
+                   "1/this.")
+def bench_compare(run_a: str, run_b: str, canary_files, cost_top: int,
+                  cost_threshold: float):
     """Compare two runs PAIRED per spec — RUN_A is the baseline, RUN_B the change.
 
     Two headline numbers cannot tell you whether a change helped: "90.7% →
     90.7%" is the same string whether nothing moved or five specs broke while
     five others got fixed. This pairs on task_id, prints the flips in both
-    directions with their notes, names every spec that could NOT be paired, and
+    directions with their notes, names every spec that could NOT be paired,
     runs McNemar's exact test on the discordant pairs — beside the counts,
-    because below 6 discordant pairs that test cannot reach p<0.05 at all.
+    because below 6 discordant pairs that test cannot reach p<0.05 at all —
+    and shows each paired spec's token/cost delta, so a cost regression is
+    attributable to a spec in minutes, not thrown away as a success bit.
 
     A REPORT, NOT A GATE: it writes nothing and always exits 0. The regression
     gate is `nh bench run --gate`; the publish refusals are in `bench publish`.
     """
     from ..eval.bench_compare import (
-        MIN_DISCORDANT_FOR_POWER, compare_runs, flaky_canary, headline_caveat,
-        interpretation, undated_run_indices)
+        MIN_DISCORDANT_FOR_POWER, compare_runs, cost_caveat, flaky_canary,
+        headline_caveat, interpretation, undated_run_indices)
 
     card_a, path_a = _load_results_json(run_a)
     card_b, path_b = _load_results_json(run_b)
@@ -7826,6 +7845,67 @@ def bench_compare(run_a: str, run_b: str, canary_files):
                 f"{escape(note)} |")
     else:
         console.print("  [dim]no spec changed verdict between these two runs[/]")
+
+    # COST, thrown away by every summary above this line: a spec that flipped
+    # for free and a spec that flipped and got 3x more expensive both read as
+    # "1 regression" in the counts and the table. This section is the reason
+    # a real cost regression (per-spec ratio 0.107 -> 0.336) went unattributed
+    # for a full release cycle.
+    console.print("")
+    if cmp.specs_costed == 0:
+        console.print(f"  [dim]{escape(cost_caveat())}[/]")
+        console.print("  [dim]no spec on either side of this comparison "
+                      "carries cost data[/]")
+    else:
+        agg = cmp.aggregate_token_delta
+        # Formatted OUTSIDE the print, same reason as `p_str` above: an
+        # `escape(f"...")` nested inside the print's own f-string still
+        # contains an un-escaped interpolation node to the AST guard.
+        agg_str = "n/a" if agg is None else f"{agg:+.0f}"
+        console.print(
+            f"  [bold]cost[/] aggregate priced-token delta (sum, B-A): "
+            f"{escape(agg_str)}  ·  {int(cmp.specs_costed)} spec(s) costed  "
+            f"·  {int(cmp.specs_missing_cost)} spec(s) missing cost")
+        console.print(f"  [dim]{escape(cost_caveat())}[/]")
+
+        top = cmp.top_cost_deltas(cost_top)
+        shown = [d for d in top if d.token_delta is not None]
+        if shown:
+            console.print("")
+            console.print("  | task | title | A tokens | B tokens | delta "
+                          "| ratio (B/A) |")
+            console.print("  |---|---|---|---|---|---|")
+            for d in shown:
+                title = (d.title or "")[:40].replace("|", "/")
+                a_tok = "n/a" if d.a is None or d.a.priced_tokens is None \
+                    else f"{d.a.priced_tokens:.0f}"
+                b_tok = "n/a" if d.b is None or d.b.priced_tokens is None \
+                    else f"{d.b.priced_tokens:.0f}"
+                delta_str = f"{d.token_delta:+.0f}"
+                ratio = d.movement_ratio
+                ratio_str = "n/a" if ratio is None else f"{ratio:.2f}x"
+                console.print(
+                    f"  | {escape(d.task_id)} | {escape(title)} | "
+                    f"{escape(a_tok)} | {escape(b_tok)} | "
+                    f"{escape(delta_str)} | {escape(ratio_str)} |")
+            if cost_top > 0 and len(cmp.cost_deltas) > cost_top:
+                remaining = len(cmp.cost_deltas) - cost_top
+                console.print(
+                    f"  [dim]… {int(remaining)} more paired spec(s) not "
+                    f"shown — raise --cost-top to see them[/]")
+
+        threshold_str = f"{cost_threshold:.2f}"
+        flagged = cmp.cost_flagged(cost_threshold)
+        if flagged:
+            console.print("")
+            for d in flagged:
+                f_title = (d.title or "")[:40]
+                ratio = d.movement_ratio
+                ratio_str = "n/a" if ratio is None else f"{ratio:.2f}x"
+                console.print(
+                    f"  [yellow]⚠ {escape(d.task_id)} {escape(f_title)} "
+                    f"flipped AND cost moved {escape(ratio_str)} "
+                    f"(threshold {escape(threshold_str)}x)[/]")
 
     if canary_files:
         history = [card_a, card_b]

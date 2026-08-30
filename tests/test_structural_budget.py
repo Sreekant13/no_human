@@ -163,7 +163,16 @@ FROZEN_FILE_LINES = {
     # convention; a shared helper was evaluated and rejected — with only two
     # call sites, the helper's own def+docstring line cost exceeds what
     # de-duplicating the 4-line block would save.
-    "cli/commands.py": 8122,
+    # cli/commands.py 8122 -> 8173 (+51): `bench compare` gained a cost
+    # section — per-spec priced-token/cost-ratio deltas were being computed
+    # in `eval/bench_compare.py` but thrown away before the CLI printed
+    # anything, so a real cost regression (per-spec ratio 0.107 -> 0.336)
+    # went unattributed for a full release cycle. Adds `--cost-top`/
+    # `--cost-threshold` options (literal defaults, not the eval module's
+    # constants, to keep this file's lazy `..eval` import convention) and the
+    # aggregate/top-N/flagged rendering, each line escape()-wrapped per the
+    # AST guard in `tests/_bench_ast_guard.py`. 2026-08-30.
+    "cli/commands.py": 8173,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`

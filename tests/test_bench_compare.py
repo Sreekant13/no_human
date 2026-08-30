@@ -8,15 +8,24 @@ under test are structural, so a real corpus adds risk and no signal.
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
+from click.testing import CliRunner
 
+from no_human.cli.commands import bench_compare, cli
 from no_human.eval.bench_compare import (
+    COST_TOKEN_KEYS,
+    DEFAULT_COST_FLIP_RATIO,
+    DEFAULT_COST_TOP,
     MIN_DISCORDANT_FOR_POWER,
     REQUIRED_SCORE_KEYS,
+    CostDelta,
     ResultsSchemaError,
+    SpecCost,
     compare_runs,
+    cost_caveat,
     flaky_canary,
     interpretation,
     mcnemar_exact_p,
@@ -37,9 +46,22 @@ from no_human.eval.northstar_card import (
 def _row(task_id: str, *, ok: bool | None = True, trial: int = 0,
          status: str = "awaiting_approval", notes: str = "",
          title: str = "", expected_escalation: bool = False,
-         escalated_honestly: bool = False) -> dict:
-    """One score row in the on-disk shape (`BenchScore.as_dict()`'s keys)."""
-    return {
+         escalated_honestly: bool = False,
+         nh_tokens: int | None = None, nh_cache_tokens: int = 0,
+         nh_cache_creation_tokens: int = 0,
+         cost_ratio: float | None = None,
+         nh_role_tokens: dict | None = None) -> dict:
+    """One score row in the on-disk shape (`BenchScore.as_dict()`'s keys).
+
+    Cost fields are opt-in and independent of each other, matching a real
+    results file: `nh_tokens`/`nh_cache_tokens`/`nh_cache_creation_tokens`
+    only appear together when `nh_tokens` is given (a row that never priced
+    at all carries none of the three, not zeros); `cost_ratio` and
+    `nh_role_tokens` are each emitted only when explicitly passed, so a test
+    can build a row with a ratio but no token breakdown, or vice versa —
+    exactly the partial-data shapes `_row_cost` has to tolerate.
+    """
+    row = {
         "task_id": task_id, "title": title or f"task {task_id}",
         "outcome_status": status, "goal_satisfied": ok,
         "escalated_honestly": escalated_honestly, "mergeable": ok,
@@ -47,6 +69,15 @@ def _row(task_id: str, *, ok: bool | None = True, trial: int = 0,
         "subset": "core", "project": "proj-a", "trial": trial,
         "notes": notes, "events": [],
     }
+    if nh_tokens is not None:
+        row["nh_tokens"] = nh_tokens
+        row["nh_cache_tokens"] = nh_cache_tokens
+        row["nh_cache_creation_tokens"] = nh_cache_creation_tokens
+    if cost_ratio is not None:
+        row["cost_ratio"] = cost_ratio
+    if nh_role_tokens is not None:
+        row["nh_role_tokens"] = nh_role_tokens
+    return row
 
 
 def _run(label: str, rows: list[dict], created_at: str = "2026-01-01T00:00:00") -> dict:
@@ -533,3 +564,184 @@ def test_the_card_and_the_comparison_agree_on_a_whole_mixed_run():
         s.task_id for s in card.ran if s.goal_satisfied}
     assert card.satisfied == sum(1 for v in verdicts.values() if v.success)
     assert unmeasured == ["s3"] and card.skipped == 1
+
+
+# --------------------------------------------------------------------------- #
+# per-spec cost — read, never invented
+# --------------------------------------------------------------------------- #
+
+def test_spec_verdict_carries_the_costs_of_the_trials_it_voted_on():
+    rows = [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.1)]
+    verdicts, _ = spec_verdicts(_run("a", rows))
+    cost = verdicts["s1"].cost
+    assert isinstance(cost, SpecCost)
+    assert cost.nh_tokens == 100
+    assert cost.cost_ratio == pytest.approx(0.1)
+    assert cost.priced_tokens == pytest.approx(100.0)
+    assert cost.trials_with_cost == 1
+
+
+def test_a_row_with_no_cost_fields_has_no_cost_never_zero():
+    """A row this module never priced (no `nh_tokens`/cache columns at all)
+    must render every cost field absent — `None` — not a fabricated `0.0`
+    that would silently read as "this spec cost nothing"."""
+    rows = [_row("s1", ok=True)]
+    verdicts, _ = spec_verdicts(_run("a", rows))
+    cost = verdicts["s1"].cost
+    assert cost is not None, "the spec still gets a SpecCost — just an empty one"
+    assert cost.priced_tokens is None
+    assert cost.nh_tokens is None
+    assert cost.cost_ratio is None
+    assert cost.trials_with_cost == 0
+
+
+def test_cost_fields_do_not_become_required_schema():
+    """Cost is optional data layered on top of the pass/fail schema — a run
+    with none of `COST_TOKEN_KEYS` must still validate and compare cleanly,
+    the same as any older results file predating this feature."""
+    validate_results(_run("ok", [_row("s1", ok=True)]))
+    assert not set(COST_TOKEN_KEYS) & set(REQUIRED_SCORE_KEYS)
+
+
+def test_top_cost_deltas_name_the_planted_regression():
+    """The motivating case: a spec whose cost ratio moved 0.107 -> 0.336 must
+    be findable in minutes, not thrown away as a success bit."""
+    a = _run("base", [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.107),
+                      _row("s2", ok=True, nh_tokens=50, cost_ratio=0.2)])
+    b = _run("change", [_row("s1", ok=False, nh_tokens=340, cost_ratio=0.336),
+                        _row("s2", ok=True, nh_tokens=50, cost_ratio=0.2)])
+    cmp = compare_runs(a, b)
+
+    top = cmp.top_cost_deltas(1)
+    assert len(top) == 1 and top[0].task_id == "s1"
+    assert top[0].token_delta == pytest.approx(240.0)
+    assert top[0].abs_token_delta == pytest.approx(240.0)
+
+    # SUM, not average or median: the unrelated, unmoved s2 does not dilute it.
+    assert cmp.aggregate_token_delta == pytest.approx(240.0)
+    assert cmp.specs_costed == 2
+    assert cmp.specs_missing_cost == 0
+
+    # `top_cost_deltas` never hides data: n<=0 returns every paired spec.
+    assert len(cmp.top_cost_deltas(0)) == 2
+    assert {d.task_id for d in cmp.top_cost_deltas(0)} == {"s1", "s2"}
+
+
+def test_a_spec_that_flipped_and_moved_cost_is_flagged():
+    a = _run("base", [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.107)])
+    b = _run("change", [_row("s1", ok=False, nh_tokens=340, cost_ratio=0.336)])
+    cmp = compare_runs(a, b)
+
+    flagged = cmp.cost_flagged(DEFAULT_COST_FLIP_RATIO)
+    assert [d.task_id for d in flagged] == ["s1"]
+    assert flagged[0].movement_ratio == pytest.approx(3.4)
+
+    # A threshold the movement does not clear leaves it unflagged.
+    assert cmp.cost_flagged(10.0) == []
+
+
+def test_a_flip_with_no_cost_data_is_not_flagged():
+    """A spec that flipped but never carried cost data must not be flagged —
+    there is nothing to compare it against, and flagging it would fabricate
+    a movement out of an absence."""
+    a = _run("base", [_row("s1", ok=True)])
+    b = _run("change", [_row("s1", ok=False)])
+    cmp = compare_runs(a, b)
+    assert cmp.cost_flagged(DEFAULT_COST_FLIP_RATIO) == []
+    d = cmp.cost_deltas[0]
+    assert d.flipped is True
+    assert d.movement_ratio is None and d.token_delta is None
+
+
+def test_movement_ratio_is_none_when_the_baseline_cost_is_zero():
+    """Never divide toward infinity: a spec whose baseline genuinely cost
+    nothing gets `movement_ratio = None`, not a huge or infinite number."""
+    a = _run("base", [_row("s1", ok=True, nh_tokens=0, cost_ratio=0.0)])
+    b = _run("change", [_row("s1", ok=True, nh_tokens=50, cost_ratio=0.1)])
+    cmp = compare_runs(a, b)
+    d = cmp.cost_deltas[0]
+    assert d.a.priced_tokens == pytest.approx(0.0)
+    assert d.movement_ratio is None
+    # token_delta is still reportable even when the ratio is not.
+    assert d.token_delta == pytest.approx(50.0)
+
+
+def test_cost_deltas_do_not_move_any_verdict():
+    """Cost is a pure reader over the pairing this module already computes —
+    planting a large cost swing on a spec that did not flip must not change
+    b_regressed/c_fixed/both_pass/both_fail."""
+    a = _run("base", [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.1),
+                      _row("s2", ok=False)])
+    b = _run("change", [_row("s1", ok=True, nh_tokens=500, cost_ratio=0.9),
+                        _row("s2", ok=False)])
+    cmp = compare_runs(a, b)
+    assert cmp.b_regressed == 0 and cmp.c_fixed == 0
+    assert cmp.both_pass == 1 and cmp.both_fail == 1
+    assert cmp.regressions == [] and cmp.fixes == []
+    # The cost movement is still visible in cost_deltas, just not a flip.
+    s1_delta = next(d for d in cmp.cost_deltas if d.task_id == "s1")
+    assert s1_delta.flipped is False
+    assert s1_delta.token_delta == pytest.approx(400.0)
+
+
+def test_a_flip_carries_its_own_cost_delta_object():
+    a = _run("base", [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.1)])
+    b = _run("change", [_row("s1", ok=False, nh_tokens=200, cost_ratio=0.2)])
+    cmp = compare_runs(a, b)
+    flip = cmp.regressions[0]
+    assert isinstance(flip.cost, CostDelta)
+    assert flip.cost.task_id == "s1"
+    assert flip.cost.token_delta == pytest.approx(100.0)
+
+
+def test_cost_caveat_names_the_absence_rule():
+    text = cost_caveat()
+    assert "no delta" in text or "never a fabricated zero" in text
+
+
+def test_bench_compare_prints_the_cost_section(tmp_path):
+    a = _run("base", [_row("s1", ok=True, nh_tokens=100, cost_ratio=0.107),
+                      _row("s2", ok=True)],
+             created_at="2026-08-29T00:00:00")
+    b = _run("change", [_row("s1", ok=False, nh_tokens=340, cost_ratio=0.336),
+                        _row("s2", ok=True)],
+             created_at="2026-08-30T00:00:00")
+    path_a = tmp_path / "run_a.json"
+    path_b = tmp_path / "run_b.json"
+    path_a.write_text(json.dumps(a))
+    path_b.write_text(json.dumps(b))
+
+    res = CliRunner().invoke(
+        cli, ["bench", "compare", str(path_a), str(path_b),
+             "--cost-top", "5", "--cost-threshold", "1.1"])
+    assert res.exit_code == 0, res.output
+    # The planted regression must be NAMED, not just counted.
+    assert "s1" in res.output
+    assert "+240" in res.output
+    assert "spec(s) missing cost" in res.output
+    assert "⚠" in res.output
+
+
+def test_bench_compare_says_so_when_no_run_carries_cost_data(tmp_path):
+    a = _run("base", [_row("s1", ok=True), _row("s2", ok=False)])
+    b = _run("change", [_row("s1", ok=False), _row("s2", ok=True)])
+    path_a = tmp_path / "run_a.json"
+    path_b = tmp_path / "run_b.json"
+    path_a.write_text(json.dumps(a))
+    path_b.write_text(json.dumps(b))
+
+    res = CliRunner().invoke(cli, ["bench", "compare", str(path_a), str(path_b)])
+    assert res.exit_code == 0, res.output
+    assert "no spec on either side" in res.output
+
+
+def test_cli_cost_option_defaults_match_the_eval_module_constants():
+    """`bench_compare`'s `--cost-top`/`--cost-threshold` options are literal
+    defaults, not `bench_compare.DEFAULT_COST_TOP`/`DEFAULT_COST_FLIP_RATIO`
+    directly — every `..eval` import in commands.py is lazy (inside function
+    bodies), and a click option default is evaluated at module load, so
+    referencing the eval-module constant there would force a top-level
+    `..eval` import. This guard is what keeps the two from drifting apart."""
+    params = {p.name: p.default for p in bench_compare.params}
+    assert params["cost_top"] == DEFAULT_COST_TOP
+    assert params["cost_threshold"] == DEFAULT_COST_FLIP_RATIO
