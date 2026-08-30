@@ -189,11 +189,14 @@ FROZEN_FILE_LINES = {
     # 5489 -> 5572 (+83): POST /api/tasks/{id}/split — the 1-click feasibility
     # split creates the confirmed sub-task drafts as child tasks (feature #1).
     # 5572 -> 5596 (+24): the /split reservation race-fix (cancel-parent-first CAS).
-    "api/app.py": 5596,
+    # 5596 -> 5615 (+19): create-time feasibility-hint wiring (feature #1).
+    "api/app.py": 5615,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
-    "core/db.py": 4388,
+    # 4388 -> 4411 (+23): Store.done_rate_by_tier — per-tier done-rate
+    # calibration for the feasibility hint (feature #1).
+    "core/db.py": 4411,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

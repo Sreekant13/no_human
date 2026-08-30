@@ -813,6 +813,25 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     await store.create_task(task)
     if _is_backlog_import:
         _record_feature_used(request, FEATURE_BACKLOG_IMPORT)
+    # Pre-flight feasibility HINT (feature #1): the free band (complexity tier +
+    # the intake eval verdict — both knowable before planning) calibrated on
+    # THIS install's own per-tier done-rate, stashed on the task for the drawer
+    # to offer a 1-click split/clarify. Best-effort: a hint failure never
+    # affects the create (estimate_feasibility is itself fail-open, and this
+    # whole block is guarded).
+    try:
+        from ..core.feasibility import estimate_feasibility
+        hint = estimate_feasibility(task, await store.done_rate_by_tier())
+        if hint is not None:
+            task.context = await store.merge_context(task.id, {
+                "feasibility_hint": {
+                    "band": hint.band, "tier": hint.tier, "offer": hint.offer,
+                    "done_rate_pct": hint.done_rate_pct,
+                    "message": hint.message(),
+                },
+            })
+    except Exception:  # noqa: BLE001 — advisory; a hint never fails a create
+        log.warning("feasibility hint at create failed for %s", task.id[:8])
     summary = TaskSummaryOut.from_task(
         task, max_pr_conflict_rounds=_max_pr_conflict_rounds())
     tasks = await _board_tasks(store, scheduler=_sched(request))

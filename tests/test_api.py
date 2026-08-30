@@ -3747,3 +3747,32 @@ async def test_a_second_split_creates_no_duplicate_children(client, store):
     # Exactly the first two children exist — the second split added nothing.
     subs = await store.list_subtasks(parent.id)
     assert {s.id for s in subs} == first
+
+
+async def test_create_stashes_a_feasibility_hint_for_a_large_task(client, store):
+    # Two pre-plan signals at create (>=5 criteria + a >=2000-char spec) → the
+    # complexity tier is `complex` → the create stashes a feasibility hint that
+    # offers a 1-click split, for the drawer to surface.
+    r = await client.post("/api/tasks", json={
+        "title": "A big multi-part task",
+        "description": "x" * 2100,
+        "acceptance_criteria": ["a", "b", "c", "d", "e", "f"],
+    })
+    assert r.status_code == 201
+    full = await store.get_task(r.json()["id"])
+    hint = (full.context or {}).get("feasibility_hint")
+    assert hint is not None
+    assert hint["tier"] == "complex"
+    assert hint["offer"] == "split"
+    assert "message" in hint
+
+
+async def test_create_of_a_simple_task_stashes_no_hint(client, store):
+    # Nothing large → no hint, so the drawer never nags a task that looks fine.
+    r = await client.post("/api/tasks", json={
+        "title": "tiny", "description": "small",
+        "acceptance_criteria": ["do the thing"],
+    })
+    assert r.status_code == 201
+    full = await store.get_task(r.json()["id"])
+    assert (full.context or {}).get("feasibility_hint") is None

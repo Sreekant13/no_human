@@ -1772,6 +1772,29 @@ class Store:
         )
         return int(row["n"]) if row else 0
 
+    async def done_rate_by_tier(self, *, min_sample: int = 10) -> dict[str, int]:
+        """This install's measured done-rate (percent, 0-100) per complexity
+        tier, over terminal tasks that recorded a tier. Calibration for the
+        pre-flight feasibility hint (``core/feasibility.py``): a task's shown
+        rate is THIS install's own history, not a hardcoded constant. A tier
+        with fewer than ``min_sample`` terminal tasks is omitted rather than
+        reported on noise. Read-only, cheap (one grouped scan)."""
+        rows = await self._fetchall(
+            "SELECT json_extract(context, '$.complexity_tier') AS tier, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done "
+            "FROM tasks "
+            "WHERE status IN ('done', 'failed', 'escalated') "
+            "  AND json_extract(context, '$.complexity_tier') IS NOT NULL "
+            "GROUP BY tier"
+        )
+        out: dict[str, int] = {}
+        for row in rows:
+            n = int(row["n"] or 0)
+            if n >= min_sample:
+                out[str(row["tier"])] = round(100 * int(row["done"] or 0) / n)
+        return out
+
     # ---------------------------- attempts --------------------------------- #
 
     @serialized_write
