@@ -905,6 +905,7 @@ class Store:
             "kind": "TEXT DEFAULT 'feature'",
             "linked_repos": "TEXT",  # JSON list of additional repo paths
             "parent_id": "TEXT",  # LeadAgent: compound task sub-task linkage
+            "follows_id": "TEXT",  # sibling link, NOT parent_id's compound-child relation
             # Cooperative cancellation. A dedicated column, NOT task.context:
             # the CLI and the running orchestrator both hold a Task copy, and
             # `update_task` rewrites the whole mutable surface from it — so a
@@ -1591,7 +1592,7 @@ class Store:
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
-                 kind=:kind, parent_id=:parent_id,
+                 kind=:kind, parent_id=:parent_id, follows_id=:follows_id,
                  blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
@@ -1721,7 +1722,7 @@ class Store:
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
-                 kind=:kind, parent_id=:parent_id,
+                 kind=:kind, parent_id=:parent_id, follows_id=:follows_id,
                  blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, plan=:plan, config=:config,
                  updated_at=:updated_at

@@ -32,8 +32,13 @@ delete process.env.NH_TEST_LOG;      // must not divert the routing under test
 
 // A live server so main.mjs attaches instead of spawning anything.
 let probes = 0;
+// nh:open-path's tests below swap this in to make one path "known" — every
+// other test never touches /api/repos, so its default of no known repos is
+// the one they run against.
+let knownRepos = "[]";
 const server = http.createServer((q, s) => {
   if (q.url === "/api/tasks") probes += 1;   // one per navigation run
+  if (q.url === "/api/repos") { s.end(knownRepos); return; }
   s.end("[]");
 });
 await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
@@ -256,4 +261,65 @@ test("nh:save-token writes the OPTIONAL OpenAI key only when one is supplied (#6
   assert.match(bad.error, /Anthropic key/);
   assert.equal(envText(), before,
     "a rejected optional key must leave both credentials on disk untouched");
+});
+
+// --- nh:requirements (Task 5: first-run requirements check) --------------- //
+
+test("nh:requirements refuses any sender that is not the setup screen", async () => {
+  const handler = stub.calls.ipc.get("nh:requirements");
+  assert.ok(handler, "main.mjs must register nh:requirements");
+  for (const url of BOARD_PAGES) {
+    const res = await handler(from(url));
+    assert.deepEqual(res, { ok: false, error: "not permitted" },
+      `accepted a requirements probe from ${url}`);
+  }
+});
+
+test("nh:requirements reports resolved claude/node the same shape the setup screen expects", async () => {
+  const handler = stub.calls.ipc.get("nh:requirements");
+  const res = await handler(from(SETUP_URL));
+  // No "ok"/"error" envelope on the success path — the setup screen renders
+  // res.claude/res.node directly, and wrapping it would silently break that.
+  assert.equal(res.ok, undefined);
+  assert.equal(typeof res.claude.ok, "boolean");
+  assert.equal(typeof res.claude.path, "string");
+  assert.equal(typeof res.claude.version, "string");
+  assert.equal(typeof res.node.ok, "boolean");
+  assert.equal(typeof res.node.path, "string");
+  // node's shape carries no version field — the setup screen's row for node
+  // must not expect one.
+  assert.equal("version" in res.node, false);
+  if (!res.claude.ok) assert.equal(res.claude.version, "",
+    "a missing claude must not report a version");
+});
+
+// --- nh:open-path ("Open repo", Task 6) ------------------------------------ //
+
+test("nh:open-path refuses a path the server does not know about", async () => {
+  const handler = stub.calls.ipc.get("nh:open-path");
+  assert.ok(handler, "main.mjs must register nh:open-path");
+  knownRepos = "[]";                      // the server knows no repos
+  stub.calls.openedPaths.length = 0;
+  const res = await handler(from(SETUP_URL), "/etc/passwd");
+  assert.deepEqual(res, { ok: false, error: "not a registered repo" });
+  assert.deepEqual(stub.calls.openedPaths, [],
+    "shell.openPath must never see a path that failed the allow-list check");
+});
+
+test("nh:open-path rejects a missing/blank path without calling the server", async () => {
+  const handler = stub.calls.ipc.get("nh:open-path");
+  for (const bad of [undefined, "", null, 42]) {
+    const res = await handler(from(SETUP_URL), bad);
+    assert.equal(res.ok, false);
+  }
+});
+
+test("nh:open-path opens a path the server reports as a known repo", async () => {
+  const handler = stub.calls.ipc.get("nh:open-path");
+  knownRepos = JSON.stringify([{ repo_path: "/tmp/known-repo", name: "known-repo" }]);
+  stub.calls.openedPaths.length = 0;
+  const res = await handler(from(SETUP_URL), "/tmp/known-repo");
+  assert.deepEqual(res, { ok: true });
+  assert.deepEqual(stub.calls.openedPaths, ["/tmp/known-repo"]);
+  knownRepos = "[]";                      // restore the default for later tests
 });

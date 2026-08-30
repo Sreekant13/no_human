@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld("nhSetup", {
     ipcRenderer.invoke("nh:save-token", value, mode, openaiKey),
   dismiss: () => ipcRenderer.invoke("nh:dismiss"),
   quit: () => ipcRenderer.invoke("nh:quit"),
+  // First-run requirements check (claude/node on PATH) — see nh:requirements
+  // in main.mjs for what it returns and why the setup screen needs it.
+  requirements: () => ipcRenderer.invoke("nh:requirements"),
 });
 
 // `npm_package_version` is set by `npm run`, and NOTHING sets it in a packaged
@@ -88,4 +91,9 @@ contextBridge.exposeInMainWorld("nhDesktop", {
   // `saved:false`, and no caller reads `saved` today. See the residual list in
   // main.mjs's createWindow before treating this as fire-and-forget.
   setTheme: (theme) => ipcRenderer.invoke("nh:set-theme", theme),
+  // "Open repo" (SlideOver.jsx) — hands a repo folder to the OS default
+  // handler. main.mjs re-checks the path against /api/repos itself before
+  // calling shell.openPath, so this bridge cannot be used to open an
+  // arbitrary path even if the renderer were compromised.
+  openPath: (p) => ipcRenderer.invoke("nh:open-path", p),
 });

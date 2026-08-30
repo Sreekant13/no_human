@@ -32,6 +32,16 @@ export default {
         ui: "var(--font-ui)",
         display: "var(--font-display)",
       },
+      // Tailwind's type scale is in `rem`, and this app sets `html { font-size:
+      // 14px }` (styles.css) — not the 16px the default scale assumes. Measured in
+      // the built bundle: text-xs resolved to 10.5px, under the 12px functional-text
+      // floor that src/typeFloor.test.mjs holds the plain CSS to. Only `xs` fell
+      // through (sm 12.25px, base 14px, lg 15.75px), so only `xs` is redefined —
+      // in px, so it cannot drift with the root again. The line-height moves with
+      // it: the default xs box is 1rem/14px, which is 1.17 on a 12px glyph.
+      fontSize: {
+        xs: ["12px", { lineHeight: "1.35" }],
+      },
     },
   },
   plugins: [],

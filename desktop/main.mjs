@@ -25,6 +25,7 @@ import { readUpdateState, writeUpdateState } from "./updateState.mjs";
 import { normalizeTheme, readTheme, themeColors, writeTheme } from "./themeState.mjs";
 import fs from "node:fs";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_ORIGIN,
@@ -32,6 +33,8 @@ import {
   forceStopServer,
   isAppOrigin,
   probe,
+  resolveClaudeCli,
+  resolveNodeBin,
   stopServer,
 } from "./server.mjs";
 
@@ -744,6 +747,28 @@ ipcMain.handle("nh:save-token", async (event, value, mode, openaiKey) => {
   return { ok: true };
 });
 
+// token.html -> main. First-run requirements check: the Agent SDK shells out
+// to `claude` for EVERY task (agent/backend_check.py) and no_human never
+// passes cli_path, so a first run that only asked for a token used to die on
+// its first task with the setup screen looking done. Same gate as
+// nh:save-token — board content must never be able to probe what's on this
+// machine's PATH. Never throws and never logs the resolved paths' contents
+// (they are filesystem paths, not credentials, but kept out of logs anyway —
+// same discipline as the token this screen also collects).
+ipcMain.handle("nh:requirements", async (event) => {
+  if (!fromSetupScreen(event)) return { ok: false, error: "not permitted" };
+  const claudePath = await resolveClaudeCli();
+  const nodePath = await resolveNodeBin();
+  const version = claudePath ? await new Promise((resolve) => {
+    execFile(claudePath, ["--version"], { timeout: 5000 }, (err, stdout) =>
+      resolve(err ? "" : stdout.trim()));
+  }) : "";
+  return {
+    claude: { ok: !!claudePath, path: claudePath, version },
+    node: { ok: !!nodePath, path: nodePath },
+  };
+});
+
 // Dismiss back to the board — only meaningful when one is reachable.
 ipcMain.handle("nh:dismiss", async (event) => {
   if (!fromSetupScreen(event)) return false;
@@ -829,6 +854,28 @@ ipcMain.handle("nh:set-theme", (_event, value) => {
     try { win.setTitleBarOverlay(overlayFor(theme)); } catch { /* next launch */ }
   }
   return { ok: true, saved };
+});
+
+// "Open repo" (SlideOver.jsx, next to a task's repo path). Hands a folder to
+// the OS default handler via shell.openPath — never the user's editor, which
+// we do not know. The one thing this handler must never become is an
+// arbitrary-path opener for whatever a compromised renderer sends it, so it
+// re-checks against the SERVER's own idea of known repos (/api/repos) rather
+// than trusting the caller: a path not in that list is refused before
+// shell.openPath ever sees it.
+ipcMain.handle("nh:open-path", async (_event, p) => {
+  if (typeof p !== "string" || !p) return { ok: false, error: "no path given" };
+  let repos;
+  try {
+    const res = await fetch(`${ORIGIN}/api/repos`);
+    repos = await res.json();
+  } catch {
+    return { ok: false, error: "could not reach the server" };
+  }
+  const known = new Set((Array.isArray(repos) ? repos : []).map((r) => r.repo_path));
+  if (!known.has(p)) return { ok: false, error: "not a registered repo" };
+  const err = await shell.openPath(p);
+  return err ? { ok: false, error: err } : { ok: true };
 });
 
 async function createWindow() {

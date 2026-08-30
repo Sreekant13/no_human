@@ -160,13 +160,14 @@ export function bundledNhPath(resourcesPath = process.resourcesPath,
  * picks.
  */
 export function windowsPathLookup(env = process.env, exists = fs.existsSync,
-                                  delimiter = path.delimiter) {
+                                  delimiter = path.delimiter,
+                                  names = ["nh.exe", "nh.cmd", "nh.bat"]) {
   // `PATH` and `Path` are the same variable on Windows and Node normalises the
   // real process.env, but a plain object handed in by a caller (or a test) is
   // not normalised — accept either spelling rather than silently finding nothing.
   const raw = env.PATH ?? env.Path ?? "";
   for (const dir of String(raw).split(delimiter).filter(Boolean)) {
-    for (const name of ["nh.exe", "nh.cmd", "nh.bat"]) {
+    for (const name of names) {
       const p = path.win32.join(dir, name);
       if (exists(p)) return p;
     }
@@ -191,6 +192,64 @@ export async function resolveNhBin(env = process.env,
     if (fs.existsSync(p)) return p;
   }
   return "";
+}
+
+/**
+ * Find an executable the way the operator's shell would, shared by
+ * resolveClaudeCli and resolveNodeBin below: login-shell `command -v <cmd>`
+ * on POSIX (a GUI app does not inherit the login shell's PATH — the same
+ * reason resolveNhBin shells out), a PATH read on Windows (a GUI process
+ * DOES inherit the user's PATH there, so windowsPathLookup's env read is
+ * enough), then CLI_HINT_DIRS as a backstop for an install that lives
+ * somewhere neither the launchd PATH nor a bare Windows PATH covers.
+ * `winNames` is the set windowsPathLookup checks in order (e.g.
+ * ["claude.cmd", "claude.exe"]) — on POSIX only the bare `cmd` name is ever
+ * a real filename, so the hint-dir scan there ignores it.
+ */
+async function resolveOnPath(cmd, winNames, env, execFileFn, exists) {
+  const viaShell = IS_WINDOWS
+    ? windowsPathLookup(env, exists, path.delimiter, winNames)
+    : await new Promise((resolve) => {
+      execFileFn(env.SHELL || "/bin/zsh", ["-lc", `command -v ${cmd}`],
+                 { timeout: 5000 }, (err, stdout) =>
+        resolve(err ? "" : stdout.trim()));
+    });
+  if (viaShell && exists(viaShell)) return viaShell;
+  const names = IS_WINDOWS ? winNames : [cmd];
+  for (const dir of CLI_HINT_DIRS) {
+    for (const name of names) {
+      const candidate = IS_WINDOWS ? path.win32.join(dir, name) : path.join(dir, name);
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return "";
+}
+
+/**
+ * Find the `claude` CLI the Agent SDK shells out to for every task
+ * (agent/backend_check.py). Same defect as an unfindable `nh`: a GUI app's
+ * narrower PATH can hide a Homebrew/npm-global install that a login shell
+ * sees fine, and the SDK never receives cli_path — so a missing `claude`
+ * used to fail silently on the first task while the setup screen, which only
+ * asked for a token, looked done. Returns "" when not found.
+ */
+export async function resolveClaudeCli(env = process.env, execFileFn = execFile,
+                                       exists = fs.existsSync) {
+  return resolveOnPath("claude", ["claude.cmd", "claude.exe"], env, execFileFn, exists);
+}
+
+/**
+ * Find `node` the same way — the npm-install line the setup screen shows
+ * only helps if node itself already runs, and "can the user's shell run
+ * node" is the same login-shell/PATH question resolveClaudeCli answers, not
+ * a question about the Node this Electron app is built on
+ * (process.execPath is Electron's own bundled runtime, not necessarily on
+ * the user's PATH, and answers a different question than the one this check
+ * needs). Returns "" when not found.
+ */
+export async function resolveNodeBin(env = process.env, execFileFn = execFile,
+                                     exists = fs.existsSync) {
+  return resolveOnPath("node", ["node.exe"], env, execFileFn, exists);
 }
 
 /**

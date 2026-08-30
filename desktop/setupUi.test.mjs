@@ -6,7 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { codexKeyToSend, dismissTarget, labels, parseCanReturn, restartFailedMessage, saveProgress } from "./setupUi.mjs";
+import { CLI_INSTALL_LINE, codexKeyToSend, dismissTarget, labels, parseCanReturn,
+         requirementLine, restartFailedMessage, saveDisabled, saveProgress } from "./setupUi.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -101,6 +102,47 @@ test("the first-run screen's copy is platform-neutral — it ships on macOS, Win
   const html = fs.readFileSync(path.join(here, "token.html"), "utf8");
   assert.doesNotMatch(html, /this Mac\b/,
     "token.html says 'this Mac' — a Linux/Windows user reads that on first run (seen on Ubuntu 24.04, 2026-08-18)");
+});
+
+test("requirementLine: an OK claude names its version and where it was found", () => {
+  const line = requirementLine("claude", { ok: true, path: "/opt/homebrew/bin/claude", version: "2.1.3" });
+  assert.equal(line, "✓ claude 2.1.3 at /opt/homebrew/bin/claude");
+});
+
+test("requirementLine: node's OK row has no version field and must not print 'undefined'", () => {
+  // The nh:requirements contract carries no version for node — a naive
+  // `${i.version}` interpolation would print the literal word "undefined"
+  // into the row shown to the operator.
+  const line = requirementLine("node", { ok: true, path: "/usr/local/bin/node" });
+  assert.equal(line, "✓ node at /usr/local/bin/node");
+  assert.doesNotMatch(line, /undefined/);
+});
+
+test("requirementLine: a missing tool shows the exact install line from the paragraph it replaced", () => {
+  assert.equal(requirementLine("claude", { ok: false, path: "", version: "" }),
+    `✗ claude not found — ${CLI_INSTALL_LINE}`);
+  assert.equal(requirementLine("node", { ok: false, path: "" }),
+    `✗ node not found — ${CLI_INSTALL_LINE}`);
+  // The exact copy the old static #prereq paragraph used to show, so a friend
+  // who has seen it once still recognises it in the checklist.
+  assert.equal(CLI_INSTALL_LINE,
+    "Install Node.js (nodejs.org), then run npm install -g @anthropic-ai/claude-code");
+});
+
+test("requirementLine: never throws on a missing/undefined info (broken IPC round-trip)", () => {
+  assert.equal(requirementLine("claude", undefined), `✗ claude not found — ${CLI_INSTALL_LINE}`);
+  assert.equal(requirementLine("claude", null), `✗ claude not found — ${CLI_INSTALL_LINE}`);
+});
+
+test("saveDisabled: locked until claude resolves, unless the operator chose to skip", () => {
+  assert.equal(saveDisabled(null, false), true, "nothing checked yet must not allow Save");
+  assert.equal(saveDisabled({ claude: { ok: false }, node: { ok: true } }, false), true);
+  assert.equal(saveDisabled({ claude: { ok: true }, node: { ok: false } }, false), false,
+    "only claude gates Save — a missing node must not also block it");
+  // The escape hatch: "I'll install it later" must free Save even with
+  // nothing found, or a friend without claude installed is locked out for good.
+  assert.equal(saveDisabled(null, true), false);
+  assert.equal(saveDisabled({ claude: { ok: false } }, true), false);
 });
 
 test("codexKeyToSend: sends a key ONLY for api_key; subscription/skip send nothing (#6b)", () => {

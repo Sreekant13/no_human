@@ -12,6 +12,7 @@ from ..core.db import USAGE_ROLES, usage_columns_for
 from ..core.metrics import cache_read_share
 from ..core.pricing import FALLBACK_PRICE_NAME
 from ..core.task import Task
+from .title_short import title_short
 
 
 class AttemptOut(BaseModel):
@@ -238,6 +239,9 @@ class TaskOut(BaseModel):
     blocker: dict | None = None
     context: dict | None = None
     parent_id: str | None = None
+    # Sibling link (Task 7): the task this one follows up on, if any — NOT the
+    # compound-child relation `parent_id` models. See core/task.py's Task.follows_id.
+    follows_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     attempts: list[AttemptOut] = []
@@ -365,6 +369,7 @@ class TaskOut(BaseModel):
             blocker=task.blocker,
             context=task.context,
             parent_id=task.parent_id,
+            follows_id=task.follows_id,
             created_at=task.created_at,
             updated_at=task.updated_at,
             attempts=[AttemptOut.from_row(a) for a in attempts],
@@ -490,6 +495,7 @@ class TaskSummaryOut(BaseModel):
     # Richer fields so the board card is useful without clicking through.
     repo_name: str | None = None
     description_short: str | None = None
+    title_short: str = ""
     attempt_count: int = 0
     last_turns: int | None = None
     blocker_question: str | None = None
@@ -524,6 +530,9 @@ class TaskSummaryOut(BaseModel):
     total_aux_cache_creation: int | None = None
     wall_seconds: float | None = None  # created → last activity; time half of the cost meter
     parent_id: str | None = None
+    # Sibling link (Task 7): see TaskOut.follows_id above — the board card's
+    # "Follow up" affordance and the drawer both need this on the summary too.
+    follows_id: str | None = None
     has_spec: bool = False
     live_status: str | None = None
     subtask_progress: str | None = None
@@ -644,6 +653,7 @@ class TaskSummaryOut(BaseModel):
             updated_at=task.updated_at,
             repo_name=repo_name,
             description_short=desc_short,
+            title_short=title_short(task.title),
             attempt_count=attempt_count,
             last_turns=last_turns,
             blocker_question=blocker_q,
@@ -665,6 +675,7 @@ class TaskSummaryOut(BaseModel):
             total_aux_cache_creation=total_aux_cache_creation,
             wall_seconds=_wall_seconds(task.created_at, _last_activity(task, attempts)),
             parent_id=task.parent_id,
+            follows_id=task.follows_id,
             has_spec=bool((task.context or {}).get("spec")),
             cancelled=_operator_cancelled(task),
             approved_at=(task.context or {}).get("approved_at"),
@@ -730,6 +741,11 @@ class CreateTaskRequest(BaseModel):
     # never reaches this endpoint) must behave identically to an import made
     # through it.
     plan_approval: bool = False
+    # Task 7: "Follow up" on a finished task. Sibling link only — the create
+    # handler 404s if this doesn't resolve to a real task, mirroring the
+    # project_id check just above it in the handler; never Task.parent_id
+    # (the compound-child relation the orchestrator still schedules on).
+    follows_id: str | None = None
 
 
 class ImportedInfo(BaseModel):

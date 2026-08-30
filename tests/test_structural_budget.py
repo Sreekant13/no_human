@@ -73,7 +73,7 @@ FROZEN_FUNCTION_LINES = {
     # landed test edits (attempt-authored gutting still fires). Re-anchored on merge.
     "core/orchestrator.py:Orchestrator._run_attempt": 2108,
     "core/orchestrator.py:Orchestrator._drive": 760,
-    "core/db.py:Store._ensure_task_columns": 448,
+    "core/db.py:Store._ensure_task_columns": 449,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
     "core/orchestrator.py:Orchestrator._finalize": 418,
     # Pre-existing on main (measured red at d3d7d3a82a, this session's start):
@@ -203,13 +203,13 @@ FROZEN_FILE_LINES = {
     # contract-fold into child descriptions (feature #1 UI backend).
     # 5639 -> 5648 (+9): GET /split-drafts PENDING guard (review A1 — no paid
     # draft call for a task that can never be split).
-    "api/app.py": 5648,
+    "api/app.py": 5657,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
     # 4388 -> 4411 (+23): Store.done_rate_by_tier — per-tier done-rate
     # calibration for the feasibility hint (feature #1).
-    "core/db.py": 4411,
+    "core/db.py": 4412,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

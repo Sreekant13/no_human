@@ -343,7 +343,11 @@ test("the GLOBAL blast-radius badge is not painted in the accent colour", () => 
       `${selector} must declare the background this badge sits on`);
     return r.body;
   };
-  const cardBody = bodyOf(".memory-card");            // .learning-card extends it
+  // `.learning-card`, not `.memory-card`: the learning card USED to inherit the
+  // plain --bg-card fill, but it declares its own purple-12% tint since the
+  // 2026-08-29 craft pass, so deriving from the parent measures a backdrop this
+  // element no longer has — the exact mistake this file's header warns about.
+  const cardBody = bodyOf(".learning-card");
   const selectedBody = bodyOf(".learning-card.selected");
 
   for (const theme of ["dark", "light"]) {

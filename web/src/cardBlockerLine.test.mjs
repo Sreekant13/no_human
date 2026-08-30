@@ -144,21 +144,29 @@ test("missing or empty input yields nothing to render", () => {
 
 // There is no React renderer in this harness (see settingsOverlay.test.mjs), so
 // the WIRING is pinned by reading the source, the way cardPrLink.test.mjs does.
-const boardJsx = readFileSync(fileURLToPath(new URL("./Board.jsx", import.meta.url)), "utf8");
+//
+// The five-facts card rewrite (spec C2) moved this call from Board.jsx's own
+// JSX into cardFacts.js's pure statusLine derivation — the card now renders
+// whatever cardFacts.js hands it, through one .card-status element shared by
+// every status, not a dedicated .card-blocker-q block.
+const cardFactsSrc = readFileSync(fileURLToPath(new URL("./cardFacts.js", import.meta.url)), "utf8");
+const slideOverJsx = readFileSync(fileURLToPath(new URL("./SlideOver.jsx", import.meta.url)), "utf8");
 
 test("the board card renders the blocker through cardBlockerLine", () => {
-  assert.match(boardJsx, /import \{ cardBlockerLine \} from "\.\/cardBlockerLine\.js"/);
+  assert.match(cardFactsSrc, /import \{ cardBlockerLine \} from "\.\/cardBlockerLine\.js"/);
   assert.match(
-    boardJsx,
-    /className="card-blocker-q"[\s\S]{0,600}<span>\{cardBlockerLine\(task\.blocker_question\)\}<\/span>/,
-    "the clamped card line must go through cardBlockerLine, not print the raw question",
+    cardFactsSrc,
+    /cardBlockerLine\(task\.blocker_question\)/,
+    "the card's status line must go through cardBlockerLine, not print the raw question",
   );
 });
 
-test("the untouched sentence is still reachable from the card", () => {
-  // Reshaping the line is only acceptable because nothing is lost: the full
-  // agent text stays on the element's title, and the drawer is unchanged.
-  assert.match(boardJsx, /className="card-blocker-q" title=\{task\.blocker_question\}/);
+test("the untouched sentence is still reachable from the drawer", () => {
+  // Reshaping the line is only acceptable because nothing is lost: the card
+  // no longer carries the raw text on hover (the five-facts card drops that
+  // affordance), but the drawer's Blocker section still prints the agent's
+  // own question verbatim, unreshaped.
+  assert.match(slideOverJsx, /\{b\.question\}/);
 });
 
 // --------------------------------------------------------------------------- //

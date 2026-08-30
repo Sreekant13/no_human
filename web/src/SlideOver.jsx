@@ -21,6 +21,9 @@ import { planApproveIndex } from "./planGate.js";
 import { decisionFor } from "./blockerDecision.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
+import { escalationLatencyLine } from "./escalationLatency.js";
+import { checkoutCommand } from "./checkoutCommand.js";
+import { followUpSeed } from "./followUpSeed.js";
 import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, artifactsFor, sectionSummary, coarseStatus,
   defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
@@ -51,7 +54,8 @@ const IconInfo = ({ size = 14 }) => (
 );
 
 export default function SlideOver({ taskId, onClose, refreshKey = 0,
-                                    reviewQueue = [], onJump = null, onApproveRefused = null }) {
+                                    reviewQueue = [], onJump = null, onApproveRefused = null,
+                                    onFollowUp = null }) {
   // W2.5: the review queue — the next awaiting-approval task after this one,
   // so five reviews feel like one pass instead of five board round-trips.
   const nextInQueue = reviewQueue.find((id) => id !== taskId) || null;
@@ -256,6 +260,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   // the task — an unclaimed active-status task is queued, nothing is running.
   const isLive = isActive && task?.claimed === true;
   const isFailed = task?.status === "failed";
+  const isDone = task?.status === "done";
   const isTerminal = isTerminalStatus(task?.status);
 
   // When the DecisionPanel is showing, it owns the actions (Resume/Reply/Stop),
@@ -267,7 +272,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const hasDecisionPanel = !!decision;
   const showParkedActions = isParked && !hasDecisionPanel;   // Reply + Resume
   const showQuietCancel = !isTerminal && !hasDecisionPanel;
-  const showActionBar = isAwaiting || isActive || isFailed || showParkedActions || showQuietCancel;
+  // Task 7: `done` joins the bar too — it used to render nothing at all for a
+  // done task (a terminal, non-failed, non-parked status matched none of the
+  // other conditions), which was fine before "Follow up" gave it a reason to.
+  const showActionBar = isAwaiting || isActive || isFailed || isDone || showParkedActions || showQuietCancel;
 
   // Already approved according to the SERVER, not merely according to this
   // drawer session — survives closing and reopening the drawer, which
@@ -557,6 +565,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                       taskId, task, diff, isActive,
                       onSpecRefresh: () => fetchTask(taskId).then(setTask),
                       onOpenSection: (key) => setOpenSection(key),
+                      onJump,
                     })}
                   </AccordionSection>
                 );
@@ -637,6 +646,19 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             {isFailed && (
               <button className="btn btn-lifecycle btn-retry" onClick={() => handleLifecycle("retry")} disabled={busy}>
                 Retry
+              </button>
+            )}
+            {(isDone || isFailed) && (
+              // Task 7: a follow-up is a NEW sibling task (follows_id), never a
+              // re-run of this one — that is Retry, right above. Seeds the New
+              // Task composer via the same `initial` mechanism the backlog
+              // start flow already uses (App.jsx's newTaskSeed/onFollowUp).
+              <button
+                className="btn btn-lifecycle btn-follow-up"
+                onClick={() => onFollowUp && onFollowUp(followUpSeed(task))}
+                disabled={busy}
+              >
+                Follow up
               </button>
             )}
             {showQuietCancel && (
@@ -1066,12 +1088,12 @@ const SECTION_LIST = [
 // Resolves a section key to its (unchanged) tab component. Only called while
 // the section is open — this IS the lazy-render boundary the old tab switch
 // had; a closed section mounts nothing and fetches nothing.
-function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh, onOpenSection }) {
+function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh, onOpenSection, onJump }) {
   switch (key) {
     case "system":   return <SystemTab taskId={taskId} task={task} isActive={isActive} />;
     case "activity": return <ActivityLog taskId={taskId} task={task} isActive={isActive} />;
     case "subtasks": return <SubtasksTab taskId={taskId} />;
-    case "details":  return <DetailsTab task={task} />;
+    case "details":  return <DetailsTab task={task} onJump={onJump} />;
     case "spec":     return <SpecTab task={task} onRefresh={onSpecRefresh} />;
     case "review":   return <ReviewTab task={task} diff={diff} onOpenSection={onOpenSection} />;
     case "diff":     return <DiffTab diff={diff} />;
@@ -1983,8 +2005,11 @@ function ActivityTab({ taskId, task, isActive, diff }) {
         <span className="al-role role-agent"><i />Worker — reads &amp; edits code</span>
         <span className="al-role role-supervisor"><i />Supervisor — course-corrects</span>
         <span className="al-role role-reviewer"><i />Reviewer — gates quality</span>
+        {/* fontSize below was 0.7rem, which resolves to 9.8px against this app's
+            14px root — the one inline style left under the 12px functional-text
+            floor on the four surfaces the 2026-08-29 craft pass covers. */}
         {totalElapsed > 0 && (
-          <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--fg-dim)' }}>
+          <span style={{ marginLeft: 'auto', fontSize: '12px', color: 'var(--fg-dim)' }}>
             {events.length} events · {fmtDuration(totalElapsed)}
           </span>
         )}
@@ -2154,9 +2179,51 @@ function fmtDuration(secs) {
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-function DetailsTab({ task }) {
+// Desktop only — window.nhDesktop.openPath is not injected in the web build,
+// so this renders nothing there. shell.openPath (main.mjs) hands the folder to
+// the OS default handler; we don't know the user's editor, so the label says
+// "repo", not "editor".
+function OpenRepoButton({ repoPath }) {
+  const [msg, setMsg] = useState(null);
+  useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 2000);
+    return () => clearTimeout(t);
+  }, [msg]);
+  if (!window.nhDesktop?.openPath) return null;
+  return (
+    <button
+      type="button"
+      className="btn btn-post-one"
+      data-testid="open-repo-btn"
+      onClick={async () => {
+        const res = await window.nhDesktop.openPath(repoPath);
+        if (!res?.ok) setMsg(res?.error || "could not open");
+      }}
+    >
+      {msg || "Open repo"}
+    </button>
+  );
+}
+
+function DetailsTab({ task, onJump = null }) {
+  // Task 7: the predecessor's title, for the "Follows: <id8> <title>" line
+  // below — fetched lazily, only while Details is open (this component's own
+  // lazy-render boundary, same as the accordion's), and only when there IS a
+  // follows_id to resolve.
+  const [followed, setFollowed] = useState(null);
+  useEffect(() => {
+    if (!task?.follows_id) { setFollowed(null); return undefined; }
+    let cancelled = false;
+    fetchTask(task.follows_id).then((t) => { if (!cancelled) setFollowed(t); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [task?.follows_id]);
+
   if (!task) return <div className="so-diff-empty">Loading…</div>;
   const findings = task.context?.findings;
+  const followedTitle = followed?.title
+    ? (followed.title.length > 60 ? `${followed.title.slice(0, 57)}…` : followed.title)
+    : null;
   return (
     <>
       {task.description && (
@@ -2200,6 +2267,39 @@ function DetailsTab({ task }) {
         <section>
           <div className="so-section-label">Repo</div>
           <div className="so-repo-path">{task.repo_path}</div>
+          <OpenRepoButton repoPath={task.repo_path} />
+        </section>
+      )}
+      {/* Task-level facts the five-facts board card no longer carries as its
+          own chips (spec C2) — source, kind, priority, an operator cancel, and
+          the escalation latency that used to be its own card line. */}
+      {(task.source || (task.kind && task.kind !== "feature") || task.priority
+        || task.cancelled || task.follows_id || escalationLatencyLine(task)) && (
+        <section>
+          <div className="so-section-label">Task info</div>
+          <div className="so-task-info">
+            {task.source && <div>Source: {task.source}</div>}
+            {task.kind && task.kind !== "feature" && <div>Kind: {task.kind}</div>}
+            {task.priority && <div>Priority: {task.priority}</div>}
+            {task.cancelled && <div>Cancelled by operator</div>}
+            {task.follows_id && (
+              <div>
+                Follows:{" "}
+                {onJump ? (
+                  <button
+                    type="button"
+                    className="so-follows-link"
+                    onClick={() => onJump(task.follows_id)}
+                  >
+                    {task.follows_id.slice(0, 8)}{followedTitle ? ` ${followedTitle}` : ""}
+                  </button>
+                ) : (
+                  <span>{task.follows_id.slice(0, 8)}{followedTitle ? ` ${followedTitle}` : ""}</span>
+                )}
+              </div>
+            )}
+            {escalationLatencyLine(task) && <div>Escalation: {escalationLatencyLine(task)}</div>}
+          </div>
         </section>
       )}
     </>
@@ -2938,6 +3038,7 @@ function DiffTab({ diff }) {
 }
 
 function AttemptsTab({ task }) {
+  const [copiedId, setCopiedId] = useState(null);
   if (!task) return <div className="so-diff-empty">Loading…</div>;
   if (!task.attempts?.length) {
     return <div className="so-diff-empty">No attempts yet.</div>;
@@ -2998,7 +3099,23 @@ function AttemptsTab({ task }) {
       {[...task.attempts].reverse().map((a) => (
         <div key={a.id} className="attempt-row">
           <div className="attempt-number">Attempt #{a.attempt_number}</div>
-          {a.branch_name && <div className="attempt-branch">{a.branch_name}</div>}
+          {a.branch_name && (
+            <div className="attempt-branch-row">
+              <div className="attempt-branch">{a.branch_name}</div>
+              <button
+                type="button"
+                className="btn btn-post-one"
+                data-testid="copy-checkout-btn"
+                onClick={() => {
+                  navigator.clipboard.writeText(checkoutCommand(a.branch_name));
+                  setCopiedId(a.id);
+                  setTimeout(() => setCopiedId((cur) => (cur === a.id ? null : cur)), 1500);
+                }}
+              >
+                {copiedId === a.id ? "Copied" : "Copy checkout command"}
+              </button>
+            </div>
+          )}
           {a.cache_read_share != null && (
             <div
               className="attempt-cache"

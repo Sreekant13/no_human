@@ -34,9 +34,17 @@ import QueueNotice from "./QueueNotice.jsx";
 // (the dialog) and takes the OTHER token as its fill, so its edge always reads.
 // (Never use an /opacity modifier on a bridged colour: the tokens are hex, not
 // channel triplets, so `bg-accent/30` would not resolve.)
+// Every button in this dialog is built from CTL, so the keyboard focus ring lives
+// here rather than on six call sites: measured 2026-08-29 against the built bundle,
+// all six (attach, ×, Cancel, the two kind chips, Start) were falling back to the
+// UA ring. Same token and offset the plain-CSS screens use (styles.css
+// ":focus-visible — keyboard navigation outlines"). The text field and the select
+// pill deliberately keep their own border-colour focus state instead; see below.
 const CTL =
   "inline-flex h-10 shrink-0 cursor-pointer items-center justify-center rounded-full " +
-  "border border-solid font-ui text-sm transition-colors";
+  "border border-solid font-ui text-sm transition-colors " +
+  "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 " +
+  "focus-visible:outline-accent";
 const ON_PANEL = `${CTL} border-line bg-card text-text-muted hover:bg-hover hover:text-text`;
 const ON_CARD = `${CTL} border-line bg-panel text-text-muted hover:bg-hover hover:text-text`;
 // `text-base` is the --base token: dark ink on the light-blue dark-theme accent,
@@ -439,6 +447,10 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
       customRepo,
       source,
       externalId,
+      // Task 7: "Follow up" seeds this via followUpSeed(task) — not user-
+      // editable in this form, so it rides through as a plain pass-through
+      // rather than its own piece of state.
+      followsId: initial?.followsId ?? null,
     });
   }
 
@@ -910,8 +922,16 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
               {/* GAP 1: the one toggle that answers "I am not letting an agent
                   burn millions of tokens on its own reading of my ticket".
                   Off by default - an unattended run stays unattended. */}
+              {/* focus-within, not focus-visible: the visible affordance is this
+                  pill, but Tab lands on the native checkbox inside it, which was
+                  drawing Chrome's own light-blue ring (2.81:1 on --bg-card — under
+                  WCAG 1.4.11's 3:1, the same defect .memory-card-header was fixed
+                  for in styles.css). Same wrapper-carries-the-focus-state trick as
+                  SelectPill above. */}
               <label
-                className={`${ON_PANEL} flex cursor-pointer items-center gap-2 px-3`}
+                className={`${ON_PANEL} flex cursor-pointer items-center gap-2 px-3 ` +
+                  "focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 " +
+                  "focus-within:outline-accent"}
                 title="Stop after planning and show me the plan before any implementation token is spent"
               >
                 <input

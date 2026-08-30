@@ -35,7 +35,7 @@ export async function fetchDiff(id) {
   return r.text();
 }
 
-export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend }) {
+export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend, follows_id }) {
   const r = await fetch(`${BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -45,7 +45,7 @@ export async function createTask({ title, description, repo_path, project_id, ki
     // handler), so an untouched control's empty string is handled exactly
     // like an absent field and behaves exactly as it did before the picker
     // existed.
-    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend }),
+    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend, follows_id }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));

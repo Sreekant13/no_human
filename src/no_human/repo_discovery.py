@@ -639,14 +639,14 @@ def discover_repos(
     if capped:
         notes.append(
             f"Showing the first {max_results} of {total} repositories found - "
-            "narrow the scan roots in Settings, or type the path directly, "
-            "to reach the rest."
+            "narrow the scan roots in Settings, or use \"Search another folder\" "
+            "to type the path, to reach the rest."
         )
     if walk_truncated:
         notes.append(
             "The search stopped early to keep this page responsive, so some "
-            "folders were not reached - type a repository path directly to "
-            "use one of them."
+            "folders were not reached - use \"Search another folder\" to type a "
+            "repository path and use one of them."
         )
 
     return {

@@ -432,13 +432,23 @@ class Task:
     plan: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     parent_id: str | None = None
+    # A follow-up task's link to the task it continues. Sibling link ONLY —
+    # unlike `parent_id` (the LeadAgent compound-child relation the orchestrator
+    # still knows about), nothing schedules or aggregates on this column; it
+    # exists so the drawer/API can say "follows <task>" without the follow-up
+    # being mistaken for a sub-task (see this file's COMPOUND_PARENT note above,
+    # ~line 170: nothing creates new compound-parent rows any more, but the
+    # transition table stays for historical rows — a follow-up must not reuse
+    # that relation).
+    follows_id: str | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
     @staticmethod
     def new(title: str, *, source: str = "freeform", repo_path: str | None = None,
             description: str | None = None, external_id: str | None = None,
-            kind: str = "feature", parent_id: str | None = None) -> "Task":
+            kind: str = "feature", parent_id: str | None = None,
+            follows_id: str | None = None) -> "Task":
         return Task(
             id=uuid.uuid4().hex,
             source=source,
@@ -448,6 +458,7 @@ class Task:
             external_id=external_id,
             kind=kind,
             parent_id=parent_id,
+            follows_id=follows_id,
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -471,6 +482,7 @@ class Task:
             "plan": json.dumps(self.plan),
             "config": json.dumps(self.config),
             "parent_id": self.parent_id,
+            "follows_id": self.follows_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -496,6 +508,7 @@ class Task:
             plan=json.loads(row["plan"] or "{}"),
             config=json.loads(row["config"] or "{}"),
             parent_id=row.get("parent_id"),
+            follows_id=row.get("follows_id"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

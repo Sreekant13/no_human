@@ -108,7 +108,7 @@ for (const theme of ["dark", "light"]) {
 
   // M5 — long unbreakable tokens (a URL) must not be sliced mid-glyph.
   const clipped = await page.evaluate(() => {
-    const sel = [".card-title", ".card-description", ".card-blocker-q"];
+    const sel = [".card-title", ".card-status"];
     const bad = [];
     for (const s of sel) {
       for (const el of document.querySelectorAll(s)) {
@@ -130,12 +130,14 @@ for (const theme of ["dark", "light"]) {
   // (M2b and the failed-lane pill checks moved to drive-5d.mjs — 5D took Failed off the board.)
 
   // The blocker question must not bleed a sliced line through its bottom padding.
+  // .card-status carries no padding (unlike the old .card-blocker-q box), so the
+  // padding-box clipping bug this guarded against cannot recur, and the inner
+  // <span> that worked around it is gone too — this now just checks the clamp.
   const qClip = await page.evaluate(() => {
-    const el = document.querySelector(".card-blocker-q");
-    const inner = el.querySelector("span");
-    return { outer: el.scrollHeight <= el.clientHeight + 1, hasInner: Boolean(inner) };
+    const el = document.querySelector(".card-status");
+    return { outer: el.scrollHeight <= el.clientHeight + 1 };
   });
-  check(`[${theme}] blocker question clamps cleanly (no sliced sliver)`, qClip.outer && qClip.hasInner);
+  check(`[${theme}] blocker question clamps cleanly (no sliced sliver)`, qClip.outer);
 
   // M6 — every lane, including DONE, fits the 1440px laptop.
   const lanes = await page.evaluate(() => {

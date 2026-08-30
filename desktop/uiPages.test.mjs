@@ -63,10 +63,11 @@ test("a rejected save marks the field invalid and announces it", () => {
   assert.ok(probe.token.msgText.length > 0, "the alert region was left empty");
   assert.equal(probe.token.labelFor, "token", "the field has no programmatic label");
   assert.deepEqual(probe.token.tabOrder,
-    ["mode-subscription", "mode-api-key", "token", "reveal",
+    ["recheck", "skip-check", "mode-subscription", "mode-api-key", "token", "reveal",
      "codex-subscription", "codex-api-key", "openai-key", "codex-reveal",
      "save", "secondary"],
-    "tab order no longer follows reading order (required Claude, then optional codex, then actions)");
+    "tab order no longer follows reading order (requirements checklist, then required "
+    + "Claude, then optional codex, then actions)");
   assert.ok(probe.token.saveMinHeight >= 44,
     `primary action is ${probe.token.saveMinHeight}px; below a 44px touch target`);
 });

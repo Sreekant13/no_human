@@ -3,12 +3,12 @@
 import os from "node:os";
 import path from "node:path";
 export const calls = { quit: 0, exit: 0, handlers: new Map(), ipc: new Map(),
-                       opened: [], nav: new Map(), badge: [], sent: [],
-                       images: [] };
+                       opened: [], openedPaths: [], nav: new Map(), badge: [],
+                       sent: [], images: [] };
 export function reset() {
   calls.quit = 0; calls.exit = 0; calls.handlers.clear(); calls.ipc.clear();
-  calls.opened.length = 0; calls.nav.clear(); calls.badge.length = 0;
-  calls.sent.length = 0; calls.images.length = 0;
+  calls.opened.length = 0; calls.openedPaths.length = 0; calls.nav.clear();
+  calls.badge.length = 0; calls.sent.length = 0; calls.images.length = 0;
 }
 let readyResolve;
 export const readyGate = new Promise((r) => { readyResolve = r; });
@@ -31,7 +31,14 @@ export const app = {
 export const ipcMain = { handle: (ch, fn) => { calls.ipc.set(ch, fn); } };
 // RECORDS what is handed to the OS: a no-op double made the scheme guard
 // untestable, so deleting it survived every test.
-export const shell = { openExternal: (u) => { calls.opened.push(u); } };
+export const shell = {
+  openExternal: (u) => { calls.opened.push(u); },
+  // RECORDS instead of touching the real filesystem/OS — a no-op double would
+  // make the nh:open-path allow-list guard untestable in the same way the
+  // comment above warns about for openExternal. Returns "" (Electron's
+  // success sentinel: an empty string means no error).
+  openPath: (p) => { calls.openedPaths.push(p); return Promise.resolve(""); },
+};
 export const nativeTheme = { shouldUseDarkColors: false };
 // RECORDS the bytes and the template flag. A double that discarded both made
 // trayIcon()'s platform routing untestable: deleting its win32 branch shipped

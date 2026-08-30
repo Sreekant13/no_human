@@ -65,7 +65,8 @@ test("isAppOrigin: same-origin stays in-window, everything else leaves", () => {
 // ------------------------------ E2 tests ---------------------------------- //
 
 import { CLI_HINT_DIRS, NH_EXE_NAME, POSIX_CLI_HINT_DIRS, WINDOWS_CLI_HINT_DIRS,
-         bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer, widenPath,
+         bundledNhPath, ensureServer, mergePath, resolveClaudeCli, resolveNhBin,
+         resolveNodeBin, stopServer, widenPath,
          taskkillArgs, windowsPathLookup } from "./server.mjs";
 import { mkdirSync } from "node:fs";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
@@ -155,6 +156,58 @@ test("resolveNhBin: bundled nh wins over PATH, but NH_BIN still wins over bundle
   chmodSync(override, 0o755);
   assert.equal(await resolveNhBin({ NH_BIN: override, SHELL: "/usr/bin/false" },
                                   [], bundled), override);
+});
+
+test("resolveClaudeCli: shell hit wins over hint dirs", { skip: IS_WIN
+  ? "the Windows branch reads env.PATH via windowsPathLookup instead of "
+    + "shelling out, so this exec-stub assertion is POSIX-only; the Windows "
+    + "lookup itself is covered by the windowsPathLookup custom-names test below"
+  : false }, async () => {
+  const execHit = (sh, args, opts, cb) => cb(null, "/opt/homebrew/bin/claude\n", "");
+  assert.equal(await resolveClaudeCli({ SHELL: "/bin/zsh" }, execHit, () => true),
+               "/opt/homebrew/bin/claude");
+});
+
+test("resolveClaudeCli: shell miss falls to CLI_HINT_DIRS, then empty", async () => {
+  const execMiss = (sh, args, opts, cb) => cb(new Error("not found"), "", "");
+  // The hint-dir scan runs on BOTH platforms (only the winNames/posix name
+  // differs), so this half is not gated on IS_WIN.
+  const hitDir = CLI_HINT_DIRS[0];
+  const wanted = IS_WIN ? join(hitDir, "claude.cmd") : join(hitDir, "claude");
+  assert.equal(
+    await resolveClaudeCli({ SHELL: "/bin/zsh" }, execMiss, (p) => p === wanted),
+    wanted, "a claude sitting in the first hint dir must be found");
+  // Nothing anywhere → "", never a throw.
+  assert.equal(await resolveClaudeCli({ SHELL: "/bin/zsh" }, execMiss, () => false), "");
+});
+
+test("resolveNodeBin: same shape as resolveClaudeCli, for `node`", { skip: IS_WIN
+  ? "exec-stub path is POSIX-only, see resolveClaudeCli's equivalent skip" : false },
+  async () => {
+  const execHit = (sh, args, opts, cb) => cb(null, "/opt/homebrew/bin/node\n", "");
+  assert.equal(await resolveNodeBin({ SHELL: "/bin/zsh" }, execHit, () => true),
+               "/opt/homebrew/bin/node");
+  const execMiss = (sh, args, opts, cb) => cb(new Error("not found"), "", "");
+  assert.equal(await resolveNodeBin({ SHELL: "/bin/zsh" }, execMiss, () => false), "");
+});
+
+test("windowsPathLookup: a custom name list finds claude.cmd/claude.exe, not nh's names", () => {
+  const has = (set) => (p) => set.has(p);
+  // Default names are still nh's — an unrelated caller must not silently start
+  // matching claude just because the parameter now exists.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a" }, has(new Set(["C:\\a\\claude.exe"])), ";"),
+    "", "the default name list must still be nh's, not claude's");
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a" }, has(new Set(["C:\\a\\claude.cmd"])), ";",
+                       ["claude.cmd", "claude.exe"]),
+    "C:\\a\\claude.cmd");
+  // Order within the custom list is honoured, same as nh's .exe-before-.cmd rule.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a" },
+      has(new Set(["C:\\a\\claude.cmd", "C:\\a\\claude.exe"])), ";",
+      ["claude.cmd", "claude.exe"]),
+    "C:\\a\\claude.cmd", "claude.cmd is listed first for this cmd, unlike nh's .exe-first order");
 });
 
 test("ensureServer: attaches without spawning when the server is up", async () => {

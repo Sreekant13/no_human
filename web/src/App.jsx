@@ -18,6 +18,8 @@ import { setFavicon } from "./favicon.js";
 import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
+import { matchShortcut } from "./shortcuts.js";
+import ShortcutsDialog from "./ShortcutsDialog.jsx";
 import { isNeedsYou, isRealFailure, deriveCounts } from "./boardLanes.js";
 import { overviewState } from "./overviewStrip.js";
 import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
@@ -383,6 +385,9 @@ function NewTaskModal({
         // falls back to worker.backend, unchanged from today. Forwarded
         // verbatim: never recomputed from other state.
         backend: fields.backend,
+        // Task 7: "Follow up" — the predecessor task's id, or null for every
+        // other create path. The server 404s if it doesn't resolve.
+        follows_id: fields.followsId || null,
       });
       // Attach any screenshots/documents to the new task (best-effort — a failed
       // upload must not lose the task that was already created).
@@ -676,6 +681,11 @@ function BacklogSeedOverlay({ issueKey, tracker, notice, queueLeft, onSkip, onSt
 
 export default function App() {
   const [tasks, dispatch] = useReducer(tasksReducer, []);
+  // C6: an empty `tasks` array is ambiguous — genuinely no tasks ever filed,
+  // OR the first fetch/snapshot just hasn't landed yet. Flipped true only once
+  // real data has arrived, so the board's first-run empty state (which reads
+  // tasks.length===0) can never fire during that loading window.
+  const [tasksLoaded, setTasksLoaded] = useState(false);
   const [wsLive, setWsLive] = useState(false);
   // Drives the stale-data banner (incident 2026-08-12): "connecting" until
   // the first open, "resyncing" once open but before the snapshot lands,
@@ -694,6 +704,13 @@ export default function App() {
   // remount: this modal is unmounted while closed, so `initial` is read fresh
   // at mount anyway, and a shared key would couple the two seeds.
   const [newTaskSeed, setNewTaskSeed] = useState(null);
+  // Task 7: "Follow up" on a done/failed task (SlideOver's action bar) reuses
+  // this SAME composer-open path, seeded via followUpSeed(task) instead of the
+  // onboarding repo hint above.
+  function openFollowUp(seed) {
+    setNewTaskSeed(seed);
+    setShowNewTask(true);
+  }
   const [page, setPage] = useState("board");
   // ── Backlog → intake queue ────────────────────────────────────────────────
   // The tickets the operator selected on the Backlog page, still to be started.
@@ -729,6 +746,9 @@ export default function App() {
   // Settings is an overlay dialog (Claude macOS desktop app model), not a
   // routed page — it can open on top of whatever page is showing.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The ⌘/ cheat-sheet dialog (task C5) — same "overlay on top of whatever
+  // page is showing" model as Settings above.
+  const [showShortcuts, setShowShortcuts] = useState(false);
   // Which Settings pane to open on — set when a Finish-setup item is clicked so
   // the overlay lands on the matching pane; null means "wherever it last was".
   const [settingsTab, setSettingsTab] = useState(null);
@@ -837,7 +857,7 @@ export default function App() {
   // initial load
   useEffect(() => {
     fetchTasks()
-      .then((ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); })
+      .then((ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); setTasksLoaded(true); })
       .catch((err) => setFetchError(err?.message || "Cannot reach the no_human API."));
   }, []);
 
@@ -913,16 +933,35 @@ export default function App() {
       const drawerOpen = Boolean(document.querySelector(".slideover"));
       // A backlog-started ticket has its own modal open — "n" must not stack a
       // second composer behind it (same trap the drawer check above closed).
-      if (shouldTriggerNewTask(e, { modalOpen: showNewTask || drawerOpen || Boolean(backlogHeadKey) })) {
+      // showShortcuts too: the cheat-sheet is reachable from the browser (About
+      // page), where bare "n" is live, and the same stacking trap applies.
+      const modalOpen = showNewTask || drawerOpen || Boolean(backlogHeadKey) || showShortcuts;
+      if (shouldTriggerNewTask(e, { modalOpen })) {
         // Swallow the keystroke: the composer autofocuses its textarea, so an
         // un-prevented "n" types itself into the prompt it just opened.
         e.preventDefault();
         setShowNewTask(true);
+        return;
       }
+      // ⌘, (Settings) and ⌘/ (this cheat-sheet) — desktop-only, and the ONLY
+      // two accelerators this handler owns. ⌘N/⌘1-4 stay the Electron
+      // application menu's alone (desktop/menu.mjs already handles them and
+      // posts "nh:menu" below); matching them here too would double-fire a
+      // single keystroke. Escape is deliberately NOT handled here: every
+      // dialog that can be open (composer, drawer, Settings, and now this
+      // one) already closes itself on Escape via its own listener, so
+      // reacting to "close" here would either be a no-op or a double-close.
+      // Same modalOpen guard as "n" above: without it, ⌘, / ⌘/ could open
+      // Settings or the cheat-sheet OVER the composer/drawer/backlog modal,
+      // and one Escape would then close both stacked dialogs at once.
+      if (modalOpen) return;
+      const action = matchShortcut(e, { isDesktop: Boolean(window.nhDesktop) });
+      if (action === "settings") { e.preventDefault(); setSettingsOpen(true); }
+      else if (action === "help") { e.preventDefault(); setShowShortcuts(true); }
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [showNewTask, backlogHeadKey]);
+  }, [showNewTask, backlogHeadKey, showShortcuts]);
 
   // Desktop application menu → the board's own navigation. The Electron shell
   // (main process) posts "nh:menu"; drive the SAME page state the tab bar does,
@@ -976,13 +1015,13 @@ export default function App() {
   useEffect(() => {
     const reconnector = createReconnector({
       connect: (handlers) => connectWS((msg) => {
-        if (msg.tasks) dispatch({ type: "sync", tasks: msg.tasks });
+        if (msg.tasks) { dispatch({ type: "sync", tasks: msg.tasks }); setTasksLoaded(true); }
         // inflight rides the WS frame; `running` stays the REST poll's
         // authority (a WS frame from a worker-less server said running:true).
         if (msg.worker) setWorkerStatus(prev => ({ ...prev, ...msg.worker }));
       }, handlers),
       fetchSnapshot: fetchTasks,
-      onSnapshot: (ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); },
+      onSnapshot: (ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); setTasksLoaded(true); },
       onStatus: (phase) => { setWsPhase(phase); setWsLive(phase === "live"); },
     });
     reconnector.start();
@@ -1296,18 +1335,28 @@ export default function App() {
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
-        {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
+        {page === "board" && (
+          <Board
+            tasks={tasks}
+            pendingOpenId={pendingOpenId}
+            onPendingOpenHandled={() => setPendingOpenId(null)}
+            tasksLoaded={tasksLoaded}
+            outcomeCount={doneCount + failedCount}
+            onNewTask={() => setShowNewTask(true)}
+            onFollowUp={openFollowUp}
+          />
+        )}
         {page === "backlog" && (
           <Backlog
             refreshNonce={backlogNonce}
             onStart={(list) => setBacklog((s) => backlogQueueReducer(s, { type: "start", issues: list }))}
           />
         )}
-        {page === "done" && <Outcomes tasks={tasks} lane="done" />}
-        {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
+        {page === "done" && <Outcomes tasks={tasks} lane="done" onFollowUp={openFollowUp} />}
+        {page === "failed" && <Outcomes tasks={tasks} lane="failed" onFollowUp={openFollowUp} />}
         {page === "stats" && <Stats tasks={tasks} />}
         {page === "learnings" && <div className="nh-page"><LearningsPanel /></div>}
-        {page === "about" && <About />}
+        {page === "about" && <About onShowShortcuts={() => setShowShortcuts(true)} />}
       </main>
       {showNewTask && (
         <NewTaskModal
@@ -1349,6 +1398,7 @@ export default function App() {
         />
       )}
       {settingsOpen && <SettingsOverlay initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(null); }} />}
+      {showShortcuts && <ShortcutsDialog isDesktop={Boolean(window.nhDesktop)} onClose={() => setShowShortcuts(false)} />}
     </div>
   );
 }

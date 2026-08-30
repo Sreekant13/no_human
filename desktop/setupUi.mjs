@@ -94,3 +94,46 @@ export function restartFailedMessage(origin, weOwnIt) {
     : `Saved, but another server is already serving ${origin} and still holds the `
       + "old token. Restart that server to pick up the new one.";
 }
+
+// --- Task 5: first-run requirements check (claude/node on PATH) ----------- //
+//
+// The Agent SDK shells out to `claude` for every task and no_human never
+// passes cli_path, so a first run that only asked for a token used to die on
+// its first task with a "connected" setup screen behind it. This block turns
+// the nh:requirements() IPC result into what the checklist shows and whether
+// Save may be pressed — pure, so the rendering and the gate are unit-testable
+// without a real Electron window.
+
+// Same install line as the paragraph this checklist replaces (token.html) —
+// kept verbatim so a friend who has seen it once recognises it here.
+export const CLI_INSTALL_LINE =
+  "Install Node.js (nodejs.org), then run npm install -g @anthropic-ai/claude-code";
+
+/**
+ * One checklist row's text for `label` ("claude" or "node"), from that key's
+ * slice of the nh:requirements() result. `info` may be missing entirely (the
+ * check hasn't run yet, or the IPC round-trip failed) — treated as "not
+ * found" rather than thrown, so a broken IPC call still renders a row instead
+ * of leaving the screen blank.
+ */
+export function requirementLine(label, info) {
+  const i = info || {};
+  if (i.ok) {
+    const version = i.version ? ` ${i.version}` : "";
+    return `✓ ${label}${version} at ${i.path}`;
+  }
+  return `✗ ${label} not found — ${CLI_INSTALL_LINE}`;
+}
+
+/**
+ * Whether Save must stay disabled. Gated on claude.ok alone — a missing
+ * `claude` is the failure the Agent SDK cannot work around, while a missing
+ * `node` only matters for the one-time `npm install` this screen suggests.
+ * `skipped` is the "I'll install it later" escape hatch: once the operator
+ * has chosen to proceed anyway, this must never re-lock them out, even on a
+ * Re-check that still finds nothing.
+ */
+export function saveDisabled(requirements, skipped) {
+  if (skipped) return false;
+  return !(requirements && requirements.claude && requirements.claude.ok);
+}

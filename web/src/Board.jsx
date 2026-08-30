@@ -1,18 +1,18 @@
 import { useState, useRef, useEffect } from "react";
-import { fmtTokens, taskBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
 import { BOARD_LANES, routeTask, isWaiting, cardActivity, waitingTagText } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
-import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
-import { cardBlockerLine } from "./cardBlockerLine.js";
-import { escalationLatencyLine } from "./escalationLatency.js";
 import { httpPrUrl } from "./prUrl.js";
 import { mergeReadyChip } from "./slideOverSummary.js";
 import {
   approveRefusalToast, setApproveError, dismissApproveError, pruneApproveErrors,
 } from "./approveRefusal.js";
+import { cardTitle } from "./cardTitle.js";
+import { cardFacts } from "./cardFacts.js";
+import { taskCost } from "./cost.js";
+import { isFirstRun } from "./boardFirstRun.js";
 
 // Toast lifetime — long enough to read a refusal sentence, short enough not
 // to pile up. The persistent source of truth is the card banner (dismissed
@@ -25,7 +25,7 @@ const APPROVE_TOAST_MS = 8_000;
 // badge still shows the true total, so nothing is hidden from awareness.
 const LANE_TOP_N = 4;
 
-export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
+export default function Board({ tasks, pendingOpenId, onPendingOpenHandled, tasksLoaded = true, outcomeCount = 0, onNewTask, onFollowUp = null }) {
   const [selectedId, setSelectedId] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const triggerRef = useRef(null);
@@ -89,6 +89,21 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
     triggerRef.current = null;
   }
 
+  // C6: an empty board (no lanes, no done, no failed) is a dead end, not a start —
+  // show the loop and the one button in, instead of three empty lanes. Gated on
+  // tasksLoaded (App only flips it once a real fetch/snapshot has landed) so a
+  // board still loading its first paint never flashes this over real data — an
+  // empty-lane view for a moment is the safe failure, not a false first-run.
+  if (tasksLoaded && isFirstRun(tasks, outcomeCount)) {
+    return (
+      <section className="board-first-run" aria-labelledby="first-run-title">
+        <h2 id="first-run-title">Your first task</h2>
+        <p>Describe a change. no_human plans it, writes the code, runs your tests, has a second model try to refute it, and opens a pull request with the evidence. You approve.</p>
+        <button type="button" className="btn btn-new-task" onClick={onNewTask}>New task</button>
+      </section>
+    );
+  }
+
   return (
     <>
       <div className="nh-board">
@@ -125,6 +140,7 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
             setSelectedId(id);
           }}
           onApproveRefused={handleApproveRefused}
+          onFollowUp={onFollowUp}
         />
       )}
       {toast && (
@@ -231,9 +247,7 @@ function Lane({ lane, tasks, onSelect, approveErrors, onDismissApproveError }) {
               <TaskCard
                 key={task.id}
                 task={task}
-                accent={lane.accent}
                 isAwaiting={!!lane.needsYou}
-                showSubStatus={lane.showSubStatus}
                 onClick={(e) => onSelect(task.id, e.currentTarget)}
                 approveError={approveErrors?.[task.id]}
                 onDismissApproveError={onDismissApproveError}
@@ -257,9 +271,7 @@ function Lane({ lane, tasks, onSelect, approveErrors, onDismissApproveError }) {
               <TaskCard
                 key={task.id}
                 task={task}
-                accent={lane.accent}
                 isAwaiting={!!lane.needsYou}
-                showSubStatus={lane.showSubStatus}
                 staleAnswer
                 onClick={(e) => onSelect(task.id, e.currentTarget)}
                 approveError={approveErrors?.[task.id]}
@@ -272,9 +284,7 @@ function Lane({ lane, tasks, onSelect, approveErrors, onDismissApproveError }) {
             <TaskCard
               key={task.id}
               task={task}
-              accent={lane.accent}
               isAwaiting={!!lane.needsYou}
-              showSubStatus={lane.showSubStatus}
               onClick={(e) => onSelect(task.id, e.currentTarget)}
               approveError={approveErrors?.[task.id]}
               onDismissApproveError={onDismissApproveError}
@@ -303,30 +313,13 @@ function Lane({ lane, tasks, onSelect, approveErrors, onDismissApproveError }) {
 const STALE_STATUSES = new Set(["context", "planning", "implementing", "reviewing", "testing", "awaiting_approval", "awaiting_input", "blocked"]);
 const STALE_THRESHOLD_S = 16 * 3600;
 
-// Human-readable action hint for "Needs You" tasks
-function actionHint(task) {
-  // B2 #19: approved-but-unmerged is no longer YOUR move — say so instead of
-  // asking for a review that already happened.
-  if (task.approved_at) return "approved — merge pending";
-  // A human who explicitly stopped this parked task already gave their
-  // answer — checked before the status branches so it wins regardless of
-  // which parked status (awaiting_input/blocked/escalated) the task is in.
-  if (task.blocker_human_stopped) return "stopped by you — parked";
-  if (task.status === "awaiting_approval") return "review & approve PR";
-  if (task.status === "awaiting_input") return "answer question";
-  if (task.status === "escalated") return "advise or split task";
-  if (task.status === "blocked") return "answer question";
-  return null;
-}
-
-function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClick, approveError, onDismissApproveError }) {
+function TaskCard({ task, isAwaiting, staleAnswer, onClick, approveError, onDismissApproveError }) {
   const activityTs = task.last_activity || task.updated_at || task.created_at;
   const ageMs = Date.now() - new Date(activityTs).getTime();
   const ageSec = ageMs / 1000;
   const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
-  const priority = task.priority ?? "medium";
-  const burn = taskBurn(task);
+  const f = cardFacts(task, { cost: taskCost(task) });
 
   // SCRUM-15: the live pulse/progress must reflect the scheduler's actual claim,
   // not merely an "active" status — an unclaimed active-status task is queued,
@@ -352,7 +345,6 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
   return (
     <div
       className={cardCls}
-      style={{ "--lane-accent": accent }}
       onClick={onClick}
       role="button"
       tabIndex={0}
@@ -382,10 +374,8 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
           ◷ {waitingTagText(task)}
         </div>
       )}
-      <div className="card-title-row">
-        <div className="card-title">{task.title}</div>
-        <div className="card-id" title="task id — use it with `nh <id>`">{task.id.slice(0, 8)}</div>
-      </div>
+      <div className="card-title" title={task.title}>{cardTitle(task)}</div>
+      {f.statusLine && !isQueuedNow && <div className="card-status">{f.statusLine}</div>}
       {approveError && (
         // Persists until dismissed or the task leaves awaiting_approval
         // (pruneApproveErrors, above) — the toast fades on its own, but a
@@ -399,9 +389,6 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
             onClick={(e) => { e.stopPropagation(); onDismissApproveError?.(task.id); }}
           >×</button>
         </div>
-      )}
-      {task.live_status && isRunningNow && (
-        <div className="card-live-status">{task.live_status}</div>
       )}
       {task.subtask_progress && (
         <div className="card-subtask-progress">sub-tasks {task.subtask_progress}</div>
@@ -419,52 +406,8 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
                style={{ width: `${taskProgress(task.status)}%` }} />
         </div>
       )}
-      {task.description_short && !task.live_status && (
-        <div className="card-description">{task.description_short}</div>
-      )}
-      {task.blocker_question && isAwaiting && (
-        <div className="card-blocker-q" title={task.blocker_question}>
-          {/* The clamp lives on an inner span: `overflow:hidden` clips at the PADDING
-              box, so a padded clamped box lets the next line show through its bottom
-              padding as a sliced sliver of text.
-              cardBlockerLine leads with the number that differs between two budget
-              blockers — clamped to two lines they were otherwise byte-identical
-              paragraphs. The untouched sentence stays available on hover and in
-              the drawer. */}
-          <span>{cardBlockerLine(task.blocker_question)}</span>
-        </div>
-      )}
-      {escalationLatencyLine(task) && (
-        <div className="card-escalation-latency" title="how long it took this run to reach a human">
-          <span aria-hidden="true">↻</span> {escalationLatencyLine(task)}
-        </div>
-      )}
-      {isAwaiting && actionHint(task) && (
-        <div className="card-action-hint">{actionHint(task)}</div>
-      )}
       <div className="card-meta">
-        {task.repo_name && <span className="card-repo">{task.repo_name}</span>}
-        <span className="card-source">{task.source}</span>
-        {task.kind && task.kind !== "feature" && (
-          <span className={`card-kind kind-${task.kind}`}>{task.kind}</span>
-        )}
-        {task.has_spec && <span className="card-spec-badge">spec</span>}
-        {task.cancelled && <span className="card-cancelled-badge">cancelled</span>}
-        {showSubStatus && (
-          <span className={`card-substatus substatus-${task.status}`}>{task.status}</span>
-        )}
-        {showConflictBadge(task) && (
-          <span className="card-conflict-badge" title="A sibling PR merged first; the coder is rebasing this branch onto main">
-            {conflictRoundLabel(task)}
-          </span>
-        )}
-        {task.attempt_count > 0 && (
-          <span className="card-attempts">
-            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{burn > 0 ? ` · ${fmtTokens(burn)} tok` : ""}
-          </span>
-        )}
-        {priority === "high" && <span className="card-priority card-priority-high">HI</span>}
-        {priority === "low"  && <span className="card-priority card-priority-low">LO</span>}
+        {f.metaLine && <span className="card-meta-line">{f.metaLine}</span>}
         {mergeReadyChip(task) && (
           <span
             className="card-merge-ready"
@@ -489,6 +432,15 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         )}
         <span className="card-age">{age}</span>
       </div>
+      {f.action && (
+        // Visual call-to-action only — the whole card is the interactive element
+        // (role="button" above); a nested <button> here would be an ARIA
+        // anti-pattern (double announce, redundant tab stop) whose onClick did
+        // nothing the card click doesn't already do (open the drawer).
+        <span className={`card-action card-action-${f.action.kind}`}>
+          {f.action.label}
+        </span>
+      )}
     </div>
   );
 }

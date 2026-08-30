@@ -766,6 +766,14 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     external_id: str | None = None
     if source == "jira" and body.external_id is not None:
         external_id = body.external_id.strip()[:64] or None
+    # Task 7: "Follow up" on a finished task — a sibling link, verified to exist
+    # up front exactly like the project_id check above (404, never a silent
+    # dangling reference). Never Task.parent_id: that is the compound-child
+    # relation the orchestrator still schedules/aggregates on.
+    if body.follows_id:
+        followed = await store.get_task(body.follows_id)
+        if not followed:
+            raise HTTPException(404, f"task {body.follows_id!r} not found")
     task = Task.new(
         title=body.title,
         source=source,
@@ -773,6 +781,7 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
         description=body.description,
         kind=body.kind,
         external_id=external_id,
+        follows_id=body.follows_id or None,
     )
     try:
         task.priority = normalise_priority(body.priority)

@@ -705,9 +705,15 @@ const UNGRADED_REVIEW = mkTask("oldrev00aaaabbbbcccc", "awaiting_approval", {
   });
   check("[D1] …and .cr-sev-unrated is finally a reachable rule, not dead paint",
     !!unratedPainted, String(unratedPainted));
+  // Reads backgroundColor, not borderLeftColor: the verdict used to be a 3px
+  // coloured stripe and is a background tint since the 2026-08-29 craft pass
+  // (two elevation devices on one bordered card). Same assertion, same strength
+  // — retargeted at the property that now carries the distinction, because a
+  // guard left pointing at the old device would have gone green on two rows
+  // that are both simply "the card border".
   const colors = await page.evaluate(() => {
     const q = (s) => document.querySelector(s);
-    const c = (s) => { const el = q(s); return el ? getComputedStyle(el).borderLeftColor : null; };
+    const c = (s) => { const el = q(s); return el ? getComputedStyle(el).backgroundColor : null; };
     return { blocking: c(".slideover .checklist-item.fail"), advisory: c(".slideover .checklist-item.advisory") };
   });
   check("[D1] a non-blocking row does not reuse the blocking red",

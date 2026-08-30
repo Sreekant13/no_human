@@ -1875,11 +1875,11 @@ CITATION_TABLE = (
      '_refuse_agent_gate_act("merge_stack_run")'),
     ("security.md", "updates.py:44", "updates.py", "PYPI_JSON_URL"),
     ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
-    ("security.md", "desktop/main.mjs:231", "desktop/main.mjs",
+    ("security.md", "desktop/main.mjs:234", "desktop/main.mjs",
      "async function checkForUpdates("),
     ("security.md", "desktop/updater.mjs:113", "desktop/updater.mjs",
      "autoUpdater.checkForUpdates()"),
-    ("security.md", "desktop/main.mjs:992", "desktop/main.mjs", "checkForUpdates()"),
+    ("security.md", "desktop/main.mjs:1039", "desktop/main.mjs", "checkForUpdates()"),
     ("security.md", "desktop/electron-builder.config.cjs:366",
      "desktop/electron-builder.config.cjs", '"github"'),
     ("security.md", "desktop/updater.mjs:66", "desktop/updater.mjs",
@@ -2230,8 +2230,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
     """
-    assert "db.py:1865" in known_issues_doc, (
-        "the traceback no longer cites db.py:1865 — this test is pointed at "
+    assert "db.py:1866" in known_issues_doc, (
+        "the traceback no longer cites db.py:1866 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4356" in known_issues_doc, (
@@ -2242,9 +2242,9 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 1865 <= len(db_lines), "db.py is now shorter than line 1865"
-    assert db_lines[1864].strip() == "await self.db.commit()", (
-        f"db.py:1865 is now {db_lines[1864]!r}, not the commit the traceback "
+    assert 1 <= 1866 <= len(db_lines), "db.py is now shorter than line 1866"
+    assert db_lines[1865].strip() == "await self.db.commit()", (
+        f"db.py:1866 is now {db_lines[1865]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (

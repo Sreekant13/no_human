@@ -14,7 +14,7 @@ function openDocs() {
   window.open(DOCS_URL, "_blank", "noopener,noreferrer");
 }
 
-export default function About() {
+export default function About({ onShowShortcuts }) {
   return (
     <div className="nh-about">
       <section className="nh-about-block">
@@ -42,6 +42,17 @@ export default function About() {
         </p>
         <button type="button" className="btn" onClick={openDocs}>
           Open the docs
+        </button>
+      </section>
+
+      <section className="nh-about-block">
+        <h2>Keyboard shortcuts</h2>
+        <p>
+          New task, navigating pages, Settings — most of the board is reachable
+          from the keyboard.
+        </p>
+        <button type="button" className="btn" onClick={onShowShortcuts}>
+          Show keyboard shortcuts
         </button>
       </section>
 

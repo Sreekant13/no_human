@@ -351,7 +351,7 @@ html, body, #root {
 .nh-navgroup { display: flex; flex-direction: column; gap: var(--sp-2); }
 .nh-navgroup-title {
   padding: 0 var(--sp-3);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -382,7 +382,7 @@ html, body, #root {
   min-width: 20px; height: 20px; padding: 0 6px;
   border-radius: var(--r-pill);
   background: var(--surface-2); color: var(--text-muted);
-  font-size: 11px; font-weight: 700; line-height: 20px; text-align: center;
+  font-size: 12px; font-weight: 700; line-height: 20px; text-align: center;
 }
 /* Badge color encodes STATE (an outcome), never decoration — same discipline
    as the board's lane/status colors. */
@@ -447,7 +447,7 @@ html, body, #root {
    .integration-chip tone-* rules are scoped to that class and have no
    tone-warn rule at all, so this chip cannot borrow them. */
 .drain-chip {
-  flex: 0 0 auto; font-size: 11px; font-weight: 600;
+  flex: 0 0 auto; font-size: 12px; font-weight: 600;
   padding: 3px 10px; border-radius: var(--r-pill); white-space: nowrap;
   border: 1px solid transparent;
 }
@@ -575,7 +575,7 @@ html, body, #root {
     flex: 1 1 0; min-width: 0; width: auto;
     flex-direction: column; align-items: center; justify-content: center;
     gap: 2px; padding: 6px 2px;
-    font-size: 11px; letter-spacing: 0; text-align: center;
+    font-size: 12px; letter-spacing: 0; text-align: center;
   }
   /* The base rule's `flex: 1` stretches the label VERTICALLY once the row is a
      column — it must size to its text and truncate horizontally instead. */
@@ -638,7 +638,7 @@ html, body, #root {
   background: var(--bg-panel);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
 }
 .stats-tr-clickable { cursor: pointer; }
 /* The row IS the control (role="button" tabIndex=0 — TaskTable.jsx), so a keyboard
@@ -754,9 +754,16 @@ html, body, #root {
   color: var(--text-hi);
 }
 .legion-tag {
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 500;
-  letter-spacing: 0.01em;
+  /* Tracking, not size: at 11.5px this line fit the sidebar's 134.8px column on
+     one line, and the 12px type floor pushed its natural width to 138.3px — it
+     wrapped to two lines. Measured in the built bundle at 1440x900: -0.01em is
+     132.8px, -0.02em 130.0px, -0.03em 127.3px. -0.03em is inside the -0.04em
+     tracking floor, in the -0.02..-0.03em band the rulebook prefers for small UI
+     text, and leaves 7.5px of slack. `white-space: nowrap` would have overflowed
+     the column rather than fitting in it. */
+  letter-spacing: -0.03em;
   color: var(--text-muted);
   margin-top: 1px;
 }
@@ -795,7 +802,7 @@ html, body, #root {
 }
 
 .nh-status-label {
-  font-size: 0.75rem;
+  font-size: 12px;
   color: var(--text-dim);
   letter-spacing: 0.02em;
 }
@@ -829,7 +836,6 @@ html, body, #root {
   .nh-ws-dot.live { animation: none; }
   .slideover-backdrop { animation: none; }
   .slideover { animation: none; }
-  .lane { animation: none; }
   .task-card, .btn, .so-close, .so-section-header { transition: none; }
   /* 1.5 — the nav active-state pill transition. */
   .nh-navrow { transition: none; }
@@ -873,6 +879,13 @@ html, body, #root {
     var(--bg);
 }
 
+/* C6: first-run empty state — replaces the three empty lanes on a board with
+   nothing filed yet. No motion, no eyebrow label: one sentence on the loop,
+   one button in. */
+.board-first-run { max-width: 48ch; margin: 18vh auto 0; text-align: center; }
+.board-first-run h2 { font-size: 20px; margin: 0 0 8px; }
+.board-first-run p { color: var(--text-muted); line-height: 1.5; margin: 0 0 16px; }
+
 /* ── LANE ─────────────────────────────────────────────────────────────────── */
 
 .lane {
@@ -896,18 +909,12 @@ html, body, #root {
   border: 1px solid var(--border);
   border-bottom: none;
   transition: border-color var(--dur-base);
-  animation: lane-enter 0.5s var(--ease-out) both;
 }
-.nh-board .lane:nth-child(1) { animation-delay: 0s; }
-.nh-board .lane:nth-child(2) { animation-delay: 0.04s; }
-.nh-board .lane:nth-child(3) { animation-delay: 0.06s; }
-.nh-board .lane:nth-child(4) { animation-delay: 0.08s; }
-.nh-board .lane:nth-child(5) { animation-delay: 0.10s; }
-.nh-board .lane:nth-child(n+6) { animation-delay: 0.12s; }
-@keyframes lane-enter {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
+/* The five lanes used to fade+rise in on a staggered 0–0.12s delay. That is
+   page-load choreography on top of the card arrival (`nh-card-arrive`), and the
+   board keeps exactly ONE authored entrance — the cards' — so the lane
+   animation, its per-child delays and its keyframes are gone. Nothing about the
+   board at rest changes. */
 
 .lane-header {
   display: flex;
@@ -925,7 +932,7 @@ html, body, #root {
 }
 
 .lane-title {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -983,20 +990,15 @@ html, body, #root {
   border-color: var(--text-dim);
   background: var(--bg-panel);
 }
+/* The collapsed arrow used to bob on a 1.8s infinite loop. An endless nudge on
+   an affordance that is already labelled ("+N more") is decorative motion, not
+   state, so the loop, its keyframes and its reduced-motion opt-out are gone; the
+   arrow still rotates 180° when the lane is open, which IS state. */
 .lane-more-arrow {
   display: inline-block;
-  animation: lane-more-bob 1.8s var(--ease-out) infinite;
 }
 .lane-more-open .lane-more-arrow {
   transform: rotate(180deg);
-  animation: none;
-}
-@keyframes lane-more-bob {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(2px); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .lane-more-arrow { animation: none; }
 }
 
 /* SCRUM-19: Needs-Answer lane's stale-escalation divider. Same ghost/dashed
@@ -1074,17 +1076,6 @@ html, body, #root {
 .lane-body .task-card:nth-child(5) { animation-delay: 0.16s; }
 .lane-body .task-card:nth-child(n+6) { animation-delay: 0.2s; }
 
-.task-card::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  border-radius: 3px 0 0 3px;
-  background: var(--lane-accent, var(--border));
-}
-
 .task-card:hover {
   transform: translateY(-3px) scale(1.005);
   box-shadow: var(--shadow-hover);
@@ -1092,27 +1083,8 @@ html, body, #root {
   background: var(--bg-panel);
 }
 
-.task-card.awaiting { --lane-accent: var(--amber); border-color: rgba(12, 102, 228, 0.2); }
+.task-card.awaiting { border-color: rgba(12, 102, 228, 0.2); }
 .task-card.awaiting:hover { border-color: rgba(12, 102, 228, 0.35); box-shadow: var(--shadow-hover), 0 0 20px rgba(12, 102, 228, 0.06); }
-
-.card-title-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-.card-title-row .card-title { flex: 1; min-width: 0; }
-.card-id {
-  flex-shrink: 0;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
-  letter-spacing: 0.06em;
-  /* No `opacity` here. --text-dim is ALREADY the dim step; multiplying it by
-     0.7 dimmed the id twice and composited it to 2.02:1 in dark / 2.83:1 in
-     light — below AA even after the token was fixed. (The declaration was also
-     duplicated, which is how it survived review.) */
-}
 
 .card-title {
   font-family: var(--font-display);
@@ -1129,32 +1101,29 @@ html, body, #root {
   overflow-wrap: anywhere;
 }
 
-.card-description {
-  font-size: 12px;
+/* The card's one status line — whatever is live right now: a running step,
+   a parked task's question (already reshaped by cardBlockerLine so two
+   BUDGET_EXHAUSTED blockers never clamp to the same identical leading
+   text), a merge-conflict rebase round, or a terminal one-liner (Cancelled /
+   Approved — merge pending / Stopped by you — parked). One slot, one job —
+   see cardFacts.js. overflow-wrap:anywhere matches the old .card-blocker-q's
+   clamp so an unbreakable token (a URL) still wraps instead of slicing. */
+.card-status {
+  font-size: 13px;
   color: var(--text-muted);
-  line-height: 1.4;
   margin-top: 4px;
-  overflow: hidden;
+  line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   line-clamp: 2;
   -webkit-box-orient: vertical;
+  overflow: hidden;
   overflow-wrap: anywhere;
 }
 
-.card-live-status {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--accent-300);
-  margin-top: 4px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  opacity: 0.85;
-}
 .card-subtask-progress {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--green);
   margin-top: 4px;
 }
@@ -1180,69 +1149,6 @@ html, body, #root {
   opacity: 0.4;
 }
 
-.card-blocker-q {
-  font-size: 12px;
-  color: var(--amber);
-  line-height: 1.4;
-  margin-top: 8px;
-  padding: 6px 10px;
-  background: var(--amber-glow);
-  border-left: 3px solid var(--amber);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-}
-.card-blocker-q > span {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  overflow-wrap: anywhere;
-}
-
-.card-escalation-latency {
-  font-size: 11px;
-  color: var(--warn);
-  line-height: 1.4;
-  margin-top: 6px;
-  padding: 4px 10px;
-  border-left: 3px solid var(--warn);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-}
-
-.card-action-hint {
-  font-size: 11px;
-  color: var(--amber);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-weight: 600;
-  margin-top: 6px;
-}
-
-.card-repo {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--cyan);
-  background: var(--bg-panel);
-  padding: 2px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  letter-spacing: 0.02em;
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.card-attempts {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
-  background: var(--bg-panel);
-  padding: 2px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-}
-
 .card-meta {
   display: flex;
   align-items: center;
@@ -1251,36 +1157,13 @@ html, body, #root {
   flex-wrap: wrap;
 }
 
-.card-source {
-  font-size: 10px;
+/* The card's one meta line — repo · attempts · cost, whichever parts exist
+   (cardFacts.js). Replaces the old .card-repo/.card-source/.card-kind/
+   .card-attempts chip row; the rest of those facts (source, kind, priority,
+   spec, cancelled) moved to the drawer's Details tab. */
+.card-meta-line {
+  font-size: 12px;
   color: var(--text-dim);
-  background: var(--bg-panel);
-  padding: 2px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-}
-
-/* Task-type pill (WS-A). Only shown for non-default kinds. */
-.card-kind {
-  font-size: 10px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  letter-spacing: 0.02em;
-  text-transform: none;
-  color: var(--text);
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-}
-.kind-bugfix       { color: var(--red);   border-color: var(--red); }
-.kind-ci_fix       { color: var(--amber); border-color: var(--amber); }
-.kind-traceability { color: var(--purple); border-color: var(--purple); }
-.kind-test_gap     { color: var(--green); border-color: var(--green); }
-
-/* D8: Spec-ready badge */
-.card-spec-badge {
-  font-size: 10px; padding: 2px 6px; border-radius: 10px;
-  background: rgba(34,197,94,0.15); color: var(--green);
-  border: 1px solid var(--green); letter-spacing: 0.02em;
 }
 
 /* Merge-ready policy chip (Review PR lane only) — advisory only, mirrors the
@@ -1288,39 +1171,20 @@ html, body, #root {
    color-mix (theme-token-relative, see .rich-file-chip above) rather than a
    fixed rgba literal so the tint tracks --green across both themes. */
 .card-merge-ready {
-  font-size: 10px; padding: 2px 6px; border-radius: 10px;
+  font-size: 12px; padding: 2px 6px; border-radius: 10px;
   background: color-mix(in oklab, var(--green) 15%, transparent);
   color: var(--green);
   border: 1px solid var(--green); letter-spacing: 0.02em;
 }
 
-/* Cancelled tasks live in the Failed lane (they share FAILED status) but were
-   an operator decision, not a capability failure — a muted, neutral badge, not
-   the alarming red of a real failure. Matches the honest Stats breakdown. */
-.card-cancelled-badge {
-  font-size: 10px; padding: 2px 6px; border-radius: 10px;
-  background: var(--surface-2); color: var(--text-muted);
-  border: 1px solid var(--border-hi); letter-spacing: 0.02em;
-}
-
-/* SCRUM-42: bounded-rebase cycle in flight (conflictStatus.js). Amber = "the
-   system is handling it", distinct from the red escalation treatments — the
-   whole point is that the operator does NOT need to act yet. */
-.card-conflict-badge {
-  font-size: 10px; padding: 2px 6px; border-radius: 10px;
-  background: color-mix(in srgb, var(--amber) 14%, transparent);
-  color: var(--amber);
-  border: 1px solid var(--amber); letter-spacing: 0.02em;
-}
-
 .card-age {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   margin-left: auto;
 }
 
 .card-pr-badge {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--green);
   padding: 2px 8px;
   border: 1px solid var(--green);
@@ -1342,15 +1206,31 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
    The painted box is unchanged — align-items:center keeps it centered. */
 .stats-pr-link { flex: 0 0 auto; margin: -2px 0; }
 
-/* Sub-status pill (In Progress lane) */
-.card-substatus {
-  font-size: 10px;
-  color: var(--text-dim);
-  padding: 2px 8px;
+/* The card's one action button — its label is the verb + object (cardFacts.js),
+   never a re-statement of the status line above it. Border colour names WHICH
+   action (review vs. answer) with the same semantic tokens the lane accents
+   already use; the fill/text stay neutral so the accent still reads as
+   action/state, not a second competing colour. */
+.card-action {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 8px;
   border: 1px solid var(--border);
-  border-radius: 10px;
-  text-transform: none;
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
+.card-action:hover { background: var(--bg-panel); border-color: var(--border-hi); }
+.card-action:active { transform: scale(0.98); }
+.card-action:disabled { opacity: 0.5; cursor: default; }
+.card-action-answer { border-color: var(--c-answer); }
+.card-action-review { border-color: var(--c-review); }
 
 /* Active working card — pulsing indicator */
 .task-card.active-working {
@@ -1384,7 +1264,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
 .cr-approve-warn {
   font-size: 13px; line-height: 1.5; color: var(--text);
   background: color-mix(in srgb, var(--c-answer, #e8a33d) 14%, transparent);
-  border-left: 3px solid var(--c-answer, #e8a33d);
+  border: 1px solid var(--border);
   border-radius: 6px; padding: 10px 12px;
 }
 .cr-approve-actions { display: flex; align-items: center; gap: 12px; }
@@ -1397,7 +1277,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
 .cr-comment-loc { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .cr-general { font-size: 12px; color: var(--text-dim); font-style: italic; }
 .cr-sev {
-  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
   letter-spacing: 0.04em; padding: 2px 7px; border-radius: 4px;
 }
 .cr-sev-high, .cr-sev-critical { background: color-mix(in srgb, #e5484d 20%, transparent); color: #e5484d; }
@@ -1430,7 +1310,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   align-items: center;
   gap: 5px;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--c-context, #7a869a);
   background: color-mix(in srgb, var(--c-context, #7a869a) 12%, transparent);
@@ -1449,7 +1329,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   align-items: center;
   gap: 5px;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--c-context, #7a869a);
   background: color-mix(in srgb, var(--c-context, #7a869a) 12%, transparent);
@@ -1477,7 +1357,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   align-items: center;
   gap: 7px;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.02em;
   color: var(--text-muted);
 }
@@ -1588,7 +1468,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   align-items: center;
   gap: 10px;
   padding: 4px 14px;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 .turn-label {
@@ -1616,7 +1496,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   gap: 8px;
   padding: 5px 14px;
   flex-wrap: wrap;
-  font-size: 11px;
+  font-size: 12px;
   border-bottom: 1px solid var(--border);
 }
 .plan-tracker-label {
@@ -1645,7 +1525,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
 .run-desc-label {
   flex-shrink: 0;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -1664,7 +1544,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   grid-column: 1 / -1;
   margin-bottom: 2px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1672,7 +1552,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
 .run-artifact { display: contents; }
 .run-artifact-key {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   align-self: baseline;
 }
 .run-artifact-val { min-width: 0; overflow-wrap: anywhere; }
@@ -1737,7 +1617,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .subtask-meta {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -1760,7 +1640,41 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .nh-nav-btn:focus-visible,
 .nh-navrow:focus-visible,
 .lane-stale-divider:focus-visible,
-.lane-more:focus-visible {
+.lane-more:focus-visible,
+/* Board chrome that was falling back to the UA ring (measured with a
+   focus-coverage probe over the built bundle, 2026-08-29): the header theme
+   toggle, the card's View-PR anchor — which had a focus rule, but only the
+   same underline it already shows on hover, not an indicator — and the two
+   sidebar "Finish setup" row buttons. */
+.nh-theme-toggle:focus-visible,
+a.card-pr-badge:focus-visible,
+.finish-setup-open:focus-visible,
+.finish-setup-done:focus-visible,
+/* Drawer controls that were falling back to the UA ring. `.slideover a` covers
+   every link in the panel in one selector — including the auto-linked URLs in
+   blocker text, which carry no class of their own to name. */
+.slideover a:focus-visible,
+.btn-approve:focus-visible,
+.btn-cancel:focus-visible,
+.btn-cancel-quiet:focus-visible,
+.btn-request-changes:focus-visible,
+.flash-banner-dismiss:focus-visible,
+.decision-btn:focus-visible,
+.decision-option-btn:focus-visible,
+.rich-thinking-toggle:focus-visible,
+.activity-load-older:focus-visible,
+.so-follows-link:focus-visible,
+.raw-toggle:focus-visible,
+.spec-change-textarea:focus-visible,
+/* Settings controls that were falling back to the UA ring: the overlay's own
+   pane nav and close button, the memory/learning card remove, the per-repo row
+   actions and the learnings filter field. */
+.settings-overlay-navitem:focus-visible,
+.settings-overlay-close:focus-visible,
+.memory-card-remove:focus-visible,
+.project-repo-action:focus-visible,
+.learning-filter:focus-visible,
+.card-action:focus-visible {
   outline: 2px solid var(--accent-500);
   outline-offset: 2px;
 }
@@ -1926,12 +1840,12 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .rich-ts {
   color: var(--text-dim);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   flex-shrink: 0;
 }
 .rich-role {
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1939,7 +1853,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-kind {
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1951,7 +1865,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .rich-elapsed {
   color: var(--text-dim);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   flex-shrink: 0;
   margin-left: auto;
 }
@@ -2018,9 +1932,9 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .rich-knowledge-body {
   margin-top: 4px;
   padding: 6px 12px;
-  border-left: 3px solid var(--purple);
-  background: var(--surface-2);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--purple) 12%, var(--surface-2));
+  border-radius: var(--r-sm);
   font-size: 12px;
 }
 .rich-knowledge-item {
@@ -2032,7 +1946,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
    did not match. The backend distinguishes them; so does this. */
 .rich-knowledge-item.held { color: var(--text-muted); }
 .rich-knowledge-why {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--amber);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2041,9 +1955,9 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .rich-thinking-body {
   margin-top: 4px;
   padding: 6px 12px;
-  border-left: 3px solid var(--text-dim);
+  border: 1px solid var(--border);
   background: var(--surface-2);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: var(--r-sm);
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -2134,7 +2048,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-tool-result {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   background: var(--surface-2);
   border-radius: var(--r-sm);
@@ -2147,7 +2061,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-tool-name {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--accent-500);
   background: color-mix(in oklab, var(--accent-500) 10%, transparent);
@@ -2156,7 +2070,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-tool-args {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2167,7 +2081,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 /* File basename chip — prominent file reference in tool events */
 .rich-file-chip {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--green);
   background: color-mix(in oklab, var(--green) 10%, transparent);
@@ -2187,16 +2101,16 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-group-count {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 .rich-group-more {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 .rich-group-toggle {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-dim);
   margin-left: auto;
 }
@@ -2223,7 +2137,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 .rich-status-arrow { color: var(--text-dim); font-size: 12px; }
 .rich-status-badge {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   padding: 2px 8px;
   border-radius: var(--r-sm);
@@ -2240,7 +2154,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-commit-hash {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--green);
   background: var(--green-dim);
   padding: 2px 8px;
@@ -2261,7 +2175,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
 }
 .rich-verdict-chip {
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -2345,14 +2259,14 @@ a.run-artifact-val:hover { text-decoration: underline; }
   position: absolute;
   top: 0; right: 10px;
   line-height: 18px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-hi);
 }
 
 .so-id {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   letter-spacing: 0.04em;
   margin-bottom: 6px;
@@ -2415,7 +2329,7 @@ a.run-artifact-val:hover { text-decoration: underline; }
   background: var(--red-dim);
 }
 .so-failure-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2538,7 +2452,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .so-chip-sub {
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -2572,7 +2486,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .so-milestone-label {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   white-space: nowrap;
 }
@@ -2706,7 +2620,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* Label that marks the demoted detail sections as secondary to the stream. */
 .so-inspector-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2717,7 +2631,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .so-section-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2786,11 +2700,15 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .checklist-item:hover { box-shadow: var(--shadow-hover); border-color: var(--border-hi); }
 
-.checklist-item.pass { border-left: 3px solid var(--green); }
-.checklist-item.fail { border-left: 3px solid var(--red); }
+/* The pass/fail/advisory verdict used to be a 3px coloured stripe down the left
+   edge of a card that already carries a 1px border — two elevation devices on one
+   box. It is a background tint now; the card keeps its normal border, and the row's
+   icon and label still name the verdict in words (colour is never the only code). */
+.checklist-item.pass { background: color-mix(in srgb, var(--green) 12%, var(--bg-raised)); }
+.checklist-item.fail { background: color-mix(in srgb, var(--red) 12%, var(--bg-raised)); }
 /* An advisory (low/nit) finding did not fail the gate, so it must not wear the
    blocking red — slate, matching the .cr-sev-low/.cr-sev-nit chip. */
-.checklist-item.advisory { border-left: 3px solid #7a869a; }
+.checklist-item.advisory { background: color-mix(in srgb, #7a869a 12%, var(--bg-raised)); }
 
 /* Header row: icon + title + file chip (all on one line) */
 .ci-header {
@@ -2823,7 +2741,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ci-filechip {
   flex-shrink: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--cyan);
   background: var(--blue-dim);
   border: 1px solid color-mix(in oklab, var(--cyan) 22%, transparent);
@@ -2854,8 +2772,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   padding: 11px 14px;
   border-top: 1px solid var(--border);
   line-height: 1.65;
-  background: var(--bg-panel);
-  border-left: 3px solid var(--accent-500);
+  background: color-mix(in srgb, var(--accent-500) 12%, var(--bg-panel));
 }
 
 .ci-evidence {
@@ -2877,7 +2794,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .btn-post-one, .btn-post-retry {
-  font-size: 11px;
+  font-size: 12px;
   font-family: var(--font-ui);
   font-weight: 500;
   padding: 5px 12px;
@@ -2909,7 +2826,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .post-badge {
-  font-size: 10px;
+  font-size: 12px;
   padding: 3px 8px;
   border-radius: 4px;
   font-weight: 600;
@@ -2930,7 +2847,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .btn-post-all {
-  font-size: 11px;
+  font-size: 12px;
   font-family: var(--font-ui);
   padding: 6px 16px;
   border-radius: var(--r-sm);
@@ -2950,7 +2867,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .btn-post-all:disabled { opacity: 0.5; cursor: wait; }
 
 .review-posted-badge {
-  font-size: 11px;
+  font-size: 12px;
   padding: 4px 10px;
   border-radius: var(--r-sm);
   background: rgba(126, 140, 90, 0.1);
@@ -3014,7 +2931,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .blocker-cat {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--red);
   border: 1px solid var(--red);
   padding: 2px 10px;
@@ -3026,7 +2943,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .blocker-confidence, .blocker-transient {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   padding: 2px 10px;
   border: 1px solid var(--border);
@@ -3038,7 +2955,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .blocker-field-label {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -3089,7 +3006,6 @@ a.so-chip-value:hover { color: var(--accent-300); }
   margin: 0 var(--sp-6) var(--sp-4);
   padding: 14px 16px 16px;
   border: 1px solid var(--red);
-  border-left: 3px solid var(--red);
   border-radius: var(--r-md);
   background: var(--red-dim);
   display: flex;
@@ -3116,7 +3032,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   gap: 9px;
 }
 .feasibility-eyebrow {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -3155,7 +3071,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .split-draft-title { font-weight: 600; font-size: 0.95rem; }
 .split-draft-desc { font-size: 0.88rem; resize: vertical; }
-.split-draft-contract { font-size: 0.8rem; color: var(--text-muted); }
+.split-draft-contract { font-size: 0.86rem; color: var(--text-muted); }
 
 .decision-head {
   display: flex;
@@ -3165,14 +3081,14 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .decision-icon { color: var(--red); display: inline-flex; }
 .decision-eyebrow {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--red);
 }
 .decision-badge {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -3297,8 +3213,8 @@ a.so-chip-value:hover { color: var(--accent-300); }
   line-height: 1.5;
   color: var(--text-hi);
   padding: 8px 10px;
-  background: var(--bg-panel);
-  border-left: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel));
+  border: 1px solid var(--border);
   border-radius: var(--r-sm);
 }
 
@@ -3318,11 +3234,17 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 .attempt-number {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-dim);
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.attempt-branch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .attempt-branch {
@@ -3352,7 +3274,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .attempt-badge {
-  font-size: 11px;
+  font-size: 12px;
   padding: 2px 10px;
   border-radius: var(--r-sm);
   border: 1px solid;
@@ -3487,6 +3409,97 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 .sendback-actions .btn { flex: none; min-width: 110px; }
 
+/* ── KEYBOARD SHORTCUTS DIALOG (⌘/) ──────────────────────────────────────── */
+/* Deliberately no entry animation — Impeccable Operate: no decorative motion. */
+.shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+}
+
+.shortcuts-dialog {
+  width: min(420px, 92vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-xl);
+  padding: 24px 28px;
+  box-shadow: var(--shadow-modal);
+}
+
+.shortcuts-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.shortcuts-dialog-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-hi);
+  margin: 0;
+}
+
+.shortcuts-dialog-close {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+}
+.shortcuts-dialog-close:hover { color: var(--text-hi); border-color: var(--text-dim); background: var(--surface-2); }
+
+.shortcuts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.shortcuts-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.shortcuts-row-label {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.shortcuts-kbd {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-hi);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm, 4px);
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.shortcuts-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
 /* empty lane — intentional resting state, not a blank void. Centred icon over
    a soft dashed frame so an empty column reads as "nothing here (on purpose)".
    The state sits in the lane's VERTICAL CENTER (F1: pinned-to-top left a
@@ -3604,7 +3617,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* CI pipeline link */
 .ci-link {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--cyan);
   text-decoration: none;
 }
@@ -3632,7 +3645,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   border-radius: var(--r-md);
   color: var(--text-dim);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   margin-top: 8px;
   max-height: 280px;
   overflow: auto;
@@ -3651,7 +3664,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: var(--bg);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   overflow: hidden;
   white-space: nowrap;
@@ -3668,30 +3681,6 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ov-oldest-stale { color: var(--amber); }
 @media (max-width: 640px) {
   .ov-hide-narrow { display: none; }
-}
-
-/* ── PRIORITY BADGE ──────────────────────────────────────────────────────── */
-
-.card-priority {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  padding: 1px 6px;
-  border-radius: var(--r-sm);
-  border: 1px solid;
-  flex-shrink: 0;
-}
-
-.card-priority-high {
-  color: var(--amber);
-  border-color: var(--amber);
-  background: var(--amber-glow);
-}
-
-.card-priority-low {
-  color: var(--text-dim);
-  border-color: var(--border);
-  background: transparent;
 }
 
 /* ── STALE INDICATOR ─────────────────────────────────────────────────────── */
@@ -3860,7 +3849,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: color-mix(in srgb, var(--red) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
   color: var(--red);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.35;
 }
 .card-approve-error-text {
@@ -3895,10 +3884,10 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .test-result-pass  { color: var(--green); }
 .test-result-fail  { color: var(--red); }
 .test-result-dim   { color: var(--text-dim); }
-.test-result-fail-msg { font-size: 11px; color: var(--red); margin-top: 4px; }
+.test-result-fail-msg { font-size: 12px; color: var(--red); margin-top: 4px; }
 /* A discarded resume checkpoint: work was lost, but the attempt is NOT failed
    — amber, so it does not read as the failure line directly below it. */
-.attempt-resume-lost { font-size: 11px; color: var(--amber); margin-top: 4px; }
+.attempt-resume-lost { font-size: 12px; color: var(--amber); margin-top: 4px; }
 
 /* ── SLIDEOVER INLINE STYLE REPLACEMENTS ─────────────────────────────────── */
 
@@ -3911,11 +3900,22 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .verdict-pass  { color: var(--green); }
 .verdict-fail  { color: var(--red); }
 .verdict-detail { color: var(--text-dim); font-weight: 500; }
-.verdict-clean { font-size: 11px; color: var(--green); }
-.verdict-excused { font-size: 11px; color: var(--warn); }
-.verdict-failed { font-size: 11px; color: var(--red); }
+.verdict-clean { font-size: 12px; color: var(--green); }
+.verdict-excused { font-size: 12px; color: var(--warn); }
+.verdict-failed { font-size: 12px; color: var(--red); }
 .so-repo-path  { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); }
+
+/* Task info (source/kind/priority/cancelled/escalation) — the facts the
+   five-facts board card no longer carries as its own chips (spec C2). */
+.so-task-info  { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
 .btn-mt        { margin-top: 12px; }
+/* Task 7: "Follows: <id8> <title>" — a plain inline link, not a button-look;
+   it opens the predecessor task in this same drawer (onJump). */
+.so-follows-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; color: var(--accent); text-decoration: underline;
+}
+.so-follows-link:hover { color: var(--text-dim); }
 
 /* ── NEW TASK MODAL ──────────────────────────────────────────────────────── */
 
@@ -3968,7 +3968,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .ntm-label {
   display: block;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -3976,7 +3976,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   margin-bottom: 6px;
 }
 .ntm-hint {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   margin-top: 4px;
   line-height: 1.5;
@@ -4060,7 +4060,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .grill-header .sendback-label { margin-bottom: 0; }
 .grill-round-badge {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--text-dim);
   background: var(--bg-panel);
@@ -4083,7 +4083,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   border: 1px solid var(--border); border-style: solid;
   border-radius: var(--r-pill);
   background: var(--bg-panel); color: var(--text-muted);
-  font: inherit; font-size: 11px; font-weight: 600;
+  font: inherit; font-size: 12px; font-weight: 600;
   padding: 3px 10px; cursor: pointer;
   transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
 }
@@ -4134,7 +4134,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   width: 100%;
   max-height: 120px;
   overflow-y: auto;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   font-family: var(--font-mono);
   border-top: 1px solid var(--border);
@@ -4159,7 +4159,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .eval-badge {
   display: inline-block; padding: 2px 8px; border-radius: 4px;
-  font-weight: 700; font-size: 11px; letter-spacing: 0.04em;
+  font-weight: 700; font-size: 12px; letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 .eval-accept { background: var(--green); color: #000; }
@@ -4168,14 +4168,14 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .eval-decompose { background: var(--purple, #8b5cf6); color: #fff; }
 .eval-dims { display: flex; gap: 6px; flex-wrap: wrap; }
 .eval-dim {
-  padding: 1px 6px; border-radius: 3px; font-size: 10px;
+  padding: 1px 6px; border-radius: 3px; font-size: 12px;
   text-transform: capitalize;
 }
 .dim-pass { background: rgba(34,197,94,0.15); color: var(--green); }
 .dim-fail { background: rgba(239,68,68,0.15); color: var(--red, #ef4444); }
-.eval-rationale { width: 100%; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.eval-rationale { width: 100%; font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 .grill-spec-section-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -4195,7 +4195,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .grill-ac-num {
   flex-shrink: 0;
   font-weight: 600;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   font-family: var(--font-mono);
 }
@@ -4253,7 +4253,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* ── LIFECYCLE BUTTONS ──────────────────────────────────────────────────── */
 
 .btn-lifecycle {
-  font-size: 11px;
+  font-size: 12px;
   padding: 8px 14px;
   border-radius: var(--r-sm);
   font-family: inherit;
@@ -4278,6 +4278,9 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 .btn-retry  { color: var(--blue); border-color: var(--blue); }
 .btn-retry:hover:not(:disabled) { background: var(--blue-dim); }
+
+.btn-follow-up { color: var(--purple); border-color: var(--purple); }
+.btn-follow-up:hover:not(:disabled) { background: var(--purple-dim); }
 
 .btn-cancel { color: var(--red); border-color: rgba(248, 113, 113, 0.3); }
 .btn-cancel:hover:not(:disabled) { background: var(--red-dim); border-color: var(--red); }
@@ -4353,7 +4356,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: linear-gradient(90deg, var(--accent-500), var(--accent-600));
 }
 .stats-card-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -4468,7 +4471,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   text-align: left;
   padding: 9px 14px;
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -4554,7 +4557,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .stats-kind-count {
   color: var(--text-dim);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 /* ── Task table ── */
@@ -4599,7 +4602,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: var(--bg-card);
   padding: 10px 14px;
   text-align: left;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -4688,7 +4691,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .stats-td-reason {
   margin-top: 2px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.35;
   white-space: normal;
 }
@@ -4758,7 +4761,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: rgba(255,255,255,0.03);
 }
 .settings-tab.sm {
-  font-size: 11px;
+  font-size: 12px;
   padding: 6px 12px;
 }
 
@@ -4834,7 +4837,13 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .auth-saved { font-size: 12px; font-weight: 600; color: var(--green); }
 
 /* project cards (settings) */
-.project-card { border-left: 3px solid var(--accent-500); }
+/* `.memory-card.project-card`, not `.project-card`: the element is
+   `className="memory-card project-card"` (Settings.jsx) and `.memory-card`'s own
+   `background: var(--bg-card)` is LATER in this file at equal specificity, so a
+   bare `.project-card` background loses the cascade and paints nothing. The
+   `border-left: 3px` stripe that used to live here was dead for the same reason.
+   Same for the accent-500 12% tint below, which is why this carries the extra class. */
+.memory-card.project-card { background: color-mix(in srgb, var(--accent-500) 12%, var(--bg-card)); }
 .project-repos { display: flex; flex-direction: column; gap: 6px; }
 .project-repo-row {
   display: flex;
@@ -4849,9 +4858,9 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .project-repo-row:hover { border-color: var(--border-hi); }
 .project-repo-name { font-weight: 600; color: var(--text-hi); }
-.project-repo-path { font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-repo-path { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-repo-primary {
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -4973,12 +4982,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 .memory-card-id {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 
 .memory-card-type {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--purple);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -5028,7 +5037,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .memory-tag {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--cyan);
   background: rgba(12, 102, 228, 0.08);
   border: 1px solid rgba(12, 102, 228, 0.15);
@@ -5040,7 +5049,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* Memory lifecycle C part B: archived/superseded state on a Rules/Skills
    card, and the "Show archived" toggle above the list. */
 .memory-card-badge {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--amber);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -5068,7 +5077,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .learning-card {
-  border-left: 3px solid var(--purple);
+  background: color-mix(in srgb, var(--purple) 12%, var(--bg-card));
 }
 
 /* Grouped confirm queue: one collapsible section per project, so a wall of
@@ -5099,7 +5108,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .learning-group-header::before {
   content: "▸";
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   transition: transform 150ms ease;
 }
 
@@ -5124,7 +5133,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
    content and dropped the rest. The scope line is the one that matters — see
    .learning-scope.global. */
 .learning-origin {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--cyan);
   text-transform: lowercase;
   letter-spacing: 0.04em;
@@ -5134,7 +5143,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .learning-scope {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   font-family: var(--font-mono);
   margin-bottom: 6px;
@@ -5162,7 +5171,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .learning-scope-id { color: var(--text-muted); }
 
 .learning-evidence {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 6px;
 }
@@ -5170,7 +5179,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* Memory lifecycle A: use_count / last_used_at / outcome histogram, shared by
    the Rules, Skills and Learnings cards (MemoryUsageRow, Settings.jsx). */
 .memory-usage-row {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   margin-top: 4px;
 }
@@ -5191,7 +5200,6 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .learning-card.selected {
-  border-left-color: var(--green);
   background: var(--green-dim);
 }
 
@@ -5230,20 +5238,20 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .learning-filter-count {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   font-family: var(--font-mono);
   white-space: nowrap;
 }
 
 .learning-cap-note {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   margin: -6px 0 12px;
 }
 
 .btn-sm {
-  font-size: 11px;
+  font-size: 12px;
   padding: 5px 14px;
 }
 
@@ -5256,7 +5264,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .config-hint code {
   font-family: var(--font-mono);
   color: var(--cyan);
-  font-size: 11px;
+  font-size: 12px;
   background: var(--surface-1);
   padding: 2px 6px;
   border-radius: var(--r-sm);
@@ -5308,7 +5316,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 .settings-overlay-group-header {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -5431,12 +5439,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .integration-mark { display: flex; flex: none; width: 22px; height: 22px; }
 .integration-name { font-weight: 600; font-size: 14px; color: var(--text-hi); }
 .integration-kind {
-  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
+  font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase;
   color: var(--text-dim); background: var(--bg-panel);
   padding: 2px 8px; border-radius: 10px;
 }
 .integration-chip {
-  margin-left: auto; font-size: 11px; font-weight: 600;
+  margin-left: auto; font-size: 12px; font-weight: 600;
   padding: 3px 10px; border-radius: var(--r-pill); white-space: nowrap;
 }
 .integration-chip.tone-neutral { color: var(--text-dim); background: var(--bg-panel); }
@@ -5467,7 +5475,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   font-family: var(--font-mono); font-size: 12px; color: var(--text-hi);
   background: var(--bg-panel); padding: 2px 7px; border-radius: 6px;
 }
-.integration-secret { color: var(--text-dim); font-size: 11.5px; }
+.integration-secret { color: var(--text-dim); font-size: 12px; }
 .integration-secret.set { color: var(--green); font-family: var(--font-mono); letter-spacing: 2px; }
 .integration-actions { display: flex; align-items: center; gap: 12px; }
 .integration-actions .btn { flex: 0 0 auto; }
@@ -5500,15 +5508,15 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .integration-config-form .ntm-field { margin-bottom: 0; }
 .integration-field-set {
-  margin-left: 7px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  margin-left: 7px; font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
   text-transform: uppercase; color: var(--green);
 }
 .integration-field-set.unset { color: var(--text-dim); }
-.integration-field-error { font-size: 11px; color: var(--red); margin-top: 5px; }
+.integration-field-error { font-size: 12px; color: var(--red); margin-top: 5px; }
 .integration-ci-note {
   font-size: 12px; line-height: 1.5; color: var(--text-hi);
   background: var(--blue-dim); border: 1px solid var(--border);
-  border-left: 3px solid var(--blue); border-radius: var(--r-md);
+  border-radius: var(--r-md);
   padding: 9px 12px;
 }
 .integration-save-ok { font-size: 12px; font-weight: 600; color: var(--green); }
@@ -5524,7 +5532,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-integration-mark { display: flex; flex: none; width: 20px; height: 20px; }
 .ob-integration-name { font-weight: 600; color: var(--text-hi); font-size: 13.5px; }
 .ob-integration-kind {
-  font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+  font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase;
   color: var(--text-dim);
 }
 .ob-integration .integration-chip { margin-left: auto; }
@@ -5554,7 +5562,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .ob-integration-field { display: flex; flex-direction: column; gap: 4px; }
 .ob-integration-label {
-  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
+  font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase;
   color: var(--text-dim);
 }
 .ob-integration-check {
@@ -5614,7 +5622,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border-hi); transition: background var(--dur-base); }
 .ob-step.current .ob-step-dot { background: var(--accent-500); box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-500) 22%, transparent); }
 .ob-step.done .ob-step-dot { background: var(--state-done); }
-.ob-step-label { font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
+.ob-step-label { font-family: var(--font-ui); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
 .ob-step.current .ob-step-label { color: var(--text-hi); }
 
 /* card */
@@ -5655,7 +5663,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-lede em { color: var(--accent-500); font-style: normal; font-weight: 600; }
 .ob-sub { font-size: 13.5px; line-height: 1.6; color: var(--text-muted); margin-bottom: 22px; max-width: 54ch; }
 .ob-note { font-size: 12px; color: var(--text-muted); margin-top: 18px; line-height: 1.6; }
-.ob-note code, .ob-faint { font-family: var(--font-mono); color: var(--accent-500); font-size: 11px; }
+.ob-note code, .ob-faint { font-family: var(--font-mono); color: var(--accent-500); font-size: 12px; }
 .ob-note em { color: var(--accent-500); font-style: normal; font-weight: 600; }
 
 /* Welcome — the three agents as role-colored cards */
@@ -5677,7 +5685,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* Welcome — the pipeline flow */
 .ob-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 22px; }
-.ob-flow span { font-family: var(--font-mono); font-size: 11px; font-weight: 500; color: var(--text-muted); background: var(--surface-2); padding: 5px 10px; border-radius: var(--r-pill); position: relative; }
+.ob-flow span { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--text-muted); background: var(--surface-2); padding: 5px 10px; border-radius: var(--r-pill); position: relative; }
 .ob-flow span:not(:last-child)::after { content: "→"; position: absolute; right: -13px; top: 50%; transform: translateY(-50%); color: var(--text-dim); }
 .ob-flow .ob-flow-pr { color: var(--ink); background: var(--accent-500); font-weight: 600; }
 .ob-flow .ob-flow-you { color: var(--state-done); background: var(--green-dim); font-weight: 600; }
@@ -5691,14 +5699,14 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .va-build-sub strong { color: var(--text-hi); font-weight: 700; }
 
 /* importance label on proposed rules */
-.ob-rule-imp { font-family: var(--font-ui); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 7px; border-radius: var(--r-pill); margin-left: 6px; }
+.ob-rule-imp { font-family: var(--font-ui); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 7px; border-radius: var(--r-pill); margin-left: 6px; }
 .imp-high { color: var(--red); background: var(--red-dim); }
 .imp-med  { color: var(--agent-supervisor); background: rgba(232, 160, 79, 0.12); }
 .imp-low  { color: var(--text-muted); background: var(--bg-panel); }
 
 /* fields */
 .ob-field { display: flex; flex-direction: column; gap: 8px; }
-.ob-field > span { font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.ob-field > span { font-family: var(--font-ui); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
 .ob-input {
   width: 100%; background: var(--base); border: 1px solid var(--border);
   border-radius: var(--r-md); color: var(--text-hi); font-family: var(--font-ui);
@@ -5731,13 +5739,13 @@ a.so-chip-value:hover { color: var(--accent-300); }
    without it two checkouts of the same repo are indistinguishable. Full-width
    so it reads as a second line under the name and badges, matching the task
    composer's discovered-repo list. */
-.ob-repo-path { flex-basis: 100%; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
-.ob-tag { font-family: var(--font-mono); font-size: 10px; color: var(--accent-300); border: 1px solid var(--border-hi); border-radius: var(--r-pill); padding: 1px 9px; }
+.ob-repo-path { flex-basis: 100%; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+.ob-tag { font-family: var(--font-mono); font-size: 12px; color: var(--accent-300); border: 1px solid var(--border-hi); border-radius: var(--r-pill); padding: 1px 9px; }
 /* A discovered repo that is mid-edit, on a detached HEAD, or not a git repo at
    all. Same pill, attention colour: pointing a task at one is a decision the
    user should make deliberately, not by missing a grey tag. */
 .ob-tag-warn { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 40%, transparent); }
-.ob-repo-status { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.ob-repo-status { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
 .ob-repo-status.ok { color: var(--state-done); }
 
 /* Recently-worked-on repos: a quick-add grid above the full list, so a user
@@ -5770,11 +5778,11 @@ a.so-chip-value:hover { color: var(--accent-300); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .ob-repo-card-path {
-  grid-column: 1; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+  grid-column: 1; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .ob-repo-card-meta {
-  grid-column: 1; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  grid-column: 1; font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);
 }
 .ob-repo-card-add {
   grid-column: 2; grid-row: 1 / 4; align-self: center;
@@ -5802,7 +5810,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .ob-rule { display: flex; gap: 12px; padding: 12px 14px; background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--agent-supervisor); border-radius: var(--r-md); cursor: pointer; }
 .ob-rule.sel { border-left-color: var(--accent-500); }
 .ob-rule input { accent-color: var(--accent-500); margin-top: 3px; }
-.ob-rule-cat { font-family: var(--font-ui); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: var(--r-pill); }
+.ob-rule-cat { font-family: var(--font-ui); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 8px; border-radius: var(--r-pill); }
 .cat-rule { color: var(--agent-supervisor); background: color-mix(in oklab, var(--agent-supervisor) 16%, transparent); }
 .cat-anti_pattern { color: var(--state-failed); background: color-mix(in oklab, var(--state-failed) 16%, transparent); }
 .cat-skill { color: var(--agent-reviewer); background: color-mix(in oklab, var(--agent-reviewer) 16%, transparent); }
@@ -5976,7 +5984,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 /* D11: Review cap indicator */
 .review-cap-indicator {
-  font-size: 11px; color: var(--text-dim); font-style: italic;
+  font-size: 12px; color: var(--text-dim); font-style: italic;
   margin-left: 8px;
 }
 
@@ -6005,13 +6013,15 @@ a.so-chip-value:hover { color: var(--accent-300); }
   padding: 8px 0;
 }
 .so-merge-policy-source {
-  font-size: 11px; color: var(--text-muted); margin-top: 4px;
+  font-size: 12px; color: var(--text-muted); margin-top: 4px;
 }
 .so-merge-policy-warn {
   display: flex; align-items: center; gap: 6px;
-  font-size: 12px; color: var(--warn); padding: 3px 0;
-  border-left: 3px solid var(--warn);
-  padding-left: 8px;
+  font-size: 12px; color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
   margin: 4px 0;
 }
 
@@ -6103,9 +6113,8 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* ── Digest cards: the "what is actually going on" layer ─────────────────── */
 .digest-card {
-  background: var(--bg-card);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-card));
   border: 1px solid var(--border-hi);
-  border-left: 3px solid var(--accent);
   border-radius: 10px;
   padding: 12px 14px;
   margin: 8px 0 12px;
@@ -6125,7 +6134,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .digest-fact { display: contents; }
 .digest-fact-label {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   align-self: baseline;
@@ -6226,7 +6235,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   50%      { opacity: 0.35; transform: scale(0.75); }
 }
 .fx-head-meta { display: flex; gap: 8px; align-items: baseline; font-size: 12px; min-width: 0; }
-.fx-status { text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; font-size: 10.5px; }
+.fx-status { text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; font-size: 12px; }
 .fx-status.s-active { color: var(--fx-color); }
 .fx-status.s-done   { color: var(--green); }
 .fx-status.s-error  { color: var(--red); }
@@ -6236,12 +6245,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .fx-model {
-  font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .fx-lane-tree { width: 100%; }
 .fx-lane-empty {
-  color: var(--text-dim); font-size: 11px; text-align: center;
+  color: var(--text-dim); font-size: 12px; text-align: center;
   padding: 14px 6px; border: 1px dashed var(--border); border-radius: 8px;
 }
 /* The expanded agent log rises into place when it opens. */
@@ -6251,10 +6260,6 @@ a.so-chip-value:hover { color: var(--accent-300); }
   to   { opacity: 1; transform: none; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-
-
-}
 @media (max-width: 900px) {
   .fx-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fx-head::after { display: none; }
@@ -6329,7 +6334,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* U4: collapsed failed-run groups */
 .failed-group-count {
-  font-size: 11px; color: var(--fg-dim, #8b93a7);
+  font-size: 12px; color: var(--fg-dim, #8b93a7);
   padding: 2px 10px 8px; cursor: default;
 }
 
@@ -6415,7 +6420,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .session-search-task { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 .session-search-taskid {
-  font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
   margin-right: 8px;
 }
 .session-search-hit {
@@ -6425,7 +6430,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .session-search-kind {
   flex: 0 0 auto; min-width: 84px;
   color: var(--text-muted); text-transform: uppercase;
-  font-size: 10px; letter-spacing: 0.04em;
+  font-size: 12px; letter-spacing: 0.04em;
 }
 .session-search-snippet {
   font-family: var(--font-mono); color: var(--text);
@@ -6483,7 +6488,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .fx-role-model {
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; color: var(--text-dim); text-align: right;
-  font-family: var(--font-mono); font-size: 11px;
+  font-family: var(--font-mono); font-size: 12px;
 }
 .fx-role-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); flex: none; margin-left: auto; }
 .fx-role-model + .fx-role-dot { margin-left: 0; }
@@ -6535,11 +6540,11 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .fx-log-titles { flex: 1 1 auto; min-width: 0; }
 .fx-log-type {
-  font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--node-color, var(--accent-500));
 }
 .fx-log-name { font-size: 15px; font-weight: 600; color: var(--text-hi); }
-.fx-log-stats { display: flex; gap: 14px; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); flex: none; }
+.fx-log-stats { display: flex; gap: 14px; font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); flex: none; }
 .fx-log-stat b { color: var(--text-hi); font-weight: 600; }
 .fx-log-close {
   flex: none; width: 26px; height: 26px; border-radius: 7px;
@@ -6632,7 +6637,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   background: transparent;
 }
 .nh-ledger-title {
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -6658,7 +6663,24 @@ a.so-chip-value:hover { color: var(--accent-300); }
    it stops badge/meta widths from wobbling as digits change. */
 .card-meta,
 .nh-navrow-badge,
-.nh-overview {
+.nh-overview,
+/* The rest of the board's numeric readouts, which were still proportional:
+   the lane header count, the card's sub-task progress, the sidebar's 24h
+   ledger block (its <b> figures already were), and the Stats table's mono
+   and right-aligned numeric columns. */
+.lane-count,
+.card-subtask-progress,
+.nh-ledger,
+.stats-td-mono,
+.stats-td-right,
+/* The drawer's attempt rows — attempt number, cache-token and duration figures
+   (`.so-chip-value` above the fold already had this). */
+.attempt-row,
+/* Settings' counts: the per-section item count, the learnings filter tally and
+   the "used Nx" usage row (`.auth-status dd` already had it). */
+.memory-count,
+.learning-filter-count,
+.memory-usage-row {
   font-variant-numeric: tabular-nums;
 }
 
@@ -6786,7 +6808,7 @@ textarea:disabled {
 .ob-prove .ob-row { margin-bottom: 6px; }
 .ob-prove-cmd, .ob-prove-log {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
 }
 .ob-prove-log {
   max-height: 220px;
@@ -6833,7 +6855,7 @@ textarea:disabled {
 .finish-setup-done {
   flex-shrink: 0;
   background: transparent; border: 1px solid var(--border); color: var(--text-muted);
-  border-radius: var(--r-sm); padding: 3px 8px; font: inherit; font-size: 11px; cursor: pointer;
+  border-radius: var(--r-sm); padding: 3px 8px; font: inherit; font-size: 12px; cursor: pointer;
 }
 .finish-setup-done:hover { border-color: var(--border-hi); color: var(--text-hi); }
 

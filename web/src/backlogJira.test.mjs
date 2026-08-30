@@ -157,7 +157,7 @@ test("SCRUM-3: client request limit matches the backend clamp (50, not 20)", () 
 
 test("createTask forwards source (undefined for every typed task, unchanged wire shape)", () => {
   assert.match(apiJs, /export async function createTask\(\{[^}]*\bsource\b[^}]*\}\)/s);
-  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend \}\)/);
+  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend, follows_id \}\)/);
 });
 
 // The board can now pick a coder backend (claude|codex|local) — this test
@@ -168,7 +168,7 @@ test("createTask forwards source (undefined for every typed task, unchanged wire
 // or assertions" rule.
 test("createTask forwards backend to the wire body (board coder-backend picker)", () => {
   assert.match(apiJs, /export async function createTask\(\{[^}]*\bbackend\b[^}]*\}\)/s);
-  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend \}\)/);
+  assert.match(apiJs, /JSON\.stringify\(\{ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id, backend, follows_id \}\)/);
 });
 
 // ── TaskComposer.jsx — coder-backend picker (public issue #5) ──────────────
@@ -314,7 +314,7 @@ test("source defaults to 'board' and survives a re-seeded composer (grill-fail e
 });
 
 test("source rides along in the onStart payload alongside the other echoed fields", () => {
-  assert.match(composerJsx, /prompt,\s*\n\s*prUrl,\s*\n\s*customRepo,\s*\n\s*source,\s*\n\s*externalId,\s*\n\s*\}\);/);
+  assert.match(composerJsx, /prompt,\s*\n\s*prUrl,\s*\n\s*customRepo,\s*\n\s*source,\s*\n\s*externalId,\s*\n[\s\S]*?followsId: initial\?\.followsId \?\? null,\s*\n\s*\}\);/);
 });
 
 // SCRUM-3: "No matching tickets." now comes from jiraEmptyMessage (empty
@@ -539,7 +539,7 @@ test("external_id_survives_grill_reseed_roundtrip: initial.externalId seeds stat
   // Echo side: onStart emits the SAME camelCase token, so the next re-seed's `initial`
   // (== a prior onStart payload) round-trips it. A name mismatch on either end is
   // exactly the bug the parked attempt's reviewer flagged.
-  assert.match(composerJsx, /prompt,\s*\n\s*prUrl,\s*\n\s*customRepo,\s*\n\s*source,\s*\n\s*externalId,\s*\n\s*\}\);/);
+  assert.match(composerJsx, /prompt,\s*\n\s*prUrl,\s*\n\s*customRepo,\s*\n\s*source,\s*\n\s*externalId,\s*\n[\s\S]*?followsId: initial\?\.followsId \?\? null,\s*\n\s*\}\);/);
 });
 
 // ── SCRUM-3: result count header + browsing-all header ──────────────────────

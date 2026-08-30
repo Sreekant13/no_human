@@ -61,8 +61,8 @@ export function discoveryMessage(res) {
     // glance (2026-08-09). A count hides exactly the fact that matters.
     parts.push(
       scanned.length === 0
-        ? "No standard clone folders found under your home directory - type a repository path instead."
-        : `Searched ${scanned.join(", ")} and found no repositories - type a repository path instead.`,
+        ? "No standard clone folders found under your home directory - use \"Search another folder\" to type a repository path."
+        : `Searched ${scanned.join(", ")} and found no repositories - use "Search another folder" to type a repository path.`,
     );
   }
   if (res.walk_truncated) {
