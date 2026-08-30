@@ -1750,3 +1750,79 @@ def test_gitlab_token_is_loaded_from_the_env_file_so_the_named_key_is_actionable
 
     glmod._subprocess_run(["glab", "api", "x"])
     assert os.environ.get("GITLAB_TOKEN") == "glpat-from-the-env-file"
+
+
+# --------------------------------------------------------------------------- #
+# CI.2 — cross-adapter conformance: unreachable CI is UNKNOWN, never FAILED   #
+# --------------------------------------------------------------------------- #
+class TestInfraStatusConformance:
+    """An unreachable/inaccessible CI is a park-or-retry signal, not a verdict.
+
+    Every backend must report ``status is PipelineStatus.UNKNOWN`` (with
+    ``infra_failure`` or ``access_failure`` carrying the real signal) for the
+    identical "I could not reach CI" condition. This class pins that contract
+    across every ``CIBackend`` subclass so a future (sixth) adapter can't
+    re-diverge the way ``jenkins.py`` once did."""
+
+    def test_jenkins(self):
+        from no_human.ci.jenkins import JenkinsCI
+
+        ci = JenkinsCI(
+            "job/x", mode="watch", poll_interval=0, max_infra_retries=0,
+            user="u", token="t", _run_cmd=lambda cmd: None,
+        )
+        result = asyncio.run(ci.trigger("PR-1"))
+        assert result.status is PipelineStatus.UNKNOWN
+        assert result.infra_failure or result.access_failure
+        assert not result.passed and not result.failed
+
+    def test_github_actions(self):
+        ci = _gha(raises=RuntimeError("gh api failed (1): HTTP 502 Bad Gateway"))
+        result = asyncio.run(ci.trigger("branch"))
+        assert result.status is PipelineStatus.UNKNOWN
+        assert result.infra_failure or result.access_failure
+        assert not result.passed and not result.failed
+
+    def test_circleci(self, monkeypatch):
+        from no_human.ci.circleci import CircleCICI
+
+        monkeypatch.delenv("CIRCLECI_TOKEN", raising=False)
+        ci = CircleCICI(project_slug="gh/acme/svc", poll_interval=0)
+        result = asyncio.run(ci.trigger("branch"))
+        assert result.status is PipelineStatus.UNKNOWN
+        assert result.infra_failure or result.access_failure
+        assert not result.passed and not result.failed
+
+    def test_gitlab(self):
+        # NOTE: this exercises the `_run_cmd` raising `GitLabInfraError` path
+        # (gitlab.py:297's `_infra_result`, already UNKNOWN-based). It does
+        # NOT exercise `_trigger_and_wait_inner`'s separate "no pipeline ID"
+        # branch (gitlab.py:381-387), which returns `FAILED + infra_failure`
+        # — a latent, structurally-identical smell in an out-of-scope file;
+        # see the PR body follow-up note.
+        from no_human.ci.gitlab import GitLabInfraError
+
+        def fake(cmd):
+            raise GitLabInfraError("502 Bad Gateway")
+
+        ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0, _run_cmd=fake)
+        result = ci._trigger_and_wait("branch", {})
+        assert result.status is PipelineStatus.UNKNOWN
+        assert result.infra_failure or result.access_failure
+        assert not result.passed and not result.failed
+
+    def test_ghe_checkruns(self):
+        # A fifth adapter, read-only: this one already conformed before this
+        # change (see tests/test_ghe_checkruns.py) — included here so the
+        # cross-adapter contract lives in one place.
+        from no_human.ci.ghe_checkruns import GHECheckRunsCI
+
+        async def raising(repo, ref, *, hostname=""):
+            raise RuntimeError("gh api failed (1): HTTP 502 Bad Gateway")
+
+        ci = GHECheckRunsCI("owner/repo", poll_interval=0,
+                            fetch_runs=raising, fetch_statuses=raising)
+        result = asyncio.run(ci.trigger("branch"))
+        assert result.status is PipelineStatus.UNKNOWN
+        assert result.infra_failure or result.access_failure
+        assert not result.passed and not result.failed

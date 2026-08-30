@@ -141,6 +141,30 @@ async def test_watch_unreachable_status_is_infra_not_green():
     assert r.infra_failure
 
 
+async def test_unreachable_status_reports_unknown_not_failed():
+    """An unreachable Jenkins is a park/retry signal (§3.4), not a code
+    failure — must match the other three adapters' UNKNOWN-not-FAILED
+    contract for the identical 'I could not reach CI' condition."""
+    fake = FakeJenkins({"api/json": [None]})
+    ci = JenkinsCI(JOB, mode="watch", poll_interval=0, max_infra_retries=0,
+                   _run_cmd=fake)
+    r = await ci.trigger("PR-042")
+    assert r.status is PipelineStatus.UNKNOWN
+    assert r.infra_failure is True
+    assert r.passed is False
+    assert r.failed is False
+
+
+async def test_infra_timeout_reports_unknown():
+    """The poll-deadline path is the same infra contract, not a real verdict."""
+    fake = FakeJenkins({"api/json": [_meta(building=True)]})
+    ci = JenkinsCI(JOB, mode="watch", poll_interval=0, max_infra_retries=0,
+                   timeout_minutes=0, _run_cmd=fake)
+    r = await ci.trigger("PR-042")
+    assert r.status is PipelineStatus.UNKNOWN
+    assert r.infra_failure is True
+
+
 async def test_unstable_with_failures_is_real():
     fake = FakeJenkins({
         "api/json": [_meta(result="UNSTABLE")],
@@ -149,6 +173,23 @@ async def test_unstable_with_failures_is_real():
     })
     ci = JenkinsCI(JOB, mode="watch", poll_interval=0, _run_cmd=fake)
     r = await ci.trigger("PR-042")
+    assert r.failed
+    assert not r.infra_failure
+
+
+async def test_completed_build_with_unmapped_result_still_failed():
+    """Pins _finalize_build's non-terminal-result fallback (jenkins.py:221):
+    a COMPLETED build whose `result` string isn't in _RESULT_STATUS is a
+    different case from an unreachable API — it stays FAILED, unlike the
+    infra/access paths this change moves to UNKNOWN. Out of scope to touch."""
+    fake = FakeJenkins({
+        "api/json": [_meta(result="PAUSED")],
+        "testReport": [json.dumps({"failCount": 0, "suites": []})],
+        "consoleText": ["finished: PAUSED"],
+    })
+    ci = JenkinsCI(JOB, mode="watch", poll_interval=0, _run_cmd=fake)
+    r = await ci.trigger("PR-042")
+    assert r.status == PipelineStatus.FAILED
     assert r.failed
     assert not r.infra_failure
 
@@ -180,6 +221,15 @@ async def test_trigger_post_failure_is_infra():
                    _run_cmd=fake)
     r = await ci.trigger("PR-042")
     assert r.infra_failure
+
+
+async def test_trigger_post_failure_reports_unknown():
+    fake = FakeJenkins({"buildWithParameters": [None]})  # curl -f non-zero
+    ci = JenkinsCI(JOB, mode="trigger", poll_interval=0, max_infra_retries=0,
+                   _run_cmd=fake)
+    r = await ci.trigger("PR-042")
+    assert r.status is PipelineStatus.UNKNOWN
+    assert r.infra_failure is True
 
 
 async def test_infra_retry_then_success(monkeypatch):
@@ -249,6 +299,24 @@ async def test_403_is_access_not_infra_and_not_retried():
     # Access failure must NOT be retried (retrying a 403 is futile).
     assert calls["n"] == 1
     assert "JENKINS_API_TOKEN" in r.parsed_output
+
+
+async def test_403_reports_unknown_with_access_failure():
+    calls = {"n": 0}
+
+    def run(cmd):
+        calls["n"] += 1
+        return _with_http("<html>Forbidden</html>", 403)
+
+    ci = JenkinsCI(JOB, mode="watch", poll_interval=0, max_infra_retries=2,
+                   _run_cmd=run)
+    r = await ci.trigger("PR-042")
+    assert r.status is PipelineStatus.UNKNOWN
+    assert r.access_failure is True
+    assert r.infra_failure is False
+    assert r.access_env_key == "JENKINS_API_TOKEN"
+    # Access failure must NOT be retried (retrying a 403 is futile).
+    assert calls["n"] == 1
 
 
 async def test_401_is_access():
@@ -466,6 +534,18 @@ async def test_cookie_access_wall_when_refresh_fails():
                    _run_cmd=rec)
     r = await ci.trigger("PR-1")
     assert r.access_failure
+    assert r.access_env_key == "SSO_PASSWORD"
+
+
+async def test_cookie_auth_access_denied_reports_unknown():
+    rec = RecordingCurl({"api/json": [_denied(), _denied()]})
+    ci = JenkinsCI(JOB, mode="watch", poll_interval=0, max_infra_retries=0,
+                   auth="cookie",
+                   cookie_provider=lambda force: {} if force else {"s": "old"},
+                   _run_cmd=rec)
+    r = await ci.trigger("PR-1")
+    assert r.status is PipelineStatus.UNKNOWN
+    assert r.access_failure is True
     assert r.access_env_key == "SSO_PASSWORD"
 
 

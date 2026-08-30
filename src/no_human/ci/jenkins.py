@@ -253,9 +253,13 @@ class JenkinsCI(CIBackend):
         return "\n".join(lines[-_CONSOLE_TAIL_LINES:])
 
     def _infra(self, why: str) -> CIResult:
+        # Unreachable CI is not a verdict. All backends (github_actions.py:103,
+        # circleci.py:101, gitlab.py:297/:318, ghe_checkruns.py:359) return
+        # UNKNOWN + infra_failure here; only a build that actually ran can be
+        # FAILED (see _finalize_build).
         return CIResult(
             pipeline_id="", pipeline_url=f"{self.base_url}/{self.job}",
-            status=PipelineStatus.FAILED, infra_failure=True, parsed_output=why,
+            status=PipelineStatus.UNKNOWN, infra_failure=True, parsed_output=why,
         )
 
     def _access(self, doing: str) -> CIResult:
@@ -263,9 +267,10 @@ class JenkinsCI(CIBackend):
         if self.auth == "cookie":
             # Cookie auth already tried a session refresh before surfacing this;
             # the remediation is to (re)establish the SSO session, not a token.
+            # Same UNKNOWN-not-FAILED contract as _infra() above.
             return CIResult(
                 pipeline_id="", pipeline_url=f"{self.base_url}/{self.job}",
-                status=PipelineStatus.FAILED, access_failure=True,
+                status=PipelineStatus.UNKNOWN, access_failure=True,
                 access_env_key="SSO_PASSWORD",
                 parsed_output=(
                     f"Jenkins denied access ({codes}) while {doing} for job "
@@ -280,7 +285,7 @@ class JenkinsCI(CIBackend):
         env_key = "JENKINS_API_TOKEN" if not self.token else "JENKINS_USER"
         return CIResult(
             pipeline_id="", pipeline_url=f"{self.base_url}/{self.job}",
-            status=PipelineStatus.FAILED, access_failure=True,
+            status=PipelineStatus.UNKNOWN, access_failure=True,
             access_env_key=env_key,
             parsed_output=(
                 f"Jenkins denied access ({codes}) while "
