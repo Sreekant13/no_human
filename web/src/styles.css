@@ -3102,6 +3102,61 @@ a.so-chip-value:hover { color: var(--accent-300); }
      its own --bg-panel fill.) The ramp above clears it: dim is 5.06:1 dark and
      4.86:1 light here. It used to be 2.49:1 / 4.46:1 — light was failing too. */
 }
+/* Feature #1: the pre-flight feasibility card — advisory, so it wears the
+   ACCENT (not the decision panel's alarm red). One honest line + one button. */
+.feasibility-card {
+  margin: 0 var(--sp-6) var(--sp-4);
+  padding: 13px 16px 15px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  background: var(--bg-card);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.feasibility-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.feasibility-msg { margin: 0; font-size: 0.95rem; color: var(--text); }
+.feasibility-actions { display: flex; }
+
+/* Feature #1: the split-review modal's editable proposed sub-tasks. */
+.split-modal { max-width: 560px; width: 92vw; }
+.split-drafts {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 4px 0 8px;
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.split-draft {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.split-draft-title,
+.split-draft-desc {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-card);
+  color: var(--text);
+  font-family: inherit;
+}
+.split-draft-title { font-weight: 600; font-size: 0.95rem; }
+.split-draft-desc { font-size: 0.88rem; resize: vertical; }
+.split-draft-contract { font-size: 0.8rem; color: var(--text-muted); }
+
 .decision-head {
   display: flex;
   align-items: center;

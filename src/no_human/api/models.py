@@ -785,8 +785,12 @@ class CancelRequest(BaseModel):
 class SplitDraft(BaseModel):
     # One proposed sub-task in a 1-click split. `title` is required; the human
     # may have edited any field in the split-review screen before confirming.
+    # `contract` is the split proposer's interface/dependency note (what this
+    # sub-task exposes to or expects from the others) — folded into the child's
+    # description so the coder keeps it, per the review (it would otherwise drop).
     title: str
     description: str | None = None
+    contract: str | None = None
     acceptance_criteria: list[str] = []
 
 

@@ -913,11 +913,17 @@ async def split_task(
     # claimable, so the children can be created without a live sibling.
     children: list[Task] = []
     for d in drafts:
+        # Fold the proposer's contract into the description so the coder keeps
+        # it (the child task has no contract field of its own).
+        desc = (d.description or "").strip()
+        contract = (d.contract or "").strip()
+        if contract:
+            desc = f"{desc}\n\nContract: {contract}".strip()
         child = Task.new(
             title=(d.title or "").strip(),
             source="board",
             repo_path=task.repo_path,
-            description=(d.description or "").strip() or None,
+            description=desc or None,
             kind=task.kind,
             parent_id=task.id,
         )
@@ -948,6 +954,24 @@ async def split_task(
         "tasks": [t.model_dump() for t in tasks],
     })
     return out
+
+
+@app.get("/api/tasks/{task_id}/split-drafts")
+async def get_split_drafts(task_id: str, request: Request) -> dict[str, Any]:
+    """Generate 2-4 sub-task drafts for the split-review screen.
+
+    LAZY: the single utility-model call runs only when the human opens the split
+    screen, never at task creation — so a task nobody splits costs nothing.
+    Returns ``{"drafts": [{title, description, contract}]}``, or ``{"drafts":
+    []}`` when the proposer produced nothing parseable (the UI shows a
+    "couldn't draft a split" state rather than an error).
+    """
+    store = _store(request)
+    task = await _require_task(store, task_id)
+    from ..intake.split_proposal import generate_split_drafts
+    files = ((task.context or {}).get("spec") or {}).get("files_to_change")
+    drafts = await generate_split_drafts(task, files_to_change=files)
+    return {"drafts": drafts or []}
 
 
 async def _record_intake_spend(store, site: str, model: str | None, obj) -> None:

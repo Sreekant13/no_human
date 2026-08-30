@@ -190,7 +190,9 @@ FROZEN_FILE_LINES = {
     # split creates the confirmed sub-task drafts as child tasks (feature #1).
     # 5572 -> 5596 (+24): the /split reservation race-fix (cancel-parent-first CAS).
     # 5596 -> 5615 (+19): create-time feasibility-hint wiring (feature #1).
-    "api/app.py": 5615,
+    # 5615 -> 5639 (+24): GET /split-drafts (lazy draft generation) + the
+    # contract-fold into child descriptions (feature #1 UI backend).
+    "api/app.py": 5639,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

@@ -195,3 +195,33 @@ test("saveModels throws the server's 422 detail verbatim, and nothing else", asy
   assert.ok(err instanceof Error);
   assert.equal(err.message, detail);
 });
+
+
+// Feature #1: the split's two calls, exercised for real against a stubbed fetch.
+import { fetchSplitDrafts, splitTask } from "./api.js";
+
+test("fetchSplitDrafts GETs the drafts endpoint and returns the drafts", async () => {
+  const calls = stubFetch({ status: 200, body: { drafts: [{ title: "A" }, { title: "B" }] } });
+  const out = await fetchSplitDrafts("t9");
+  assert.equal(calls[0].url, "/api/tasks/t9/split-drafts");
+  assert.deepEqual(out.drafts.map((d) => d.title), ["A", "B"]);
+});
+
+test("splitTask POSTs the confirmed drafts and returns the children", async () => {
+  let sentBody;
+  globalThis.fetch = async (url, opts) => {
+    sentBody = JSON.parse(opts.body);
+    assert.equal(String(url), "/api/tasks/t9/split");
+    assert.equal(opts.method, "POST");
+    return { ok: true, status: 201, json: async () => [{ id: "c1" }, { id: "c2" }] };
+  };
+  const children = await splitTask("t9", [{ title: "A" }, { title: "B" }]);
+  assert.deepEqual(sentBody, { drafts: [{ title: "A" }, { title: "B" }] });
+  assert.deepEqual(children.map((c) => c.id), ["c1", "c2"]);
+});
+
+test("splitTask surfaces the server's 409 reason, not a bare status", async () => {
+  stubFetch({ status: 409, body: { detail: "task is no longer pending — it started running or was already split" } });
+  await assert.rejects(splitTask("t9", [{ title: "A" }, { title: "B" }]),
+    /no longer pending/);
+});

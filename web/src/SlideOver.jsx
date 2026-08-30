@@ -3,7 +3,7 @@ import {
   approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
   fetchTask, fetchTaskEvents, finishReview,
   pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
-  connectTaskSSE, connectTaskProgress,
+  connectTaskSSE, connectTaskProgress, fetchSplitDrafts, splitTask,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
@@ -73,6 +73,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const [replyMsg, setReplyMsg] = useState("");
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelReason, setCancelReason] = useState("");
+  const [splitOpen, setSplitOpen] = useState(false);   // feature #1 split-review
   const closeSb = useCallback(() => setSbOpen(false), []);
   const closeReply = useCallback(() => setReplyOpen(false), []);
   const closeCancel = useCallback(() => setCancelOpen(false), []);
@@ -491,6 +492,18 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             bar below still leads with Approve/Reply/etc. */}
         {task && <TaskSummary task={task} isActive={isLive} />}
 
+        {/* Pre-flight feasibility (feature #1): only while the task is still
+            PENDING and the create-time hint offered a mitigation — a task
+            already running is past the point of splitting. Advisory: it offers
+            a 1-click split, never blocks. */}
+        {task && task.status === "pending"
+          && (task.context || {}).feasibility_hint?.offer === "split" && (
+          <FeasibilityCard
+            hint={task.context.feasibility_hint}
+            onSplit={() => setSplitOpen(true)}
+          />
+        )}
+
         {/* Decision panel — the one thing to act on, promoted above the
             accordion. Only when the task is parked with a blocker; carries the
             plain-language ask + one-click actions so the operator never has to
@@ -757,11 +770,127 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         </div>
       )}
+
+      {splitOpen && task && (
+        <SplitReview
+          taskId={taskId}
+          onClose={() => setSplitOpen(false)}
+          onDone={() => { setSplitOpen(false); onClose?.(); }}
+        />
+      )}
     </>
   );
 }
 
 /* ── sub-components ───────────────────────────────────────────────────────── */
+
+// Feature #1: the pre-flight feasibility card. Advisory — a band and one honest
+// line ("X% of similar tasks finished in one pass") + a single button. Never a
+// gate; the user can always ignore it and run the task.
+function FeasibilityCard({ hint, onSplit }) {
+  return (
+    <div className="feasibility-card" role="region" aria-label="Task size">
+      <div className="feasibility-eyebrow">Before you start</div>
+      <p className="feasibility-msg ph-no-capture">{hint.message}</p>
+      <div className="feasibility-actions">
+        <button className="btn btn-approve" onClick={onSplit}>
+          Split into sub-tasks
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Feature #1: the split-review modal. Lazily fetches the proposed 2-4 sub-tasks
+// (generated server-side only now), lets the human edit them, and creates the
+// confirmed set with one click. On success the original is cancelled, so the
+// drawer closes.
+function SplitReview({ taskId, onClose, onDone }) {
+  const [drafts, setDrafts] = useState(null);   // null=loading, []=none, [...]=ready
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchSplitDrafts(taskId)
+      .then((r) => { if (!cancelled) setDrafts(r.drafts || []); })
+      .catch((e) => { if (!cancelled) { setErr(e.message); setDrafts([]); } });
+    return () => { cancelled = true; };
+  }, [taskId]);
+
+  function edit(i, field, value) {
+    setDrafts((ds) => ds.map((d, j) => (j === i ? { ...d, [field]: value } : d)));
+  }
+
+  async function create() {
+    if (!drafts || drafts.length < 2 || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await splitTask(taskId, drafts.map((d) => ({
+        title: (d.title || "").trim(),
+        description: d.description || null,
+        contract: d.contract || null,
+      })));
+      onDone();
+    } catch (e) {
+      setErr(e.message || "split failed");
+      setBusy(false);
+    }
+  }
+
+  const ready = drafts && drafts.length >= 2;
+  const canCreate = ready && drafts.every((d) => (d.title || "").trim()) && !busy;
+  return (
+    <div className="sendback-overlay" data-nested-modal onMouseDown={keepFocusInDialog}>
+      <div className="sendback-modal split-modal" role="dialog" aria-modal="true"
+           aria-label="Split into sub-tasks">
+        <div className="sendback-label">Split into sub-tasks</div>
+        {drafts === null && <p className="reply-context">Drafting a split…</p>}
+        {drafts && drafts.length === 0 && (
+          <p className="reply-context">
+            Couldn’t draft a split — cancel and run the task as it is, or edit it first.
+          </p>
+        )}
+        {ready && (
+          <div className="split-drafts ph-no-capture">
+            {drafts.map((d, i) => (
+              <div className="split-draft" key={i}>
+                <input
+                  className="split-draft-title"
+                  value={d.title || ""}
+                  onChange={(e) => edit(i, "title", e.target.value)}
+                  aria-label={`Sub-task ${i + 1} title`}
+                />
+                <textarea
+                  className="split-draft-desc"
+                  value={d.description || ""}
+                  onChange={(e) => edit(i, "description", e.target.value)}
+                  rows={2}
+                  aria-label={`Sub-task ${i + 1} description`}
+                />
+                {d.contract && (
+                  <div className="split-draft-contract">Why this split: {d.contract}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {err && <div className="decision-choice-err">{err}</div>}
+        <div className="sendback-actions">
+          <button className="btn btn-sendback" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          {ready && (
+            <button className="btn btn-approve" onClick={create} disabled={!canCreate}>
+              {busy ? "Creating…" : `Create these ${drafts.length} tasks`}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // `msg` is either a plain string (the lifecycle/reply flows) or the
 // { text, role, tone } shape approvalFeedback returns. The role makes it a live

@@ -110,6 +110,32 @@ export async function finishReview(id) {
   return r.json();
 }
 
+// Feature #1 — the 1-click split. `fetchSplitDrafts` lazily generates the 2-4
+// proposed sub-tasks (a utility-model call runs server-side only when the split
+// screen opens); `splitTask` creates the human-confirmed set as child tasks and
+// cancels the original.
+export async function fetchSplitDrafts(id) {
+  const r = await fetch(`${BASE}/api/tasks/${id}/split-drafts`);
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `GET split-drafts → ${r.status}`));
+  }
+  return r.json();   // { drafts: [{title, description, contract}] }
+}
+
+export async function splitTask(id, drafts) {
+  const r = await fetch(`${BASE}/api/tasks/${id}/split`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ drafts }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `POST split → ${r.status}`));
+  }
+  return r.json();   // [child TaskSummaryOut]
+}
+
 export async function replyTask(id, answer) {
   const r = await fetch(`${BASE}/api/tasks/${id}/reply`, {
     method: "POST",
