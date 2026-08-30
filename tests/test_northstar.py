@@ -535,6 +535,47 @@ def test_goal_prompt_states_the_missing_input_rule():
         assert rule_idx < marker_idx
 
 
+def test_judge_calibration_records_the_2026_08_23_audit_below_the_bar():
+    """A second model evidence-audit ran 2026-08-23 (operator-directed), blind
+    from primary evidence, and disagreed with the judge beyond the κ ≥ 0.8
+    bar. JUDGE_CALIBRATION.md's own purpose is that calibration attempts are
+    recorded so nobody reconstructs them from memory — pin every number, the
+    three disagreement rows, the unscoreable row, and all three confounds, and
+    pin that the Bottom line still declares the human calibration not done."""
+    text = (Path(__file__).resolve().parents[1] / "eval"
+            / "JUDGE_CALIBRATION.md").read_text()
+
+    # Numbers verbatim.
+    for needle in ("2026-08-23", "opus5-2026-07-26-post12merges", "0.8421",
+                   "16/19", "0.5042", "0.682", "19", "10 lowest-task-id"):
+        assert needle in text, f"missing {needle!r}"
+
+    # The unscoreable row.
+    assert "ns-49db751d" in text and "cant-tell" in text
+
+    # The three disagreement rows, each with its judge-error classification.
+    assert "ns-10c30dec" in text and "false-positive" in text
+    assert "ns-90b6ff3c" in text and "false-negative" in text
+    assert "ns-9d9d9572" in text and "false-negative" in text
+
+    # The three confounds, stated verbatim.
+    assert "same model family as the judge" in text
+    assert "human slot REMAINS OPEN" in text
+    assert "event streams" in text
+    assert "different (arguably richer) evidence base" in text
+    assert "stratified 10/10" in text
+    assert "not an unbiased corpus-level estimate" in text
+
+    # Bottom line intact: human calibration still declared not done.
+    assert "has NOT been calibrated against a human" in text
+    assert "human calibration (κ ≥ 0.8)" in text and "not done" in text
+    assert "κ ≥ 0.8" in text
+    assert "the human calibration happened" not in text
+
+    # The bar itself is untouched, not restated inside the new section.
+    assert text.count("**κ ≥ 0.8**") == 1
+
+
 class _JudgeBackend:
     """Fake backend: returns `replies` in order. A reply is a str (final_text,
     is_error=False) or a (str, is_error) tuple."""

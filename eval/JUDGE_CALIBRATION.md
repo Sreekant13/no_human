@@ -8,7 +8,7 @@ has to reconstruct it from memory — and, more importantly, so the gap between
 what was checked and what a calibration would need stays visible.
 
 **Bottom line, stated first: the judge has NOT been calibrated against a human.
-One model evidence-audit exists. It is not a substitute, and the target below
+Two model evidence-audits exist. Neither is a substitute, and the target below
 is still open.**
 
 ## The target this is measured against
@@ -71,6 +71,58 @@ can clear the judge of internal incoherence. It cannot clear it of a blind spot
 the two share — which is exactly the failure mode a same-family rater is worst
 placed to see. The human label slots remain open and the gate remains unmet.
 
+## What was done — second model evidence-audit, 2026-08-23 (operator-directed)
+
+Run `opus5-2026-07-26-post12merges` again, on a **stratified 20-row sample**:
+the 10 lowest-task-id `goal_satisfied=true` rows and the 10 lowest-task-id
+`goal_satisfied=false` rows, non-crashed.
+
+Protocol:
+
+1. Labeler: a fresh-context Claude agent, labeling **BLIND from primary
+   evidence only** — each row's request title, terminal status,
+   `expected_escalation` flag, and full event stream (state transitions, gate
+   results, escalation rationales).
+2. The judge's verdict and notes were **STRIPPED** from what the labeler saw.
+3. "Can't tell" rows are excluded and recorded as unscoreable, per the target
+   above.
+
+| | |
+|---|---|
+| sample | 20 stratified rows (10 satisfied / 10 not-satisfied, lowest task id) |
+| unscoreable | 1 (`ns-49db751d`) |
+| scoreable pairs `n` | 19 |
+| observed agreement `p_o` | 0.8421 (16/19) |
+| chance agreement `p_e` | 0.5042 |
+| **κ (audit)** | **0.682 — BELOW the 0.8 bar** |
+
+### The unscoreable row
+`ns-49db751d` — cant-tell: a diagnosis-only `done` with no reviewer
+verification, wrapped up under a budget nudge.
+
+### The three disagreements — each a plausible judge error
+* `ns-10c30dec` — judge **satisfied**; labeler: BUDGET_EXHAUSTED thrash
+  aborted mid-implementation, WIP-BLOCKED. Judge **false-positive** candidate.
+* `ns-90b6ff3c` — judge **unsatisfied**; labeler: the commit-and-push was
+  completed and verified via `git ls-remote`, reviewer PASS. Judge
+  **false-negative** candidate.
+* `ns-9d9d9572` — judge **unsatisfied**; labeler: script + output delivered,
+  +2 passing tests, review PASS. Judge **false-negative** candidate.
+
+### Confounds — stated so the number is not over-read
+(a) the labeler is the **same model family as the judge**, so this is
+model-vs-model agreement, NOT the human κ the bar above defines — **the
+human slot REMAINS OPEN**; (b) the labeler judged from harness **event streams**,
+a different (arguably richer) evidence base than the judge used; (c) the
+sample is **stratified 10/10**, so κ here measures agreement on this sample
+and is not an unbiased corpus-level estimate.
+
+### What it means
+Even a same-family model reading primary evidence disagrees with the judge
+beyond the bar, so the published 47%'s judge-scored caveat is UNDERSTATED if
+anything; the three disagreement rows are concrete audit targets for
+judge-prompt improvement.
+
 ## The one finding worth acting on
 
 **The judge applies two different standards to specs whose inputs do not exist
@@ -95,6 +147,7 @@ policy per spec.
 | | |
 |---|---|
 | model evidence-audit | done, 2026-08-03, κ_audit = 1.00 over 20 pairs |
+| second model evidence-audit (blind, primary evidence) | done, 2026-08-23, κ = 0.682 over 19 pairs — **below the bar** |
 | human calibration (κ ≥ 0.8) | **not done** — sheet with the operator, slots empty |
 | missing-input rule for the judge | done — explicit policy paragraph in `build_goal_prompt`, `src/no_human/eval/judge.py` (pinned by `tests/test_northstar.py::test_goal_prompt_states_the_missing_input_rule`) |
 
