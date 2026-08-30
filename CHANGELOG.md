@@ -4,7 +4,70 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — 0.1.7
+## [0.1.8] — 2026-08-30
+
+The pre-flight release. no_human now reads a new task before you start it: when
+it looks large or spread across many surfaces, the board says so honestly — with
+the band of how often similar tasks finished in one pass, never a promise — and
+offers a one-click split into scoped sub-tasks you edit before creating. The
+coder backend is selectable from the board, and the codex backend stops leaking
+a file descriptor per attempt.
+
+### Added
+
+- **Pre-flight feasibility hint + 1-click split.** A new task that looks large or
+  multi-surface gets an advisory card ("this looks large") showing the free
+  signal — the share of similar tasks that finished in one pass — and a
+  "Split into sub-tasks" button that drafts 2–8 scoped children you can edit
+  before creating them. Purely advisory: nothing is gated, and the honest copy
+  never claims the task will fail.
+- **Coder-backend selector in the board.** The coder backend (Claude / Codex /
+  local) is now selectable from Settings, not only from the CLI and API — a user
+  who installed a local model can finally reach it from the UI.
+- **Configurable worker count** in Settings, and a **Settings/onboarding pass**:
+  clearer first-run/model panes and a redesigned running-task digest on top of
+  the 0.1.7 running-task screen.
+
+### Changed — cost accounting
+
+- **Codex attempts are priced server-side** at OpenAI rates instead of being
+  billed at Anthropic's flat rate, so per-task cost is honest across backends.
+- **The tamper base is `origin/<base>...HEAD`**, so a sanctioned merge is no
+  longer charged with main's already-landed edits.
+
+### Fixed — reliability
+
+- **The deployed-0.1.7 update stall is fixed** — installing a new build while a
+  task is in flight no longer wedges the scheduler behind a dead sibling.
+- **The codex backend no longer leaks a file descriptor per attempt** — the
+  subprocess transport is closed on teardown.
+- **Reviewer-worktree integrity guard** now catches `git update-index
+  --assume-unchanged` on a tracked source file (the one thing it exists to
+  catch), and no longer discards a verdict on a benign `.git/common/config`
+  reserialization.
+- **The safety guard peels `timeout`/`xargs`/`nice`/`stdbuf` wrappers**, so a
+  wrapped destructive command in an already-denied compound classifies
+  DESTRUCTIVE, not HYGIENE.
+- **A quota wall in a verifier/supervisor call is classified QUOTA and parked**,
+  not misreported as an infra failure; the tamper adjudicator gets one bounded
+  retry on a mechanical failure instead of returning CANNOT_DECIDE; a failed
+  `head_sha()` no longer clobbers a real "behind HEAD" verdict.
+- **The Jenkins CI adapter reports an infra/access error as UNKNOWN, not
+  FAILED.**
+
+### Changed — privacy & telemetry
+
+- **Dead-click and heatmap capture are pinned off** in the analytics init; the
+  never-pre-tick proposals privacy guard now lives in Settings.
+
+### Fixed — tests & docs
+
+- Handoff-family mutation-test gaps are covered (assertions made to bite), three
+  order-dependent tests were made hermetic, and doc citations were re-anchored to
+  symbols rather than line numbers.
+- The Claude-credential paragraph was dropped from the README Install section.
+
+## [0.1.7] — 2026-08-30
 
 Server/fleet reliability + cost-observability work landed after the 0.1.6 cut
 (068db272). Each change landed behind an independent fresh-context review.
