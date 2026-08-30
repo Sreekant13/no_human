@@ -82,6 +82,8 @@ test("consent → posthog-js imported once, init gets the exact masking options"
     autocapture: false,
     capture_pageview: false,
     capture_pageleave: false,
+    capture_dead_clicks: false,
+    capture_heatmaps: false,
     session_recording: { maskAllInputs: true },
     person_profiles: "never",
     bootstrap: { distinctID: "inst-uuid" },
@@ -90,6 +92,10 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   assert.equal(options.autocapture, false, "$el_text channel must be disabled");
   assert.equal(options.capture_pageview, false, "implicit $pageview must be disabled");
   assert.equal(options.capture_pageleave, false, "implicit $pageleave must be disabled");
+  assert.equal(options.capture_dead_clicks, false,
+    "$dead_click must not fall through to the PostHog project's server-side setting");
+  assert.equal(options.capture_heatmaps, false,
+    "$$heatmap must not fall through to the PostHog project's server-side setting");
   assert.equal(options.session_recording.maskTextSelector, undefined,
     "maskTextSelector matches zero elements in this UI and must not be configured");
 

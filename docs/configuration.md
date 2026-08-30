@@ -596,11 +596,15 @@ never minted in, or accepted from, the browser) and `app_version`. No person
 profiles are created (`person_profiles: "never"`); events are not linked to
 any human identity.
 
-**Autocapture is off.** `autocapture`, `capture_pageview` and
-`capture_pageleave` are all disabled in the PostHog client init
-(`web/src/telemetry.js`), so no click/change/submit element text and no
-implicit page-view events are ever collected — only the seven event kinds
-above, ever.
+**Autocapture is off.** `autocapture`, `capture_pageview`,
+`capture_pageleave`, `capture_dead_clicks` and `capture_heatmaps` are all
+disabled in the PostHog client init (`web/src/telemetry.js`), so no
+click/change/submit element text, no implicit page-view events and no
+element-level dead-click/heatmap events are ever collected — only the seven
+event kinds above, ever. The last two are pinned in the client because their
+posthog-js default defers to the PostHog project's server-side setting;
+pinning them means a dashboard toggle cannot reintroduce element events
+without a code change.
 
 **Session replay, honestly stated.** When telemetry is on, PostHog session
 recording captures the app's own interface. All form inputs are masked

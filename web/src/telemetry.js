@@ -16,7 +16,8 @@
 //    hand-applied to every element that renders operator content: task
 //    titles, specs/descriptions, diffs, activity logs, the composer,
 //    backlog ticket titles. Never your code. (No blanket text-mask selector
-//    is configured — see the removal note on `maskTextSelector` below.)
+//    is configured: `maskTextSelector` would match zero elements in this UI,
+//    so it is deliberately unset — pinned by web/src/telemetry.test.mjs.)
 //  - ONE IDENTIFIER: events are tagged with the same anonymous `instance_id`
 //    as the server channel (registered below), not PostHog's own generated
 //    device id. NO PERSON PROFILES: person_profiles "never".
@@ -60,6 +61,15 @@ export async function initTelemetry(cfg, { importer } = {}) {
       autocapture: false,
       capture_pageview: false,
       capture_pageleave: false,
+      // Two lazily-loaded element-level channels whose PostHog CLIENT default
+      // is "ask the project's SERVER-side setting" (posthog-js 1.417.1:
+      // dead-clicks-autocapture.js isDeadClicksEnabledForAutocapture, and
+      // heatmaps.js isEnabled falling through to _enabledServerSide). Left
+      // unset, a dashboard toggle alone would reintroduce $dead_click and
+      // $$heatmap element events with no code change. Pinned false here so
+      // the published event list is client-enforced, not dashboard-dependent.
+      capture_dead_clicks: false,
+      capture_heatmaps: false,
       session_recording: { maskAllInputs: true },
       person_profiles: "never",
       ...(consent.instanceId ? { bootstrap: { distinctID: consent.instanceId } } : {}),
