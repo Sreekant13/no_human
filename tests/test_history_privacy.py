@@ -698,11 +698,25 @@ def test_api_marks_every_proposal_unselected():
 def test_spa_does_not_pre_tick_proposals():
     """Client side. The line that shipped the defect selected every proposal id:
         setChosenRules(new Set((an.proposals || []).map((p) => p.id)))
-    """
-    src = (Path(__file__).resolve().parents[1]
-           / "web" / "src" / "Onboarding.jsx").read_text(encoding="utf-8")
-    assert "setChosenRules(new Set((an.proposals || []).map((p) => p.id)))" not in src
-    assert "filter((p) => p.selected === true)" in src
+
+    The AI-learnings / proposals review moved OUT of onboarding into Settings'
+    LearningsPanel (2026-08-30 — onboarding trimmed 8->6 steps); the never-pre-
+    tick guard moved with it. So this guards both ends: the onboarding pre-tick
+    defect must never return, AND the LearningsPanel must start with NOTHING
+    selected and confirm only the proposals a human explicitly ticked."""
+    root = Path(__file__).resolve().parents[1] / "web" / "src"
+    onboarding = (root / "Onboarding.jsx").read_text(encoding="utf-8")
+    settings = (root / "Settings.jsx").read_text(encoding="utf-8")
+    learning = (root / "learningCard.js").read_text(encoding="utf-8")
+    # The exact pre-tick defect must never come back to onboarding.
+    assert "setChosenRules(new Set((an.proposals || []).map((p) => p.id)))" not in onboarding
+    # The proposals-review UI (now the Settings LearningsPanel) starts with an
+    # EMPTY selection set — nothing is pre-ticked...
+    assert "const [selected, setSelected] = useState(() => new Set())" in settings
+    # ...and a bulk confirm acts ONLY on that explicit selection, never on all
+    # visible proposals (bulkConfirmIds keeps only ids the human ticked).
+    assert "bulkConfirmIds(visible, selected)" in settings
+    assert "chosen.has(id)" in learning
 
 
 def test_pii_bearing_messages_are_dropped_before_the_llm_prompt():
