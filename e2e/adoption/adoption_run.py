@@ -934,11 +934,13 @@ def build_ctx(args) -> Ctx:
 # Full mode — real task execution
 # --------------------------------------------------------------------------- #
 
-# The product's OWN indicative cost model, mirrored from `costOf` in
-# web/src/cost.js so that a number this harness prints and a number the board
-# prints cannot disagree. NOT a rate table invented here: fresh in/out tokens
-# and cache CREATION at full price, a cache READ at a tenth. `test_adoption.py`
-# pins these two constants to the ones in cost.js so they cannot drift apart.
+# The product's OWN indicative cost model: the flat Sonnet-coder rate ($3/1M
+# fresh, a cache READ at a tenth). NOT a rate table invented here. PR #869 moved
+# exact pricing server-side (per-model, MODEL_PRICES_USD_PER_MTOK) and the board
+# now only formats server-computed dollars, so this harness — which runs in a
+# curated persona PATH with no_human absent and can't call that server pricing —
+# keeps the flat rate locally. `test_adoption_harness.py` pins it to the
+# product's Sonnet INPUT price so the two cannot drift apart.
 RATE_FRESH_PER_TOKEN = 0.003 / 1000
 RATE_CACHE_READ_PER_TOKEN = 0.0003 / 1000
 

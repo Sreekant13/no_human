@@ -39,21 +39,24 @@ def _importable():
 def test_cost_model_matches_the_products_own():
     """The harness must not invent a second cost model.
 
-    `web/src/cost.js` is the single home for indicative dollars — the comment
-    in it records two separate incidents of surfaces quoting blended rates that
-    disagreed. The harness mirrors those constants; this pins the mirror, so a
-    rate change in cost.js fails here instead of silently producing an adoption
-    report priced differently from the board.
+    The harness prints an INDICATIVE dollar figure at the product's flat
+    Sonnet-coder rate ($3/1M fresh, a tenth for cache reads). Until PR #869 the
+    single home for that rate was `web/src/cost.js`; #869 moved exact pricing
+    server-side (per-model, `MODEL_PRICES_USD_PER_MTOK`) and the board now only
+    formats server-computed dollars. So the harness's flat indicative rate is
+    pinned against the product's Sonnet INPUT price instead — a rate change
+    there fails here rather than silently pricing the adoption report
+    differently from the product. (The harness can't call the per-model server
+    pricing: it runs in a curated persona PATH with no_human absent, so it keeps
+    a local flat rate; this test is what stops that rate from drifting.)
     """
     import adoption_run
+    from no_human.core.pricing import MODEL_PRICES_USD_PER_MTOK
 
-    js = (REPO_ROOT / "web" / "src" / "cost.js").read_text()
-    fresh = re.search(r"RATE_FRESH_PER_TOKEN\s*=\s*([0-9.]+)\s*/\s*1000", js)
-    cached = re.search(r"RATE_CACHE_READ_PER_TOKEN\s*=\s*([0-9.]+)\s*/\s*1000", js)
-    assert fresh and cached, "cost.js no longer declares its rates as expected"
-
-    assert adoption_run.RATE_FRESH_PER_TOKEN == float(fresh.group(1)) / 1000
-    assert adoption_run.RATE_CACHE_READ_PER_TOKEN == float(cached.group(1)) / 1000
+    sonnet_in_usd_per_mtok = MODEL_PRICES_USD_PER_MTOK["claude-sonnet-5"][0]
+    assert adoption_run.RATE_FRESH_PER_TOKEN == pytest.approx(sonnet_in_usd_per_mtok / 1_000_000)
+    # Cache reads price at a tenth of the fresh rate.
+    assert adoption_run.RATE_CACHE_READ_PER_TOKEN == pytest.approx(sonnet_in_usd_per_mtok / 1_000_000 / 10)
     # And the composition, not just the constants: a cache read is a tenth.
     assert adoption_run.cost_of(1000, 0, 0) == pytest.approx(0.003)
     assert adoption_run.cost_of(0, 1000, 0) == pytest.approx(0.003)
