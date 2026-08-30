@@ -57,12 +57,24 @@ TAMPER = _verdict(
 UNSURE = _verdict('{"verdict": "CANNOT_DECIDE", "uncertainty": "no criterion '
                   'mentions the deleted file"}')
 
+#: Mechanical-failure shapes — the judge NEVER SPOKE. Each exercises one
+#: distinct branch of `tamper_adjudication.is_mechanical_failure`.
+MAX_TURNS_TAIL = (
+    "I'll take a look at this... Claude Code returned an error result: "
+    "Reached maximum number of turns (1)"
+)
+EMPTY = ""
+#: Doubt shapes — the judge spoke and said nothing usable. Never retried.
+HEDGED = "Hard to say, honestly. Could go either way. I'd lean towards fine."
+UNPARSEABLE = "ADJUDICATION_JSON_START {this is not json at all"
+
 
 class _FakeAgentResult:
-    def __init__(self, final_text: str):
+    def __init__(self, final_text: str, *, is_error: bool = False,
+                 stop_reason: str = "end_turn"):
         self.final_text = final_text
-        self.is_error = False
-        self.stop_reason = "end_turn"
+        self.is_error = is_error
+        self.stop_reason = stop_reason
         self.num_turns = 1
         self.tokens_used = 1234
         self.cache_read_tokens = 0
@@ -72,10 +84,15 @@ class _FakeAgentResult:
 
 
 class _RecordingBackend:
-    """Replays canned adjudication verdicts and keeps every prompt it saw."""
+    """Replays canned adjudication results and keeps every prompt it saw.
 
-    def __init__(self, *verdicts: str):
-        self._verdicts = list(verdicts)
+    Each item is either a verdict string (wrapped in a default, no-error
+    `_FakeAgentResult`) or a pre-built `_FakeAgentResult` — the latter lets a
+    test hand back an `is_error=True` / empty-text mechanical-failure shape.
+    """
+
+    def __init__(self, *results):
+        self._results = list(results)
         self.prompts: list[str] = []
         self.turns: list[int] = []
 
@@ -83,9 +100,9 @@ class _RecordingBackend:
                   on_event=None, **kw):
         self.prompts.append(prompt)
         self.turns.append(max_turns)
-        return _FakeAgentResult(
-            self._verdicts.pop(0) if len(self._verdicts) > 1
-            else self._verdicts[0])
+        item = (self._results.pop(0) if len(self._results) > 1
+                else self._results[0])
+        return item if isinstance(item, _FakeAgentResult) else _FakeAgentResult(item)
 
 
 class _CrashingBackend:
@@ -432,6 +449,171 @@ async def test_the_off_switch_restores_the_old_escalation(store, tmp_path):
     assert outcome.status is TaskStatus.ESCALATED
     assert "test-tampering detected" in (await store.get_task(task.id)).blocker[
         "evidence"] + outcome.detail
+
+
+# --------------------------------------------------------------------------- #
+# 3a. The bounded retry contract: the judge never spoke vs. the judge spoke
+#     and hedged. Mirrors verifiers.py's run_verifiers no-verdict retry
+#     (b4db79d66), not shared code with it.
+# --------------------------------------------------------------------------- #
+
+def test_is_mechanical_failure_classifies_each_shape():
+    """Pure unit ablation lever: remove `is_mechanical_failure`'s is_error/
+    empty/marker branches and only this test (and the retry-count tests
+    below) should go red — `parse()`'s own CANNOT_DECIDE-on-doubt default is
+    untouched either way."""
+    # A parseable verdict always outranks every mechanical signal.
+    assert ta.is_mechanical_failure(LEGIT, is_error=True) is False
+    # The judge never spoke: empty response.
+    assert ta.is_mechanical_failure("", is_error=False) is True
+    # The judge never spoke: transport/is_error result, regardless of text.
+    assert ta.is_mechanical_failure("garbled but present", is_error=True) is True
+    # The judge never spoke: the backend's own max-turns tail text.
+    assert ta.is_mechanical_failure(MAX_TURNS_TAIL, is_error=False) is True
+    # The judge spoke and hedged: doubt, not mechanical.
+    assert ta.is_mechanical_failure(HEDGED, is_error=False) is False
+    # The judge spoke and delivered something unparseable: doubt, not
+    # mechanical.
+    assert ta.is_mechanical_failure(UNPARSEABLE, is_error=False) is False
+
+
+async def test_a_max_turns_death_buys_exactly_one_retry(store, tmp_path):
+    backend = _RecordingBackend(
+        _FakeAgentResult(MAX_TURNS_TAIL, is_error=False), LEGIT)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1, ta.RETRY_TURNS], (
+        "exactly one retry, at the bounded budget, after a max-turns death")
+    assert outcome is None, "the retry's genuine LEGITIMATE verdict must be used"
+
+
+async def test_an_is_error_result_buys_exactly_one_retry(store, tmp_path):
+    backend = _RecordingBackend(
+        _FakeAgentResult("the session errored", is_error=True), LEGIT)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1, ta.RETRY_TURNS]
+    assert outcome is None
+
+
+async def test_an_empty_response_buys_exactly_one_retry(store, tmp_path):
+    backend = _RecordingBackend(_FakeAgentResult(EMPTY), LEGIT)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1, ta.RETRY_TURNS]
+    assert outcome is None
+
+
+async def test_a_hedged_but_delivered_answer_is_doubt_and_is_never_retried(
+    store, tmp_path
+):
+    backend = _RecordingBackend(HEDGED)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1], (
+        "a delivered hedge is doubt, not a transport failure — retrying it "
+        "would be verdict-shopping")
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+
+
+async def test_an_unparseable_but_delivered_answer_is_never_retried(
+    store, tmp_path
+):
+    backend = _RecordingBackend(UNPARSEABLE)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1]
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+
+
+@pytest.mark.parametrize("verdict,expected_status", [
+    (LEGIT, None),
+    (TAMPER, TaskStatus.FAILED),
+])
+async def test_a_genuine_verdict_on_the_first_call_never_retries(
+    store, tmp_path, verdict, expected_status
+):
+    """TEST (e), unit-level regression, mirroring
+    `test_verifiers.py::test_run_verifiers_a_genuine_first_call_failure_never_retries`:
+    a real, parseable verdict on the FIRST call must be used exactly as before
+    the retry existed — no retry fires."""
+    backend = _RecordingBackend(verdict)
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1], (
+        "a genuine verdict on the first call must never trigger a retry")
+    if expected_status is None:
+        assert outcome is None
+    else:
+        assert outcome.status is expected_status
+
+
+async def test_a_genuine_verdict_with_a_stray_is_error_flag_never_retries(
+    store, tmp_path
+):
+    """A parseable ADJUDICATION_JSON block outranks a stray is_error flag —
+    the backend can misreport transport health, but if the judge actually
+    delivered a verdict, retrying it would be verdict-shopping."""
+    backend = _RecordingBackend(_FakeAgentResult(TAMPER, is_error=True))
+    orch = _orch(store, tmp_path, backend)
+
+    outcome = await _fire(orch, await _task(store), tmp_path)
+
+    assert backend.turns == [1]
+    assert outcome.status is TaskStatus.FAILED
+
+
+async def test_a_second_mechanical_failure_parks_with_both_errors_recorded(
+    store, tmp_path
+):
+    backend = _RecordingBackend(
+        _FakeAgentResult(MAX_TURNS_TAIL, is_error=False),
+        _FakeAgentResult(EMPTY, is_error=False),
+    )
+    orch = _orch(store, tmp_path, backend)
+    task = await _task(store)
+
+    outcome = await _fire(orch, task, tmp_path)
+
+    assert backend.turns == [1, ta.RETRY_TURNS]
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+    ctx = await store.merge_context(task.id, {})
+    entry = ctx["tamper_adjudications"][0]
+    assert entry["verdict"] == ta.CANNOT_DECIDE
+    assert "infrastructure failure" in entry["uncertainty"]
+    assert "first: " in entry["uncertainty"]
+    assert "retry: " in entry["uncertainty"]
+
+
+async def test_the_retry_folds_the_first_calls_tokens_into_one_record(tmp_path):
+    """The first call's paid tokens must not vanish when a retry replaces its
+    decision — `_record_review_usage` reads only the returned decision."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    backend = _RecordingBackend(
+        _FakeAgentResult(MAX_TURNS_TAIL, is_error=False), LEGIT)
+
+    decision = await AdversarialReviewer(backend=backend).review(
+        Task(id="t1", source="manual", title="t", description="d"),
+        repo_path=tmp_path, mode="tamper_adjudication",
+        tamper_findings="2 assertions deleted", diff_override="- assert x",
+    )
+
+    assert backend.turns == [1, ta.RETRY_TURNS]
+    assert decision.tokens_used == 2 * 1234, (
+        "the first call's paid tokens must be folded onto the final decision")
 
 
 # --------------------------------------------------------------------------- #

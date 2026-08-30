@@ -379,6 +379,11 @@ class ReviewDecision:
     # disabled — never populated with a fail already turned into a checklist
     # item elsewhere, so this is purely additive record-keeping.
     verifiers: list[dict[str, Any]] = field(default_factory=list)
+    # Set by `_fast_review` when the session ERRORED or never returned a
+    # result at all — the "the judge never spoke" signal, distinct from "it
+    # spoke and said nothing usable". Only the tamper-adjudication branch
+    # reads it; additive and ignored elsewhere (not in `as_dict`).
+    transport_error: bool = False
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
@@ -2127,6 +2132,79 @@ class AdversarialReviewer:
             code_review_timeout=code_review_timeout_seconds(data),
         )
 
+    async def _review_tamper_adjudication(
+        self,
+        task: Task,
+        repo_path: Path,
+        *,
+        tamper_findings: str,
+        diff_override: str | None,
+    ) -> ReviewDecision:
+        # The tamper guard fired and something has to decide whether the
+        # TICKET required those test changes (see `review/tamper_adjudication.py`
+        # for why this exists and what it may not be given). Deliberately the
+        # narrowest call in this class:
+        #
+        #   * SINGLE-TURN, NO TOOLS (`_fast_review`). Every other mode can open
+        #     files; this one must not. The party under suspicion authored the
+        #     commit messages, the PR body and its own session summary, and a
+        #     multi-turn adjudicator would simply go and read its advocacy — the
+        #     mitigation would be a comment rather than a wall.
+        #   * `confirmed_rules` is accepted (the chokepoint always sets it) and
+        #     deliberately NOT threaded into the prompt: a memory-derived rule
+        #     is a channel into a verdict, and this verdict's whole input
+        #     surface is ticket + guard findings + test diff.
+        #   * The tri-state verdict rides on `stages`, not on `passed` alone —
+        #     `passed` cannot distinguish TAMPERING (bounce to the coder) from
+        #     CANNOT_DECIDE (park), and those are different consequences.
+        #   * One bounded retry (`tamper_adjudication.RETRY_TURNS`) fires only
+        #     when the judge never spoke at all (is_error / max-turns death /
+        #     empty response) — the same no-verdict contract `verifiers.py`'s
+        #     `run_verifiers` uses. A delivered-but-hedged or unparseable
+        #     answer is doubt, not a transport failure, and is never retried:
+        #     retrying it would be verdict-shopping.
+        prompt = tamper_adjudication.build_prompt(
+            task,
+            guard_findings=tamper_findings,
+            test_diff=diff_override or "",
+        )
+        decision = await self._fast_review(prompt, repo_path)
+        adj = tamper_adjudication.parse(decision.raw_output)
+        if (adj.verdict == tamper_adjudication.CANNOT_DECIDE
+                and tamper_adjudication.is_mechanical_failure(
+                    decision.raw_output, is_error=decision.transport_error)):
+            # ONE bounded retry, only on the shapes where the judge never
+            # spoke — same contract as verifiers.run_verifiers' no-verdict
+            # retry (b4db79d66). A hedged or unparseable-but-DELIVERED
+            # answer is doubt and stays CANNOT_DECIDE: retrying it would
+            # be verdict-shopping.
+            retry = await self._fast_review(
+                prompt, repo_path, max_turns=tamper_adjudication.RETRY_TURNS)
+            retry_adj = tamper_adjudication.parse(retry.raw_output)
+            # Fold the first call's paid usage onto the decision we
+            # return, or `_record_review_usage` loses it.
+            retry.tokens_used += decision.tokens_used
+            retry.cache_read_tokens += decision.cache_read_tokens
+            retry.cache_creation_tokens += decision.cache_creation_tokens
+            if decision.output_tokens is not None:
+                retry.output_tokens = (
+                    (retry.output_tokens or 0) + decision.output_tokens)
+            if (retry_adj.verdict == tamper_adjudication.CANNOT_DECIDE
+                    and tamper_adjudication.is_mechanical_failure(
+                        retry.raw_output, is_error=retry.transport_error)):
+                retry_adj = tamper_adjudication.after_failed_retry(
+                    adj, retry_adj)
+            decision, adj = retry, retry_adj
+        decision.passed = adj.passes_gate
+        decision.stages = {tamper_adjudication.STAGE_KEY: adj.to_dict()}
+        decision.checklist = [ChecklistItem(
+            f"tamper adjudication: {adj.verdict}",
+            adj.passes_gate,
+            "; ".join(adj.justification or adj.restore
+                      or [adj.uncertainty or "no reason given"]),
+        )]
+        return decision
+
     async def review(
         self,
         task: Task,
@@ -2151,40 +2229,15 @@ class AdversarialReviewer:
         reviewed_sha: str = "",
         reviewed_branch: str = "",
     ) -> ReviewDecision:
-        # Tamper-adjudication mode: the tamper guard fired and something has to
-        # decide whether the TICKET required those test changes (see
-        # `review/tamper_adjudication.py` for why this exists and what it may
-        # not be given). Deliberately the narrowest call in this class:
-        #
-        #   * SINGLE-TURN, NO TOOLS (`_fast_review`). Every other mode can open
-        #     files; this one must not. The party under suspicion authored the
-        #     commit messages, the PR body and its own session summary, and a
-        #     multi-turn adjudicator would simply go and read its advocacy — the
-        #     mitigation would be a comment rather than a wall.
-        #   * `confirmed_rules` is accepted (the chokepoint always sets it) and
-        #     deliberately NOT threaded into the prompt: a memory-derived rule
-        #     is a channel into a verdict, and this verdict's whole input
-        #     surface is ticket + guard findings + test diff.
-        #   * The tri-state verdict rides on `stages`, not on `passed` alone —
-        #     `passed` cannot distinguish TAMPERING (bounce to the coder) from
-        #     CANNOT_DECIDE (park), and those are different consequences.
+        # Tamper-adjudication mode: see `_review_tamper_adjudication` for why
+        # this exists, what it may not be given, and the bounded-retry
+        # contract on transport failures.
         if mode == "tamper_adjudication":
-            prompt = tamper_adjudication.build_prompt(
-                task,
-                guard_findings=tamper_findings,
-                test_diff=diff_override or "",
+            return await self._review_tamper_adjudication(
+                task, repo_path,
+                tamper_findings=tamper_findings,
+                diff_override=diff_override,
             )
-            decision = await self._fast_review(prompt, repo_path)
-            adj = tamper_adjudication.parse(decision.raw_output)
-            decision.passed = adj.passes_gate
-            decision.stages = {tamper_adjudication.STAGE_KEY: adj.to_dict()}
-            decision.checklist = [ChecklistItem(
-                f"tamper adjudication: {adj.verdict}",
-                adj.passes_gate,
-                "; ".join(adj.justification or adj.restore
-                          or [adj.uncertainty or "no reason given"]),
-            )]
-            return decision
 
         # Code review mode: higher diff cap, different prompt, multi-turn agent.
         if mode == "code_review":
@@ -2478,10 +2531,16 @@ class AdversarialReviewer:
             return False
 
     async def _fast_review(self, prompt: str, repo_path: Path,
-                           *, before_ref: str = "HEAD~1") -> ReviewDecision:
-        """Single-turn review — diff already in prompt, no tools needed."""
+                           *, before_ref: str = "HEAD~1",
+                           max_turns: int = 1) -> ReviewDecision:
+        """Single-turn review — diff already in prompt, no tools needed.
+
+        `max_turns` defaults to 1 for every existing caller (angle passes, the
+        gate's `diff_override` path) — byte-identical behaviour. Only the
+        tamper-adjudication branch's one bounded retry passes a larger value.
+        """
         result, timed_out = await self._run_bounded(
-            prompt, repo_path, max_turns=1, timeout=180,
+            prompt, repo_path, max_turns=max_turns, timeout=180,
             on_event=self._on_event,
         )
         if result is None:
@@ -2492,6 +2551,7 @@ class AdversarialReviewer:
                 passed=False,
                 checklist=[ChecklistItem("timeout", False,
                     f"reviewer {timed_out} — fail closed")],
+                transport_error=True,
             )
         decision = _parse_review_output(result.final_text or "",
                                         repo_path=repo_path, before_ref=before_ref)
@@ -2501,6 +2561,7 @@ class AdversarialReviewer:
         # Default None, not 0 — an absent split must stay distinguishable from
         # a measured zero all the way to `attempts.review_output_tokens`.
         decision.output_tokens = getattr(result, "output_tokens", None)
+        decision.transport_error = bool(getattr(result, "is_error", False))
         return decision
 
     async def _agent_review(

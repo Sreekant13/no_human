@@ -669,9 +669,11 @@ async def test_a_clean_round_is_untouched_by_the_error_gate(tmp_path):
 async def test_tamper_adjudication_fails_closed_on_a_truncated_session(tmp_path):
     """Pins the OTHER mode's behaviour, which does NOT go through
     `_review_once`: `tamper_adjudication` is single-turn via `_fast_review`,
-    which has no error gate and no retry. It is fail-closed by its PARSER —
-    anything unparseable is CANNOT_DECIDE, which parks — so a truncated
-    adjudication cannot pass the tamper gate. Unchanged by this commit; pinned
+    with one bounded retry when the judge never spoke at all (see
+    `test_tamper_adjudication.py`'s retry-contract tests). This adjudicator
+    dies the same mechanical way on both the first call and the retry, so it
+    still lands on CANNOT_DECIDE — fail-closed by the PARSER, not by the
+    retry — so a truncated adjudication cannot pass the tamper gate. Pinned
     so a future edit to either side has to notice."""
     from no_human.review import tamper_adjudication
     from no_human.review.reviewer import AdversarialReviewer

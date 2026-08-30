@@ -89,7 +89,6 @@ FROZEN_FUNCTION_LINES = {
     "core/orchestrator.py:Orchestrator._reformat_summary_markdown": 327,
     "core/orchestrator.py:Orchestrator._generate_plan": 322,
     "core/orchestrator.py:Orchestrator._scan_leaf_blocks": 319,
-    "review/reviewer.py:AdversarialReviewer.review": 319,
     "core/orchestrator.py:Orchestrator._escalate_reviewer_unavailable": 317,
     # Grew to 314 (> 300) when the done_no_evidence repair shape landed
     # (task bf413cc6): two new refusal guards + the DONE branch. The growth
@@ -180,7 +179,11 @@ FROZEN_FILE_LINES = {
     # +27: the `harvest` config section (interval_hours, enabled) for the
     # recurring learning-harvest cadence.
     "config.py": 3076,
-    "review/reviewer.py": 2835,
+    # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
+    # failure classification + the extracted `_review_tamper_adjudication`
+    # helper that keeps `AdversarialReviewer.review` itself under the
+    # function-line threshold — see the FROZEN_FUNCTION_LINES deletion note).
+    "review/reviewer.py": 2896,
     "blockers/wake.py": 2706,
     "agent/guard.py": 2801,
     # +44: idle-path recover_quota_cooldown gate in tick() and the

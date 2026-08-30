@@ -202,6 +202,62 @@ def parse(raw_output: str) -> Adjudication:
 
 
 # --------------------------------------------------------------------------- #
+# One bounded retry for a judge that never spoke, mirroring (not sharing code
+# with) verifiers.py's run_verifiers/_classify_unavailable no-verdict retry
+# (b4db79d66). Triggered by an incident where the adjudicator died with
+# "Reached maximum number of turns (1)" and landed on CANNOT_DECIDE with no
+# retry at all — indistinguishable in the record from genuine doubt.
+# --------------------------------------------------------------------------- #
+
+# Modestly larger than the normal single-turn budget — enough headroom for a
+# judge that stalled at max_turns=1, not enough to let it start reading files.
+RETRY_TURNS = 2
+
+_MECHANICAL_MARKERS = (
+    "reached maximum number of turns",
+    "returned an error result",
+)
+
+
+def is_mechanical_failure(raw_output: str, *, is_error: bool = False,
+                           timed_out: bool = False) -> bool:
+    """Did the judge NEVER SPEAK (retryable), as opposed to speaking and
+    saying nothing usable (doubt — CANNOT_DECIDE, never retried)?
+
+    A parseable ADJUDICATION_JSON block always outranks every mechanical
+    signal below — a delivered verdict is never second-guessed by a stray
+    "maximum number of turns" substring elsewhere in the text (verdict-
+    shopping and injection-safety both cut this way). Absent that, an empty
+    response, a transport error, or the backend's own timeout/max-turns text
+    are all "the judge never spoke"; anything else delivered but unparseable
+    is doubt, not a mechanical failure.
+    """
+    if _ADJ_JSON.search(raw_output or ""):
+        return False
+    if not (raw_output or "").strip():
+        return True
+    if is_error or timed_out:
+        return True
+    low = raw_output.lower()
+    return any(marker in low for marker in _MECHANICAL_MARKERS)
+
+
+def after_failed_retry(first: Adjudication, retry: Adjudication) -> Adjudication:
+    """Both the first call and the one bounded retry reached no verdict.
+    Parks exactly as a single mechanical failure always has — never
+    LEGITIMATE — but the record now preserves both attempts' reasons so a
+    human doesn't have to guess whether this was one failure or two.
+    """
+    return Adjudication(
+        verdict=CANNOT_DECIDE,
+        uncertainty=(
+            "the adjudicator never returned a verdict, on the first call or "
+            "on one bounded retry with max_turns=2 — this is an "
+            "infrastructure failure, not a judgement about the test changes; "
+            f"first: {first.uncertainty}; retry: {retry.uncertainty}"))
+
+
+# --------------------------------------------------------------------------- #
 # The prompt. Its ARGUMENTS are the coercion mitigation: exactly three inputs,
 # none of them coder-authored prose.
 # --------------------------------------------------------------------------- #
