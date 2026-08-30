@@ -204,6 +204,91 @@ async def test_b_a_review_failed_attempt_hands_its_commit_to_the_next_attempt(
     assert orch._resume_branch_point(repo, refreshed.context, attempt_n=2) == commit_sha
 
 
+async def test_k_a_layered_test_plan_gate_failure_hands_its_commit_to_the_next_attempt(
+        bare_repo, tmp_path, store):
+    """RED against deleting the `_persist_handoff(gate="tests", ...)` call at
+    orchestrator.py:5789-5791 — the LAYERED test-plan branch's own
+    tests-gate-failure handoff site, the third of the three write paths
+    (single-command: `test_a`; review: `test_b`). Without it, a project with
+    a layered TestPlan silently loses a gate-failed commit's handoff exactly
+    like the original 621b9fef defect, just unbound on this one path.
+
+    Forces the layered branch the same way
+    `test_e2e_orchestrator.py::test_layered_test_plan_failure_detail_aggregates_traceback_blocks`
+    does: patch `_resolve_test_plan` to return a `TestPlan` with a blocking
+    layer, and patch `plan_runner.run_test_plan` (the module attribute — the
+    orchestrator does a local `from ..testing.plan_runner import
+    run_test_plan` at call time) to return a failing `PlanResult`."""
+    from unittest.mock import patch as _patch
+
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    import no_human.testing.plan_runner as plan_runner_mod
+    from no_human.testing.runner import TestRunResult
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+
+    def mutate(cwd):
+        # A real, committed defect — no test tampering — so the (faked)
+        # layered tests gate, not the tamper guard, is what fails this
+        # attempt.
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a - b  # wrong\n")
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="pytest -q", gating=Gating.BLOCKING),
+    ])
+
+    captured_layered = False
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        nonlocal captured_layered
+        captured_layered = True
+        return PlanResult(layer_results=[
+            LayerResult(
+                layer_name="unit", gating=Gating.BLOCKING,
+                result=TestRunResult(
+                    ran=True, ok=False, passed=0, failed=1, errors=0,
+                    command="pytest -q", output="1 failed",
+                    failing_tests=["test_calc.py::test_add"],
+                ),
+            ),
+        ])
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("fix add()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["add(a,b) returns a+b"]
+    await store.create_task(t)
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        outcome = await orch.run_task(t)
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL, outcome.detail
+    # Pin that the LAYERED branch actually ran — a future refactor that
+    # routes this repo down the single-command path must turn this test red
+    # rather than let it vacuously bind the wrong site.
+    assert captured_layered is True
+
+    attempts = await store.list_attempts(t.id)
+    commit_sha = attempts[-1]["commit_sha"]
+    assert commit_sha, attempts[-1]
+
+    refreshed = await store.get_task(t.id)
+    handoff = (refreshed.context or {}).get("handoff") or {}
+    # These three all die when the `_persist_handoff(gate="tests", ...)`
+    # call at orchestrator.py:5789-5791 is removed — the handoff dict stays
+    # empty and `failed_gate == "tests"` also proves the REVIEW gate passed
+    # first, so this test cannot silently bind at the review site instead.
+    assert handoff.get("wip_sha") == commit_sha, handoff
+    assert handoff.get("failed_gate") == "tests", handoff
+    assert handoff.get("own_partial") is True, handoff
+
+    repo = GitRepo(bare_repo)
+    assert orch._resume_branch_point(repo, refreshed.context, attempt_n=2) == commit_sha
+
+
 def test_c_the_handoff_names_the_gate_and_the_failure():
     """`build_resume_digest` must render the gate name and its failure summary,
     and stop calling a gate-failed ordinary commit "WIP-PARTIAL" (it never was
@@ -622,6 +707,57 @@ def test_g_an_inherited_gate_failed_commit_is_still_the_loops_own_partial(tmp_pa
     orch = object.__new__(Orchestrator)
     ctx = {"handoff": {"wip_sha": branch_point, "failed_gate": "tests", "own_partial": True}}
     assert orch._is_own_partial(repo, ctx, branch_point) is True
+
+
+def test_l_a_stale_handoff_from_an_older_commit_is_not_credited_as_own_partial(tmp_path):
+    """RED against weakening `_is_own_partial`'s
+    `handoff.get("own_partial") and handoff.get("wip_sha") == branch_point`
+    conjunct (orchestrator.py:16537) to bare `handoff.get("own_partial")`:
+    per the comment at orchestrator.py:16530-16536, "a stale flag from an
+    OLDER handoff must not credit an unrelated sha, hence the `wip_sha ==
+    branch_point` check". A handoff's `own_partial=True` was written for a
+    specific commit (`wip_sha`); once the branch point has moved past it
+    (e.g. a later, unrelated commit), that stale flag must NOT be credited
+    to the new branch point."""
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "u@e.com")
+    _git(work, "config", "user.name", "u")
+    (work / "a.py").write_text("base\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "base")
+
+    # The attempt the handoff was ACTUALLY written for.
+    (work / "a.py").write_text("first gate-failed attempt\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "fix add() to return the sum")  # ORDINARY subject
+    stale_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, check=True,
+                               capture_output=True, text=True).stdout.strip()
+
+    # A later, unrelated commit that is now the actual branch point — the
+    # handoff above (written for stale_sha) is stale relative to it.
+    (work / "a.py").write_text("a later, unrelated commit\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "chore: unrelated commit a human made")  # ORDINARY subject
+    branch_point = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+    repo = GitRepo(work)
+    orch = object.__new__(Orchestrator)
+
+    # No `resume_from` — deliberately, so `resume.get("sha") != branch_point`
+    # and the stale-handoff branch (rather than the provenance branch) is the
+    # one exercised.
+    ctx = {"handoff": {"wip_sha": stale_sha, "failed_gate": "tests", "own_partial": True}}
+    assert orch._is_own_partial(repo, ctx, branch_point) is False
+
+    # Positive control on the SAME fixture: a handoff whose wip_sha DOES
+    # match the branch point is still credited — pins that the guard cannot
+    # be satisfied by a mutation that just always returns False, which would
+    # be a different, equally wrong guard.
+    ctx_matched = {"handoff": {"wip_sha": branch_point, "own_partial": True}}
+    assert orch._is_own_partial(repo, ctx_matched, branch_point) is True
 
 
 def test_h_no_third_writer_of_the_handoff_key():
