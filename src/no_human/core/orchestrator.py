@@ -5487,7 +5487,12 @@ class Orchestrator:
         # (merge-base..HEAD), not HEAD~1..HEAD — test-gutting buried in an
         # earlier commit of the branch (a resumed attempt's checkpoint, or a
         # commit the agent made itself) used to be invisible to the guard.
-        tamper_before = self._review_base(repo, base)
+        # 2026-08-23 (b3463d74 attempt 7): a sanctioned `merge origin/main`
+        # charged the attempt with main's own landed test changes, because
+        # the recorded base is never updated for the merge. Widen it to the
+        # attempt's own contribution — see `runner.attempt_own_base`.
+        tamper_before = runner.attempt_own_base(
+            repo.path, self._review_base(repo, base), base)
         tamper = runner.tamper_check_between(repo.path, before_ref=tamper_before)
         self.emit("tamper", tamper.summary, tampered=tamper.tampered)
         outcome = await self._handle_tamper_fire(
@@ -5507,8 +5512,12 @@ class Orchestrator:
                 # Same whole-branch window as the primary repo. The linked
                 # repo's merge-base is derived from the same base-branch name;
                 # _repro_base_ref falls back to HEAD~1 when it doesn't resolve.
-                lr_before = (
-                    await self._repro_base_ref(linked, base) if base else "HEAD~1"
+                # Widened the same way as `tamper_before` above, so a merged
+                # `origin/<base>` in a linked repo can't false-fire either.
+                lr_before = runner.attempt_own_base(
+                    linked,
+                    await self._repro_base_ref(linked, base) if base else "HEAD~1",
+                    base,
                 )
                 lr_tamper = runner.tamper_check_between(linked, before_ref=lr_before)
             except Exception as exc:  # noqa: BLE001 — guard must not crash the pipeline

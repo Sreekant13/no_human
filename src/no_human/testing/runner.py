@@ -1217,10 +1217,111 @@ class TamperCheckUnavailable(RuntimeError):
     """
 
 
+def _rev_parse(repo_path: Path, ref: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
+def _merge_base(repo_path: Path, a: str, b: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "merge-base", a, b], cwd=repo_path, capture_output=True, text=True,
+    )
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
+def _is_ancestor(repo_path: Path, ancestor: str, descendant: str) -> bool:
+    proc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def attempt_own_base(
+    repo_path: Path, recorded_base: str, default_branch: str | None = None,
+) -> str:
+    """The tamper guard's comparison base — the attempt's OWN contribution.
+
+    Equivalent to three-dot ``origin/<default_branch>...HEAD`` semantics: the
+    window used for the before/after snapshot is
+    ``merge-base(HEAD, current default branch)`` when that merge-base is a
+    descendant of (strictly forward of, or equal to) ``recorded_base`` —
+    otherwise ``recorded_base`` verbatim. Candidates are tried in preference
+    order (``origin/<default_branch>`` first, then the local branch) and only
+    ever move the base FORWARD from `recorded_base`, never sideways or back.
+
+    Incident (2026-08-23, task b3463d74 attempt 7): the coder was instructed
+    by an escalation reply to merge `origin/main` and resolve conflicts — the
+    standard recovery for a branch that diverged. The guard at the time
+    compared the merged tree against the task's ORIGINAL recorded base (never
+    updated for the merge), so main's own landed commit b31b53f76 —
+    `tests/test_readme_claims.py` gaining two skip markers — showed up inside
+    the attempt's window and the guard fired: "tests/test_readme_claims.py
+    gained skip markers (from 0 to 2), so some tests no longer run", escalating
+    a false AMBIGUITY to a human. `git diff origin/main...<branch> --
+    tests/test_readme_claims.py` showed ZERO skip lines added by the attempt
+    on every branch of that task — the change was entirely main's, carried in
+    by the sanctioned merge.
+
+    Why this does not weaken the guard: a candidate base is only ever widened
+    to commits that are ALSO reachable from the current default branch, i.e.
+    already landed independently of this attempt. Anything the attempt itself
+    adds, removes, or reverts — including reverting a test the default branch
+    added mid-flight — is not reachable from the default branch alone and
+    still falls inside the window, so it still fires. On a branch that never
+    merges the default branch, the widened candidate never advances past
+    `recorded_base` and behaviour is bit-identical to today.
+
+    Fails closed: `default_branch` falsy, a ref that does not resolve
+    (unmerged branch, single-branch clone, detached worktree, no remote), a
+    non-git directory, or any git/OSError — all return `recorded_base`
+    unchanged. Never raises. Local git reads only (`rev-parse`,
+    `merge-base`), never a `git fetch`.
+    """
+    repo_path = Path(repo_path)
+    if not default_branch:
+        return recorded_base
+    try:
+        if not (repo_path / ".git").exists():
+            return recorded_base
+        if _rev_parse(repo_path, recorded_base) is None:
+            return recorded_base
+
+        best = recorded_base
+        for candidate_ref in (f"origin/{default_branch}", default_branch):
+            resolved = _rev_parse(repo_path, candidate_ref)
+            if resolved is None:
+                continue
+            merge_base = _merge_base(repo_path, "HEAD", resolved)
+            if merge_base is None:
+                continue
+            if _is_ancestor(repo_path, best, merge_base):
+                best = merge_base
+        return best
+    except Exception:  # noqa: BLE001 — fail closed to the recorded base
+        return recorded_base
+
+
 def tamper_check_between(
-    repo_path: Path, before_ref: str = "HEAD~1", after_ref: str = "HEAD"
+    repo_path: Path, before_ref: str = "HEAD~1", after_ref: str = "HEAD",
+    *, default_branch: str | None = None,
 ) -> tamper_guard.TamperReport:
     """Snapshot test files at two refs and run the tamper guard between them.
+
+    Comparison base: `before_ref` verbatim, UNLESS `default_branch` is given,
+    in which case it is first widened by `attempt_own_base` to
+    `merge-base(HEAD, current default branch)` — three-dot
+    `origin/<default_branch>...HEAD` semantics — so that changes the default
+    branch landed mid-flight (e.g. via a sanctioned `merge origin/main`) are
+    excluded from the attempt's window instead of being charged to it. See
+    `attempt_own_base` for the full rationale and the 2026-08-23 incident
+    (task b3463d74 attempt 7) that this parameter exists to fix. Callers that
+    omit `default_branch` get exactly today's unwidened behaviour.
 
     Raises `TamperCheckUnavailable` when the checkout is not there to inspect.
     That is deliberately an ERROR and never a clean report: a missing worktree
@@ -1243,6 +1344,8 @@ def tamper_check_between(
     if not (repo_path / ".git").exists():
         raise TamperCheckUnavailable(
             f"cannot run the tamper guard: {repo_path} is not a git checkout")
+    if default_branch:
+        before_ref = attempt_own_base(repo_path, before_ref, default_branch)
     before, after = {}, {}
     for path in _git_files(repo_path, before_ref):
         if tamper_guard.is_test_file(path):

@@ -1074,3 +1074,248 @@ def test_consolidating_tests_is_tampering_even_when_assertions_hold():
         f"consolidating 3 tests into 1 was called clean: {r.summary}. Only the "
         "net test-count term can see this; if it was removed as redundant, this "
         "is the case that proves it is not.")
+
+
+# --- attempt_own_base: exclude main's mid-flight landed test changes ------- #
+#
+# 2026-08-23 (task b3463d74, attempt 7): the coder was instructed by an
+# escalation reply to `merge origin/main` and resolve conflicts — the
+# standard recovery for a diverged branch. The tamper guard compared the
+# merged tree against the task's ORIGINAL recorded base, so main's own
+# landed commit (b31b53f76, `tests/test_readme_claims.py` 0->2 skips) showed
+# up as attempt-authored and escalated a false AMBIGUITY. `git diff
+# origin/main...<branch> -- tests/test_readme_claims.py` showed ZERO skip
+# lines added by the attempt on every branch of that task.
+
+
+def _commit_all(repo: Path, message: str) -> None:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", message],
+                   capture_output=True, check=True)
+
+
+def _rev_parse(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, check=True, text=True,
+    ).stdout.strip()
+
+
+def _merged_main_repo(tmp_path: Path):
+    """A `feat` branch that merged a `main` which landed skip markers.
+
+    Returns `(repo, recorded_base_sha)` where `recorded_base_sha` is the
+    commit `feat` branched from — the task's original recorded base, exactly
+    what `_review_base` would have returned before the merge.
+    """
+    repo = tmp_path / "merged_main_repo"
+    repo.mkdir()
+    _init_repo(repo)
+
+    test_file = repo / "tests" / "test_x.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        "def test_a():\n    assert 1 + 1 == 2\n"
+        "def test_b():\n    assert 2 + 2 == 4\n"
+    )
+    # A second, persistent test file — present at `recorded_base`, untouched
+    # by main's landing commit, and carried unchanged through the merge. Used
+    # by the "attempt-authored skip still fires" test below: an EXISTING file
+    # in the widened before-window, so a skip the attempt adds to it cannot
+    # be mistaken for the new-file skip exemption (`tamper_guard.py`'s `is_new`
+    # rule, which is deliberately out of scope here — see OUT OF SCOPE).
+    other_file = repo / "tests" / "test_z.py"
+    other_file.write_text("def test_c():\n    assert 3 + 3 == 6\n")
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"],
+                   capture_output=True, check=True)
+    _commit_all(repo, "init")
+    recorded_base = _rev_parse(repo)
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feat"],
+                   capture_output=True, check=True)
+    product_file = repo / "product.py"
+    product_file.write_text("def f():\n    return 1\n")
+    _commit_all(repo, "attempt: add product code")
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"],
+                   capture_output=True, check=True)
+    test_file.write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skip(reason='flaky')\n"
+        "def test_a():\n    assert 1 + 1 == 2\n"
+        "@pytest.mark.skip(reason='flaky')\n"
+        "def test_b():\n    assert 2 + 2 == 4\n"
+    )
+    _commit_all(repo, "main: land skip markers (b31b53f76 stand-in)")
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "feat"],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "merge", "main", "--no-edit"],
+                   capture_output=True, check=True)
+
+    return repo, recorded_base
+
+
+def test_a_merged_main_that_landed_skips_is_not_charged_to_the_attempt(tmp_path):
+    """RED-first repro: the false escalation from the 2026-08-23 incident."""
+    from no_human.testing.runner import tamper_check_between
+
+    repo, recorded_base = _merged_main_repo(tmp_path)
+
+    # Old behaviour, documented: without the widened base, main's landed
+    # skip markers read as attempt-authored and the guard fires.
+    stale = tamper_check_between(repo, before_ref=recorded_base)
+    assert stale.tampered is True
+
+    # Fixed behaviour: widening the base past main's own commits clears it.
+    fixed = tamper_check_between(
+        repo, before_ref=recorded_base, default_branch="main")
+    assert fixed.tampered is False
+    assert not any("skip" in r for r in fixed.reasons), fixed.reasons
+
+
+def test_an_attempt_authored_skip_marker_still_fires_after_the_merge(tmp_path):
+    """A skip marker the ATTEMPT adds itself must still fire post-merge.
+
+    Neuters `tests/test_z.py` — a file present at `recorded_base`, untouched
+    by main's landing commit, and carried through the merge unchanged — so
+    the new-file skip exemption cannot mask the attempt's own tampering.
+    """
+    from no_human.testing.runner import tamper_check_between
+
+    repo, recorded_base = _merged_main_repo(tmp_path)
+
+    other_test = repo / "tests" / "test_z.py"
+    other_test.write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skip(reason='attempt-authored')\n"
+        "def test_c():\n    assert 3 + 3 == 6\n"
+    )
+    _commit_all(repo, "attempt: neuter test_z.py (this is the tamper)")
+
+    report = tamper_check_between(
+        repo, before_ref=recorded_base, default_branch="main")
+    assert report.tampered is True
+    assert any("skip/xfail markers" in r for r in report.reasons), report.reasons
+
+
+def test_reverting_a_test_main_added_mid_flight_still_fires(tmp_path):
+    """Deleting a test file main landed mid-flight must still fire."""
+    from no_human.testing.runner import tamper_check_between
+
+    repo = tmp_path / "revert_main_test_repo"
+    repo.mkdir()
+    _init_repo(repo)
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_x.py").write_text("def test_a():\n    assert 1 == 1\n")
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"],
+                   capture_output=True, check=True)
+    _commit_all(repo, "init")
+    recorded_base = _rev_parse(repo)
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feat"],
+                   capture_output=True, check=True)
+    (repo / "product.py").write_text("def f():\n    return 1\n")
+    _commit_all(repo, "attempt: add product code")
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"],
+                   capture_output=True, check=True)
+    new_from_main = repo / "tests" / "test_new_from_main.py"
+    new_from_main.write_text(
+        "def test_landed_mid_flight():\n    assert 2 == 2\n"
+        "def test_landed_mid_flight_2():\n    assert 3 == 3\n"
+    )
+    _commit_all(repo, "main: land a new test file mid-flight")
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "feat"],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "merge", "main", "--no-edit"],
+                   capture_output=True, check=True)
+
+    # The attempt reverts main's mid-flight test file — must still fire.
+    (repo / "tests" / "test_new_from_main.py").unlink()
+    _commit_all(repo, "attempt: delete test_new_from_main.py (this is the tamper)")
+
+    report = tamper_check_between(
+        repo, before_ref=recorded_base, default_branch="main")
+    assert report.tampered is True
+    assert any("test file deleted:" in r for r in report.reasons), report.reasons
+
+
+def test_a_branch_that_never_merged_main_uses_the_recorded_base_unchanged(tmp_path):
+    """Non-merged branches: `attempt_own_base` and the report are unchanged."""
+    from no_human.testing.runner import attempt_own_base, tamper_check_between
+
+    repo = tmp_path / "never_merged_repo"
+    repo.mkdir()
+    _init_repo(repo)
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_x.py").write_text("def test_a():\n    assert 1 == 1\n")
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"],
+                   capture_output=True, check=True)
+    _commit_all(repo, "init")
+    recorded_base = _rev_parse(repo)
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feat"],
+                   capture_output=True, check=True)
+    (repo / "product.py").write_text("def f():\n    return 1\n")
+    _commit_all(repo, "attempt: add product code")
+
+    # main advances independently — feat never merges it.
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"],
+                   capture_output=True, check=True)
+    (repo / "tests" / "test_x.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.skip(reason='unrelated main work')\n"
+        "def test_a():\n    assert 1 == 1\n"
+    )
+    _commit_all(repo, "main: unrelated skip, feat never sees it")
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "feat"],
+                   capture_output=True, check=True)
+
+    assert attempt_own_base(repo, recorded_base, "main") == recorded_base
+
+    without = tamper_check_between(repo, before_ref=recorded_base)
+    with_default_branch = tamper_check_between(
+        repo, before_ref=recorded_base, default_branch="main")
+    assert without.tampered == with_default_branch.tampered
+    assert without.reasons == with_default_branch.reasons
+
+
+@pytest.mark.parametrize("default_branch", [None, "nope"])
+def test_attempt_own_base_falls_back_to_the_recorded_base(tmp_path, default_branch):
+    """Fail-closed: no resolvable candidate always returns `recorded_base`."""
+    from no_human.testing.runner import attempt_own_base
+
+    repo = tmp_path / "fallback_repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "f.txt").write_text("x")
+    _commit_all(repo, "init")
+    recorded_base = _rev_parse(repo)
+
+    assert attempt_own_base(repo, recorded_base, default_branch) == recorded_base
+
+
+def test_attempt_own_base_falls_back_on_a_non_git_directory(tmp_path):
+    """Fail-closed: a non-git directory never raises."""
+    from no_human.testing.runner import attempt_own_base
+
+    not_a_repo = tmp_path / "not_a_repo"
+    not_a_repo.mkdir()
+
+    assert attempt_own_base(not_a_repo, "deadbeef", "main") == "deadbeef"
+
+
+def test_the_guards_comparison_base_is_documented_with_the_incident():
+    """AC #4: the docstrings name the rule and carry the incident's shape."""
+    from no_human.testing.runner import attempt_own_base, tamper_check_between
+
+    for doc in (attempt_own_base.__doc__, tamper_check_between.__doc__):
+        assert doc is not None
+        assert "merge" in doc
+        assert "origin/main" in doc
+        assert "2026-08-23" in doc

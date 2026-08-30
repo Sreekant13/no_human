@@ -68,7 +68,10 @@ MAX_FILE_LINES = 2500
 # Measured with the scanner below; see the PR body for the full table.
 # 16 functions > 300 lines.
 FROZEN_FUNCTION_LINES = {
-    "core/orchestrator.py:Orchestrator._run_attempt": 2099,
+    # 2099 -> 2108 (+9): PR #877 widens the tamper base to three-dot
+    # origin/<base>...HEAD so a sanctioned merge isn't charged with main's own
+    # landed test edits (attempt-authored gutting still fires). Re-anchored on merge.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2108,
     "core/orchestrator.py:Orchestrator._drive": 760,
     "core/db.py:Store._ensure_task_columns": 448,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
@@ -135,7 +138,9 @@ FROZEN_FILE_LINES = {
     # 19630 -> 19650 (+20): PR #929's fail-closed .git/common/config allowlist
     # (a benign shared-config reserialization no longer discards the reviewer
     # verdict; execution-surface keys still discard). Re-anchored on merge.
-    "core/orchestrator.py": 19650,
+    # 19650 -> 19659 (+9): PR #877's tamper-base widening in _run_attempt (same
+    # +9 lines as the function bump above). Re-anchored on merge.
+    "core/orchestrator.py": 19659,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
