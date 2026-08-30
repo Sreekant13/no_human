@@ -46,14 +46,6 @@ The AI coding factory you <ins>**can trust**</ins>:
 
 ## Install
 
-Whichever way you install, you need a **Claude credential**: an OAuth token
-from `claude setup-token` (personal subscription or enterprise), so install the
-Claude Code CLI first — `npm install -g @anthropic-ai/claude-code`, or
-`curl -fsSL https://claude.ai/install.sh | bash`. The desktop app also calls
-that CLI for every task. To pay Anthropic directly instead, set
-`llm.auth_mode: "api_key"` and put your `ANTHROPIC_API_KEY` in
-`~/.no_human/.env`.
-
 ### One line (CLI + board)
 
 ```bash
