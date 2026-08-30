@@ -7,12 +7,15 @@ system already computed must gate deterministically: held-out failed → the
 attempt fails BEFORE any reviewer tokens are spent.
 """
 
+import shutil
+
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 from no_human.review.selfcheck import ChecklistItem
 from no_human.review.reviewer import ReviewDecision
 
+from ._isolated_run import run_node_id_isolated, scrubbed_path
 from .test_e2e_orchestrator import (  # noqa: F401
     FakeBackend,
     _config,
@@ -116,7 +119,9 @@ async def test_advisory_mode_cannot_rubber_stamp_past_held_out(
     assert outcome.status is not TaskStatus.AWAITING_APPROVAL
 
 
-async def test_passing_held_out_does_not_block(bare_repo, tmp_path, store):
+async def test_passing_held_out_does_not_block(
+    bare_repo, tmp_path, store, own_pytest_on_path
+):
     def correct_mul(cwd):
         (cwd / "calc.py").write_text(
             "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
@@ -132,3 +137,28 @@ async def test_passing_held_out_does_not_block(bare_repo, tmp_path, store):
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
     assert outcome.pr_url is not None
+
+
+def test_passing_holdout_passes_with_no_pytest_on_path(tmp_path):
+    """Regression twin: `run_held_out_tests` (runner.py:1158) hardcodes a
+    bare `pytest -q <path>` shell command with no venv-relative fallback, so
+    the target test above must supply its own resolvable `pytest` rather than
+    depending on the ambient PATH of whatever launched this suite — see
+    `tests/conftest.py`'s `own_pytest_on_path` docstring for the measured
+    root cause.
+    """
+    path = scrubbed_path()
+    assert shutil.which("pytest", path=path) is None, (
+        "the precondition of this guard is a pytest-free PATH — a machine "
+        f"with a system pytest would make it a tautology: PATH={path!r}"
+    )
+    node_id = "tests/test_holdout_gate.py::test_passing_held_out_does_not_block"
+    assert node_id.rsplit("::", 1)[-1] != (
+        "test_passing_holdout_passes_with_no_pytest_on_path"
+    ), "must target the fixture test, not re-enter this regression test"
+    home = tmp_path / "home"
+    home.mkdir()
+    proc = run_node_id_isolated(node_id, home)
+    tail = (proc.stdout + proc.stderr)[-4000:]
+    assert proc.returncode == 0, tail
+    assert "1 passed" in proc.stdout, tail

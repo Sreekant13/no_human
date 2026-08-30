@@ -24,6 +24,7 @@ depending on machine load.
 """
 
 import json as _json
+import shutil
 import subprocess
 import sys
 
@@ -33,6 +34,7 @@ from no_human.notify.slack import SlackNotifier
 from no_human.testing import runner
 from no_human.vcs.git import GitRepo
 
+from ._isolated_run import run_node_id_isolated, scrubbed_path
 from .test_e2e_orchestrator import (  # noqa: F401
     FakeBackend,
     _config,
@@ -105,7 +107,7 @@ def _probe_repo(tmp_path, name, files) -> "GitRepo":
 
 
 async def test_flaky_test_green_on_rerun_does_not_fail_the_attempt(
-    bare_repo, tmp_path, store
+    bare_repo, tmp_path, store, own_pytest_on_path
 ):
     _seed_flaky_repo(bare_repo, tmp_path / "flaky.marker")
     events = []
@@ -138,6 +140,36 @@ async def test_flaky_test_green_on_rerun_does_not_fail_the_attempt(
         "the event must SAY it re-ran — a bare ok=True is a silent pass: "
         + str([e.get("text") for e in notes])
     )
+
+
+def test_flaky_green_on_rerun_passes_with_no_pytest_on_path(tmp_path):
+    """Regression twin for the fixture above: the target test must be
+    self-contained, not merely lucky about what launched THIS suite.
+
+    See `tests/conftest.py`'s `own_pytest_on_path` docstring for the measured
+    root cause. Runs the target id ALONE, in a subprocess, under a fresh HOME
+    with no `pytest` resolvable on PATH; the subprocess acquires its own
+    `own_pytest_on_path` fixture from this same conftest, same as any other
+    test.
+    """
+    path = scrubbed_path()
+    assert shutil.which("pytest", path=path) is None, (
+        "the precondition of this guard is a pytest-free PATH — a machine "
+        f"with a system pytest would make it a tautology: PATH={path!r}"
+    )
+    node_id = (
+        "tests/test_flaky_rerun_attribution.py::"
+        "test_flaky_test_green_on_rerun_does_not_fail_the_attempt"
+    )
+    assert node_id.rsplit("::", 1)[-1] != (
+        "test_flaky_green_on_rerun_passes_with_no_pytest_on_path"
+    ), "must target the fixture test, not re-enter this regression test"
+    home = tmp_path / "home"
+    home.mkdir()
+    proc = run_node_id_isolated(node_id, home)
+    tail = (proc.stdout + proc.stderr)[-4000:]
+    assert proc.returncode == 0, tail
+    assert "1 passed" in proc.stdout, tail
 
 
 # ---------------------------------------------------------------------------

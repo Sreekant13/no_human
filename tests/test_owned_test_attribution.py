@@ -22,11 +22,13 @@ regression twin below are drawn from.
 """
 
 import json as _json
+import shutil
 
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 
+from ._isolated_run import run_node_id_isolated, scrubbed_path
 from .test_e2e_orchestrator import (  # noqa: F401
     FakeBackend,
     _config,
@@ -121,7 +123,7 @@ async def test_a_new_flaky_test_the_change_added_is_billed_not_excused(
 
 
 async def test_an_untouched_function_in_a_modified_file_is_still_excused(
-    bare_repo, tmp_path, store
+    bare_repo, tmp_path, store, own_pytest_on_path
 ):
     marker = tmp_path / "sibling.marker"
     (bare_repo / "pytest.ini").write_text("[pytest]\n")
@@ -159,6 +161,34 @@ async def test_an_untouched_function_in_a_modified_file_is_still_excused(
         "test_b was never touched by this attempt's diff and must not be "
         "reported as owned: " + str(persisted)
     )
+
+
+def test_untouched_function_excuse_passes_with_no_pytest_on_path(tmp_path):
+    """Regression twin: the target test's flaky re-run path is rescued by the
+    rc=127 invocation retry (runner.py:1014), but the substituted command is
+    then discarded (orchestrator.py:10702) — so, like its two siblings, it
+    must supply its own resolvable `pytest` rather than depending on the
+    ambient PATH of whatever launched this suite. See `tests/conftest.py`'s
+    `own_pytest_on_path` docstring for the measured root cause.
+    """
+    path = scrubbed_path()
+    assert shutil.which("pytest", path=path) is None, (
+        "the precondition of this guard is a pytest-free PATH — a machine "
+        f"with a system pytest would make it a tautology: PATH={path!r}"
+    )
+    node_id = (
+        "tests/test_owned_test_attribution.py::"
+        "test_an_untouched_function_in_a_modified_file_is_still_excused"
+    )
+    assert node_id.rsplit("::", 1)[-1] != (
+        "test_untouched_function_excuse_passes_with_no_pytest_on_path"
+    ), "must target the fixture test, not re-enter this regression test"
+    home = tmp_path / "home"
+    home.mkdir()
+    proc = run_node_id_isolated(node_id, home)
+    tail = (proc.stdout + proc.stderr)[-4000:]
+    assert proc.returncode == 0, tail
+    assert "1 passed" in proc.stdout, tail
 
 
 # ---------------------------------------------------------------------------

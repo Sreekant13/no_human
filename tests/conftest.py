@@ -8,6 +8,9 @@ WANTS to observe a delay can set it back explicitly.
 """
 
 import os
+import shlex
+import shutil
+import sys
 
 import pytest
 
@@ -257,3 +260,64 @@ def _hermetic_sdk(request, monkeypatch):
     monkeypatch.setattr(
         "no_human.cli.commands.ClaudeBackend", _HermeticUtilityBackend)
     yield
+
+
+@pytest.fixture
+def own_pytest_on_path(tmp_path, monkeypatch):
+    """Give a `bare_repo`-shaped subprocess a `pytest` it can resolve on PATH.
+
+    `tests/test_e2e_orchestrator.py`'s `bare_repo` fixture ships no `uv.lock`
+    and no `.venv`, so `detect_command` (runner.py:177) returns bare
+    `"pytest -q"`, `_venv_bin` returns None, and `_env_for` (runner.py:763)
+    passes the PARENT process's PATH through to a `shell=True` `/bin/sh`. In
+    the normal dev/CI loop that parent is `uv run pytest`, which happens to
+    put a `pytest` console script on PATH — so three tests that assert a
+    GREEN pipeline outcome (test_flaky_rerun_attribution.py,
+    test_holdout_gate.py, test_owned_test_attribution.py) silently depend on
+    the launcher's ambient PATH rather than anything they set up themselves
+    (see CONTRIBUTING.md 104-118). Run bare, e.g. under a plain
+    `.venv/bin/python -m pytest` with no `pytest` script on PATH, all three
+    fail on `/bin/sh: pytest: command not found` surfacing as two distinct
+    production shapes:
+
+      1. holdout — `run_held_out_tests` (runner.py:1158) hardcodes
+         `f"pytest -q {held_path}"` with no retry or fallback -> the held-out
+         suite is reported FAIL: "0 passed, 0 failed, 0 errors" -> ESCALATED.
+      2. flaky/owned — the main run is rescued by the rc=127 invocation retry
+         (runner.py:1014), but the flaky re-run's substituted command is then
+         discarded by orchestrator.py:10702 (pinned by
+         test_a_substituted_command_is_not_the_verdict_we_asked_for) -> no
+         excuse lands -> ESCALATED.
+
+    This fixture supplies RESOLUTION, not a stub: it writes a real shim that
+    execs `sys.executable -m pytest`, so the subprocess still runs the actual
+    test suite — it just no longer depends on what launched the outer suite.
+    Named, requested by argument, and deliberately NOT autouse: an autouse
+    fixture that monkeypatches would raise this file's
+    `tamper_guard.count_faking_fixtures` score (see `isolated_env_file`
+    above for the same doctrine spelled out in full).
+    """
+    bin_dir = tmp_path / "_pytest_shim_bin"
+    bin_dir.mkdir()
+
+    posix_shim = bin_dir / "pytest"
+    posix_shim.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pytest \"$@\"\n"
+    )
+    posix_shim.chmod(0o755)
+
+    # Written unconditionally (cheap) so both platforms' fixture bodies stay
+    # identical rather than branching on os.name.
+    windows_shim = bin_dir / "pytest.bat"
+    windows_shim.write_text(f'@echo off\r\n"{sys.executable}" -m pytest %*\r\n')
+
+    monkeypatch.setenv(
+        "PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+
+    resolved = shutil.which("pytest")
+    assert resolved and str(bin_dir) in resolved, (
+        "own_pytest_on_path did not make itself the resolved `pytest` — a "
+        f"silent no-op here would re-hide the bug: shutil.which -> {resolved!r}"
+    )
+    return bin_dir
