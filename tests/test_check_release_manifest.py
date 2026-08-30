@@ -246,13 +246,39 @@ def test_write_omits_the_manifest_itself_and_sorts_rows(tmp_path):
 # the classification guard: --write must never pin what must not ship
 # --------------------------------------------------------------------------
 
-def test_write_is_unguarded_where_there_is_no_classification():
+def test_write_is_unguarded_where_there_is_no_classification(tmp_path):
     """The RELEASE case, and the reason the guard is conditional rather than
     absolute. A tree with no EXPORT_CLASSIFICATION.txt has no dropped file to
     protect — every tracked file ships — so regenerating is exactly right. It is
     the tree this script is shipped to verify, and `make_repo` is that tree:
     every test above regenerates freely."""
-    # Asserted by construction: `write_manifest` is used by all of the above.
+    repo = make_repo(tmp_path)
+    assert not (repo / "EXPORT_CLASSIFICATION.txt").exists()
+    assert not (repo / "RELEASE_MANIFEST.txt").exists()
+
+    proc = run("--root", str(repo), "--write")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "REFUSED" not in proc.stderr
+    assert "must not ship" not in proc.stderr
+    assert "wrote 2 row(s)" in proc.stdout
+
+    manifest = repo / "RELEASE_MANIFEST.txt"
+    assert manifest.exists()
+    rows = [l for l in manifest.read_text().splitlines()
+            if l and not l.startswith("#")]
+    parsed = [r.split("  ", 1) for r in rows]
+    assert [rel for _, rel in parsed] == ["README.md", "pkg/a.py"]
+    for digest, rel in parsed:
+        assert digest == hashlib.sha256((repo / rel).read_bytes()).hexdigest()
+
+    check = run("--root", str(repo))
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert "OK: 2 file(s) match" in check.stdout
+
+    before = manifest.read_bytes()
+    again = run("--root", str(repo), "--write")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert manifest.read_bytes() == before
 
 
 @needs_builder
