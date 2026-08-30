@@ -168,7 +168,11 @@ FROZEN_FILE_LINES = {
     # review; the landing omitted this re-anchor, which turned main red at
     # the next full-suite run (2026-08-30). Frozen at its landing baseline;
     # growth from here fails.
-    "api/app.py": 5372,
+    # Grew to 5471 (+99) with the 0.1.8 worker-count feature: the
+    # GET/PUT /api/config/workers endpoints + their _workers_payload helper, so
+    # the concurrent-worker count is configurable from the Settings Models pane
+    # (config.set_concurrency). Re-anchored in the same session it landed.
+    "api/app.py": 5471,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -178,7 +182,12 @@ FROZEN_FILE_LINES = {
     # +75: Codex account config helpers.
     # +27: the `harvest` config section (interval_hours, enabled) for the
     # recurring learning-harvest cadence.
-    "config.py": 3076,
+    # +164: the 0.1.8 worker-count feature's concurrency support —
+    # set_concurrency (validated max_workers 1..64 + .enabled write, with
+    # reload-verify and restore-on-failure), the _CONCURRENCY_HEADER_RE /
+    # _splice_concurrency_scalar plumbing, and the concurrency config section.
+    # Re-anchored in the same session it landed.
+    "config.py": 3240,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
