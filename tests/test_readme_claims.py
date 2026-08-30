@@ -1769,7 +1769,7 @@ CITATION_TABLE = (
     ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
     ("security.md", "desktop/main.mjs:231", "desktop/main.mjs",
      "async function checkForUpdates("),
-    ("security.md", "desktop/updater.mjs:104", "desktop/updater.mjs",
+    ("security.md", "desktop/updater.mjs:113", "desktop/updater.mjs",
      "autoUpdater.checkForUpdates()"),
     ("security.md", "desktop/main.mjs:992", "desktop/main.mjs", "checkForUpdates()"),
     ("security.md", "desktop/electron-builder.config.cjs:366",
