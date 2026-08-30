@@ -83,7 +83,7 @@ def _render_proposal(drafts: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-async def generate_split_proposal(
+async def generate_split_drafts(
     task: Any,
     files_to_change: list[str] | None = None,
     surfaces: Any = None,
@@ -91,13 +91,20 @@ async def generate_split_proposal(
     backend: Any | None = None,
     model: str | None = None,
     usage_sink: UsageSink | None = None,
-) -> str | None:
-    """Draft a 2-4 sub-task split proposal for an over-scope task.
+) -> list[dict[str, str]] | None:
+    """The STRUCTURED 2-4 sub-task drafts (``[{title, description, contract}]``)
+    for an over-scope task, or ``None`` on any failure.
 
-    Utility-model, single-turn, strictly-parsed. Returns ``None`` on any
-    failure (missing block, bad JSON, wrong draft count, bad sentence count,
-    missing contract, backend exception) — a missing proposal degrades a
-    hint, it never blocks or retries beyond the single parse retry below.
+    This is the machine-readable form the 1-click split UI creates real child
+    tasks from (``POST /api/tasks/{id}/split``). ``generate_split_proposal``
+    renders the same drafts to text for advisory display; both go through the
+    same single deduped generation, so the text a human reads and the tasks a
+    click creates can never describe different splits.
+
+    Utility-model, single-turn, strictly-parsed. Returns ``None`` on any failure
+    (missing block, bad JSON, wrong draft count, bad sentence count, missing
+    contract, backend exception) — a missing split degrades a hint, it never
+    blocks or retries beyond the single parse retry below.
     """
     try:
         import tempfile
@@ -141,7 +148,28 @@ async def generate_split_proposal(
         if drafts is None:
             log.warning("split proposal failed strict validation")
             return None
-        return _render_proposal(drafts)
+        return drafts
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("split proposal failed: %s", type(exc).__name__)
         return None
+
+
+async def generate_split_proposal(
+    task: Any,
+    files_to_change: list[str] | None = None,
+    surfaces: Any = None,
+    *,
+    backend: Any | None = None,
+    model: str | None = None,
+    usage_sink: UsageSink | None = None,
+) -> str | None:
+    """The RENDERED-TEXT split proposal for advisory display — a thin renderer
+    over :func:`generate_split_drafts`. Returns ``None`` on any failure. Existing
+    callers (``ctx['split_proposal']``) are unchanged; the structured form is
+    available via ``generate_split_drafts`` for the 1-click create path.
+    """
+    drafts = await generate_split_drafts(
+        task, files_to_change, surfaces,
+        backend=backend, model=model, usage_sink=usage_sink,
+    )
+    return _render_proposal(drafts) if drafts else None

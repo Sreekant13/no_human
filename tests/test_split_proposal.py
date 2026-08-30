@@ -9,7 +9,10 @@ import pytest
 from no_human.agent.claude_backend import AgentResult
 from no_human.config import DEFAULT_CONFIG
 from no_human.core.task import Task
-from no_human.intake.split_proposal import generate_split_proposal
+from no_human.intake.split_proposal import (
+    generate_split_drafts,
+    generate_split_proposal,
+)
 
 VALID_BLOCK = """
 SPLIT_JSON_START
@@ -76,6 +79,37 @@ async def test_valid_2_to_4_drafts_returns_text():
     assert "Wire the call site" in out
     assert "Contract" in out
     assert be.calls == 1
+
+
+async def test_generate_split_drafts_returns_the_structured_list():
+    # The 1-click split UI creates real child tasks from these structured
+    # drafts (POST /api/tasks/{id}/split), so the drafts must survive as data —
+    # not only as the rendered text generate_split_proposal returns.
+    be = _ScriptedBackend([VALID_BLOCK])
+    drafts = await generate_split_drafts(_task(), backend=be)
+    assert isinstance(drafts, list)
+    assert [d["title"] for d in drafts] == [
+        "Extract the parser", "Add the validator", "Wire the call site",
+    ]
+    for d in drafts:
+        # Each draft is exactly the shape the /split endpoint consumes.
+        assert set(d) == {"title", "description", "contract"}
+        assert d["title"] and d["description"] and d["contract"]
+    assert be.calls == 1
+
+
+async def test_proposal_text_is_a_thin_render_of_the_same_drafts():
+    # The text a human reads and the tasks a click creates must describe the
+    # SAME split — both go through generate_split_drafts.
+    text = await generate_split_proposal(_task(), backend=_ScriptedBackend([VALID_BLOCK]))
+    drafts = await generate_split_drafts(_task(), backend=_ScriptedBackend([VALID_BLOCK]))
+    for d in drafts:
+        assert d["title"] in text
+
+
+async def test_generate_split_drafts_is_none_on_unparseable():
+    be = _ScriptedBackend(["no split block here", "still nothing"])
+    assert await generate_split_drafts(_task(), backend=be) is None
 
 
 async def test_defaults_to_utility_model(monkeypatch):
