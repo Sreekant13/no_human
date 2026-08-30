@@ -416,6 +416,52 @@ def test_an_unresolvable_head_reads_as_no_answer_not_as_current(monkeypatch):
     assert notes == [recovered_head]
 
 
+def test_a_head_lookup_failure_does_not_erase_a_known_stale_verdict(monkeypatch):
+    """A transient git hiccup (missing binary, non-repo, timeout) must not
+    overwrite an established 'behind HEAD' verdict with (None, None) — that
+    renders bit-for-bit identically to 'current' on a board that polls every
+    10s. The prior answer must survive, in the return value AND the cache, so
+    the next poll is not silent either."""
+    api = importlib.import_module("no_human.api.app")
+    seeded_head = "a" * 40
+    seeded_note = (
+        "loaded code deadbeef is behind HEAD aaaaaaaa — "
+        "restart to pick up merged fixes"
+    )
+    monkeypatch.setattr(api, "_stale_cache", (seeded_head, seeded_note))
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: None)
+    monkeypatch.setattr(
+        "no_human.core.build_info.staleness_note",
+        lambda *a, **kw: pytest.fail("ancestry re-ran on an unmeasurable HEAD"))
+
+    result = api._loaded_code_stale()
+
+    assert result is not None
+    assert result == seeded_note
+    assert api._stale_cache == (seeded_head, seeded_note)
+
+
+def test_the_retained_verdict_is_replaced_once_git_recovers(monkeypatch):
+    """Retention is not sticky: once head_sha() succeeds again, the cache
+    re-keys to the freshly measured HEAD and note."""
+    api = importlib.import_module("no_human.api.app")
+    seeded_head = "a" * 40
+    recovered_head = "b" * 40
+    heads = iter((None, recovered_head))
+
+    monkeypatch.setattr(api, "_stale_cache", (seeded_head, "behind"))
+    monkeypatch.setattr("no_human.core.build_info.head_sha", lambda: next(heads))
+    monkeypatch.setattr(
+        "no_human.core.build_info.staleness_note",
+        lambda _info, *, head: "behind again" if head == recovered_head else None)
+
+    assert api._loaded_code_stale() == "behind"
+    assert api._stale_cache == (seeded_head, "behind")
+
+    assert api._loaded_code_stale() == "behind again"
+    assert api._stale_cache == (recovered_head, "behind again")
+
+
 async def test_recorded_version_survives_later_updates(store):
     """update_attempt rewrites the mutable surface; the provenance stamp is
     written at creation and must not be lost by a later write."""

@@ -3276,9 +3276,11 @@ _stale_inflight = threading.Lock()
 def _loaded_code_stale() -> str | None:
     """The advisory staleness note, keyed by the live checkout HEAD.
 
-    Every status read measures the checkout HEAD. The expensive ancestry check
-    is cached only while that HEAD is unchanged. Purely informational: no
-    caller gates on it, and by design nothing here can stop a task being
+    A status read that wins the single-flight lock measures the checkout HEAD;
+    a concurrent loser serves the last known answer without measuring, and so
+    does a read whose HEAD lookup fails. The expensive ancestry check is
+    cached only while that measured HEAD is unchanged. Purely informational:
+    no caller gates on it, and by design nothing here can stop a task being
     claimed.
 
     Single-flight, and NON-BLOCKING about it. A cache miss alone is not enough
@@ -3313,9 +3315,22 @@ def _loaded_code_stale() -> str | None:
     try:
         from ..core.build_info import head_sha, loaded_code, staleness_note
         head = head_sha()
+        if not head:
+            # A HEAD we could not measure is not evidence the code is current.
+            # `head_sha` fails soft for a missing git binary, a non-repository,
+            # or a timeout (see `build_info._git`), and this path runs on EVERY
+            # status read — the board polls every 10s (`App.jsx`) — so one
+            # transient hiccup used to overwrite an established "behind HEAD"
+            # verdict with (None, None), which renders bit-for-bit identically
+            # to "your code is current". That is the one thing `build_info`
+            # exists not to do: fail soft to unknown, never lie. Retain the last
+            # answer and leave the cache untouched so the next successful
+            # measurement re-keys it normally. With nothing cached this still
+            # returns None — the deliberate first-cold-miss silence.
+            return cached[1] if cached is not None else None
         if cached is not None and cached[0] == head:
             return cached[1]
-        note = None if head is None else staleness_note(loaded_code(), head=head)
+        note = staleness_note(loaded_code(), head=head)
         _stale_cache = (head, note)
         return note
     finally:
@@ -3354,7 +3369,9 @@ async def worker_status(request: Request) -> dict[str, Any]:
     `loaded_code` / `loaded_code_stale` answer a different question on the same
     poll: WHICH code is running. The server never reloads, so a merged fix is
     not live until it restarts; the stale flag re-measures the checkout HEAD on
-    every read and flips on the first read after that HEAD moves.
+    each read that wins its single-flight lock and flips on the first such
+    read after that HEAD moves; a read that loses the lock, or whose HEAD
+    lookup fails, serves the last known answer rather than silence.
     """
     sched = getattr(request.app.state, "scheduler", None)
     watcher_error = getattr(request.app.state, "watcher_error", None)
