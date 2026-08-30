@@ -521,16 +521,10 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "http:urllib.request": Allowed(
             "no_human's own API", "loopback: http://{server.host}:{server.port}"
             "/api/tasks, server.host defaults to 127.0.0.1"),
-        # ctypes is charged as a channel because in general it can name any
-        # DLL; this module loads exactly kernel32, for OpenProcess /
-        # GetExitCodeProcess — the liveness probe that replaces the
-        # `os.kill(pid, 0)` idiom, which on Windows TERMINATES the probed
-        # process instead of testing it.
-        "pkg:ctypes": Allowed(
-            "nothing off this machine — kernel32 process-liveness queries for "
-            "the instance lock and `nh stop` (`_windows_pid_alive`)",
-            _ON + "pidfile lock check and `nh stop`, on Windows only; the "
-            "POSIX path keeps os.kill(pid, 0)"),
+        # (The kernel32/ctypes liveness probe `_windows_pid_alive` moved OUT of
+        # cli/commands.py into config.py — see config.py's pkg:ctypes entry
+        # above; cli/commands.py now only imports the helper, so this module no
+        # longer opens the ctypes channel and its stale entry was removed.)
         # `nh merge-stack run` is the operator's command. The agent is never
         # allowed to reach `gh pr merge` (constraint #2, docs/security.md §2).
         "exec:gh": Allowed("your GitHub host — `gh pr merge`",
