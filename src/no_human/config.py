@@ -2301,15 +2301,66 @@ def worktree_owner(dir_name: str) -> tuple[str, int | None]:
     return parts[0], None
 
 
+def _kernel32():
+    """The Win32 ``kernel32`` handle. Imported lazily — ``ctypes.WinDLL`` does
+    not exist off Windows — and split out so a test can substitute it."""
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _windows_pid_alive(pid: int):
+    """Whether *pid* is a live process, WITHOUT signalling it (OpenProcess, not
+    ``os.kill(pid, 0)`` — signal 0 is CTRL_C_EVENT on Windows).
+
+    UNTESTED ON WINDOWS. Returns True (alive), False (no such process) or None
+    (exists but not ours to touch), matching the POSIX branch's tri-state.
+    """
+    import ctypes
+
+    ERROR_ACCESS_DENIED = 5
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = _kernel32()
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        # ERROR_ACCESS_DENIED means the process EXISTS but belongs to someone
+        # else; every other failure (ERROR_INVALID_PARAMETER) means no such pid.
+        denied = ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        return None if denied else False
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True  # we hold a handle, so it exists; state unreadable
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
 def pid_alive(pid: int) -> bool:
     """Whether *pid* names a live process.
 
-    Errs toward ALIVE. Every caller uses this to decide whether removing a
-    worktree is safe, so an unanswerable question — a pid we are not allowed to
-    signal, a platform that refuses — must read as "in use". A recycled pid
-    likewise reads as alive: that leaks a directory the doctor then reports,
-    where the opposite error deletes a checkout somebody is working in.
+    Errs toward ALIVE for UNANSWERABLE questions only — a pid we are not
+    allowed to signal (POSIX EPERM), a process that exists but is not ours
+    (Windows access-denied). A recycled pid likewise reads as alive: that leaks
+    a directory the doctor then reports, where the opposite error deletes a
+    checkout somebody is working in.
+
+    A PROVABLY-dead pid reads as dead on every platform. On Windows this must
+    NOT go through ``os.kill(pid, 0)``: signal 0 is ``CTRL_C_EVENT``, so
+    ``os.kill`` there is ``GenerateConsoleCtrlEvent`` (a Ctrl-C broadcast, not a
+    liveness probe — see ``cli.commands._probe_pid``), and its
+    ERROR_INVALID_PARAMETER fires for a *live* non-group pid too. It goes
+    through ``_windows_pid_alive`` (OpenProcess) instead, so a genuinely-absent
+    pid reads dead while access-denied keeps the err-toward-ALIVE bias. This is
+    the scheduler-lease footgun's fix: an ungracefully-killed instance (the NSIS
+    upgrade path taskkills the running app) leaves a ``scheduler_heartbeat``
+    row; without a correct dead-pid read the new instance saw a live sibling for
+    the whole heartbeat-stale window and silently refused to dispatch.
     """
+    if _IS_WINDOWS:
+        # tri-state: True alive, False no-such-process, None exists-not-ours.
+        return _windows_pid_alive(pid) is not False
     import os
     try:
         os.kill(pid, 0)

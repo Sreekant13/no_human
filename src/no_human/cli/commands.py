@@ -27,6 +27,7 @@ from ..agent.claude_backend import ClaudeBackend
 from ..agent.backend import make_backend, resolve_backend_name, SUPPORTED_BACKENDS
 from ..config import (
     AuthError,
+    _windows_pid_alive,
     assert_codex_mode,
     assert_local_backend_mode,
     assert_subscription_mode,
@@ -6629,39 +6630,9 @@ def _denied_message(pid: int) -> None:
     )
 
 
-def _kernel32():
-    """The Win32 ``kernel32`` handle. Imported lazily — ``ctypes.WinDLL`` does
-    not exist off Windows — and split out so a test can substitute it."""
-    import ctypes
-
-    return ctypes.WinDLL("kernel32", use_last_error=True)
-
-
-def _windows_pid_alive(pid: int):
-    """Whether *pid* is a live process, WITHOUT signalling it.
-
-    UNTESTED ON WINDOWS. Returns True (alive), False (no such process) or None
-    (exists but not ours to touch), matching the POSIX branch's tri-state.
-    """
-    import ctypes
-
-    ERROR_ACCESS_DENIED = 5
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    k32 = _kernel32()
-    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-    if not handle:
-        # ERROR_ACCESS_DENIED means the process EXISTS but belongs to someone
-        # else; every other failure (ERROR_INVALID_PARAMETER) means no such pid.
-        denied = ctypes.get_last_error() == ERROR_ACCESS_DENIED
-        return None if denied else False
-    try:
-        code = ctypes.c_ulong()
-        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return True  # we hold a handle, so it exists; state unreadable
-        return code.value == STILL_ACTIVE
-    finally:
-        k32.CloseHandle(handle)
+# `_kernel32` and `_windows_pid_alive` now live in ..config (next to pid_alive,
+# which needs the same OpenProcess probe for the scheduler-lease dead-sibling
+# check); imported above so there is one source of truth.
 
 
 def _probe_pid(pid: int):

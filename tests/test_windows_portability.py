@@ -557,7 +557,7 @@ def test_probe_pid_never_signals_on_windows(monkeypatch):
     monkeypatch.setattr(cmds.os, "kill", lambda *a: (_ for _ in ()).throw(
         AssertionError("os.kill must never be reached on Windows")))
     fake = _FakeKernel32(handle=7)
-    monkeypatch.setattr(cmds, "_kernel32", lambda: fake)
+    monkeypatch.setattr(cfg, "_kernel32", lambda: fake)  # the probe now lives in config
     assert cmds._probe_pid(1234) is True
     assert fake.calls == ["OpenProcess(0x1000,1234)", "GetExitCodeProcess",
                           "CloseHandle"]
@@ -569,7 +569,7 @@ def test_probe_pid_reports_an_exited_process_as_gone(monkeypatch):
     cmds = importlib.import_module("no_human.cli.commands")
 
     monkeypatch.setattr(cmds, "_IS_WINDOWS", True)
-    monkeypatch.setattr(cmds, "_kernel32",
+    monkeypatch.setattr(cfg, "_kernel32",
                         lambda: _FakeKernel32(handle=7, exit_code=0))
     assert cmds._probe_pid(1234) is False
 
@@ -581,7 +581,7 @@ def test_probe_pid_distinguishes_denied_from_gone_on_windows(monkeypatch):
     import ctypes
 
     monkeypatch.setattr(cmds, "_IS_WINDOWS", True)
-    monkeypatch.setattr(cmds, "_kernel32", lambda: _FakeKernel32(handle=0))
+    monkeypatch.setattr(cfg, "_kernel32", lambda: _FakeKernel32(handle=0))
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
     assert cmds._probe_pid(1234) is None
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 87, raising=False)

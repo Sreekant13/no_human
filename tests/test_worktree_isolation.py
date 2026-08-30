@@ -482,3 +482,22 @@ def test_pid_liveness_errs_toward_in_use():
     assert pid_alive(os.getpid()) is True
     assert pid_alive(1) is True, "a pid we cannot signal must read as in use"
     assert pid_alive(4194303) is False
+
+
+def test_pid_liveness_delegates_to_openprocess_probe_on_windows(monkeypatch):
+    """FINDING E: on Windows pid_alive must NOT go through os.kill(pid, 0) —
+    signal 0 is CTRL_C_EVENT there, so os.kill is a Ctrl-C broadcast, not a
+    liveness probe, and its errors can't tell a dead pid from a live non-group
+    one. It delegates to the OpenProcess-based _windows_pid_alive tri-state: a
+    no-such-process (False) reads DEAD, so a scheduler_heartbeat left by an
+    ungracefully-killed instance stops blocking the new one; alive (True) and
+    exists-but-not-ours (None) both read alive (err-toward-ALIVE)."""
+    from no_human import config
+
+    monkeypatch.setattr(config, "_IS_WINDOWS", True)
+    monkeypatch.setattr(config, "_windows_pid_alive", lambda _pid: False)
+    assert config.pid_alive(4321) is False, "no such process → dead"
+    monkeypatch.setattr(config, "_windows_pid_alive", lambda _pid: True)
+    assert config.pid_alive(4321) is True, "alive → alive"
+    monkeypatch.setattr(config, "_windows_pid_alive", lambda _pid: None)
+    assert config.pid_alive(4321) is True, "exists but not ours → err-toward-ALIVE"
