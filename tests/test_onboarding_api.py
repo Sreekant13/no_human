@@ -205,6 +205,39 @@ async def test_reonboard_with_changed_test_command_resets_the_proof(client, stor
 
 
 @pytest.mark.asyncio
+async def test_reonboard_with_changed_install_keeps_the_test_proof(client, store, tmp_path):
+    """FINDING D: a proof is PER-COMMAND. Proving a repo creates a lockfile, so
+    re-derivation flips install ``npm install``->``npm ci`` — an unrelated
+    change that must NOT wipe the UNCHANGED test proof the review gate runs.
+    (The old all-or-nothing carry reset every proof on any command change, so a
+    re-onboard silently lost the test command until the user re-proved.)"""
+    repo = tmp_path / "svc"
+    (repo / ".git").mkdir(parents=True)
+    repo.joinpath("package.json").write_text('{"scripts":{"test":"jest","lint":"eslint"}}')
+    # no lockfile yet -> install derives as `npm install`
+    r = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r.status_code == 200, r.text
+    prof = await store.get_profile(str(repo.resolve()))
+    install_before = prof.install_cmd
+    assert install_before == "npm install"
+    prof.proven = {"test_cmd": True}
+    prof.confirmed = True
+    await store.upsert_profile(prof)
+
+    # the prove run creates a lockfile -> re-derive flips install to `npm ci`
+    repo.joinpath("package-lock.json").write_text("{}")
+    r2 = await client.post("/api/onboarding/repos/onboard", json={"repo_path": str(repo)})
+    assert r2.status_code == 200, r2.text
+    prof2 = await store.get_profile(str(repo.resolve()))
+    assert prof2.install_cmd == "npm ci"          # premise: install command really flipped
+    assert prof2.test_cmd == prof.test_cmd         # test command unchanged
+    assert prof2.proven.get("test_cmd") is True    # the test proof SURVIVED the install flip
+    assert r2.json()["proven"] is True
+    assert prof2.confirmed is True
+    assert prof2.is_usable is True
+
+
+@pytest.mark.asyncio
 async def test_onboard_rejects_non_repo(client, tmp_path):
     d = tmp_path / "plain"
     d.mkdir()

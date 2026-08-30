@@ -4690,12 +4690,25 @@ async def onboarding_onboard_repo(
     # Observed 2026-08-17: "Profile N repos" silently wiped proven+confirmed
     # for every already-proven repo it re-derived.
     prior = await store.get_profile(str(repo))
-    carry = bool(
-        prior
-        and prior.install_cmd == _first("install")
-        and prior.test_cmd == _first("test")
-        and prior.lint_cmd == _first("lint")
-    )
+    # Carry each command's proof forward PER-COMMAND — keep a proof only when
+    # THAT exact command is unchanged. The old all-or-nothing carry wiped every
+    # proof (incl. the review gate's test proof) whenever any one command
+    # changed — and re-derivation flips install `npm install`->`npm ci` once the
+    # prove run has created a lockfile, so re-onboarding a proven repo silently
+    # lost its test command. Per-command carry preserves the unchanged test
+    # proof through an unrelated install-command flip.
+    prior_proven = dict(getattr(prior, "proven", None) or {}) if prior else {}
+    carried_proven = {}
+    if prior:
+        if prior.install_cmd == _first("install") and prior_proven.get("install_cmd"):
+            carried_proven["install_cmd"] = prior_proven["install_cmd"]
+        if prior.test_cmd == _first("test") and prior_proven.get("test_cmd"):
+            carried_proven["test_cmd"] = prior_proven["test_cmd"]
+        if prior.lint_cmd == _first("lint") and prior_proven.get("lint_cmd"):
+            carried_proven["lint_cmd"] = prior_proven["lint_cmd"]
+    # `confirmed` (the human's "use this repo") holds while the test command it
+    # was confirmed against is still proven; otherwise the gate has nothing to run.
+    carry_confirmed = bool(prior and prior.confirmed and carried_proven.get("test_cmd"))
     profile = ProjectProfile(
         repo_path=str(repo),
         ecosystem=derived.ecosystem,
@@ -4709,9 +4722,9 @@ async def onboarding_onboard_repo(
         required_credentials=derive_required_credentials(
             derived.ci, vcs_host, derived.human_gated_steps, github_hosts),
         derived_from=sorted(set(derived.sources)),
-        proven=dict(prior.proven) if carry else {},
-        confirmed=prior.confirmed if carry else False,
-        notes=(prior.notes if carry else
+        proven=carried_proven,
+        confirmed=carry_confirmed,
+        notes=(prior.notes if (prior and carried_proven) else
                "derived in onboarding wizard (unproven — prove it to give the "
                "review gate a test command to run)"),
     )
