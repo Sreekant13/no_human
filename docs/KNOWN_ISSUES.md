@@ -71,7 +71,7 @@ not one the store code is still holding a Python reference to.
 
 **Lead, not a fix.** Opening the connection in autocommit mode
 (`aiosqlite.connect(path, isolation_level=None)`, a one-line change at
-`db.py:471`) took the isolated test from 3/8 failures to **0/12**. That is a
+`db.py:Store.connect`) took the isolated test from 3/8 failures to **0/12**. That is a
 strong signal about where the problem lives, but it is not a fix that can be
 adopted on that evidence: it removes multi-statement atomicity from every write
 path in the product (`create_attempt`'s `UPDATE` + `INSERT` pair, `_migrate`,

@@ -51,8 +51,8 @@ NotebookEdit, MultiEdit), every git or forge mutation, and subagents; Bash stays
 so a shell redirection is not prevented by the guard — a change the reviewer
 leaves in the tree is a gate-integrity question, not a tool one. (This sentence
 said "read-only: all write tools are blocked unconditionally" until 2026-08-22.
-`6ef8921ae` corrected it and `da3599ae4` reverted it; `guard.py:58` defines
-WRITE_TOOLS as those four names and Bash is in no read-only denial set.)
+`6ef8921ae` corrected it and `da3599ae4` reverted it; `guard.py:WRITE_TOOLS`
+defines those four names and Bash is in no read-only denial set.)
 
 The guard does not enumerate ways to spoof the identity (`--author=`, `env -u
 GIT_AUTHOR_*`, `git -c user.email=`, ...); instead `Orchestrator._foreign_authored_commits`
@@ -98,7 +98,8 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 **Read this first: no_human is not an offline tool, and this page does not claim
 to be an exhaustive list of its network traffic.** It cannot be one. The coder
 session is a Claude Agent SDK session built with **no tool restrictions** and
-`permission_mode="bypassPermissions"` (`agent/claude_backend.py:519`, `:544`) —
+`permission_mode="bypassPermissions"`
+(`agent/claude_backend.py:ClaudeBackend.__init__:519`, `:ClaudeBackend.__init__:544`) —
 no tool allowlist, no tool denylist, no per-call permission callback. It has
 Bash. Anything an agent decides to run — `curl`, `pip install`, `npm i`, a test
 suite that hits a staging API — leaves your machine, and nothing in no_human sits
@@ -138,11 +139,12 @@ named here.
   body carries the commit summary and test evidence; reviewer findings cite file
   and line and quote the lines they are about. Same destination as the push.
 - **PR receipt and status polling** — `gh` / `glab` calls for the PR's head SHA
-  and its mergeability (`vcs/pr_watcher.py:507-533`, `vcs/receipts.py`), plus
-  `git fetch origin` (`vcs/git.py:884`, `:916`), while a task waits on CI or review.
+  and its mergeability (`vcs/pr_watcher.py:default_pr_state`, `vcs/receipts.py`), plus
+  `git fetch origin` (`vcs/git.py:GitRepo.remote_branch_relation:884`, `:GitRepo.fetch:916`),
+  while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:2807`). This is *your* command, not the agent's — an agent
+  (`cli/commands.py:merge_stack_run:2807`). This is *your* command, not the agent's — an agent
   session's Bash is denied it for the spellings the rule models
   (`_LEXICAL_MERGE_STACK` in `agent/guard.py`, plus the argv check beside it),
   in both session modes; see §2 for the bound.
@@ -231,7 +233,7 @@ named here.
   launch (`ClaudeBackend._options()`, `CodexBackend._child_env()`) with an
   env-var mark that is inherited by every descendant of that session, no
   matter how it is invoked. `nh approve` and `nh merge-stack run`
-  (`_refuse_agent_gate_act`, `cli/commands.py:4955`, `:2777`) refuse before
+  (`_refuse_agent_gate_act`, `cli/commands.py:approve:4955`, `:merge_stack_run:2777`) refuse before
   `_bootstrap` runs when the calling process carries that mark, and an HTTP
   middleware in `api/app.py` (`_refuse_marked_gate_acts`, by `_csp_header`)
   refuses
@@ -381,7 +383,7 @@ config key that turns it on and the default that keeps it off.
 - **Integration health checks.** `nh integrations` / the board's integrations
   page authenticate against whichever of Jira, Linear, CircleCI and the Teams
   webhook you have configured, to show a live status
-  (`integrations/__init__.py:512`, `:546`). Nothing configured → nothing sent.
+  (`integrations/__init__.py:_probe_github_ambient:512`, `:_probe_github_ambient:546`). Nothing configured → nothing sent.
 - **Team brain control plane.** `team_brain.enabled` defaults to **`false`** and
   `team_brain.control_plane_url` to **`""`**; when set, the client exchanges
   task patterns with that URL over `https` (loopback excepted)
@@ -391,7 +393,7 @@ config key that turns it on and the default that keeps it off.
 
 The CLI, the desktop app and the MCP bridge talk to no_human's **own** API on
 `127.0.0.1:8420` (`cli/api_client.py`, `intake/mcp_bridge.py:29`,
-`cli/commands.py:78`), and the transcript-research reader probes a language
+`cli/commands.py:print_no_task_matching:78`), and the transcript-research reader probes a language
 server on localhost (`history/extractor.py:65-72`). These never leave the
 machine, and `server.host` defaults to `127.0.0.1`.
 

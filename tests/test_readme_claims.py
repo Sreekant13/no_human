@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import warnings
 from collections import namedtuple
 from pathlib import Path
 
@@ -624,7 +625,7 @@ RETIRED_REVIEWER_CLAIMS = [
     # blocked unconditionally" (docs/security.md, until 2026-08-22).
     # Ground truth: guard.py:58 WRITE_TOOLS = {"Write", "Edit",
     # "NotebookEdit", "MultiEdit"}; the readonly denial set is WRITE_TOOLS +
-    # BACKGROUND_TOOLS + SPAWN_TOOLS (guard.py:2404-2408) — Bash is in none
+    # BACKGROUND_TOOLS + SPAWN_TOOLS (guard.py:evaluate) — Bash is in none
     # of those sets, so a shell redirection writes. `6ef8921ae` corrected
     # this; `da3599ae4`, built on an older base, silently reverted it;
     # `bd0733456` corrected it again — this entry is the guard against a
@@ -636,7 +637,7 @@ RETIRED_REVIEWER_CLAIMS = [
         "During review the backend runs read-only: all write tools are "
         "blocked unconditionally.",
         "guard.py:58 WRITE_TOOLS has 4 names; Bash is in no readonly denial "
-        "set (guard.py:2404-2408) — reintroduced by da3599ae4 over "
+        "set (guard.py:evaluate) — reintroduced by da3599ae4 over "
         "6ef8921ae",
     ),
     # False claim: the other half of the same da3599ae4 sentence — "the
@@ -649,9 +650,9 @@ RETIRED_REVIEWER_CLAIMS = [
         "the backend runs read-only",
         "During review, the backend runs read-only, so nothing changes on "
         "disk.",
-        "guard.py:58/2404-2408 — Bash is not in any readonly denial set, so "
-        "the backend is not read-only; reintroduced by da3599ae4 over "
-        "6ef8921ae",
+        "guard.py:WRITE_TOOLS/evaluate — Bash is not in any readonly denial "
+        "set, so the backend is not read-only; reintroduced by da3599ae4 "
+        "over 6ef8921ae",
     ),
     # False claim: PRODUCT.md's pre-bd0733456 spelling — "adversarial review
     # by a different model in fresh context with read-only tools". Matched
@@ -664,8 +665,8 @@ RETIRED_REVIEWER_CLAIMS = [
         "with read-only tools",
         "an adversarial review by a different model in fresh context with "
         "read-only tools, told to refute \"done\".",
-        "guard.py:58/2404-2408 — Bash is not denied, so the session is not "
-        "read-only; corrected by bd0733456 (PRODUCT.md's Positioning "
+        "guard.py:WRITE_TOOLS/evaluate — Bash is not denied, so the session "
+        "is not read-only; corrected by bd0733456 (PRODUCT.md's Positioning "
         "section)",
     ),
     # False claim, retired pre-emptively: "cannot modify it" as a
@@ -679,7 +680,7 @@ RETIRED_REVIEWER_CLAIMS = [
         "cannot modify it",
         "the reviewer session cannot modify it, so any change on disk is "
         "impossible.",
-        "guard.py:58/2404-2408 — Bash can still write via shell "
+        "guard.py:WRITE_TOOLS/evaluate — Bash can still write via shell "
         "redirection; precedent for the failure mode: da3599ae4 over "
         "6ef8921ae",
     ),
@@ -1731,39 +1732,146 @@ def test_is_agent_session_is_real_but_absent_from_approve(security_doc):
     )
 
 
-# --- file:line citations must resolve to the code they describe --------------
+# --- file:line and file:symbol citations must resolve to the code they
+# describe ---------------------------------------------------------------
 #
 # `docs/verification.md` moved its citations to SYMBOLS for exactly the reason
 # stated at `test_documented_source_citations_resolve` above: line numbers rot
-# on every edit above them. security.md, eval.md and KNOWN_ISSUES.md still use
-# `path:line[-line]` citations, and rewriting that convention would be a style
-# change this fix does not make — so instead every citation is pinned here to
-# a literal token on the line(s) it names, and every citation actually written
-# in the three docs is required to appear in the table below.
+# on every edit above them. security.md, eval.md and KNOWN_ISSUES.md used to
+# be `path:line[-line]`-only, and two same-day incidents made the cost of that
+# concrete: task e5eb7b63 burned 4 attempts on its own edits shifting the line
+# it had just cited, and a doc-truth PR's `guard.py:2404-2408` citations had
+# re-rotted to ~2504-2510 within hours of an unrelated landing. Rewriting the
+# convention wholesale would be a style change this fix does not make — so a
+# SECOND citation form is accepted alongside the line form: `file.py:Symbol`
+# (a class, function, or module-level constant name, optionally followed by
+# `:line_start-line_end` as a purely advisory, never-checked hint). Every
+# citation actually written in the three docs — either form — is required to
+# appear in the table below.
 
 _LINE_CITATION_RE = re.compile(
     r"`((?:[\w./-]+\.(?:py|mjs|cjs))?:\d+(?:-\d+)?)`"
 )
+#: `file.py:Symbol[.method]` optionally followed by an advisory `:N[-M]` that
+#: is parsed but never checked — the whole point is that it may go stale.
+#: Reuses `_SYMBOL` (module scope, above) so both citation surfaces recognize
+#: the same identifier shape.
+_SYMBOL_CITATION_RE = re.compile(
+    r"`((?:[\w./-]+\.py)?:" + _SYMBOL + r"(?::\d+(?:-\d+)?)?)`"
+)
+_LEGACY_LINE_SPEC_RE = re.compile(r"^\d+(?:-\d+)?$")
+_REGEX_FALLBACK_DEF_RE = re.compile(r"^(?:async\s+)?(?:def|class)\s+(\w+)\b")
+_REGEX_FALLBACK_ASSIGN_RE = re.compile(r"^(\w+)\s*(?::[^=]+)?=")
+
+
+def _symbol_vicinity_by_regex(lines: list[str], symbol: str) -> list[str] | None:
+    """Degraded resolution used only when the source fails to parse as AST.
+
+    Column-0 `def`/`class`/assignment statements only — good enough to
+    survive a transient syntax error elsewhere in the file without turning
+    every citation in it RED. A nested `Class.method` symbol or a genuinely
+    missing name still returns None (the citation still fails) rather than
+    guessing at indentation.
+    """
+    name = symbol.split(".", 1)[0]
+    start = None
+    for i, line in enumerate(lines):
+        match = _REGEX_FALLBACK_DEF_RE.match(line)
+        if match and match.group(1) == name:
+            start = i
+            break
+        match = _REGEX_FALLBACK_ASSIGN_RE.match(line)
+        if match and match.group(1) == name:
+            return [line]
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if _REGEX_FALLBACK_DEF_RE.match(lines[j]) or _REGEX_FALLBACK_ASSIGN_RE.match(lines[j]):
+            end = j
+            break
+    return lines[start:end]
+
+
+def _symbol_vicinity(source_text: str, symbol: str) -> list[str] | None:
+    """The lines making up *symbol*'s vicinity in *source_text*.
+
+    For a function or class: its `def`/`class` line through its last line,
+    including the docstring and body, EXCLUDING any decorator lines (a
+    `@click.option`-decorated command is cited by its body, not its
+    decorators). For a module-level constant: the assignment statement.
+    `Outer.method` reaches one level into a class body, matching the depth
+    `_defined_symbols` (above) already supports for the documented-surface
+    citations.
+
+    AST-first. A source file that fails to parse (SyntaxError/ValueError/
+    UnicodeDecodeError — e.g. a mid-edit sibling function elsewhere in a hot
+    file) falls back to `_symbol_vicinity_by_regex` and emits a UserWarning
+    rather than failing every citation into that file; a symbol that is
+    genuinely renamed or deleted still resolves to None either way.
+
+    Returns None when *symbol* is not found.
+    """
+    lines = source_text.splitlines()
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        warnings.warn(
+            f"AST parse failed while resolving citation symbol {symbol!r} "
+            f"({exc}); falling back to regex resolution",
+            UserWarning,
+            stacklevel=2,
+        )
+        return _symbol_vicinity_by_regex(lines, symbol)
+
+    outer, dot, inner = symbol.partition(".")
+
+    def _search(node, name):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if child.name == name:
+                    return child
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        return child
+            elif isinstance(child, (ast.If, ast.Try)):
+                found = _search(child, name)
+                if found is not None:
+                    return found
+        return None
+
+    node = _search(tree, outer)
+    if dot:
+        node = _search(node, inner) if isinstance(node, ast.ClassDef) else None
+
+    if node is None:
+        return None
+    return lines[node.lineno - 1 : node.end_lineno]
 
 #: (doc filename, raw citation text exactly as it appears between backticks,
 #: path to resolve it against — inherited from the preceding citation in the
-#: same doc for a bare `:NNN` continuation, exactly as a reader would read it
-#: in prose — expected literal substring on the cited line(s)).
+#: same doc for a bare `:NNN` / `:Symbol` continuation, exactly as a reader
+#: would read it in prose — expected literal substring in the cited line(s)
+#: or, for a `file.py:Symbol` row, anywhere in that symbol's vicinity).
 CITATION_TABLE = (
     # docs/security.md
-    ("security.md", "guard.py:58", "guard.py", 'WRITE_TOOLS = {"Write"'),
-    ("security.md", "agent/claude_backend.py:519", "agent/claude_backend.py",
-     'permission_mode: str = "bypassPermissions"'),
-    ("security.md", ":544", "agent/claude_backend.py", "PreToolUse guard"),
-    ("security.md", "vcs/pr_watcher.py:507-533", "vcs/pr_watcher.py",
+    ("security.md", "guard.py:WRITE_TOOLS", "guard.py", 'WRITE_TOOLS = {"Write"'),
+    ("security.md", "agent/claude_backend.py:ClaudeBackend.__init__:519",
+     "agent/claude_backend.py", 'permission_mode: str = "bypassPermissions"'),
+    ("security.md", ":ClaudeBackend.__init__:544", "agent/claude_backend.py",
+     "PreToolUse guard"),
+    ("security.md", "vcs/pr_watcher.py:default_pr_state", "vcs/pr_watcher.py",
      '"gh", "pr", "view"'),
-    ("security.md", "vcs/git.py:884", "vcs/git.py", '"git", "fetch"'),
-    ("security.md", ":916", "vcs/git.py", '["fetch", remote]'),
-    ("security.md", "cli/commands.py:2807", "cli/commands.py",
+    ("security.md", "vcs/git.py:GitRepo.remote_branch_relation:884", "vcs/git.py",
+     '"git", "fetch"'),
+    ("security.md", ":GitRepo.fetch:916", "vcs/git.py", '["fetch", remote]'),
+    ("security.md", "cli/commands.py:merge_stack_run:2807", "cli/commands.py",
      '"gh", "pr", "merge"'),
-    ("security.md", "cli/commands.py:4955", "cli/commands.py",
+    ("security.md", "cli/commands.py:approve:4955", "cli/commands.py",
      '_refuse_agent_gate_act("approve")'),
-    ("security.md", ":2777", "cli/commands.py",
+    ("security.md", ":merge_stack_run:2777", "cli/commands.py",
      '_refuse_agent_gate_act("merge_stack_run")'),
     ("security.md", "updates.py:44", "updates.py", "PYPI_JSON_URL"),
     ("security.md", "updates.py:57", "updates.py", "DISABLE_ENV_VAR"),
@@ -1790,35 +1898,36 @@ CITATION_TABLE = (
      "httpx.post(self.webhook_url"),
     ("security.md", "notify/teams.py:205", "notify/teams.py",
      "httpx.post(self.webhook_url"),
-    ("security.md", "integrations/__init__.py:512", "integrations/__init__.py",
-     "_probe_github_ambient"),
-    ("security.md", ":546", "integrations/__init__.py",
+    ("security.md", "integrations/__init__.py:_probe_github_ambient:512",
+     "integrations/__init__.py", "_probe_github_ambient"),
+    ("security.md", ":_probe_github_ambient:546", "integrations/__init__.py",
      "Only WHETHER a non-empty token exists"),
     ("security.md", "brain/client.py:89-133", "brain/client.py",
      "cfg.control_plane_url"),
     ("security.md", "intake/mcp_bridge.py:29", "intake/mcp_bridge.py",
      "127.0.0.1:8420"),
-    ("security.md", "cli/commands.py:78", "cli/commands.py", "no task matching"),
+    ("security.md", "cli/commands.py:print_no_task_matching:78", "cli/commands.py",
+     "no task matching"),
     ("security.md", "history/extractor.py:65-72", "history/extractor.py",
      "csrf_token"),
     # docs/eval.md
-    ("eval.md", "src/no_human/cli/commands.py:7116", "src/no_human/cli/commands.py",
-     '"--trials"'),
-    ("eval.md", ":7446", "src/no_human/cli/commands.py", "asyncio.gather"),
-    ("eval.md", ":7329", "src/no_human/cli/commands.py",
+    ("eval.md", "src/no_human/cli/commands.py:bench_run:7123",
+     "src/no_human/cli/commands.py", "different --trials are not resumed"),
+    ("eval.md", ":bench_run:7446", "src/no_human/cli/commands.py", "asyncio.gather"),
+    ("eval.md", ":bench_run:7329", "src/no_human/cli/commands.py",
      "(sc.task_id, sc.trial)"),
-    ("eval.md", "src/no_human/eval/northstar_card.py:443",
+    ("eval.md", "src/no_human/eval/northstar_card.py:NorthStarCard.pass_k_rate:443",
      "src/no_human/eval/northstar_card.py", "def pass_k_rate("),
-    ("eval.md", "northstar_card.py:829-830", "northstar_card.py",
+    ("eval.md", "northstar_card.py:success_headline:829-830", "northstar_card.py",
      "pass^{card.trials}"),
-    ("eval.md", "northstar_card.py:1474-1478", "northstar_card.py",
+    ("eval.md", "northstar_card.py:render_northstar_md:1474-1478", "northstar_card.py",
      "Per-spec reliability"),
     ("eval.md", "tests/test_bench_trials.py:272", "tests/test_bench_trials.py",
      '"pass^1" not in line'),
-    ("eval.md", "northstar_card.py:360", "northstar_card.py",
-     "def spec_mean_success_rate("),
+    ("eval.md", "northstar_card.py:NorthStarCard.spec_mean_success_rate:360",
+     "northstar_card.py", "def spec_mean_success_rate("),
     # docs/KNOWN_ISSUES.md
-    ("KNOWN_ISSUES.md", "db.py:471", "db.py", "aiosqlite.connect"),
+    ("KNOWN_ISSUES.md", "db.py:Store.connect", "db.py", "aiosqlite.connect"),
 )
 
 assert len(CITATION_TABLE) >= 20, (
@@ -1864,19 +1973,69 @@ def _citation_source_lines(resolve_path: str, spec: str) -> list[str]:
     return lines[start - 1:end]
 
 
-def _check_citation(doc: str, raw: str, resolve_path: str, token: str) -> None:
+def _check_citation(
+    doc: str,
+    raw: str,
+    resolve_path: str,
+    token: str,
+    *,
+    source_text: str | None = None,
+) -> None:
     """Shared assertion body for a single citation row — factored out so the
-    non-vacuity control below can drive it directly with a wrong token."""
-    spec = raw.split(":", 1)[1] if raw.startswith(":") else raw.rsplit(":", 1)[1]
-    lines = _citation_source_lines(resolve_path, spec)
-    assert lines, (
-        f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
-        f"does not resolve to a real line range — the code moved or the "
-        f"citation was never re-derived"
+    non-vacuity control below can drive it directly with a wrong token.
+
+    Dispatches on the shape of the spec after the (possibly inherited) path:
+    a bare line number or range (`58`, `507-533`) resolves against the real
+    file on disk, unchanged from before symbol citations existed. Anything
+    else is a symbol (optionally followed by an advisory `:line-line` that is
+    parsed and then ignored — the whole point of a symbol citation is to
+    survive that range going stale).
+
+    *source_text* lets a test inject file content directly instead of
+    reading the resolved path from disk (used by the refactor-resilience and
+    AST-fallback tests below); it only applies to the symbol path — a legacy
+    line citation always reads the real file, since there is nothing to
+    fake a stale line range against.
+    """
+    tail = raw.split(":", 1)[1]
+    if _LEGACY_LINE_SPEC_RE.match(tail):
+        lines = _citation_source_lines(resolve_path, tail)
+        assert lines, (
+            f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
+            f"does not resolve to a real line range — the code moved or the "
+            f"citation was never re-derived"
+        )
+        haystack = "\n".join(lines)
+        assert token in haystack, (
+            f"{doc} cites `{raw}` for {token!r}, but the line(s) now read:\n"
+            f"  {haystack!r}\n"
+            f"re-derive the citation from the current tree"
+        )
+        return
+
+    # Symbol citation: strip the optional advisory `:line[-line]` suffix —
+    # it is never consulted for pass/fail, only parsed so the format allows it.
+    symbol = tail.split(":", 1)[0]
+    if source_text is not None:
+        text = source_text
+        display_path = resolve_path
+    else:
+        hits = _resolve_source(resolve_path)
+        assert len(hits) == 1, (
+            f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
+            f"resolves to {len(hits)} files, not one"
+        )
+        display_path = hits[0]
+        text = hits[0].read_text(encoding="utf-8")
+
+    vicinity = _symbol_vicinity(text, symbol)
+    assert vicinity is not None, (
+        f"{doc} cites `{raw}` but {symbol!r} is not defined in {display_path} "
+        f"— renamed or deleted, and the doc still sends readers to it"
     )
-    haystack = "\n".join(lines)
+    haystack = "\n".join(vicinity)
     assert token in haystack, (
-        f"{doc} cites `{raw}` for {token!r}, but the line(s) now read:\n"
+        f"{doc} cites `{raw}` for {token!r}, but {symbol}'s body now reads:\n"
         f"  {haystack!r}\n"
         f"re-derive the citation from the current tree"
     )
@@ -1939,10 +2098,13 @@ def test_absent_tolerant_citation_still_checks_content_when_present():
 
 
 def test_the_citation_table_covers_every_line_citation_in_the_three_docs():
-    """Every backticked `path:line[-line]` citation actually written in
-    security.md/eval.md/KNOWN_ISSUES.md must have a row in CITATION_TABLE —
-    otherwise this guard only ever checks the citations someone remembered to
-    add, which is exactly the blind spot that let the originals rot.
+    """Every backticked `path:line[-line]` OR `path:Symbol[:line[-line]]`
+    citation actually written in security.md/eval.md/KNOWN_ISSUES.md must
+    have a row in CITATION_TABLE — otherwise this guard only ever checks the
+    citations someone remembered to add, which is exactly the blind spot
+    that let the originals rot. Legacy line-only citations remain legal —
+    migrating to a symbol anchor is encouraged for rot-prone hot files, not
+    required for every row.
     """
     table_by_doc: dict[str, set[str]] = {}
     for doc, raw, _, _ in CITATION_TABLE:
@@ -1952,7 +2114,9 @@ def test_the_citation_table_covers_every_line_citation_in_the_three_docs():
     extra: list[str] = []
     for doc, path in _CITATION_DOC_PATHS.items():
         text = path.read_text(encoding="utf-8")
-        found = set(_LINE_CITATION_RE.findall(text))
+        found = set(_LINE_CITATION_RE.findall(text)) | set(
+            _SYMBOL_CITATION_RE.findall(text)
+        )
         table = table_by_doc.get(doc, set())
         missing.extend(f"{doc}: {raw}" for raw in sorted(found - table))
         extra.extend(f"{doc}: {raw}" for raw in sorted(table - found))
@@ -1966,6 +2130,94 @@ def test_the_citation_table_covers_every_line_citation_in_the_three_docs():
         "docs (stale table entries — the doc changed and the table did not):"
         "\n  " + "\n  ".join(extra)
     )
+
+
+def test_symbol_citation_resilience():
+    """The entire point of a `file.py:Symbol` citation: it must keep
+    resolving to the same code after the cited file grows above it.
+
+    Prepending 100 arbitrary lines to each migrated citation's real source
+    shifts every historical line number in the file by exactly 100 without
+    touching any symbol. A citation that (despite appearances) secretly
+    depended on the line number it was first written against — or on a now
+    very-stale advisory `:line-line` suffix — would go RED here; one that
+    resolves the symbol by name, as designed, does not notice the padding.
+    """
+    pad_text = "\n".join(f"# padding line {i}" for i in range(100)) + "\n"
+    checked = 0
+    for doc, raw, resolve_path, token in CITATION_TABLE:
+        tail = raw.split(":", 1)[1]
+        if _LEGACY_LINE_SPEC_RE.match(tail):
+            continue  # legacy line citation — not part of this migration
+        hits = _resolve_source(resolve_path)
+        assert len(hits) == 1, (
+            f"{resolve_path} (from {doc} citation `{raw}`) does not resolve "
+            f"to exactly one file in this tree"
+        )
+        padded_source = pad_text + hits[0].read_text(encoding="utf-8")
+        _check_citation(doc, raw, resolve_path, token, source_text=padded_source)
+        checked += 1
+    assert checked >= 15, (
+        f"only {checked} symbol citations were exercised by the resilience "
+        f"check — the ~20-row migration this test guards should cover most "
+        f"of CITATION_TABLE's symbol-anchored rows"
+    )
+
+
+def test_symbol_citation_fails_on_wrong_symbol():
+    """A symbol citation must fail exactly as loudly as a line citation does
+    when the code under it has moved — a renamed/deleted symbol, or a token
+    no longer present in an otherwise-correctly-resolved symbol's vicinity.
+    """
+    source_text = (
+        "class Widget:\n"
+        "    def spin(self):\n"
+        "        return 'whee'\n"
+    )
+    with pytest.raises(AssertionError, match="is not defined in"):
+        _check_citation(
+            "security.md",
+            "fake.py:NoSuchSymbol",
+            "fake.py",
+            "whee",
+            source_text=source_text,
+        )
+    with pytest.raises(AssertionError, match="re-derive the citation"):
+        _check_citation(
+            "security.md",
+            "fake.py:Widget.spin",
+            "fake.py",
+            "not-anywhere-in-spin",
+            source_text=source_text,
+        )
+
+
+def test_symbol_citation_falls_back_to_regex_when_ast_fails():
+    """A syntax error anywhere in a hot file must not turn every citation
+    into that file RED — a well-formed symbol elsewhere in the same file
+    should still resolve via the regex fallback, with a UserWarning that
+    makes the degraded path visible instead of silently swallowing it.
+    """
+    source_text = (
+        "def healthy_symbol():\n"
+        "    return 'still here'\n"
+        "\n"
+        "def broken(:\n"
+        "    pass\n"
+    )
+    with pytest.warns(UserWarning, match="falling back to regex"):
+        vicinity = _symbol_vicinity(source_text, "healthy_symbol")
+    assert vicinity is not None, "regex fallback failed to resolve a top-level def"
+    assert "still here" in "\n".join(vicinity)
+
+    with pytest.warns(UserWarning, match="falling back to regex"):
+        _check_citation(
+            "security.md",
+            "fake.py:healthy_symbol",
+            "fake.py",
+            "still here",
+            source_text=source_text,
+        )
 
 
 # --- KNOWN_ISSUES.md's traceback citations (not backtick-wrapped) ------------
