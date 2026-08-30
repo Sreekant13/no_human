@@ -132,7 +132,10 @@ FROZEN_FILE_LINES = {
     # 19599 -> 19630 (+31): three `WorktreeCheckFailed` catch-site audit
     # comments in `_run_reviewer` (task reviewer-worktree-returncode-audit) —
     # comments only, no behaviour change.
-    "core/orchestrator.py": 19630,
+    # 19630 -> 19650 (+20): PR #929's fail-closed .git/common/config allowlist
+    # (a benign shared-config reserialization no longer discards the reviewer
+    # verdict; execution-surface keys still discard). Re-anchored on merge.
+    "core/orchestrator.py": 19650,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

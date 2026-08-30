@@ -300,6 +300,93 @@ def test_config_reserialization_excused_but_key_change_and_source_edit_caught(
         f"modified={delta.modified}")
 
 
+def test_a_bookkeeping_branch_key_written_to_the_shared_config_is_excused_and_disclosed(
+    worktree_env,
+):
+    """Root-cause regression for the 31 recorded `.git/common/config`
+    verdict-discards (task: reviewer-worktree-integrity-benign-config-write).
+
+    Every one of those attempts shared the identical shape: zero tracked-path
+    changes, and the sole diff a key added to the WORKTREE-SHARED
+    `.git/config` by a CONCURRENT process (another worktree's `git branch`/
+    `checkout -b`/`fetch`) during the review window — never the reviewer
+    under test. This plants exactly that shape: a `branch.<name>.rebase` key,
+    the same key git itself writes on `git branch --set-upstream-to`/
+    `checkout -b`, added directly to the shared common config as a stand-in
+    for the concurrent worktree that really writes it.
+
+    `delta.is_empty()` must stay True (the verdict is accepted) while the
+    path and key are still surfaced through `delta.benign`/`benign_keys` (the
+    disclosure survives even though the discard does not).
+    """
+    wt = worktree_env["wt"]
+    common_dir = worktree_env["common_dir"]
+    cfg = common_dir / "config"
+
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    _git(wt, "config", "--file", str(cfg), "branch.some-other-task.rebase", "true")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert delta.is_empty(), (
+        "a bookkeeping branch key written to the shared config discarded the "
+        f"verdict: added={delta.added} modified={delta.modified} "
+        f"deleted={delta.deleted}"
+    )
+    assert any(p.endswith("common/config") or p == ".git/common/config"
+               for p in delta.benign), (
+        f"the excused config write was not disclosed: benign={delta.benign}")
+    assert "branch.some-other-task.rebase" in delta.benign_keys, (
+        f"the changed key was not disclosed: benign_keys={delta.benign_keys}")
+
+
+def test_a_non_bookkeeping_config_key_and_a_tracked_edit_still_discard(
+    worktree_env,
+):
+    """Pin: the benign-key allowlist must not swallow a real violation.
+
+    Same baseline as the bookkeeping-key test above, but this time the
+    changed config key (`include.path`) is NOT on the allowlist, and a
+    tracked source file is ALSO edited. Both must still land in `modified`
+    and the delta must stay non-empty — this is the exact protection the
+    module exists for, and the allowlist added by this change must not widen
+    to cover it.
+    """
+    wt = worktree_env["wt"]
+    common_dir = worktree_env["common_dir"]
+    cfg = common_dir / "config"
+
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    _git(wt, "config", "--file", str(cfg), "include.path", "/tmp/evil")
+    (wt / "src" / "main.py").write_text("v2 -- reviewer edit\n")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert any(p.endswith("/config") for p in delta.modified), (
+        f"a non-allowlisted config key was excused instead of caught: "
+        f"modified={delta.modified} benign={delta.benign}")
+    assert not any(p.endswith("/config") for p in delta.benign), (
+        f"a non-allowlisted config key landed in benign: benign={delta.benign}")
+    assert "src/main.py" in delta.modified, (
+        f"the tracked edit alongside a config change was not caught: "
+        f"modified={delta.modified}")
+    assert not delta.is_empty()
+
+    # Mixed case: a benign key added ALONGSIDE the tracked edit must still
+    # yield a non-empty delta — the tracked edit alone is enough to keep the
+    # gate from ever excusing the whole review.
+    before2 = rw.snapshot(wt, timeout=_TIMEOUT)
+    _git(wt, "config", "--file", str(cfg), "branch.some-other-task.rebase", "true")
+    (wt / "src" / "main.py").write_text("v3 -- another reviewer edit\n")
+
+    mixed = rw.compare(wt, before2, timeout=_TIMEOUT)
+    assert "src/main.py" in mixed.modified
+    assert not mixed.is_empty(), (
+        "a tracked edit alongside a benign-only config key was excused: "
+        f"added={mixed.added} modified={mixed.modified} deleted={mixed.deleted}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Part A2: index FLAG BITS (assume-unchanged / skip-worktree)
 # --------------------------------------------------------------------------- #

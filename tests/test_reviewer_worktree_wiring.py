@@ -330,3 +330,51 @@ async def test_a_reviewer_that_really_wrote_reports_its_path_and_is_reverted(
     assert not (repo / planted).exists(), (
         "the reviewer's real write survived instead of being reverted")
 
+
+async def test_a_bookkeeping_config_write_keeps_the_verdict_and_records_an_event(
+    store, tmp_path, monkeypatch,
+):
+    """The production wiring for `delta.benign` (reviewer-worktree-benign-
+    config-write): a `compare()` result whose ONLY change is an excused
+    `.git/common/config` bookkeeping key must still return the reviewer's
+    PASS, and must disclose the excused write through its own event kind —
+    never through `reviewer_wrote`, which is reserved for a discard.
+    """
+    def _benign_only(*a, **k):
+        return rw.Delta(added=[], modified=[], deleted=[],
+                        benign=[".git/common/config"],
+                        benign_keys=["branch.x.rebase"])
+
+    monkeypatch.setattr(rw, "compare", _benign_only)
+
+    events = []
+    repo = _git_repo(tmp_path / "repo")
+    cfg = load_config(tmp_path / "config.yaml")
+    orch = Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None),
+                        event_sink=events.append)
+    reviewer = _PassingReviewer()
+    orch.reviewer = reviewer
+
+    decision = await orch._run_reviewer(_task(), repo_path=repo)
+
+    assert reviewer.calls == 1
+    assert decision.passed is True, (
+        "a benign-only .git/common/config write discarded the reviewer's "
+        "PASS instead of accepting it")
+
+    written = [e for e in events
+               if (e.get("kind") if isinstance(e, dict) else None)
+               == "reviewer_wrote"]
+    assert not written, (
+        f"a benign-only config write was reported through reviewer_wrote, "
+        f"which discards the verdict: {written}")
+
+    benign_events = [e for e in events
+                     if (e.get("kind") if isinstance(e, dict) else None)
+                     == "reviewer_worktree_benign_git_write"]
+    assert len(benign_events) == 1, (
+        f"expected exactly one benign-git-write event, got: {benign_events}")
+    event = benign_events[0]
+    assert ".git/common/config" in event.get("paths", []), event
+    assert "branch.x.rebase" in event.get("keys", []), event
+

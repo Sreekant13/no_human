@@ -16379,6 +16379,26 @@ class Orchestrator:
             raise self._reviewer_worktree_unavailable(
                 f"gate integrity could not be established: {exc}", decision) from exc
 
+        # `delta.benign` (reviewer-worktree-benign-config-write): paths
+        # `compare()` excused via the config benign-key allowlist — a real
+        # key-set change confined to bookkeeping keys git/concurrent
+        # worktrees write to the SHARED `.git` common dir, never the
+        # reviewer under test (see `_BENIGN_CONFIG_KEY_PATTERNS`). Disclosed
+        # here, before the empty-delta return, so the event survives even
+        # though the verdict is accepted unchanged. `getattr` because
+        # `tests/test_reviewer_worktree_wiring.py` monkeypatches `rw.compare`
+        # with stand-ins that predate this field.
+        if getattr(delta, "benign", None):
+            self.emit(
+                "reviewer_worktree_benign_git_write",
+                "git bookkeeping wrote the shared .git config during the "
+                "review; no tracked path changed — the verdict stands",
+                paths=list(delta.benign),
+                keys=list(getattr(delta, "benign_keys", [])),
+                at=datetime.now(timezone.utc).isoformat(),
+                baseline_commit=before.head,
+            )
+
         if delta.is_empty():
             return decision
 

@@ -104,6 +104,16 @@ class Delta:
     added: list[str]
     modified: list[str]
     deleted: list[str]
+    #: `.git`-common-dir config paths EXCUSED by `compare()`'s benign-key
+    #: allowlist (see `_BENIGN_CONFIG_KEY_PATTERNS`) — disclosed but NOT a
+    #: verdict-discarding write. Deliberately excluded from `is_empty()`: a
+    #: benign-only delta IS empty for gate purposes, same as an
+    #: effective-equal config re-serialization already was before this field
+    #: existed.
+    benign: list[str] = field(default_factory=list)
+    #: The config keys that changed within `benign` paths, for the disclosure
+    #: event — never used for gating.
+    benign_keys: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (self.added or self.modified or self.deleted)
@@ -512,6 +522,74 @@ def _config_effective(path: Path, *, timeout: float) -> str | None:
     return "\0".join(sorted(proc.stdout.split("\0")))
 
 
+def _config_keyvals(norm: str) -> dict[str, list[str]]:
+    """Parse `_config_effective`'s normalized `key\\nvalue\\0key\\nvalue...`
+    string into `{key: sorted([value, ...])}`, keyed by name so a caller can
+    ask "did this KEY'S value set change" rather than only "did the whole
+    file change."
+
+    `git config --list -z` emits one `key\\nvalue` record per `\\0`-terminated
+    entry; a key missing its `\\n` (git can emit a bare key for a
+    valueless/boolean-shorthand entry) reads as value `""`. `maxsplit=1` on
+    the split is deliberate — a value may itself contain a literal newline
+    (a multi-line config value), and only the FIRST newline separates key
+    from value. A key set more than once (e.g. `remote.origin.fetch`) keeps
+    every value, sorted, so a reordering of duplicate entries is not mistaken
+    for a value change.
+    """
+    out: dict[str, list[str]] = {}
+    for rec in norm.split("\0"):
+        if not rec:
+            continue
+        key, _, value = rec.partition("\n")
+        out.setdefault(key, []).append(value)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+#: Evidence for this allowlist: 31 `attempts` rows in `~/.no_human/no_human.db`
+#: (`failure_reason like '%reviewer wrote to the worktree%'`) all share the
+#: identical shape `(0 added, 1 modified, 0 deleted): ~.git/common/config` —
+#: zero tracked-path changes, the sole diff a key added/changed in the
+#: worktree-shared `.git/config` by a CONCURRENT process (another worktree's
+#: `git branch`/`checkout -b`/`fetch`, editor tooling) during the review
+#: window, never the reviewer under test. `git config --list --file` on the
+#: shared config in this install shows exactly this churn: dozens of
+#: `branch.<name>.rebase|remote|merge|vscode-merge-base` keys written by other
+#: concurrent worktrees, plus `maintenance.*`/`gc.*` bookkeeping git writes to
+#: itself. None of these keys has an execution surface — they are read by
+#: `git branch`/`git pull --rebase`/`git maintenance`, never by a hook,
+#: filter, alias, or include. Matched on the NORMALIZED LOWERCASE key: git
+#: itself lowercases the section and the trailing subkey name but preserves
+#: the middle branch/remote NAME verbatim, so the pattern must allow arbitrary
+#: (non-dot) text in that middle segment.
+#:
+#: Deliberately NOT here, with an execution surface each: `remote.*.url`
+#: (redirects a future fetch/push), `remote.*.uploadpack`/`receivepack`
+#: (arbitrary command on push/fetch), `core.*` (`core.hooksPath`,
+#: `core.fsmonitor`), `alias.*` (arbitrary command), `filter.*`
+#: (smudge/clean/process — arbitrary command), `include`/`includeif.*`
+#: (pulls in attacker-controlled config), `extensions.*`, `credential.*`,
+#: `http.*` (proxy/cert overrides), `pager.*`, `diff.*.textconv` (arbitrary
+#: command), `submodule.*` (arbitrary repo URL). An unrecognised key returns
+#: `False` from `_is_benign_config_key` — fail-closed default, same posture as
+#: every other adjudication in this module.
+_BENIGN_CONFIG_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^branch\.[^.]+\.(rebase|remote|merge|pushremote|description|"
+               r"vscode-merge-base)$"),
+    re.compile(r"^maintenance\..+$"),
+    re.compile(r"^gc\..+$"),
+)
+
+
+def _is_benign_config_key(key: str) -> bool:
+    """`True` only for a config key this module has evidence is written as
+    git/tooling bookkeeping with no execution surface. See
+    `_BENIGN_CONFIG_KEY_PATTERNS` for the evidence and the exclusion list.
+    """
+    normalized = key.strip().lower()
+    return any(p.match(normalized) for p in _BENIGN_CONFIG_KEY_PATTERNS)
+
+
 def _config_norm_map(
     admin_dir: Path, common_dir: Path, *, timeout: float
 ) -> dict[str, str]:
@@ -840,6 +918,8 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
     added: list[str] = []
     modified: list[str] = []
     deleted: list[str] = []
+    benign: list[str] = []
+    benign_keys: list[str] = []
     for path in sorted(set(before.entries) | set(after.entries)):
         b = before.entries.get(path)
         a = after.entries.get(path)
@@ -894,8 +974,26 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
             # snapshot value and also falls through, fail-closed.
             bn = before.config_norm.get(path)
             an = after.config_norm.get(path)
-            if bn is not None and an is not None and bn == an:
-                continue
+            if bn is not None and an is not None:
+                if bn == an:
+                    continue
+                # Real key-set change. Excuse it ONLY when every changed key
+                # is on the bookkeeping allowlist (see
+                # `_BENIGN_CONFIG_KEY_PATTERNS`) — the exact shape of the 31
+                # recorded `.git/common/config` false-discards, all zero
+                # tracked-path changes and all confined to keys git/tooling
+                # write to itself. A single non-allowlisted key among the
+                # changed set (`include.path`, `alias.*`, ...) keeps the
+                # whole file a violation, same fail-closed shape as an
+                # unparseable file below.
+                bkv = _config_keyvals(bn)
+                akv = _config_keyvals(an)
+                changed = {k for k in set(bkv) | set(akv)
+                           if bkv.get(k) != akv.get(k)}
+                if changed and all(_is_benign_config_key(k) for k in changed):
+                    benign.append(f".git/{path}")
+                    benign_keys.extend(sorted(changed))
+                    continue
         display = f".git/{path}"
         if a is None:
             deleted.append(display)
@@ -922,7 +1020,8 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
             modified.append(f".git/index:{path} [flag cleared]")
     if before.head != after.head:
         modified.append(f"HEAD:{before.head}->{after.head}")
-    return Delta(added=sorted(added), modified=sorted(modified), deleted=sorted(deleted))
+    return Delta(added=sorted(added), modified=sorted(modified), deleted=sorted(deleted),
+                 benign=sorted(benign), benign_keys=sorted(set(benign_keys)))
 
 
 def revert(repo_path: Path, before: Snapshot, delta: Delta, *, timeout: float) -> None:
