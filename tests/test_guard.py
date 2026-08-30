@@ -3073,6 +3073,126 @@ def test_a_mutation_in_any_segment_of_a_compound_is_destructive(cmd):
     assert _terminating(d) is True
 
 
+@pytest.mark.parametrize("cmd", [
+    # `timeout N` takes a bare (non-flag) duration operand, so the recovery
+    # scan in `_strip_wrappers` (which only fires on a following `-flag`)
+    # never sees the `find` underneath.
+    "grep -rn X /Users && timeout 5 find /Users -delete",
+    "grep -rn X /Users && xargs find /Users -delete",
+    # `timeout -k 1 5 find ...`: a flag+value pair before the duration operand.
+    "grep -rn X /Users && timeout -k 1 5 find /Users -delete",
+    "grep -rn X /Users && nice -n 10 find /Users -name '*.pem' -exec rm {} +",
+    "grep -rn X /Users && stdbuf -oL find /Users -delete",
+    # Absolute path to the wrapper: PurePosixPath(...).name still resolves it.
+    "grep -rn X /Users && /usr/bin/timeout 5 find /Users -delete",
+    # A `_WRAPPERS` name stacked in front of a `_SCAN_WRAPPER_NAMES` one.
+    "grep -rn X /Users && env timeout 5 find /Users -delete",
+    # `VAR=value` assignment ahead of the wrapper name itself.
+    "grep -rn X /Users && TMPDIR=/tmp timeout 5 find /Users -delete",
+    # Two scan-wrapper names nested.
+    "grep -rn X /Users && timeout 5 xargs find /Users -delete",
+    "grep -rn X /Users; ionice -c 2 find /Users -fprintf /tmp/loot %p",
+])
+def test_a_wrapped_find_mutation_in_a_compound_is_destructive(cmd):
+    """Regression for the mislabel this PR fixes: a `find ... -delete`/`-exec`
+    wrapped in `timeout`/`xargs`/`nice`/`stdbuf` (and siblings) inside an
+    already-denied compound must still classify DESTRUCTIVE, not HYGIENE — the
+    grep half already denies the command, so nothing new is ALLOWED here; only
+    the terminating/non-terminating LABEL was wrong before `_peel_scan_wrappers`.
+    See `_segment_scans_and_mutates` and `_peel_scan_wrappers`."""
+    d = _ev("Bash", {"command": cmd})
+    assert d.allow is False and "filesystem-wide scan blocked" in d.reason
+    assert d.severity == guard.GUARD_DESTRUCTIVE, f"{cmd!r} -> {d.severity}"
+    assert _terminating(d) is True
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -rn X /Users && timeout 5 find /Users -name '*.py'",
+    "grep -rn X /Users && nice -n 10 ls -R /Users",
+    "grep -rn X /Users && timeout 5 grep -rn 'a->b' /Users",
+    # `find` here is an ARGUMENT to `python`, not the command being wrapped —
+    # `_peel_scan_wrappers` must not jump over `python` to reach it.
+    "grep -rn X /Users && timeout 5 python x.py find -delete",
+])
+def test_a_wrapped_pure_read_scan_stays_hygiene(cmd):
+    """The other direction of the same fix: a genuinely clean read, wrapped
+    the same way, must stay HYGIENE — `_peel_scan_wrappers` must not
+    over-peel into treating an unrelated command as a scan, and a wrapped
+    read with no mutation primary is still just a read."""
+    d = _ev("Bash", {"command": cmd})
+    assert d.allow is False and "filesystem-wide scan blocked" in d.reason
+    assert d.severity == guard.GUARD_HYGIENE, f"{cmd!r} -> {d.severity}"
+    assert _terminating(d) is False
+
+
+def test_a_standalone_wrapped_scan_denial_scope_is_unchanged():
+    """Boundary pin, not a regression test for this PR: `root_scan_denial`
+    (untouched, OUT OF SCOPE) still runs the unmodified `_strip_wrappers`, so
+    a STANDALONE wrapped scan with no earlier denied segment to anchor on is
+    not denied at all yet — it is simply allowed through, same as before this
+    fix. This pins that the fix does NOT accidentally widen denial coverage:
+    `_peel_scan_wrappers` only changes the HYGIENE/DESTRUCTIVE label of a
+    scan `root_scan_denial` already decided to deny; it cannot make
+    `root_scan_denial` deny something new."""
+    for cmd in (
+        "timeout 5 find /Users -name x",
+        "timeout 5 find / -perm -111 >/dev/null 2>&1",
+    ):
+        d = _ev("Bash", {"command": cmd})
+        assert d.allow is True, f"{cmd!r} -> {d.allow!r} (denial scope changed)"
+        assert d.severity is None, f"{cmd!r} -> {d.severity!r}"
+
+
+def test_the_scan_severity_wrapper_peel_is_local_not_a_wrappers_widening():
+    """AC3: `_WRAPPERS` is shared by five other consumers (`root_scan_denial`
+    itself, the git-push guard's `_git_push_invocations`, the package-install
+    guard, the approve/forge guard, and the venv guard) — widening it would
+    silently change all of them. The scan-severity fix must add a SIBLING
+    list instead, exactly like `_ASSIGN_DECLARATORS` does for the
+    approve/forge guard."""
+    assert guard._WRAPPERS == frozenset(
+        {"env", "sudo", "nohup", "command", "exec", "time", "builtin"}
+    ), "the shared _WRAPPERS set must not change for this fix"
+    assert guard._SCAN_WRAPPER_NAMES.isdisjoint(guard._WRAPPERS), (
+        "the local scan-wrapper list must not overlap the shared set")
+
+    # Spot-check two of the five _strip_wrappers consumers behave exactly as
+    # before: the git-push guard still recurses into `xargs git push` itself
+    # (denied), and a wrapped command with nothing for the scan guard to deny
+    # is still allowed outright.
+    push = _ev("Bash", {"command": "xargs git push origin main"})
+    assert push.allow is False, "the git-push guard's own xargs handling regressed"
+
+    plain = _ev("Bash", {"command": "timeout 5 ls"})
+    assert plain.allow is True, "an unrelated wrapped command must stay allowed"
+
+
+def test_peel_scan_wrappers_pins_both_directions():
+    """AC4: a direct unit pin of `_peel_scan_wrappers` itself, independent of
+    the `evaluate()` plumbing above — both the forward peel and the refusal
+    to over-peel, plus nested wrappers and a bounded adversarial input."""
+    peeled = guard._peel_scan_wrappers(["timeout", "5", "find", "/Users", "-delete"])
+    assert peeled == ["find", "/Users", "-delete"]
+
+    # Not a scan underneath (`find` is an argument to `python`, not argv[0]
+    # after peeling) -> returned UNCHANGED, argv[0] stays the wrapper name.
+    unchanged = guard._peel_scan_wrappers(
+        ["timeout", "5", "python", "x.py", "find", "-delete"])
+    assert unchanged == ["timeout", "5", "python", "x.py", "find", "-delete"]
+    assert guard.PurePosixPath(unchanged[0]).name not in guard._SCAN_EXECUTABLES
+
+    # Two scan-wrapper names nested.
+    nested = guard._peel_scan_wrappers(
+        ["timeout", "5", "xargs", "-0", "nice", "-n", "10", "find", "/x", "-delete"])
+    assert nested == ["find", "/x", "-delete"]
+
+    # Bounded: `_SCAN_WRAPPER_PEEL_CAP` outer iterations, not O(len(words)) —
+    # must return promptly and must not crash or raise on 1000 tokens.
+    adversarial = ["timeout"] * 1000 + ["find", "-delete"]
+    result = guard._peel_scan_wrappers(adversarial)
+    assert result, "must not collapse to empty on an adversarial wrapper chain"
+
+
 def test_read_only_polling_and_over_budget_reads_are_hygiene_too(tmp_path):
     """Two more denials of acts that changed nothing: a planner busy-waiting
     on a background tool, and a whole-file read over the context budget."""

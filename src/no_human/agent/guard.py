@@ -229,6 +229,94 @@ def _is_scan_exe_name(name: str) -> bool:
     return name in _SCAN_EXECUTABLES
 
 
+#: Wrappers peeled for the SCAN-SEVERITY check ONLY. Deliberately a sibling
+#: list, not a widening of `_WRAPPERS` (below): that set is shared by FIVE
+#: other consumers — `root_scan_denial` itself, the git-push guard
+#: (`_git_push_invocations`, which deliberately RECURSES into `xargs git
+#: push` rather than stripping it), the package-install guard, the
+#: approve/forge guard, and the venv guard (two call sites) — so adding these
+#: there would silently change all of them and demand re-gating every one.
+#: Same reasoning and shape as `_ASSIGN_DECLARATORS` above. `env`/`sudo`/
+#: `nohup`/`time` already come from `_WRAPPERS` via `_strip_wrappers`, which
+#: `_peel_scan_wrappers` below still runs first.
+_SCAN_WRAPPER_NAMES = frozenset({
+    "timeout", "xargs", "nice", "ionice", "stdbuf", "setsid", "taskset", "chrt"})
+
+#: `VAR=value` assignment token — the same shape `_strip_wrappers` checks.
+_SCAN_WRAPPER_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+#: A duration/number operand these wrappers take as a bare (non-flag)
+#: argument (`timeout 5`, `timeout 5s`) or a hex CPU-affinity mask
+#: (`taskset 0x3`).
+_SCAN_WRAPPER_OPERAND = re.compile(r"\d+(\.\d+)?[smhd]?|0x[0-9a-fA-F]+")
+
+#: Caps so an adversarial line (`timeout timeout timeout ... find -delete`)
+#: stays linear instead of quadratic — cf. the `_unmask` superlinearity
+#: comment further down this file.
+_SCAN_WRAPPER_PEEL_CAP = 4
+_SCAN_WRAPPER_WALK_CAP = 16
+
+
+def _peel_scan_wrappers(words: list[str]) -> list[str]:
+    """`_strip_wrappers` plus the delay/parallel/priority/buffering wrappers.
+
+    `_strip_wrappers`'s recovery scan only fires when the token after a
+    wrapper starts with `-`; `timeout`/`xargs`/`nice`/`stdbuf` (and siblings)
+    take a NON-flag operand (`timeout 5 find …`) or a flag+value pair
+    (`xargs -0 find …`, `stdbuf -oL find …`), so argv[0] stayed the wrapper
+    name and the `find` underneath was never seen — measured 2026-08-30 as
+    `grep -rn X /Users && timeout 5 find /Users -delete` labelled HYGIENE.
+    PRE-EXISTING, not a #826 regression.
+
+    Walks forward over SKIPPABLE tokens only (a flag, a `VAR=value`
+    assignment, an xargs replace-string `{}`, a duration/number operand, or
+    another `_SCAN_WRAPPER_NAMES`/`_WRAPPERS` name) and stops at the first
+    real word, so `timeout 5 python x.py find -delete` (where `find` is an
+    ARGUMENT, not the command) is NOT read as a scan. Mutation primaries
+    (`-delete`, `-exec`) can only appear after `find` itself, so jumping to
+    the scan-exe token never skips one.
+
+    Feeds `_scan_is_pure_read` only, which merely chooses HYGIENE vs
+    DESTRUCTIVE for a scan `root_scan_denial` has ALREADY denied:
+    over-peeling can only make a denial more terminating, never allow a
+    command that would otherwise be blocked.
+    """
+    argv = _strip_wrappers(words, _is_scan_exe_name)
+    for _ in range(_SCAN_WRAPPER_PEEL_CAP):
+        if not argv:
+            return argv
+        name = PurePosixPath(argv[0]).name
+        if name in _SCAN_EXECUTABLES:
+            return argv
+        if name not in _SCAN_WRAPPER_NAMES:
+            return argv
+        j = 1
+        steps = 0
+        while j < len(argv) and steps < _SCAN_WRAPPER_WALK_CAP:
+            tok = argv[j]
+            if tok.startswith("-") and tok != "-":
+                pass
+            elif _SCAN_WRAPPER_ASSIGN.fullmatch(tok):
+                pass
+            elif tok == "{}":
+                pass
+            elif _SCAN_WRAPPER_OPERAND.fullmatch(tok):
+                pass
+            else:
+                break
+            j += 1
+            steps += 1
+        if j >= len(argv):
+            return argv
+        candidate_name = PurePosixPath(argv[j]).name
+        if candidate_name in _SCAN_EXECUTABLES:
+            return argv[j:]
+        if candidate_name in _SCAN_WRAPPER_NAMES:
+            argv = argv[j:]
+            continue
+        return argv
+    return argv
+
+
 def _is_recursive_scan(name: str, args: list) -> bool:
     """Whether this invocation traverses a directory tree at all — a
     non-recursive `grep pattern file.txt` or `ls dir` never sweeps anything,
@@ -436,8 +524,11 @@ def _scan_is_pure_read(cmd: str) -> bool:
 
 def _segment_scans_and_mutates(words: list[str]) -> bool:
     """A single command segment (already quote-split into argv words) that is
-    a scan carrying a `find` mutation primary."""
-    argv = _strip_wrappers(words, _is_scan_exe_name)
+    a scan carrying a `find` mutation primary. Peels delay/parallel/priority/
+    buffering wrappers (`timeout 5 find … -delete`, `xargs find … -delete`)
+    via `_peel_scan_wrappers` so a wrapped mutation is not mislabelled a pure
+    read — see that function's docstring."""
+    argv = _peel_scan_wrappers(words)
     return (bool(argv) and PurePosixPath(argv[0]).name in _SCAN_EXECUTABLES
             and any(a in _SCAN_MUTATION_PRIMARIES for a in argv[1:]))
 

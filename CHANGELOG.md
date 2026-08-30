@@ -32,6 +32,18 @@ Server/fleet reliability + cost-observability work landed after the 0.1.6 cut
   cost-weighted — the exact metric BUDGET_EXHAUSTED kills on), so a human can see
   how close a task is to being killed, sourced from the gate's own helpers.
 
+### Fixed — safety guard
+
+- **A `find … -delete`/`-exec` wrapped in `timeout`/`xargs`/`nice`/`stdbuf` (and
+  siblings) inside an already-denied compound now classifies DESTRUCTIVE, not
+  HYGIENE**, on the codex post-hoc backend (e.g. `grep -rn X /Users && timeout 5
+  find /Users -delete`). The scan-severity check's wrapper-stripping missed
+  these because they take a non-flag operand or flag+value pair, not the bare
+  flag `_strip_wrappers`'s recovery scan expects — the compound was already
+  denied via the `grep` half, so only the terminating/non-terminating label was
+  wrong. Fixed with a local `_peel_scan_wrappers` helper scoped to that one
+  check; the shared `_WRAPPERS` set and its five other consumers are unchanged.
+
 ## [0.1.6] — 2026-08-28
 
 Release range `8a55a92d3..c3cd200bf1`, each change landed behind an independent

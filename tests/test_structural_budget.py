@@ -172,7 +172,10 @@ FROZEN_FILE_LINES = {
     # GET/PUT /api/config/workers endpoints + their _workers_payload helper, so
     # the concurrent-worker count is configurable from the Settings Models pane
     # (config.set_concurrency). Re-anchored in the same session it landed.
-    "api/app.py": 5471,
+    # Grew to 5488 (+17) when PR #913's _loaded_code_stale fix landed (a failed
+    # head_sha() no longer clobbers a cached 'behind HEAD' verdict) — re-anchored
+    # here on the next merge (#913 landed without re-measuring the ratchet).
+    "api/app.py": 5488,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -194,7 +197,11 @@ FROZEN_FILE_LINES = {
     # function-line threshold — see the FROZEN_FUNCTION_LINES deletion note).
     "review/reviewer.py": 2896,
     "blockers/wake.py": 2706,
-    "agent/guard.py": 2801,
+    # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
+    # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
+    # only, so a wrapped `find … -delete` in a denied compound classifies
+    # DESTRUCTIVE instead of HYGIENE. Local sibling list, `_WRAPPERS` untouched.
+    "agent/guard.py": 2892,
     # +44: idle-path recover_quota_cooldown gate in tick() and the
     # never-shorten-a-live-wall guard in _run — the quota-wall storm cost fix.
     # +129: `HarvestJob` — the cadence job (`due()`/`maybe_run()`) that runs
