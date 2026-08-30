@@ -968,6 +968,15 @@ async def get_split_drafts(task_id: str, request: Request) -> dict[str, Any]:
     """
     store = _store(request)
     task = await _require_task(store, task_id)
+    # Only a PENDING task can actually BE split (POST /split enforces the same),
+    # so refuse to spend a utility-model call drafting a split that could never
+    # be applied to a running/parked/terminal task.
+    if task.status != TaskStatus.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"only a pending task can be split; this one is "
+                    f"{task.status.value!r}"),
+        )
     from ..intake.split_proposal import generate_split_drafts
     files = ((task.context or {}).get("spec") or {}).get("files_to_change")
     drafts = await generate_split_drafts(task, files_to_change=files)

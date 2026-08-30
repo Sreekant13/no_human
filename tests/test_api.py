@@ -3776,3 +3776,11 @@ async def test_create_of_a_simple_task_stashes_no_hint(client, store):
     assert r.status_code == 201
     full = await store.get_task(r.json()["id"])
     assert (full.context or {}).get("feasibility_hint") is None
+
+
+async def test_split_drafts_refuses_a_non_pending_task_without_a_paid_call(client, store):
+    # The GET generates drafts via a utility-model call; a running/terminal task
+    # can never be split, so it must 409 BEFORE spending that call.
+    running = await _seed_task(store, status=TaskStatus.IMPLEMENTING, title="running")
+    r = await client.get(f"/api/tasks/{running.id}/split-drafts")
+    assert r.status_code == 409

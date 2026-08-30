@@ -192,7 +192,9 @@ FROZEN_FILE_LINES = {
     # 5596 -> 5615 (+19): create-time feasibility-hint wiring (feature #1).
     # 5615 -> 5639 (+24): GET /split-drafts (lazy draft generation) + the
     # contract-fold into child descriptions (feature #1 UI backend).
-    "api/app.py": 5639,
+    # 5639 -> 5648 (+9): GET /split-drafts PENDING guard (review A1 — no paid
+    # draft call for a task that can never be split).
+    "api/app.py": 5648,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
