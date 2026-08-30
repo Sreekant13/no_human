@@ -29,6 +29,19 @@ invisibly to that instrument, and this module's own `revert()` calls
 closes the detection gap; the `-c core.hooksPath=`/`-c core.fsmonitor=false`
 flags on every `revert()` git call close the execution gap. Neither one does
 the other's job — both are required.
+
+Third re-scope (this revision): `_git_dir_inventory` hashes the `.git`
+subtree's BYTES, but the `"index"` entry in `_VOLATILE_GIT_EXACT` excludes
+the index file from that byte inventory — correctly, since every read-only
+`git status`/`git diff` the reviewer legitimately runs rewrites its
+stat-cache bytes. That exclusion also discarded the only signal that the
+index's FLAG BITS had been tampered with. `git update-index
+--assume-unchanged calc.py` (or `--skip-worktree calc.py`) followed by
+rewriting `calc.py` leaves `git status --porcelain` EMPTY while disk holds
+the reviewer's payload — this module's own opening threat, with no `.git`
+artefact involved. `_index_flags`/`compare()` close this by reading the
+index's FLAG BITS via `git ls-files -v`, watched separately from the
+excused bytes.
 """
 
 from __future__ import annotations
@@ -75,6 +88,15 @@ class Snapshot:
     #: `filter.*`, `core.hooksPath`, …). Only present-and-parseable files
     #: appear; a missing key reads as "could not establish" -> fail closed.
     config_norm: dict[str, str] = field(default_factory=dict)
+    #: `{path: tag}` for every tracked path whose index FLAG BITS blind
+    #: `git status --porcelain` to further writes on disk -- the
+    #: assume-unchanged and skip-worktree bits, from `git ls-files -v` (see
+    #: `_index_flags`). Like `config_norm`, this is the semantic-content
+    #: reader for the index: `compare` needs the FLAG BITS, not the index's
+    #: bytes, to catch a stat-cache refresh (bytes change, flags don't) vs a
+    #: blinding bit flip (flags change) -- the "index" entry in
+    #: `_VOLATILE_GIT_EXACT` excuses only the former.
+    index_flags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -212,8 +234,24 @@ def _parse_porcelain_z(raw: str) -> list[tuple[str, str]]:
 # path *relative to the root it was found under* (so "index" excludes both
 # the admin dir's and the common dir's index file, not a directory prefix):
 _VOLATILE_GIT_EXACT = frozenset({
-    # Rewritten by every read-only `git status`/`git diff` the reviewer
-    # legitimately runs (stat-cache refresh). Not an execution surface.
+    # BYTES stay excused: rewritten by every read-only `git status`/`git
+    # diff` the reviewer legitimately runs (stat-cache refresh), and the
+    # bytes are not an execution surface. That is NOT the whole story — an
+    # earlier revision's "not an execution surface" was true and beside the
+    # point: the index is the FILTER through which `git status --porcelain`
+    # sees the worktree, so excluding its bytes also removed the only
+    # signal that the filter itself had been tampered with. `git
+    # update-index --assume-unchanged calc.py` (or `--skip-worktree`)
+    # followed by rewriting `calc.py` leaves porcelain EMPTY while disk
+    # holds the reviewer's payload — this module's own opening threat, with
+    # no `.git` artefact involved. WHAT THIS EXCLUSION COVERS: nothing by
+    # itself now — the assume-unchanged and skip-worktree FLAG BITS are
+    # watched separately, by `_index_flags`/`compare()`, via
+    # `git ls-files -v` rather than by hashing this file. WHAT IT DOES NOT
+    # COVER: the index's other contents (staged blobs, cache-tree,
+    # extensions) remain unwatched, and, as `_git_dir_inventory` records for
+    # the tree at large, a bit set and cleared again BETWEEN the two
+    # snapshots is invisible.
     "index",
     # Transient lock created/removed around index writes. Never executed.
     "index.lock",
@@ -392,6 +430,12 @@ def _is_volatile_git_path(rel: str, label: str) -> bool:
     detected here; pointing it at a NEW decoy ref, though, needs a write
     under `refs/heads/` in a packed or loose form the primary checkout would
     then act on — a channel `refs/` pruning already concedes on main too.
+
+    The effectively-watched set (see the paragraph above) also includes,
+    separately from the `.git` byte inventory it describes, the index's
+    FLAG BITS via `_index_flags` — the assume-unchanged and skip-worktree
+    bits that would otherwise blind `git status --porcelain` to a rewritten
+    tracked file with no `.git` artefact involved at all.
     """
     if rel in _VOLATILE_GIT_EXACT or rel.startswith(_VOLATILE_GIT_PREFIX):
         return True
@@ -483,6 +527,45 @@ def _config_norm_map(
             norm = _config_effective(root / name, timeout=timeout)
             if norm is not None:
                 out[f"{label}/{name}"] = norm
+    return out
+
+
+def _index_flags(repo_path: Path, *, timeout: float) -> dict[str, str]:
+    """`{path: tag}` for every tracked path whose index FLAG BITS blind
+    `git status --porcelain` to further writes on disk.
+
+    Reads `git ls-files -v -z`, which tags every tracked path with a single
+    letter. Git LOWERCASES the tag when the assume-unchanged bit is set
+    (`H` -> `h`, the documented marker), and uses `S`/`s` for skip-worktree
+    (`s` when both bits are set on the same path — caught by the lowercase
+    check too, hence the `tag.upper() == "S"` test rather than a bare
+    `== "S"`). Only these two tampering-relevant shapes are returned;
+    ordinary states the same command also reports (`H` cached, `M`/`U`
+    unmerged, `R` removed, `C` modified, `K`, `?`) are exactly what `git
+    status` already reports honestly on its own and must NOT be flagged
+    here, or an ordinary review would trip this check on every run.
+
+    Uses `_run_git`, not a bare `subprocess.run`: a non-zero exit, timeout
+    or OSError already raises `WorktreeCheckFailed` there, which is the
+    fail-conservative behaviour this check needs — unparseable or
+    unreadable index state must never be read as "no flags set." A
+    malformed `-z` record (not `"<tag><space><path>"`) is unverifiable
+    state for the same reason and also raises rather than being skipped.
+    """
+    raw = _run_git(repo_path, "ls-files", "-v", "-z", timeout=timeout)
+    records = raw.split("\0")
+    if records and records[-1] == "":
+        records.pop()
+    out: dict[str, str] = {}
+    for rec in records:
+        if not rec:
+            continue
+        if len(rec) < 3 or rec[1] != " ":
+            raise WorktreeCheckFailed(
+                f"git ls-files -v returned an unparseable record: {rec!r}")
+        tag, path = rec[0], rec[2:]
+        if tag.islower() or tag.upper() == "S":
+            out[path] = tag
     return out
 
 
@@ -713,8 +796,10 @@ def snapshot(repo_path: Path, *, timeout: float) -> Snapshot:
         except OSError:
             common_head = None  # unreadable reads as "not a symref" -> fail closed
     config_norm = _config_norm_map(admin_dir, common_dir, timeout=timeout)
+    index_flags = _index_flags(repo_path, timeout=timeout)
     return Snapshot(head=head, entries=entries, git_entries=git_entries,
-                    common_head=common_head, config_norm=config_norm)
+                    common_head=common_head, config_norm=config_norm,
+                    index_flags=index_flags)
 
 
 #: One branch symref line, exactly — what `git checkout <branch>` writes.
@@ -818,6 +903,23 @@ def compare(repo_path: Path, before: Snapshot, *, timeout: float) -> Delta:
             added.append(display)
         else:
             modified.append(display)
+    # Index FLAG BITS (assume-unchanged / skip-worktree) — see
+    # `_index_flags` and the "index" entry in `_VOLATILE_GIT_EXACT`.
+    # Reporting ANY path flagged in `after` (not merely a before/after
+    # difference) is deliberate — the only entry in this module whose
+    # baseline is "no flags set," not "the same as before": a bit already
+    # set at snapshot time blinds `git status --porcelain` to that path for
+    # the WHOLE review, so an unchanged-since-`before` flag is still not
+    # safe. A product-built reviewer worktree (`GitRepo.add_worktree`) never
+    # sets these bits, so this costs no false positives against ordinary
+    # use. The before-side is still consulted so a bit CLEARED during the
+    # review — also a change to the filter through which `git status` sees
+    # the tree — is reported too, as `[flag cleared]` rather than a tag.
+    for path in sorted(set(before.index_flags) | set(after.index_flags)):
+        if path in after.index_flags:
+            modified.append(f".git/index:{path} [{after.index_flags[path]}]")
+        else:
+            modified.append(f".git/index:{path} [flag cleared]")
     if before.head != after.head:
         modified.append(f"HEAD:{before.head}->{after.head}")
     return Delta(added=sorted(added), modified=sorted(modified), deleted=sorted(deleted))
