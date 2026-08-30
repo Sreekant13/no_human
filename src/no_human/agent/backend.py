@@ -597,6 +597,18 @@ DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 #: live ChatGPT session and is forbidden from creating one via `codex login`,
 #: so this value is carried from the operator's measurement rather than
 #: re-confirmed here.
+#:
+#: ENTITLED is not the same claim as PRICED: whether an account's ChatGPT
+#: plan can reach this id (measured above) is independent of whether this
+#: codebase has a sourced per-token rate for it. `gpt-5.6-terra` happens to be
+#: both — it is entitled per the measurement above AND carries a documented,
+#: cited row in `core.pricing.MODEL_PRICES_USD_PER_MTOK` (see the citation
+#: block at `core/pricing.py:189` and the row itself a few lines below it) —
+#: so it is priced at its own published rate, never the unrecorded-model
+#: fallback. An id that is entitled but NOT in that table (or an id this
+#: constant is later changed to) still runs; it is just priced at the
+#: backend-aware fallback (`core.pricing.fallback_output_extra_weight`) until
+#: someone adds a sourced row for it.
 DEFAULT_CODEX_MODEL_SUBSCRIPTION = "gpt-5.6-terra"
 
 

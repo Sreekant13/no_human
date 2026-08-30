@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Literal
 
 from ..agent.advisory import advisory_backend
-from ..agent.backend import AgentEvent, CodingBackend
+from ..agent.backend import AgentEvent, CodingBackend, resolve_backend_name
 from ..agent.claude_backend import ClaudeBackend
 from ..agent.claude_backend import (
     TRANSPORT_DIAGNOSIS_MARKER as _TRANSPORT_BLOCKER_MARKER,
@@ -1272,6 +1272,20 @@ class Orchestrator:
     # defaults are immutable, so an instance that never assigns cannot share
     # state with another. `_cancel_reason` is (task_id, reason) once raised.
     _cancel_reason: tuple[str, str] | None = None
+    # The running attempt's resolved coder backend (`_task_backend`), stashed
+    # by `_arm_attempt_budget` for the two mid-attempt pricing sites that hold
+    # no `Task` — the live usage watch in `_agent_sink` and `budget_status()`.
+    # A class-level default so both read a real value (never AttributeError)
+    # even on an instance built with `Orchestrator.__new__` that skips
+    # `__init__`, exactly like `_active_task_id` above.
+    _attempt_backend: str | None = None
+    # A class-level default so `_task_backend`'s `resolve_backend_name(self.config,
+    # ...)` reads a real (empty) dict rather than raising AttributeError on an
+    # instance built with `Orchestrator.__new__` that never assigns `.config` —
+    # several existing tests do exactly that. Never mutated in place (the only
+    # assignment anywhere in this class is `self.config = config` in `__init__`),
+    # so sharing this literal across instances that skip `__init__` is safe.
+    config: dict[str, Any] = {}
     _active_task_id: str | None = None
     _active_branch: str | None = None
     # Set by `request_task_cancel` immediately before force-cancelling
@@ -2004,7 +2018,8 @@ class Orchestrator:
                 # a tenth of the rate — as if it were fresh input, so this
                 # watch fired on how LONG the conversation was rather than on
                 # what it cost (d6e4b72a: 6.59M cache-read out of 6.76M).
-                spent = _weighted_tokens(**_usage_classes(usage))
+                spent = _weighted_tokens(
+                    **_usage_classes(usage), backend=self._attempt_backend)
                 if spent >= ceiling[1]:
                     # The message names WHICH ceiling was crossed — the abort
                     # handler routes on it: the lifetime cross parks behind
@@ -2012,7 +2027,7 @@ class Orchestrator:
                     # attempt so the bounded loop retries with fresh context.
                     raise BudgetAbort(
                         f"attempt spend {spent:,} cost-weighted tokens "
-                        f"[{_class_breakdown(**_usage_classes(usage))}] "
+                        f"[{_class_breakdown(**_usage_classes(usage), backend=self._attempt_backend)}] "
                         f"crossed {ceiling[2]} ({ceiling[1]:,})"
                     )
             return
@@ -10362,7 +10377,9 @@ class Orchestrator:
             await self.store.lifetime_usage_by_class(task.id))
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         return self._over_lifetime_caps(
-            used_attempts, cap_attempts, _weighted_tokens(**by_class), cap_tokens)
+            used_attempts, cap_attempts,
+            _weighted_tokens(**by_class, backend=self._task_backend(task)),
+            cap_tokens)
 
     def _review_base(self, repo: GitRepo, base: str | None) -> str:
         """The commit the whole change should be reviewed against.
@@ -12788,7 +12805,14 @@ class Orchestrator:
         Extracted from `_run_attempt` purely so this is reachable from a test.
         It was the one enforcement point with no coverage: a mutation swapping
         the weighted read for the raw one left every budget test green.
+
+        Also stashes `self._attempt_backend` — the mid-attempt watch
+        (`_agent_sink`'s live usage check) and `budget_status()` fire from
+        inside a running attempt with no `Task` in scope, only the ids and
+        counters armed here, so this is the one place in the arming path that
+        still holds `task` and can resolve it once for both of them.
         """
+        self._attempt_backend = self._task_backend(task)
         remaining = await self._attempt_spendable_tokens(task)
         self._begin_attempt_accounting(
             task.id, remaining_tokens=remaining,
@@ -12820,7 +12844,7 @@ class Orchestrator:
             return _NO_LIFETIME_CEILING
         _attempts, included, _excluded = (
             await self.store.lifetime_usage_by_class(task.id))
-        used_life = _weighted_tokens(**included)
+        used_life = _weighted_tokens(**included, backend=self._task_backend(task))
         cap_life = self._lifetime_limits(task)[1]
         return max(cap_life - used_life, 1)
 
@@ -13004,6 +13028,33 @@ class Orchestrator:
         # tiny cap (the shape every budget test uses) instead of lowering it.
         return max(raw_cap_as_weighted(value), 1)
 
+    def _task_backend(self, task: Task) -> str | None:
+        """Which coder backend THIS task's spend was priced against — the
+        one input `core.pricing`'s per-backend fallback
+        (`fallback_output_extra_weight`) needs to avoid under-pricing an
+        unrecorded Codex model id below every priced OpenAI premium.
+
+        Mirrors `core.runtime.task_backend_override` exactly (a per-task
+        `task.config["backend"]` override, else `None` meaning "no opinion")
+        and then falls through to the GLOBAL `worker.backend` config the same
+        way `agent.backend.resolve_backend_name` resolves it for role="coder"
+        — the same two-step resolution the coder session itself was actually
+        built with. Not imported from `core.runtime` directly: that module
+        imports `Orchestrator` (this class), and importing it back at module
+        scope here would be circular; a local import keeps the one true
+        implementation in `core.runtime` without paying that cost.
+
+        There is no `attempts.backend` DB column — a task's config is the
+        only place this is recorded — so a task created before this field
+        existed, or with no config at all, resolves through the same global
+        fallback `resolve_backend_name` gives the CODER role, never `None`.
+        """
+        from .runtime import task_backend_override
+        override = task_backend_override(task)
+        if override:
+            return override
+        return resolve_backend_name(self.config, role="coder")
+
     def _lifetime_limits(self, task: Task) -> tuple[int, int]:
         """(attempts, tokens) lifetime caps, honouring a per-task override.
 
@@ -13156,7 +13207,11 @@ class Orchestrator:
             return None
         used_attempts, by_class, excluded_class = (
             await self.store.lifetime_usage_by_class(task.id))
-        used_tokens = _weighted_tokens(**by_class)
+        # Resolved ONCE and reused at every pricing call below — the printed
+        # rate must equal the charged rate, and this task's backend cannot
+        # change mid-gate.
+        backend = self._task_backend(task)
+        used_tokens = _weighted_tokens(**by_class, backend=backend)
         # The three ADDEND classes only. `by_class` also carries
         # `output_tokens`, which is a SLICE of `tokens_used` rather than a
         # bucket beside it, so a bare `sum(by_class.values())` double-counts
@@ -13165,17 +13220,17 @@ class Orchestrator:
         # recorded yet; it inflates the moment one does, and it inflates the
         # RAW figure this blocker prints as the reconcilable one.
         raw_tokens = sum(by_class[n] for n in Store._usage_columns_by_class())
-        breakdown = _class_breakdown(**by_class)
+        breakdown = _class_breakdown(**by_class, backend=backend)
         # The mirror: spend `lifetime_usage_by_class` excluded from the cap
         # (infra-classified dispatches, mechanical rounds, dead-interrupted
         # rows) — not the task's own spend against the cap, but real tokens
         # the ENVIRONMENT burned. Reported here, never silently dropped, so
         # `nh status`/the drawer can show "X weighted excluded as infra"
         # instead of a figure that looks like the task ran for free.
-        excluded_tokens = _weighted_tokens(**excluded_class)
+        excluded_tokens = _weighted_tokens(**excluded_class, backend=backend)
         excluded_raw = sum(
             excluded_class[n] for n in Store._usage_columns_by_class())
-        excluded_breakdown = _class_breakdown(**excluded_class)
+        excluded_breakdown = _class_breakdown(**excluded_class, backend=backend)
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         # The shared predicate — see `_over_lifetime_caps`. This gate and the
         # advisory `_at_lifetime_ceiling` used to hold separate copies of it.
@@ -13280,6 +13335,11 @@ class Orchestrator:
             tokens_used=totals["tokens_used"],
             cache_read_tokens=totals["cache_read_tokens"],
             cache_creation_tokens=totals["cache_creation_tokens"],
+            # No `output_tokens` above, so the backend-selected premium has
+            # nothing to multiply here — but passed anyway, uniformly with
+            # every other `_weighted_tokens` call site in this file, so a
+            # future column addition here does not also need to remember it.
+            backend=self._task_backend(task),
         )
         return totals["calls"], weighted
 
@@ -13453,6 +13513,7 @@ class Orchestrator:
                 tokens_used=int(event.get("tokens_used", 0)),
                 cache_read_tokens=int(event.get("cache_read", 0)),
                 cache_creation_tokens=int(event.get("cache_creation", 0)),
+                backend=self._task_backend(task),
             )
             if cheapest is None or weighted < cheapest[1]:
                 cheapest = (attempt_number, weighted)
@@ -13495,7 +13556,8 @@ class Orchestrator:
         used_attempts, by_class, excluded_class = (
             await self.store.lifetime_usage_by_class(task.id)
         )
-        used_tokens = _weighted_tokens(**by_class)
+        backend = self._task_backend(task)
+        used_tokens = _weighted_tokens(**by_class, backend=backend)
         _cap_attempts, cap_tokens = self._lifetime_limits(task)
         remaining = cap_tokens - used_tokens
         floor, provenance = await self._min_viable_attempt_cost(task)
@@ -13526,9 +13588,9 @@ class Orchestrator:
                 f"tokens ({used_tokens:,}/{cap_tokens:,} spent, "
                 f"{used_attempts} attempts); minimum viable attempt cost: "
                 f"{floor:,} cost-weighted tokens ({provenance}); by class so "
-                f"far: {_class_breakdown(**by_class)}. Excluded as "
+                f"far: {_class_breakdown(**by_class, backend=backend)}. Excluded as "
                 f"infra/mechanical/dead-interrupted (not charged to this "
-                f"cap): {_weighted_tokens(**excluded_class):,} cost-weighted "
+                f"cap): {_weighted_tokens(**excluded_class, backend=backend):,} cost-weighted "
                 f"tokens. The next attempt's "
                 "fixed startup (attempt_distill + implement prompt + skills "
                 "+ map) is re-accumulated before its first model turn does "
@@ -13871,7 +13933,10 @@ class Orchestrator:
                 return None
             if ceiling is None or usage is None or ceiling[0] != task.id:
                 return None
-            return _weighted_tokens(**_usage_classes(usage)), ceiling[1]
+            return (
+                _weighted_tokens(**_usage_classes(usage), backend=self._attempt_backend),
+                ceiling[1],
+            )
 
         return SupervisorHook(
             task_title=task.title,

@@ -140,7 +140,9 @@ FROZEN_FILE_LINES = {
     # verdict; execution-surface keys still discard). Re-anchored on merge.
     # 19650 -> 19659 (+9): PR #877's tamper-base widening in _run_attempt (same
     # +9 lines as the function bump above). Re-anchored on merge.
-    "core/orchestrator.py": 19659,
+    # 19659 -> 19724 (+65): PR #867 threads a backend kwarg through the budget/
+    # pricing sites (output_extra_weight/weighted_tokens/class_breakdown callers).
+    "core/orchestrator.py": 19724,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -183,7 +185,8 @@ FROZEN_FILE_LINES = {
     # Grew to 5488 (+17) when PR #913's _loaded_code_stale fix landed (a failed
     # head_sha() no longer clobbers a cached 'behind HEAD' verdict) — re-anchored
     # here on the next merge (#913 landed without re-measuring the ratchet).
-    "api/app.py": 5488,
+    # 5488 -> 5489 (+1): PR #867 backend kwarg at the drawer pricing site.
+    "api/app.py": 5489,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

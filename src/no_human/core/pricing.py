@@ -86,14 +86,19 @@ OpenAI-hosted pricing page (see the ``#:`` block above the table for the exact
 URL, date, and row per id — never guessed, never interpolated from a sibling).
 None of them share the Anthropic family's 5:1 ratio: ``gpt-5.3-codex`` is 8:1,
 so its ``output_extra_weight`` (7.0) is ABOVE ``OUTPUT_EXTRA_WEIGHT`` (4.0).
-That means "the fallback is never cheaper than any priced model" now only
-holds within the Claude family it was derived from — a genuinely unpriced
-OpenAI id (one this table has no row for) is priced by the 4.0 fallback, which
-is *cheaper* than several of the priced OpenAI ids actually cost. That is a
-known, visible gap: an id in that state is surfaced by
-``unknown_pricing_models()`` rather than silently under-priced, which is the
-reporting improvement this whole change exists to make for the ids it CAN
-price, and the honest limit for the ones it still cannot.
+"The fallback is never cheaper than any priced model" held only within the
+Claude family it was derived from until the fallback was keyed per backend
+(``fallback_output_extra_weight``; ``output_extra_weight``/``weighted_tokens``/
+``class_breakdown`` all take a keyword-only ``backend``): a genuinely unpriced
+id (one this table has no row for) on the ``"codex"`` backend now takes the
+MAX premium over this table's own OpenAI rows — computed live at call time
+from ``MODEL_PRICES_USD_PER_MTOK``, never a copied literal, so a newly sourced
+OpenAI row raises the fallback with it — which restores the invariant on that
+backend too. Every other backend (``"claude"``, ``"local"``, and unset/blank)
+keeps the plain 4.0 fallback unchanged. An id in either state is still
+surfaced by ``unknown_pricing_models()`` rather than silently under-priced,
+which remains the reporting improvement this whole change exists to make for
+the ids it CAN price, and the honest limit for the ones it still cannot.
 
 A run billed by a flat ChatGPT subscription plan gets NO row here and no
 per-token price at all — not ``0.0`` (that would price its output at nothing,
@@ -241,7 +246,66 @@ def _reset_unknown_pricing_models() -> None:
     _unknown_models.clear()
 
 
-def output_extra_weight(model: str | None) -> float:
+#: Every id this table carries for the Claude family is spelled with this
+#: prefix (see ``MODEL_PRICES_USD_PER_MTOK``'s citation block) — the same
+#: prefix `tests/test_pricing.py`'s ``OPENAI_IDS`` derives ``not
+#: k.startswith("claude-")`` from. Named once so `_rows_for_backend` and this
+#: prefix cannot drift apart from a hand-typed literal in two places.
+CLAUDE_ID_PREFIX = "claude-"
+
+
+def _rows_for_backend(backend: str | None) -> dict[str, tuple[float, float]]:
+    """The subset of ``MODEL_PRICES_USD_PER_MTOK`` a fallback for *backend*
+    may draw its premium from.
+
+    Only ``"codex"`` currently has more than one vendor family in the table,
+    so it is the only backend with a non-empty result: every row that is NOT
+    a Claude id (``CLAUDE_ID_PREFIX``) — today that is exactly the OpenAI
+    rows, but this reads the prefix rather than naming the vendor, so a
+    future non-Claude row prices correctly without touching this function.
+    Every other backend (``"claude"``, ``"local"``, unset/blank, or an
+    unrecognised name) returns ``{}`` — deliberately, so
+    ``fallback_output_extra_weight`` falls through to the plain
+    ``OUTPUT_EXTRA_WEIGHT`` for them instead of silently drawing a premium
+    from a vendor that backend does not run.
+    """
+    if backend != "codex":
+        return {}
+    return {
+        model_id: rates
+        for model_id, rates in MODEL_PRICES_USD_PER_MTOK.items()
+        if not model_id.startswith(CLAUDE_ID_PREFIX)
+    }
+
+
+def fallback_output_extra_weight(*, backend: str | None = None) -> float:
+    """The premium an UNRECORDED/unpriced model on *backend* falls back to.
+
+    Plain ``OUTPUT_EXTRA_WEIGHT`` (4.0) for every backend except ``"codex"``:
+    that value was the highest premium in the table while it held only the
+    Claude family, and stopped being that the moment a non-5:1 vendor
+    entered it (``gpt-5.3-codex`` publishes 8:1, premium 7.0) — priced BELOW
+    its true rate is the one thing a fallback must never do. For
+    ``backend="codex"`` this instead returns the MAX premium over that
+    backend's own priced rows (``_rows_for_backend``), computed live from
+    ``MODEL_PRICES_USD_PER_MTOK`` at call time — never a copied literal, so a
+    newly sourced OpenAI row (or one that is repriced) raises or lowers this
+    fallback with it automatically.
+
+    Always at least ``OUTPUT_EXTRA_WEIGHT``: a codex table with no OpenAI
+    rows at all (e.g. under a test's ``monkeypatch.setitem`` that strips them)
+    has nothing to compute a max over and must not fall through to 0 — it
+    falls back to the plain 4.0 instead, the same floor every other backend
+    uses.
+    """
+    rows = _rows_for_backend(backend)
+    if not rows:
+        return OUTPUT_EXTRA_WEIGHT
+    premiums = (price_out / price_in - 1.0 for price_in, price_out in rows.values())
+    return max(OUTPUT_EXTRA_WEIGHT, max(premiums))
+
+
+def output_extra_weight(model: str | None, *, backend: str | None = None) -> float:
     """The output PREMIUM for one model — its ``out/in`` ratio, minus the 1.0
     that ``tokens_used`` has already charged.
 
@@ -251,26 +315,35 @@ def output_extra_weight(model: str | None) -> float:
     THE FALLBACK, and why it is what it is. ``None``/empty (11 of this
     install's 684 attempt rows carry ``models = '{}'``, and the utility tier
     has never been recorded at all) and any id absent from the table both fall
-    back to ``OUTPUT_EXTRA_WEIGHT`` = 4.0 — the premium every model Anthropic
-    currently publishes charges, and the value this whole file used before it
-    was keyed per model. It was the HIGHEST premium in the table while the
-    table was Anthropic-only; it no longer is — ``gpt-5.3-codex`` publishes
-    8:1 (premium 7.0), so an UNRECORDED OpenAI model id is priced BELOW its
-    true rate by this fallback (see the module docstring: that residual is
-    known and deliberate until the fallback is keyed per backend). What the
-    fallback still guarantees is that it can never be 0. A 0 or a missing multiplier here
-    would price unknown output at nothing, which is the precise defect that
-    once left a per-attempt brake inert on 27 of 27 tasks.
+    back to ``fallback_output_extra_weight(backend=backend)`` — plain
+    ``OUTPUT_EXTRA_WEIGHT`` = 4.0 for every backend except ``"codex"``, which
+    fell out of date the moment a second, non-5:1 vendor entered the table:
+    ``gpt-5.3-codex`` publishes 8:1 (premium 7.0), so an UNRECORDED id on the
+    ``"codex"`` backend priced at the plain 4.0 would be priced BELOW its true
+    rate — exactly the "an unknown tier is never priced below a known one"
+    invariant this fallback exists to hold. ``backend="codex"`` instead takes
+    the MAX premium over this table's own OpenAI rows, computed live at call
+    time (never a copied literal), so the invariant holds on that backend too;
+    every other backend — ``"claude"``, ``"local"``, unset/blank — keeps the
+    plain 4.0 unchanged. What the fallback still guarantees, on every backend,
+    is that it can never be 0. A 0 or a missing multiplier here would price
+    unknown output at nothing, which is the precise defect that once left a
+    per-attempt brake inert on 27 of 27 tasks.
 
     An unknown NON-EMPTY id is also recorded in ``unknown_pricing_models()``
     and logged once — silence and a default would be the same bug wearing a
     different hat. ``None`` is not logged: it is the documented "this caller
     does not know the model" path, not an anomaly.
+
+    ``backend`` is IGNORED once ``model`` is priced: a row in
+    ``MODEL_PRICES_USD_PER_MTOK`` is the actual billed rate, and a backend
+    hint can never override a known price.
     """
     if not model:
-        return OUTPUT_EXTRA_WEIGHT
+        return fallback_output_extra_weight(backend=backend)
     priced = MODEL_PRICES_USD_PER_MTOK.get(model)
     if priced is None:
+        fallback = fallback_output_extra_weight(backend=backend)
         first_sighting = model not in _unknown_models
         _unknown_models[model] += 1
         if first_sighting:
@@ -278,9 +351,9 @@ def output_extra_weight(model: str | None) -> float:
                 "no published price for model %r; pricing its output at the "
                 "fallback premium %.1fx. Add a sourced row to "
                 "core.pricing.MODEL_PRICES_USD_PER_MTOK.",
-                model, OUTPUT_EXTRA_WEIGHT,
+                model, fallback,
             )
-        return OUTPUT_EXTRA_WEIGHT
+        return fallback
     price_in, price_out = priced
     return price_out / price_in - 1.0
 
@@ -292,6 +365,7 @@ def weighted_tokens(
     cache_creation_tokens: int = 0,
     output_tokens: int | None = None,
     model: str | None = None,
+    backend: str | None = None,
 ) -> int:
     """Spend in fresh-input-equivalent tokens — the unit every budget cap is in.
 
@@ -319,11 +393,15 @@ def weighted_tokens(
     priced on its own. Note that ``None`` here does NOT mean "free" — it
     means "unknown", and unknown prices at the highest published premium.
 
+    ``backend`` selects which fallback an UNPRICED ``model`` (or a ``None``
+    one) takes — see ``output_extra_weight``/``fallback_output_extra_weight``.
+    It is ignored once ``model`` is a priced id.
+
     Floored to an int so the caps stay integer comparisons end to end.
     """
     return int(
         int(tokens_used or 0) * FRESH_WEIGHT
-        + int(output_tokens or 0) * output_extra_weight(model)
+        + int(output_tokens or 0) * output_extra_weight(model, backend=backend)
         + int(cache_read_tokens or 0) * CACHE_READ_WEIGHT
         + int(cache_creation_tokens or 0) * CACHE_CREATION_WEIGHT
     )
@@ -487,6 +565,7 @@ def class_breakdown(
     cache_creation_tokens: int = 0,
     output_tokens: int | None = None,
     model: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """The raw per-class numbers, for a human reading a parked task.
 
@@ -505,13 +584,15 @@ def class_breakdown(
     ``weighted_tokens``, and must be passed the same way at both call sites:
     the whole job of this string is to let a human reconcile the number the
     gate acted on, so printing a rate the gate did not charge would be worse
-    than printing nothing.
+    than printing nothing. ``backend`` must likewise match whatever the same
+    call's ``weighted_tokens``/``output_extra_weight`` used, for the same
+    reason — the printed rate must equal the charged rate.
     """
     fresh = int(tokens_used or 0)
     read = int(cache_read_tokens or 0)
     creation = int(cache_creation_tokens or 0)
     out = int(output_tokens or 0)
-    out_rate = FRESH_WEIGHT + output_extra_weight(model)
+    out_rate = FRESH_WEIGHT + output_extra_weight(model, backend=backend)
     out_note = f" of which {out:,} output (x{out_rate:g})" if out else ""
     return (
         f"raw {fresh + read + creation:,} = {fresh:,} fresh (x{FRESH_WEIGHT:g})"

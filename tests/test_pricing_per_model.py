@@ -120,6 +120,44 @@ def test_prices_are_positive_so_no_row_can_price_output_at_nothing():
         assert price_in > 0 and price_out > 0, model
 
 
+@pytest.mark.parametrize("backend", ["claude", "codex", "local", "unknown-backend", None])
+def test_the_fallback_is_never_cheaper_than_any_priced_model_of_its_own_backend(backend):
+    """The invariant restored, per backend. `test_the_fallback_is_never_cheaper_than_any_priced_model`
+    above already pins that this stopped holding GLOBALLY once the OpenAI rows
+    arrived (by design — `gpt-5.3-codex` is 7.0 > 4.0). What must hold instead,
+    for every backend, is the narrower claim: that backend's own fallback is
+    never cheaper than any of ITS OWN priced rows — i.e. "failing to record
+    the model" never buys headroom on any backend's own price table.
+
+    Claude/local/unknown/None all price OpenAI rows too when a Claude-tier
+    caller happens to see one (todo: a mixed fleet), so this only asserts each
+    backend's fallback against the rows that backend can actually route to:
+    Claude ids for everything except "codex", and every non-Claude id for
+    "codex" — the same split `core.pricing._rows_for_backend` makes.
+    """
+    from no_human.core.pricing import CLAUDE_ID_PREFIX, fallback_output_extra_weight
+
+    fallback = fallback_output_extra_weight(backend=backend)
+    if backend == "codex":
+        own_rows = {
+            m: v for m, v in MODEL_PRICES_USD_PER_MTOK.items()
+            if not m.startswith(CLAUDE_ID_PREFIX)
+        }
+    else:
+        own_rows = {
+            m: v for m, v in MODEL_PRICES_USD_PER_MTOK.items()
+            if m.startswith(CLAUDE_ID_PREFIX)
+        }
+    assert own_rows, f"no rows to check for backend={backend!r}"
+    for model, (price_in, price_out) in own_rows.items():
+        premium = price_out / price_in - 1.0
+        assert fallback >= premium, (
+            f"backend={backend!r} fallback {fallback} is cheaper than "
+            f"{model}'s own premium {premium} — an unrecorded model would "
+            f"be priced below a known one"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # RISK 3 — keyed on the recorded id, never on live config
 # --------------------------------------------------------------------------- #

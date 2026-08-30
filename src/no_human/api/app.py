@@ -1074,7 +1074,8 @@ async def get_task(task_id: str, request: Request) -> TaskOut:
         task.config or {}, "lifetime_tokens",
         Bounds.from_config(request.app.state.config.data.get("bounds")).lifetime_tokens,
         task)
-    used = weighted_tokens(**by_class)
+    from ..core.runtime import task_backend_override
+    used = weighted_tokens(**by_class, backend=task_backend_override(task))
     out.budget = BudgetOut(used=used, cap=cap, remaining=cap - used)
     # SCRUM-16: same claimed contract as the board summaries (SCRUM-15) — the
     # slide-over must know whether a live session actually holds this task.

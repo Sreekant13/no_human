@@ -18,11 +18,15 @@ import pytest
 
 from no_human.core import pricing
 from no_human.core.pricing import (
+    CLAUDE_ID_PREFIX,
     MODEL_PRICES_USD_PER_MTOK,
     OUTPUT_EXTRA_WEIGHT,
     _reset_unknown_pricing_models,
+    class_breakdown,
+    fallback_output_extra_weight,
     output_extra_weight,
     unknown_pricing_models,
+    weighted_tokens,
 )
 
 # Ids `codex exec` actually resolved on this machine on 2026-08-22 (measured
@@ -197,3 +201,153 @@ def test_the_openai_rows_are_exactly_the_four_sourced_pairs():
     assert actual == EXPECTED_OPENAI_ROWS, (
         f"OpenAI price rows drifted from the sourced set: {actual!r} != {EXPECTED_OPENAI_ROWS!r}")
     assert set(OPENAI_IDS) == set(EXPECTED_OPENAI_ROWS)
+
+
+# --------------------------------------------------------------------------- #
+# the backend-keyed fallback — an unrecorded model must never price below a
+# known one, on ANY backend, not just the Claude family it was derived from.
+# --------------------------------------------------------------------------- #
+
+def test_an_unrecorded_model_on_the_codex_backend_takes_the_max_openai_premium():
+    """The bug this whole change exists to close: before this fix, an
+    unrecorded Codex model priced at the flat 4.0, which is BELOW several
+    priced OpenAI rows (`gpt-5.3-codex` is 7.0) — "failing to record the
+    model" bought budget headroom on the Codex path. The fallback must now be
+    at least as expensive as every priced row it could be standing in for.
+    """
+    expected_max_premium = max(
+        price_out / price_in - 1.0
+        for model, (price_in, price_out) in MODEL_PRICES_USD_PER_MTOK.items()
+        if not model.startswith(CLAUDE_ID_PREFIX)
+    )
+    assert expected_max_premium > OUTPUT_EXTRA_WEIGHT, (
+        "test assumption broken: no OpenAI row exceeds the 4.0 fallback any more"
+    )
+    assert output_extra_weight(None, backend="codex") == pytest.approx(expected_max_premium)
+    assert output_extra_weight("", backend="codex") == pytest.approx(expected_max_premium)
+    assert output_extra_weight("a-genuinely-unknown-id", backend="codex") == pytest.approx(
+        expected_max_premium
+    )
+    assert fallback_output_extra_weight(backend="codex") == pytest.approx(expected_max_premium)
+
+
+@pytest.mark.parametrize("backend", ["claude", "local", "unknown-backend", None, "", "  "])
+def test_the_claude_and_unknown_backends_keep_the_four_point_zero_fallback(backend):
+    """Only `"codex"` gets the raised fallback. Every other backend — the
+    Claude default, the local coding-backend, an unrecognized string, and the
+    unset/blank cases every pre-existing caller passes — must be BIT-FOR-BIT
+    unchanged: still the plain `OUTPUT_EXTRA_WEIGHT`, never the OpenAI max."""
+    assert output_extra_weight(None, backend=backend) == OUTPUT_EXTRA_WEIGHT
+    assert output_extra_weight("a-genuinely-unknown-id", backend=backend) == OUTPUT_EXTRA_WEIGHT
+    assert fallback_output_extra_weight(backend=backend) == OUTPUT_EXTRA_WEIGHT
+
+
+def test_a_priced_id_ignores_the_backend():
+    """A row in the table is the actual billed rate — a backend hint can never
+    override a known price, in either direction."""
+    price_in, price_out = MODEL_PRICES_USD_PER_MTOK["gpt-5.3-codex"]
+    expected = price_out / price_in - 1.0
+    for backend in ("codex", "claude", "local", None, "bogus"):
+        assert output_extra_weight("gpt-5.3-codex", backend=backend) == pytest.approx(expected)
+    # Also true the other way: a Claude id priced while `backend="codex"` is
+    # passed still reports its own 4.0, not the raised Codex fallback.
+    assert output_extra_weight("claude-sonnet-5", backend="codex") == pytest.approx(4.0)
+
+
+def test_the_codex_fallback_is_derived_from_the_table_not_a_literal():
+    """`fallback_output_extra_weight` must recompute from
+    `MODEL_PRICES_USD_PER_MTOK` at call time — never a copied number — so a
+    newly sourced OpenAI row raises the fallback with it, the same derivation
+    rule `test_the_openai_rows_are_exactly_the_four_sourced_pairs` and
+    `OPENAI_IDS` already hold the table to elsewhere in this file."""
+    before = fallback_output_extra_weight(backend="codex")
+    saved = dict(MODEL_PRICES_USD_PER_MTOK)
+    try:
+        # A hypothetical row priced far above every existing OpenAI premium.
+        MODEL_PRICES_USD_PER_MTOK["gpt-hypothetical-future"] = (1.0, 100.0)
+        after = fallback_output_extra_weight(backend="codex")
+        assert after == pytest.approx(99.0)
+        assert after > before
+    finally:
+        MODEL_PRICES_USD_PER_MTOK.clear()
+        MODEL_PRICES_USD_PER_MTOK.update(saved)
+    # Restored exactly — no test-order leakage into any test that follows.
+    assert fallback_output_extra_weight(backend="codex") == pytest.approx(before)
+
+
+def test_the_codex_fallback_survives_a_table_with_no_openai_rows():
+    """If every OpenAI row were ever removed, the Codex fallback must degrade
+    to the plain 4.0 rather than crash on an empty `max()` — a genuinely
+    unpriced model is still better served by the old conservative number than
+    by an exception."""
+    saved = dict(MODEL_PRICES_USD_PER_MTOK)
+    try:
+        for model in list(MODEL_PRICES_USD_PER_MTOK):
+            if not model.startswith(CLAUDE_ID_PREFIX):
+                del MODEL_PRICES_USD_PER_MTOK[model]
+        assert fallback_output_extra_weight(backend="codex") == OUTPUT_EXTRA_WEIGHT
+    finally:
+        MODEL_PRICES_USD_PER_MTOK.clear()
+        MODEL_PRICES_USD_PER_MTOK.update(saved)
+
+
+def test_an_unknown_codex_id_is_still_surfaced_once_by_id():
+    """The backend-keyed fallback must not regress the existing
+    surfaced-not-silent contract: a genuinely unpriced Codex id is still
+    counted by `unknown_pricing_models`, warned once, and never twice."""
+    import logging
+
+    logger = logging.getLogger("no_human.core.pricing")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        for _ in range(3):
+            output_extra_weight("gpt-genuinely-new", backend="codex")
+    finally:
+        logger.removeHandler(handler)
+    assert unknown_pricing_models() == {"gpt-genuinely-new": 3}
+    hits = [r for r in records if "gpt-genuinely-new" in r.getMessage()]
+    assert len(hits) == 1, hits
+
+
+def test_weighted_tokens_and_class_breakdown_forward_the_backend():
+    """`weighted_tokens`/`class_breakdown` must resolve the SAME fallback
+    `output_extra_weight` does — the whole point of a keyword-only `backend`
+    parameter is that every consumer of the class dict prices identically."""
+    expected_premium = fallback_output_extra_weight(backend="codex")
+    classes = dict(tokens_used=1_000_000, output_tokens=100_000)
+    priced_codex = weighted_tokens(**classes, backend="codex")
+    priced_default = weighted_tokens(**classes)
+    expected_codex = int(1_000_000 + 100_000 * expected_premium)
+    expected_default = int(1_000_000 + 100_000 * OUTPUT_EXTRA_WEIGHT)
+    assert priced_codex == expected_codex
+    assert priced_default == expected_default
+    assert priced_codex > priced_default
+
+    text = class_breakdown(tokens_used=1_000, output_tokens=400, backend="codex")
+    assert f"(x{1.0 + expected_premium:g})" in text
+
+
+# --------------------------------------------------------------------------- #
+# AC4 — the subscription-default comment names the priced/entitled distinction
+# --------------------------------------------------------------------------- #
+
+def test_the_subscription_default_comment_documents_priced_vs_entitled():
+    """`agent/backend.py`'s `DEFAULT_CODEX_MODEL_SUBSCRIPTION` comment must
+    distinguish "entitled on this account" (what the operator measured) from
+    "documented and priced" (has a sourced row in `MODEL_PRICES_USD_PER_MTOK`)
+    — and must not claim a priced id is undocumented."""
+    import pathlib
+
+    from no_human.agent import backend as agent_backend
+
+    source = pathlib.Path(agent_backend.__file__).read_text()
+    start = source.index("DEFAULT_CODEX_MODEL_SUBSCRIPTION")
+    comment_block = source[:start].rsplit("\n\n", 1)[-1]
+    lowered = comment_block.lower()
+    assert "entitle" in lowered
+    assert "priced" in lowered
+    assert "not a documented" not in lowered

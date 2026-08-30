@@ -1936,3 +1936,146 @@ async def test_detail_payload_budget_honours_a_per_task_cap_override(store, tmp_
     assert gate_cap == 9_000_000
     assert body["budget"]["cap"] == gate_cap
     assert body["budget"]["remaining"] == 9_000_000 - 1_000_000
+
+
+# --------------------------------------------------------------------------- #
+# The Codex fallback bug: an unrecorded model on the codex backend must price #
+# at the MAX OpenAI premium, never the plain 4.0 that (before this fix) sat   #
+# below several priced OpenAI rows and bought a Codex task budget headroom    #
+# for simply failing to record its model.                                    #
+# --------------------------------------------------------------------------- #
+
+async def test_a_codex_task_prices_an_unrecorded_model_at_the_codex_fallback(store):
+    """A task whose `task.config["backend"] == "codex"` must route its
+    unrecorded-model output tokens through the raised Codex fallback — the
+    same figure `_check_lifetime_budget` reports on the `lifetime_budget`
+    event, since neither this gate nor the ledger it reads ever thread a
+    per-role `model` into `_weighted_tokens`/`_class_breakdown` (six roles are
+    summed per attempt; see `weighted_tokens`'s docstring on why `model` stays
+    `None` at every one of these call sites) — every attempt here IS the
+    unrecorded-model case, not a corner of it.
+
+    RED before this fix: the gate priced this exact spend at the plain 4.0
+    regardless of `task.config["backend"]`, silently under-charging every
+    Codex task's unrecorded output tokens relative to what the priced OpenAI
+    rows say they actually cost.
+    """
+    from no_human.core.pricing import OUTPUT_EXTRA_WEIGHT, fallback_output_extra_weight
+
+    premium = fallback_output_extra_weight(backend="codex")
+    assert premium > OUTPUT_EXTRA_WEIGHT, (
+        "test assumption broken: the codex fallback is no longer raised")
+
+    t = Task.new("codex task", repo_path="/tmp/x")
+    t.config = {
+        "backend": "codex",
+        "lifetime_tokens": 1_000_000_000,
+        BUDGET_UNIT_KEY: WEIGHTED_UNIT,
+    }
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, tokens_used=1_000_000, output_tokens=1_000_000)
+
+    events = []
+    o = _orch(store)
+    o._sink = events.append
+    assert await o._check_lifetime_budget(t) is None
+    ev = next(e for e in events if e["kind"] == "lifetime_budget")
+
+    expected = int(1_000_000 * 1.0 + 1_000_000 * premium)
+    assert ev["tokens_weighted"] == expected
+    # And strictly more than the plain-fallback figure a pre-fix gate reported.
+    assert ev["tokens_weighted"] > int(1_000_000 + 1_000_000 * OUTPUT_EXTRA_WEIGHT)
+
+
+async def test_a_claude_task_is_unchanged(store):
+    """A task with no backend override — the default, and an explicit
+    `"claude"` — must price identically to before this change: the plain 4.0
+    fallback, never the raised Codex one. Pinned as a regression: this fix
+    must not move a single number for the Claude path."""
+    t = Task.new("claude task (no override)", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 1_000_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, tokens_used=1_000_000, output_tokens=1_000_000)
+
+    events = []
+    o = _orch(store)
+    o._sink = events.append
+    assert await o._check_lifetime_budget(t) is None
+    ev = next(e for e in events if e["kind"] == "lifetime_budget")
+    assert ev["tokens_weighted"] == weighted_tokens(
+        tokens_used=1_000_000, output_tokens=1_000_000)  # == 5,000,000, unchanged
+
+    # Explicit "claude" reads identically to no override at all.
+    t2 = Task.new("claude task (explicit)", repo_path="/tmp/x")
+    t2.config = {
+        "backend": "claude", "lifetime_tokens": 1_000_000_000,
+        BUDGET_UNIT_KEY: WEIGHTED_UNIT,
+    }
+    await store.create_task(t2)
+    aid2 = await store.create_attempt(t2.id, 1)
+    await store.update_attempt(aid2, tokens_used=1_000_000, output_tokens=1_000_000)
+    events2 = []
+    o2 = _orch(store)
+    o2._sink = events2.append
+    assert await o2._check_lifetime_budget(t2) is None
+    ev2 = next(e for e in events2 if e["kind"] == "lifetime_budget")
+    assert ev2["tokens_weighted"] == ev["tokens_weighted"]
+
+
+async def test_the_orchestrator_backend_reader_agrees_with_task_backend_override(store):
+    """`Orchestrator._task_backend` must exactly mirror
+    `core.runtime.task_backend_override` when a task carries a per-task
+    override, and fall through to the worker-config default
+    (`agent.backend.resolve_backend_name`, role="coder") only when it does
+    not — the same two-step resolution the running attempt actually uses to
+    pick a coding backend, so the gate can never price a task under a
+    different backend than the one that spent the tokens."""
+    from no_human.agent.backend import resolve_backend_name
+    from no_human.core.runtime import task_backend_override
+
+    o = _orch(store, config={"worker": {"backend": "local"}})
+
+    t = Task.new("with override", repo_path="/tmp/x")
+    t.config = {"backend": "codex"}
+    await store.create_task(t)
+    assert task_backend_override(t) == "codex"
+    assert o._task_backend(t) == "codex"
+
+    t2 = Task.new("no override", repo_path="/tmp/x")
+    t2.config = {}
+    await store.create_task(t2)
+    assert task_backend_override(t2) is None
+    assert o._task_backend(t2) == "local" == resolve_backend_name(o.config, role="coder")
+
+    t3 = Task.new("blank override", repo_path="/tmp/x")
+    t3.config = {"backend": "   "}
+    await store.create_task(t3)
+    assert task_backend_override(t3) is None
+    assert o._task_backend(t3) == "local"
+
+
+async def test_detail_payload_budget_uses_the_codex_fallback_for_a_codex_task(store, tmp_path):
+    """`api/app.py`'s `get_task` must thread the SAME backend the gate resolves
+    into its own `weighted_tokens` call — the surfaced `budget.used` a human
+    reads in the drawer must equal what `BUDGET_EXHAUSTED` would actually kill
+    on, not a cheaper number computed with the plain fallback."""
+    from no_human.core.pricing import fallback_output_extra_weight
+
+    t = Task.new("codex burn", repo_path="/tmp/x")
+    t.config = {
+        "backend": "codex",
+        "lifetime_tokens": 1_000_000_000,
+        BUDGET_UNIT_KEY: WEIGHTED_UNIT,
+    }
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, tokens_used=1_000_000, output_tokens=1_000_000)
+
+    _, by_class, _ = await store.lifetime_usage_by_class(t.id)
+    gate_used = weighted_tokens(**by_class, backend="codex")
+
+    body = await _detail(store, tmp_path, t.id)
+    assert body["budget"]["used"] == gate_used
+    assert gate_used == int(1_000_000 + 1_000_000 * fallback_output_extra_weight(backend="codex"))
