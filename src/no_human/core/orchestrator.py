@@ -136,7 +136,10 @@ from ..vcs.receipts import verify_pr_receipt
 from ..vcs.task_pr import resolve_task_pr
 from . import merge_policy
 from . import plan_gate
-from .bounds import Bounds, QuotaExhausted, StuckDetector, error_signature
+from .bounds import (
+    Bounds, QuotaExhausted, StuckDetector, error_signature,
+    quota_reason, quota_signal,
+)
 from ..blockers.taxonomy import carried_checkpoint, resume_checkpoint
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
@@ -903,62 +906,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# The CLI's own rejections are phrased "You've hit your <period> limit", and
-# the period varies: two observed live are "monthly spend limit" and "weekly
-# limit". Neither matched any literal below, so a hard billing wall was
-# classified as a generic error and burned all 3 attempts against it instead of
-# parking with a wake condition. Matching the SHAPE covers the periods we have
-# not seen.
-#
-# The class includes both apostrophes so possessive periods match too —
-# "hit your team's weekly limit" is the enterprise phrasing, and constraint #1
-# makes enterprise profiles first-class. (A previous comment here claimed the
-# class covered "the CLI's typographic apostrophe"; it did not — the
-# apostrophe in "You've" sits BEFORE the match window, so that case passed by
-# accident, not by design.)
-# Bounded by WORDS, not characters. The CLI's period is always one or two
-# words ("weekly", "monthly spend", "team's weekly"), while the English
-# false positive a character bound admits — "hit your head on the limit
-# switch" — needs three. Reachability is already low (only an ERRORED
-# result's text reaches here), but a classifier deciding between parking
-# and burning three attempts should not depend on its caller to be right.
-_QUOTA_RE = re.compile(r"hit your (?:[\w'\u2019-]+ ){0,2}limit")
-
-# EVERY term must contain a space or be a full API error type. `final_text`
-# carries a TRACEBACK, so a bare substring matches FILE PATHS: the old literal
-# "quota" fired on any traceback through a directory or module whose name
-# contains it — and this codebase is full of quota-handling code, so
-# `quota_park.py` in a stack trace was enough to park a healthy task on a
-# billing wall it never hit. Paths do not contain spaces.
-_QUOTA_TERMS = (
-    "usage limit", "spend limit", "rate limit exceeded",
-    "quota exceeded", "quota reached", "out of quota", "insufficient quota",
-    "your quota", "rate_limit_error",
-)
-
-
-def _quota_reason(text: str) -> str:
-    """The CLI's own one-line explanation, for the park detail.
-
-    Trimmed to the first non-empty line: `final_text` also carries a traceback,
-    and the park detail is a human-facing summary, not a log.
-    """
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()[:200]
-    return "subscription quota exhausted"
-
-
-def _quota_signal(text: str) -> bool:
-    """Is this failure a billing wall rather than a broken task?
-
-    Decides between parking with a wake condition and burning all 3 attempts,
-    so it must be wrong in neither direction. Only ever applied to text from an
-    ERRORED result — see the is_error gate in claude_backend — which is what
-    makes it safe to match more phrasings: a coder's own summary saying "added
-    rate limit handling" no longer reaches here at all."""
-    t = text.lower()
-    return bool(_QUOTA_RE.search(t)) or any(s in t for s in _QUOTA_TERMS)
+# `_QUOTA_RE`/`_QUOTA_TERMS`/`_quota_reason`/`_quota_signal` used to live here;
+# they moved verbatim to `core.bounds` (`quota_reason`/`quota_signal`) so the
+# verifier (`review/verifiers.py`) and supervisor (`agent/supervisor.py`) paths
+# can classify the same quota-wall shapes without importing this module.
+# Kept as module-level aliases below: `_run_attempt` shadows `quota_reason`
+# with a local variable of the same name, so call sites inside this module
+# keep using the underscored alias rather than the public `bounds` name.
+_quota_signal = quota_signal
+_quota_reason = quota_reason
 
 
 # INCIDENT (2026-08-13 17:14-18:15): the operator's subscription hit its
@@ -1392,6 +1348,16 @@ class Orchestrator:
         # `_raise_blocker` reads this to add the caveat to the persisted
         # blocker's evidence — the checkpoint succeeded, but unverified.
         self._last_checkpoint_unverified: str = ""
+        # Latched by `_build_supervisor`'s `on_decision` closure the moment
+        # the supervisor's own side-channel LLM call observes a subscription
+        # session/weekly-limit wall (`agent.supervisor`'s `quota_park`
+        # action) — the coder's OWN turn can still stream back a perfectly
+        # clean, non-error result in the same round (the abort races the
+        # in-flight generation), so `_run_attempt`'s ordinary
+        # `_quota_signal(result.final_text)` check on the coder's result has
+        # nothing to see. Checked (and cleared) right alongside that
+        # existing check so either signal parks the task the same way.
+        self._supervisor_quota_wall: str | None = None
 
     # ----------------------------- events ---------------------------------- #
 
@@ -4085,6 +4051,17 @@ class Orchestrator:
             return await self.store.latest_review_verdict(task.id) == 1
         return await self._mechanical_round(task)
 
+    async def _check_supervisor_quota_wall(self, attempt_id: str) -> None:
+        """Close+raise if the supervisor side channel latched a quota wall
+        this round (`_supervisor_quota_wall` in `__init__`) — checked
+        unconditionally since `result` in `_run_attempt` may look healthy."""
+        if not self._supervisor_quota_wall:
+            return
+        wall_reason = self._supervisor_quota_wall
+        self._supervisor_quota_wall = None
+        await self.store.update_attempt(attempt_id, status="failed", failure_reason=f"quota: {wall_reason}", infra_failure=1)
+        raise QuotaExhausted(wall_reason)
+
     async def _run_attempt(
         self, task: Task, repo: GitRepo, attempt_n: int, base: str | None = None
     ) -> TaskOutcome:
@@ -4928,9 +4905,9 @@ class Orchestrator:
         # breaker was building BEFORE the error-routing below, so a genuine
         # in-work failure (max_turns, a real traceback) never counts toward
         # a fleet-wide pause meant for dead dispatches.
-        if (result.tokens_used or result.cache_read_tokens
-                or result.cache_creation_tokens):
+        if result.tokens_used or result.cache_read_tokens or result.cache_creation_tokens:
             infra_breaker().record_healthy()
+        await self._check_supervisor_quota_wall(attempt_id)
         if result.is_error and _quota_signal(result.final_text or ""):
             # Close THIS row before the park, classified exactly like the SDK
             # shape below: a billing wall is not the coder's failure and must
@@ -11146,6 +11123,20 @@ class Orchestrator:
             self._opened_draft_this_attempt = not pre_existing
         return url
 
+    async def _raise_if_verifier_quota_wall(self, attempt_id: str, reason: str | None) -> None:
+        """Route a bare verifier-call failure through the same classifier the
+        coder path uses (`quota_signal`): a genuine quota wall never had a
+        chance, so retrying wastes time and escalating misreports it as a
+        NOVEL_UNKNOWN infra incident (INCIDENT 2026-08-20). Close THIS
+        attempt row before the park, else `lifetime_usage_by_class` charges
+        a lifetime attempt for a round that never got a verdict."""
+        reason = reason or ""
+        if not quota_signal(reason):
+            return
+        wall_reason = quota_reason(reason)
+        await self.store.update_attempt(attempt_id, status="failed", failure_reason=f"quota: {wall_reason}", infra_failure=1)
+        raise QuotaExhausted(wall_reason)
+
     async def _run_review(
         self, task: Task, repo: GitRepo, attempt_id: str, base: str | None = None,
         draft_pr: str = "", draft_pr_absent: str = "",
@@ -11251,9 +11242,7 @@ class Orchestrator:
             if primary_resolved is not None and lp.resolve() == primary_resolved:
                 continue  # a linked entry that is the primary repo — do not double-count
             try:
-                lr_before = (
-                    await self._repro_base_ref(lp, base) if base else "HEAD~1"
-                )
+                lr_before = await self._repro_base_ref(lp, base) if base else "HEAD~1"
             except Exception:  # noqa: BLE001 — never block review on base resolution
                 lr_before = "HEAD~1"
             linked_for_review.append((lp, lr_before))
@@ -11326,9 +11315,12 @@ class Orchestrator:
 
             async def _judge_call(prompt: str, timeout: int) -> tuple[str, int]:
                 nonlocal verifier_output_seen
-                result, _reason = await self.reviewer._run_bounded(
+                result, reason = await self.reviewer._run_bounded(
                     prompt, repo.path, max_turns=1, timeout=timeout, on_event=None)
                 if result is None:
+                    # Ordinarily infra (fall through to no_verdict) unless it's
+                    # actually a quota wall (see the helper's docstring).
+                    await self._raise_if_verifier_quota_wall(attempt_id, reason)
                     return "", 0  # parse_result → no_verdict → one bounded retry
                 verifier_tok["total"] += result.tokens_used or 0
                 verifier_tok["cache_read"] += result.cache_read_tokens or 0
@@ -11467,9 +11459,7 @@ class Orchestrator:
         # keeps reviewer + verifier spend from clobbering each other.
         decision.verifiers = verifier_dicts
         decision.tokens_used = (decision.tokens_used or 0) + verifier_tok["total"]
-        decision.cache_read_tokens = (
-            (decision.cache_read_tokens or 0) + verifier_tok["cache_read"]
-        )
+        decision.cache_read_tokens = (decision.cache_read_tokens or 0) + verifier_tok["cache_read"]
         decision.cache_creation_tokens = (
             (decision.cache_creation_tokens or 0) + verifier_tok["cache_creation"]
         )
@@ -13825,6 +13815,16 @@ class Orchestrator:
                 "supervisor_decision", decision.action,
                 message=decision.message[:200] if decision.message else "",
             )
+            if decision.action == "quota_park":
+                # Latch it (see the attribute's docstring in `__init__`) —
+                # `hook()` has already aborted the session by the time this
+                # fires, but the coder's OWN result object may still look
+                # clean, so `_run_attempt` needs this side channel to park
+                # the task instead of booking a normal outcome.
+                self._supervisor_quota_wall = (
+                    decision.message or "supervisor observed a subscription "
+                    "quota wall"
+                )
 
         # Skills the supervisor may tell the coder to use (EVOLUTION_PLAN §1.2
         # #2, §1.3 row 1) — exactly the names in the coder's delivered

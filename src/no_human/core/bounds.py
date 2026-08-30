@@ -409,6 +409,64 @@ def parse_quota_reset(message: str, *, now: datetime) -> datetime | None:
     return result
 
 
+# The CLI's own rejections are phrased "You've hit your <period> limit", and
+# the period varies: two observed live are "monthly spend limit" and "weekly
+# limit". Neither matched any literal below, so a hard billing wall was
+# classified as a generic error and burned all 3 attempts against it instead of
+# parking with a wake condition. Matching the SHAPE covers the periods we have
+# not seen.
+#
+# The class includes both apostrophes so possessive periods match too —
+# "hit your team's weekly limit" is the enterprise phrasing, and constraint #1
+# makes enterprise profiles first-class. (A previous comment here claimed the
+# class covered "the CLI's typographic apostrophe"; it did not — the
+# apostrophe in "You've" sits BEFORE the match window, so that case passed by
+# accident, not by design.)
+# Bounded by WORDS, not characters. The CLI's period is always one or two
+# words ("weekly", "monthly spend", "team's weekly"), while the English
+# false positive a character bound admits — "hit your head on the limit
+# switch" — needs three. Reachability is already low (only an ERRORED
+# result's text reaches here), but a classifier deciding between parking
+# and burning three attempts should not depend on its caller to be right.
+_QUOTA_RE = re.compile(r"hit your (?:[\w'\u2019-]+ ){0,2}limit")
+
+# EVERY term must contain a space or be a full API error type. `final_text`
+# carries a TRACEBACK, so a bare substring matches FILE PATHS: the old literal
+# "quota" fired on any traceback through a directory or module whose name
+# contains it — and this codebase is full of quota-handling code, so
+# `quota_park.py` in a stack trace was enough to park a healthy task on a
+# billing wall it never hit. Paths do not contain spaces.
+_QUOTA_TERMS = (
+    "usage limit", "spend limit", "rate limit exceeded",
+    "quota exceeded", "quota reached", "out of quota", "insufficient quota",
+    "your quota", "rate_limit_error",
+)
+
+
+def quota_reason(text: str) -> str:
+    """The CLI's own one-line explanation, for the park detail.
+
+    Trimmed to the first non-empty line: `final_text` also carries a traceback,
+    and the park detail is a human-facing summary, not a log.
+    """
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return "subscription quota exhausted"
+
+
+def quota_signal(text: str) -> bool:
+    """Is this failure a billing wall rather than a broken task?
+
+    Decides between parking with a wake condition and burning all 3 attempts,
+    so it must be wrong in neither direction. Only ever applied to text from an
+    ERRORED result — see the is_error gate in claude_backend — which is what
+    makes it safe to match more phrasings: a coder's own summary saying "added
+    rate limit handling" no longer reaches here at all."""
+    t = text.lower()
+    return bool(_QUOTA_RE.search(t)) or any(s in t for s in _QUOTA_TERMS)
+
+
 class QuotaExhausted(Exception):
     """Raised when a subscription usage limit is hit mid-task.
 

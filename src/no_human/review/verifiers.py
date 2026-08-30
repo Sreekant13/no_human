@@ -25,7 +25,11 @@ signal to escalate, NEVER as a coder-facing high-severity finding — the
 verdict still renders as "not satisfied" (fail-closed is unchanged), but it
 must not be billed to the coder as a defect nobody found. See
 ``_classify_unavailable`` for the transport-failure vs. malformed-response
-distinction used to word the escalation message.
+distinction used to word the escalation message. A judge failure whose text
+carries a subscription usage-limit signal (``core.bounds.quota_signal``) is
+a DIFFERENT case again: it is not a no-verdict at all, and ``_judge_once``
+re-raises it as ``QuotaExhausted`` so the round parks the task instead of
+spending the bounded retry or escalating as infra.
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from typing import Any
 import yaml
 
 from ..core import pathglob
+from ..core.bounds import QuotaExhausted, quota_reason, quota_signal
 from .selfcheck import ChecklistItem
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
@@ -559,6 +564,10 @@ async def _judge_once(
             exc, Exception
         ):
             raise
+        if isinstance(exc, QuotaExhausted):
+            raise
+        if quota_signal(str(exc)):
+            raise QuotaExhausted(quota_reason(str(exc))) from exc
         return VerifierResult(
             verifier_id=verifier.id,
             passed=False,

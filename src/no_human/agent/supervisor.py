@@ -27,6 +27,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from ..core.bounds import quota_reason, quota_signal
 from ..core.prompt_blocks import supervisor_channel_tag
 
 log = logging.getLogger("no_human.supervisor")
@@ -36,6 +37,31 @@ _TAG_CONTINUE = "SUPERVISOR_CONTINUE"
 _TAG_CORRECT = "SUPERVISOR_CORRECT"
 _TAG_ANSWER = "SUPERVISOR_ANSWER"
 _TAG_STOP = "SUPERVISOR_STOP"
+
+# Not one of the four tags the LLM emits — a decision the supervisor itself
+# synthesises when the raw text (a tag-less LLM turn, or an exception's own
+# message) carries a subscription session/weekly-limit signal
+# (`core.bounds.quota_signal`, the SAME classifier the coder path uses). This
+# is not "unparseable" in the ordinary sense: the supervisor's own call hit
+# the SAME wall the coder is about to hit, so treating it as "defaulting to
+# CONTINUE" would wave the agent through blind, and the orchestrator's own
+# `hook()` dispatch must abort the session instead of silently continuing.
+_ACTION_QUOTA_PARK = "quota_park"
+
+# `quota_signal`'s own docstring: "Only ever applied to text from an ERRORED
+# result ... which is what makes it safe to match more phrasings" — outside
+# that gate, `_QUOTA_TERMS` bare phrases like "usage limit" or "rate limit
+# exceeded" can appear in ordinary prose (a supervisor turn discussing the
+# coder's OWN rate-limit-handling code, for instance) with no wall involved.
+# `parse_decision`'s tag-less fallback has no `is_error` bit to gate on — the
+# LLM call itself succeeded, it just didn't emit a tag — so the closest
+# equivalent is shape: a genuine CLI quota banner is one short line (see the
+# fixture strings in tests/test_supervisor_quota_park.py, both well under
+# 100 chars); a tag-less but otherwise-coherent supervisor analysis runs to
+# paragraphs. Bounding on length (not on widening the phrase set — OUT OF
+# SCOPE forbids that) keeps a long chatty mention from false-parking a
+# healthy task while still catching the bare wall string.
+_QUOTA_PARK_TEXT_MAX_LEN = 220
 
 # Limit how much tool response text we keep per call (controls prompt size).
 _RESPONSE_CAP = 1500
@@ -124,8 +150,33 @@ def parse_decision(text: str) -> SupervisorDecision:
                     if end != -1:
                         after = after[:end].strip()
             return SupervisorDecision(action=action, message=after, raw=text)
-    # No recognisable tag → default to CONTINUE (safe fallback: don't
-    # inject noise when the LLM's response is unparseable).
+    # No recognisable tag. Before falling back to CONTINUE, check whether the
+    # raw text itself is a subscription session/weekly-limit wall (the SAME
+    # `quota_signal` classifier the coder path already uses) — e.g. the
+    # backend handed the supervisor's own turn the bare quota string instead
+    # of any tagged verdict. That is not "the LLM said something we couldn't
+    # parse", it is "the LLM never got to say anything" — waving it through
+    # as CONTINUE would let the working agent keep spending against a wall
+    # nobody has acknowledged. Route it to a park instead.
+    #
+    # Gated on length (`_QUOTA_PARK_TEXT_MAX_LEN`), mirroring the coder
+    # path's `is_error` gate: this text carries no error flag of its own (the
+    # LLM call succeeded), so `quota_signal`'s bare phrases must not be
+    # trusted against arbitrary-length prose — only against a turn that IS,
+    # shape-wise, the short wall banner and not a longer analysis that merely
+    # mentions the same vocabulary.
+    if len(text) <= _QUOTA_PARK_TEXT_MAX_LEN and quota_signal(text):
+        log.warning(
+            "supervisor: LLM output carries a subscription quota-limit "
+            "signal — parking the attempt rather than waving it through; "
+            "raw: %.200r",
+            text,
+        )
+        return SupervisorDecision(
+            action=_ACTION_QUOTA_PARK, message=quota_reason(text), raw=text
+        )
+    # No recognisable tag, no quota signal → default to CONTINUE (safe
+    # fallback: don't inject noise when the LLM's response is unparseable).
     # Log the excerpt, which is what `raw` is FOR (see its field comment) and
     # was never doing. Without it this fallback is invisible twice over: the
     # warning said only THAT a parse failed, and the decision returned
@@ -406,6 +457,26 @@ class SupervisorHook:
         try:
             raw = await self._llm_call(prompt)
         except Exception as exc:  # noqa: BLE001
+            if quota_signal(str(exc)):
+                # The supervisor's OWN call hit the same subscription wall
+                # the coder is about to hit — not a broken/unavailable LLM
+                # tier, which fails open (below) because the supervisor's
+                # own error is never a reason to block the coder. A quota
+                # wall is different: fail-open here would let the working
+                # agent keep spending against a wall the orchestrator hasn't
+                # acknowledged yet. Route through the same classifier the
+                # coder path uses so the caller (`hook()`) aborts instead.
+                log.warning(
+                    "supervisor: LLM call hit a subscription quota wall — "
+                    "parking: %s", exc,
+                )
+                decision = SupervisorDecision(
+                    action=_ACTION_QUOTA_PARK, message=quota_reason(str(exc)),
+                    raw=f"LLM error: {exc}",
+                )
+                if self._on_decision:
+                    self._on_decision(decision)
+                return decision
             log.warning("supervisor LLM call failed: %s", exc)
             return SupervisorDecision(action="continue", raw=f"LLM error: {exc}")
         decision = parse_decision(raw)
@@ -428,6 +499,23 @@ class SupervisorHook:
         try:
             raw = await self._llm_call(prompt)
         except Exception as exc:  # noqa: BLE001
+            if quota_signal(str(exc)):
+                # Same reasoning as `evaluate()`'s quota branch: the
+                # supervisor's own preflight call hit the subscription wall
+                # the coder is about to hit, so fail-open CONTINUE would let
+                # the coder start a plan against a wall nobody has
+                # acknowledged. Park instead.
+                log.warning(
+                    "supervisor: preflight LLM call hit a subscription "
+                    "quota wall — parking: %s", exc,
+                )
+                decision = SupervisorDecision(
+                    action=_ACTION_QUOTA_PARK, message=quota_reason(str(exc)),
+                    raw=f"LLM error: {exc}",
+                )
+                if self._on_decision:
+                    self._on_decision(decision)
+                return decision
             log.warning("supervisor preflight LLM call failed: %s", exc)
             return SupervisorDecision(action="continue", raw=f"LLM error: {exc}")
         decision = parse_decision(raw)
@@ -523,6 +611,22 @@ class SupervisorHook:
             return {
                 "continue_": False,
                 "stopReason": f"Supervisor abort: {decision.message}",
+            }
+
+        if decision.action == _ACTION_QUOTA_PARK:
+            # Unlike "continue" (the safe fallback for a genuinely broken/
+            # unparseable supervisor turn), a quota wall must abort the
+            # session — the orchestrator's own `_quota_signal` gate on the
+            # coder's result cannot see this (the coder's own turn may have
+            # streamed a clean result before the supervisor's side-channel
+            # call hit the wall), so if this hook silently continues the
+            # session keeps spending against a wall nobody has acknowledged.
+            # Aborting here hands control back to the attempt loop, which
+            # closes and reports on the same wall the coder path already
+            # parks on.
+            return {
+                "continue_": False,
+                "stopReason": f"Supervisor quota wall: {decision.message}",
             }
 
         return {}  # unknown action → safe fallback
