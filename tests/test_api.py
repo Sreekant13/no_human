@@ -1694,6 +1694,154 @@ def test_task_out_surfaces_the_failure_reason_the_drawer_asks_for():
     assert TaskOut.from_task(t, []).failure_reason is None
 
 
+# --- cost_usd / cost_model: the API prices attempts server-side (core/cost.py), the ----
+# board only formats what these fields already send. web/src/cost.js used to hardcode one
+# flat Anthropic rate and price EVERY attempt at it, which was simply wrong for a
+# Codex/OpenAI attempt once core/pricing.py gained per-model OpenAI rows. core/cost.py's
+# own unit tests (tests/test_cost.py) and pricing.usd_cost's (tests/test_pricing_usd.py)
+# pin the arithmetic; these pin that the API actually wires it onto every surface the
+# board reads (AttemptOut, TaskOut, TaskSummaryOut).
+
+def test_attempt_out_prices_codex_row_from_the_openai_table():
+    """gpt-5.3-codex is $1.75/Mtok, not Sonnet's $3 — the exact bug
+    web/src/cost.js had (one hardcoded Anthropic rate for every attempt)."""
+    from no_human.api.models import AttemptOut
+    row = {"id": "a1", "attempt_number": 1, "tokens_used": 1_000_000,
+           "models": {"coder": "gpt-5.3-codex"}}
+    out = AttemptOut.from_row(row)
+    assert out.cost_usd == pytest.approx(1.75)
+    assert out.cost_model == "gpt-5.3-codex"
+
+
+def test_attempt_out_prices_each_role_with_its_own_model():
+    """A Codex coder reviewed by Claude is real and common — each role prices
+    at its own recorded model; the label is 'mixed' when priced roles
+    disagree, never collapsed to just one of them."""
+    from no_human.api.models import AttemptOut
+    row = {
+        "id": "a1", "attempt_number": 1,
+        "tokens_used": 1_000_000, "review_tokens_used": 1_000_000,
+        "models": {"coder": "gpt-5.3-codex", "reviewer": "claude-opus-4-8"},
+    }
+    out = AttemptOut.from_row(row)
+    assert out.cost_usd == pytest.approx(1.75 + 5.0)
+    assert out.cost_model == "mixed"
+
+
+def test_attempt_out_unpriced_model_uses_the_named_fallback_and_is_visible():
+    """An id with no row in MODEL_PRICES_USD_PER_MTOK must still price
+    nonzero and say so via the fallback label — never a silent 0.0 and never
+    the bare unpriced id, which would look like a real price was found."""
+    from no_human.api.models import AttemptOut
+    from no_human.core.pricing import FALLBACK_PRICE_NAME
+    row = {"id": "a1", "attempt_number": 1, "tokens_used": 1_000_000,
+           "models": {"coder": "gpt-5-codex"}}  # deliberately absent from the table
+    out = AttemptOut.from_row(row)
+    assert out.cost_usd > 0
+    assert out.cost_model == FALLBACK_PRICE_NAME
+    assert out.cost_model != "gpt-5-codex"
+
+
+def test_attempt_out_empty_models_prices_at_fallback():
+    """11 of this install's 684 attempt rows predate the `models` column —
+    NULL there must still price (fallback), never crash and never show 0.0
+    for real recorded spend."""
+    from no_human.api.models import AttemptOut
+    from no_human.core.pricing import FALLBACK_PRICE_NAME
+    out = AttemptOut.from_row({"id": "a1", "attempt_number": 1, "tokens_used": 1_000_000})
+    assert out.cost_usd == pytest.approx(3.0)
+    assert out.cost_model == FALLBACK_PRICE_NAME
+
+
+def test_task_summary_cost_is_the_sum_of_its_attempt_costs():
+    from no_human.api.models import TaskSummaryOut
+    from no_human.core.task import Task
+    t = Task.new("x", repo_path="/tmp/r")
+    attempts = [
+        {"id": "a1", "attempt_number": 1, "tokens_used": 1_000_000,
+         "models": {"coder": "claude-sonnet-5"}},
+        {"id": "a2", "attempt_number": 2, "tokens_used": 1_000_000,
+         "models": {"coder": "gpt-5.3-codex"}},
+    ]
+    s = TaskSummaryOut.from_task(t, attempts=attempts)
+    assert s.cost_usd == pytest.approx(3.0 + 1.75)
+    assert s.cost_model == "mixed"
+    # No attempts yet -> None, not 0.0 — "no attempts" and "attempts that
+    # spent nothing" are different facts and must not both render as 0.
+    assert TaskSummaryOut.from_task(t, attempts=None).cost_usd is None
+    assert TaskSummaryOut.from_task(t, attempts=None).cost_model is None
+
+
+def test_task_out_cost_matches_task_summary_cost():
+    """The drawer (TaskOut) and the board card (TaskSummaryOut) must never
+    disagree about the same task's price — both call attempts_cost on the
+    same attempt rows, never a local computation of their own."""
+    from no_human.api.models import TaskOut, TaskSummaryOut
+    from no_human.core.task import Task
+    t = Task.new("x", repo_path="/tmp/r")
+    attempts = [
+        {"id": "a1", "attempt_number": 1, "tokens_used": 2_000_000,
+         "cache_read_tokens": 500_000, "models": {"coder": "claude-sonnet-5"}},
+    ]
+    out = TaskOut.from_task(t, attempts)
+    s = TaskSummaryOut.from_task(t, attempts=attempts)
+    # weighted = 2,000,000 fresh (x1.0) + 500,000 cache-read (x0.1) = 2,050,000
+    # dollars = 2,050,000 * $3/Mtok = 6.15
+    assert out.cost_usd == s.cost_usd == pytest.approx(6.15)
+    assert out.cost_model == s.cost_model == "claude-sonnet-5"
+
+
+def test_task_cost_model_is_mixed_when_roles_disagree():
+    from no_human.api.models import TaskOut
+    from no_human.core.task import Task
+    t = Task.new("x", repo_path="/tmp/r")
+    attempts = [
+        {"id": "a1", "attempt_number": 1, "tokens_used": 1_000_000,
+         "review_tokens_used": 1_000_000,
+         "models": {"coder": "gpt-5.3-codex", "reviewer": "claude-opus-4-8"}},
+    ]
+    out = TaskOut.from_task(t, attempts)
+    assert out.cost_model == "mixed"
+
+
+async def test_metrics_cost_usd_total_equals_the_sum_of_task_costs(tmp_path):
+    """core.metrics.compute_metrics's cost_usd_total must price the whole
+    install with the SAME function (core.cost.attempts_cost) TaskSummaryOut
+    uses per task — summing every task's own cost_usd must equal the
+    lifetime figure the North Star lifetime tile renders, or the board card
+    and the lifetime tile disagree (the exact class of bug this rebuild
+    exists to prevent)."""
+    from no_human.api.models import TaskSummaryOut
+    from no_human.core.db import Store
+    from no_human.core.metrics import compute_metrics
+    from no_human.core.task import Task
+
+    store = await Store(tmp_path / "nh.db").connect()
+    try:
+        t1 = Task.new("a", repo_path="/tmp/a")
+        await store.create_task(t1)
+        a1 = await store.create_attempt(t1.id, attempt_number=1)
+        await store.update_attempt(
+            a1, tokens_used=1_000_000, models={"coder": "claude-sonnet-5"})
+
+        t2 = Task.new("b", repo_path="/tmp/b")
+        await store.create_task(t2)
+        a2 = await store.create_attempt(t2.id, attempt_number=1)
+        await store.update_attempt(
+            a2, tokens_used=1_000_000, models={"coder": "gpt-5.3-codex"})
+
+        m = await compute_metrics(store)
+
+        s1 = TaskSummaryOut.from_task(t1, attempts=await store.list_attempts(t1.id))
+        s2 = TaskSummaryOut.from_task(t2, attempts=await store.list_attempts(t2.id))
+
+        assert m["cost_usd_total"] == pytest.approx(s1.cost_usd + s2.cost_usd)
+        assert m["cost_usd_total"] == pytest.approx(3.0 + 1.75)
+        assert m["cost_model_total"] == "mixed"
+    finally:
+        await store.close()
+
+
 def test_task_out_withholds_a_failure_reason_that_would_be_a_lie():
     """Two cases where a plausible string is worse than nothing.
 

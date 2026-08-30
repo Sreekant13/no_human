@@ -199,7 +199,12 @@ test("a human-stopped task does NOT auto-open a section (DecisionPanel carries t
 
 test("chips include cost+tokens, wall-time, attempts, and a PR link when present", () => {
   const task = {
+    // taskBurn (the chip's visibility gate, and its "N tok" sub-label) still sums the raw
+    // token buckets — that display is unchanged by the pricing fix. The price itself
+    // (chips[0].label) is now taskCost, a pure read of cost_usd: the API prices it
+    // server-side (core/cost.py), so the fixture must carry that field directly.
     total_tokens: 500_000, total_cache_read: 2_000_000, total_cache_creation: 0,
+    cost_usd: 4.50, cost_model: "claude-sonnet-5",
     wall_seconds: 305, attempt_count: 2,
     attempts: [{ branch_name: "nh/task-1", pr_url: null }, { branch_name: "nh/task-1-v2", pr_url: "https://example.com/pr/9" }],
   };

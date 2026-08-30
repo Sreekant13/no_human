@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
-import { costOf } from "./cost.js";
 
 const NOW = new Date("2026-07-17T06:00:00Z").getTime();
 const hoursAgo = (h) => new Date(NOW - h * 3600_000).toISOString();
@@ -25,20 +24,18 @@ test("counts done / real-failed / needs-you inside the window only", () => {
   assert.equal(s.quiet, false);
 });
 
-test("cost prices the WHOLE run from the list endpoint's real field names", () => {
-  // The nine TaskSummaryOut buckets (models.py B2 #12/#5): coder + review +
-  // aux. PR #104 review found the ledger reading attempt-level names that do
-  // not exist on tasks — priced everything at $0 with a test written to the
-  // bug. These are the production names.
-  const s = ledgerSummary([t("done", 1, {
-    total_tokens: 10_000, total_cache_creation: 5_000, total_cache_read: 900_000,
-    total_review_tokens: 2_000, total_review_cache_creation: 1_000,
-    total_review_cache_read: 80_000,
-    total_aux_tokens: 500, total_aux_cache_creation: 0, total_aux_cache_read: 20_000,
-  })], NOW);
-  assert.equal(s.cost, costOf({
-    used: 12_500, creation: 6_000, read: 1_000_000,
-  }));
+test("cost sums the API's cost_usd across every task in the window", () => {
+  // ledgerSummary sums `taskCost(t)` per task, and taskCost is now a pure read of
+  // `t.cost_usd` — the API (core/cost.py) already priced coder + reviewer + aux
+  // per-model before this field ever reaches the board. PR #104 review found the
+  // ledger once reading attempt-level names that do not exist on tasks — priced
+  // everything at $0 with a test written to the bug; the guard now is that the
+  // ledger's total is exactly the sum of each task's own API-priced cost_usd.
+  const s = ledgerSummary([
+    t("done", 1, { cost_usd: 3.30, cost_model: "claude-sonnet-5" }),
+    t("done", 2, { cost_usd: 1.75, cost_model: "gpt-5.3-codex" }),
+  ], NOW);
+  assert.equal(s.cost, 5.05);
   assert.ok(s.cost > 0);
 });
 
@@ -48,7 +45,7 @@ test("a window with no events AND no spend is quiet; spend alone is not", () => 
   assert.equal(quiet.cost, 0);
   // An in-flight task that burned real tokens is NOT a quiet night (review
   // finding 4: "quiet" must never hide spend).
-  const burning = ledgerSummary([t("implementing", 1, { total_tokens: 50_000 })], NOW);
+  const burning = ledgerSummary([t("implementing", 1, { cost_usd: 1.5 })], NOW);
   assert.equal(burning.quiet, false);
   assert.ok(burning.cost > 0);
 });

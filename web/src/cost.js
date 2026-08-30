@@ -1,6 +1,28 @@
-// Token formatting + indicative cost (W2.5). One home so the board, the drawer and Stats all
-// say the same number — spend must be visible where approval decisions happen, not only on an
-// aggregate page.
+// Token formatting + cost DISPLAY (W2.5, then the per-model pricing fix). One home so the
+// board, the drawer and Stats all say the same number — spend must be visible where approval
+// decisions happen, not only on an aggregate page.
+//
+// THIS FILE NO LONGER COMPUTES A DOLLAR FIGURE. It used to (see the two repair stories below,
+// kept as history): a flat `costOf` priced every attempt at one hardcoded Anthropic rate
+// ($3/1K fresh, $0.3/1K cache-read), which was wrong for any Codex/OpenAI attempt the moment
+// `core/pricing.py` gained per-model OpenAI rows — a `gpt-5.3-codex` attempt ($1.75/$14
+// published) rendered on the board as if it had been billed at Sonnet's $3/$15. Fixing that in
+// JS a third time (a second price table, or a defaulted-fallback rate baked into a `??`) would
+// just move the drift somewhere else, so the fix moves pricing server-side: `core/cost.py`'s
+// `attempt_cost` /
+// `attempts_cost` price every attempt at ITS OWN recorded model via `core/pricing.py`, and the
+// API sends the result as `cost_usd` (+ `cost_model`, naming what priced it) on every
+// attempt/task/metrics payload. `taskCost` and `lifetimeCost` below now only READ those fields
+// — no rate, no per-bucket arithmetic, nothing to drift a second time. The Python side of this
+// split is pinned in `tests/test_pricing_usd.py`; the API wiring in `tests/test_api.py`.
+//
+// Cost HISTORY, kept because the failure modes it documents are still the reason the buckets
+// below are named rather than positional, even though the arithmetic that used them is gone:
+// the burn a card shows and the cost it is priced at must have the SAME basis — they didn't
+// (the Token Usage tile once read "169.87M · est. $73.58", pricing 6M cache-creation tokens
+// the count never showed), and a single-argument `estimateCost(tokens, cacheRead = 0)` let a
+// one-argument call silently price a TOTAL burn at the fresh rate (how a Stats tile once
+// claimed $29.98 per merged PR).
 
 export function fmtTokens(n) {
   if (n == null) return "—";
@@ -17,37 +39,11 @@ export function fmtTokens(n) {
  * displayed and the cost it priced had different bases (the Token Usage tile read
  * "169.87M · est. $73.58" — a price for 6M tokens the count never showed).
  *
- * Named buckets, like {@link costOf}: they cannot be transposed or silently dropped.
+ * Named buckets: they cannot be transposed or silently dropped.
  */
 export function totalBurn(buckets) {
   const { used = 0, creation = 0, read = 0 } = buckets || {};
   return (used || 0) + (creation || 0) + (read || 0);
-}
-
-// Indicative rates. Fresh work — in/out tokens AND cache-CREATION — is full price; a cache
-// READ is a tenth of it.
-const RATE_FRESH_PER_TOKEN = 0.003 / 1000;
-const RATE_CACHE_READ_PER_TOKEN = 0.0003 / 1000;
-
-/**
- * The ONE cost model: three buckets, priced in dollars.
- *
- * It takes an OBJECT so the buckets cannot be transposed. The old signature —
- * `estimateCost(tokens, cacheRead = 0)` — let a ONE-argument call silently price a TOTAL burn
- * at the fresh rate, which is how the Stats tile came to claim $29.98 per merged PR. The
- * repair after that (splitting the total by `cache_economics.creation_share`) was also wrong:
- * `tokens_per_pr` contains no cache-creation at all, while `creation_share`'s universe is
- * creation+read — a category error that still left two tiles on one page implying blended
- * rates 20% apart.
- *
- * Every surface (per-PR tile, lifetime tile, task table, drawer header) now divides the SAME
- * number by a different denominator, so they cannot disagree.
- */
-export function costOf(buckets) {
-  const { used = 0, creation = 0, read = 0 } = buckets || {};
-  return (used || 0) * RATE_FRESH_PER_TOKEN
-    + (creation || 0) * RATE_FRESH_PER_TOKEN
-    + (read || 0) * RATE_CACHE_READ_PER_TOKEN;
 }
 
 /** Format a dollar figure — or say nothing, which beats saying a wrong number. */
@@ -58,11 +54,8 @@ export function fmtCost(dollars) {
 }
 
 /**
- * One task's token burn across the same nine buckets {@link taskCost} prices — so a surface
- * showing both cannot show a price for tokens its own count never included. That mismatch is
- * on the record in this file: "169.87M · est. $73.58", a price for 6M tokens the count never
- * showed. It recurred twice here: the Stats Token Usage tile and the task table's Tokens
- * column each counted the coder's buckets beside a whole-run price.
+ * One task's token burn across the same nine buckets the API's `cost_usd` prices — so a
+ * surface showing both cannot show a price for tokens its own count never included.
  */
 export function taskBurn(task) {
   if (!task) return 0;
@@ -82,60 +75,24 @@ export function taskBurn(task) {
 }
 
 /**
- * One task's cost: coder + reviewer + aux (every other named role: planner, utility,
- * supervisor, distill) — the per-task twin of
- * {@link lifetimeCost}, which prices the same nine buckets from the metrics payload. All
- * nine that TaskSummaryOut sends, because the API sends them so "the task row prices the
- * WHOLE run, not just coder+review" (models.py). If you add a bucket to one of these, add it
- * to the other, or a page showing both will contradict itself.
+ * One task's cost — read straight off the API. Priced server-side by `core/cost.py`'s
+ * `attempt_cost`/`attempts_cost`, each attempt at its OWN recorded model
+ * (`core/pricing.py`'s per-model table), summed across coder + reviewer + aux. `task.cost_model`
+ * names what priced it: a model id, `"mixed"` when the task's attempts used more than one, or
+ * `pricing.FALLBACK_PRICE_NAME` when nothing priced could be resolved — never a rate computed
+ * here. `0` for a task with no attempts yet or no cost field (an older payload shape), same as
+ * before this file stopped computing.
  */
 export function taskCost(task) {
-  if (!task) return 0;
-  return (
-    costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read })
-    + costOf({
-      used: task.total_review_tokens,
-      creation: task.total_review_cache_creation,
-      read: task.total_review_cache_read,
-    })
-    + costOf({
-      used: task.total_aux_tokens,
-      creation: task.total_aux_cache_creation,
-      read: task.total_aux_cache_read,
-    })
-  );
+  return task?.cost_usd ?? 0;
 }
 
 /**
- * The lifetime cost, from /api/metrics — the SINGLE source both the "Cost / merged PR" tile
- * and the "Token Usage" tile read.
- *
- * They must not each assemble their own buckets: when one of them kept a fallback to
- * task-summed tokens and the other didn't, the same page showed $68.50 and $73.58 for the
- * same burn. Returns null when the buckets are not all there — then BOTH tiles say "—"
- * together, which is honest, instead of disagreeing.
+ * The lifetime cost, from `/api/metrics`'s `cost_usd_total` — the SINGLE source both the
+ * "Cost / merged PR" tile and the "Token Usage" tile read. `null` when the install has no
+ * attempts yet (distinct from "attempts spent $0"), so both tiles say "—" together rather than
+ * disagreeing.
  */
 export function lifetimeCost(metrics) {
-  const used = metrics?.tokens_used_total;
-  if (used == null) return null;
-  const ce = metrics.cache_economics || {};
-  // The coder AND the gate AND aux. The reviewer's tokens used to be discarded after the
-  // verdict, so every cost surface priced the coder half of the run and called it "spend" —
-  // 59 Opus-4-8 review passes over full diffs cost $0 on the page. Aux was the same story one
-  // bucket later: metrics.py ships aux_*_total, this function ignored them, and the moment
-  // taskCost started pricing aux the per-task rollup on Stats exceeded the lifetime tile
-  // directly above it. Same nine buckets as {@link taskCost}, or the page contradicts itself.
-  return (
-    costOf({ used, creation: ce.cache_creation_total, read: ce.cache_read_total })
-    + costOf({
-      used: metrics.review_tokens_used_total,
-      creation: metrics.review_cache_creation_total,
-      read: metrics.review_cache_read_total,
-    })
-    + costOf({
-      used: metrics.aux_tokens_used_total,
-      creation: metrics.aux_cache_creation_total,
-      read: metrics.aux_cache_read_total,
-    })
-  );
+  return metrics?.cost_usd_total ?? null;
 }

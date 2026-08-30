@@ -7,8 +7,10 @@ from typing import Any
 
 from pydantic import BaseModel, model_validator
 
+from ..core.cost import attempt_cost, attempts_cost
 from ..core.db import USAGE_ROLES, usage_columns_for
 from ..core.metrics import cache_read_share
+from ..core.pricing import FALLBACK_PRICE_NAME
 from ..core.task import Task
 
 
@@ -52,6 +54,16 @@ class AttemptOut(BaseModel):
     # owns this arithmetic (core.metrics.cache_read_share); this field never
     # derives it locally.
     cache_read_share: float | None = None
+    # USD, computed server-side by core.cost.attempt_cost from core.pricing's
+    # per-model table — the ONE place this attempt's dollar figure is priced.
+    # web/src/cost.js used to compute this itself at one hardcoded Anthropic
+    # rate, which was wrong for every Codex/OpenAI attempt; the board now only
+    # formats this number, never derives it. cost_model names what priced it:
+    # the recorded model id, or pricing.FALLBACK_PRICE_NAME when nothing
+    # priced could be resolved, or "mixed" when this attempt's roles used
+    # different models.
+    cost_usd: float = 0.0
+    cost_model: str = FALLBACK_PRICE_NAME
     status: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
@@ -66,6 +78,7 @@ class AttemptOut(BaseModel):
                     pass
             return v
 
+        cost_usd, cost_model = attempt_cost(row)
         return cls(
             id=row.get("id", ""),
             attempt_number=row.get("attempt_number", 0),
@@ -88,6 +101,8 @@ class AttemptOut(BaseModel):
             cache_creation_tokens=row.get("cache_creation_tokens"),
             cache_read_share=cache_read_share(
                 row.get("cache_read_tokens"), row.get("cache_creation_tokens")),
+            cost_usd=cost_usd,
+            cost_model=cost_model,
             status=row.get("status"),
             started_at=row.get("started_at"),
             completed_at=row.get("completed_at"),
@@ -297,6 +312,12 @@ class TaskOut(BaseModel):
     #: (near the "Attempt: #N" item, ~line 1658) is the obvious place to add a
     #: "used/cap · N% of budget" chip from `task.budget`; no UI is built here.
     budget: BudgetOut | None = None
+    # USD, summed across every attempt by core.cost.attempts_cost — the same
+    # per-model pricing AttemptOut.cost_usd uses, never a local computation.
+    # `None` means "no attempts yet" (distinct from "attempts spent $0"), the
+    # same distinction every total_* field above already makes.
+    cost_usd: float | None = None
+    cost_model: str | None = None
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":
@@ -313,6 +334,7 @@ class TaskOut(BaseModel):
         total_review_cache_creation = _sum("review_cache_creation_tokens")
         total_review_cache_read = _sum("review_cache_read_tokens")
         total_aux_tokens, total_aux_cache_read, total_aux_cache_creation = _aux_totals(attempts)
+        cost_usd, cost_model = attempts_cost(attempts)
         escalation_attempts = None
         escalation_tokens = None
         if task.blocker and isinstance(task.blocker, dict):
@@ -362,6 +384,8 @@ class TaskOut(BaseModel):
             escalation_tokens=escalation_tokens,
             cancelled=_operator_cancelled(task),
             full_report=full_report,
+            cost_usd=cost_usd,
+            cost_model=cost_model,
         )
 
 
@@ -543,6 +567,10 @@ class TaskSummaryOut(BaseModel):
     # `nh approve`, the only merge path, never reads this field).
     # ADVISORY ONLY: nothing reads this field to merge anything.
     merge_ready: bool | None = None
+    # USD, summed across every attempt by core.cost.attempts_cost — same
+    # source and same "None means no attempts yet" contract as TaskOut.cost_usd.
+    cost_usd: float | None = None
+    cost_model: str | None = None
 
     @classmethod
     def from_task(
@@ -602,6 +630,7 @@ class TaskSummaryOut(BaseModel):
             total_review_cache_creation = _rsum("review_cache_creation_tokens")
         total_aux_tokens, total_aux_cache_read, total_aux_cache_creation = _aux_totals(attempts)
         merge_ready = merge_ready_for(task, attempts)
+        cost_usd, cost_model = attempts_cost(attempts)
         return cls(
             id=task.id,
             external_id=task.external_id,
@@ -643,6 +672,8 @@ class TaskSummaryOut(BaseModel):
                 (task.context or {}).get("pr_conflict_rounds")),
             max_pr_conflict_rounds=max_pr_conflict_rounds,
             merge_ready=merge_ready,
+            cost_usd=cost_usd,
+            cost_model=cost_model,
         )
 
 

@@ -1,8 +1,9 @@
 // Mode-aware LAST 24H spend line (SCRUM-20). Subscription/enterprise profiles
-// pay a flat fee — the dollar figure the same cost.js rate model produces is
-// an ESTIMATE of API-rate value, not money that changed hands, so tokens lead
-// and the dollars are marked "est.". api_key (BYO) mode pays Anthropic per
-// token for real, so the dollar figure IS the spend — same as today's line.
+// pay a flat fee — the dollar figure the API prices server-side (core/cost.py,
+// core/pricing.py's per-model table) is an ESTIMATE of API-rate value, not
+// money that changed hands, so tokens lead and the dollars are marked "est.".
+// api_key (BYO) mode pays Anthropic per token for real, so the dollar figure
+// IS the spend — same as today's line.
 // Pure derivation, no fetching: the caller (the sidebar block) already has
 // every number this needs from data it already fetches.
 import { fmtTokens, fmtCost } from "./cost.js";

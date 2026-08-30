@@ -22,11 +22,13 @@ test("zero merged PRs reads as bad; a non-zero count is NOT 'good'", () => {
 });
 
 test("cost/PR only shows once something merged; cache share inverts", () => {
+  // The API prices the lifetime figure server-side now (core/metrics.py's cost_usd_total,
+  // core/cost.py's attempts_cost) — this tile just divides that number by prs_merged, so the
+  // fixture sets cost_usd_total directly rather than reconstructing it from token buckets.
   const t = northStarTiles({
-    prs_merged: 2, tokens_used_total: 1_000_000,
-    cache_economics: { creation_share: 0.0335, cache_creation_total: 0, cache_read_total: 10_000_000 },
+    prs_merged: 2, cost_usd_total: 6.00, cost_model_total: "claude-sonnet-5",
+    cache_economics: { creation_share: 0.0335 },
   });
-  // $3.00 (1M in/out) + $3.00 (10M read @ 1/10) = $6.00 over 2 merged = $3.00
   const cost = t.find((x) => x.label === "Cost / merged PR");
   assert.equal(cost.value, "$3.00");
   assert.match(cost.sub, /\$6\.00 spent · 2 merged/);
@@ -34,22 +36,19 @@ test("cost/PR only shows once something merged; cache share inverts", () => {
   assert.equal(cache.value, "97%");   // 1 - 0.0335
   assert.equal(cache.tone, "good");
   // no merge → a dash, not a misleading number
-  const t2 = northStarTiles({ prs_merged: 0, tokens_used_total: 5000 });
+  const t2 = northStarTiles({ prs_merged: 0, cost_usd_total: 5000 });
   assert.equal(t2.find((x) => x.label === "Cost / merged PR").value, "—");
 });
 
-// M1 — the cost lie. `estimateCost(tokens_per_pr)` priced a TOTAL burn at the fresh rate.
+// M1 — the cost lie. A JS-side `estimateCost(tokens_per_pr)` used to price a TOTAL burn at
+// the fresh rate. That arithmetic is gone; the API prices the lifetime total server-side
+// (core/cost.py, per-model, summed across every attempt) and this tile only divides by
+// prs_merged, so tokens_per_pr (a per-OPENED-PR, cache-creation-excluding figure) cannot
+// leak into the cost shown here even by accident.
 test("the cost per merged PR is the LIFETIME cost over merged PRs — not tokens_per_pr", () => {
-  // The live buckets. tokens_per_pr (9.99M) is a per-OPENED-PR figure that excludes
-  // cache-creation entirely — pricing it, however cleverly, cannot produce this number.
   const tiles = northStarTiles({
     prs_merged: 13, prs_opened: 17, tokens_per_pr: 9_992_527,
-    tokens_used_total: 1_694_616,
-    cache_economics: {
-      creation_share: 0.0345,
-      cache_creation_total: 6_014_457,
-      cache_read_total: 168_178_356,
-    },
+    cost_usd_total: 73.58, cost_model_total: "claude-sonnet-5",
   });
   const cost = tiles.find((t) => t.label === "Cost / merged PR");
   assert.equal(cost.value, "$5.66");            // NOT $3.93 (split model), NOT $29.98 (fresh-rate)
@@ -89,8 +88,7 @@ test("the per-PR tile and the lifetime tile derive from the same cost — they c
   const { lifetimeCost, fmtCost } = await import("./cost.js");
   const metrics = {
     prs_merged: 13, prs_opened: 17,
-    tokens_used_total: 1_694_616,
-    cache_economics: { cache_creation_total: 6_014_457, cache_read_total: 168_178_356, creation_share: 0.0345 },
+    cost_usd_total: 73.58, cost_model_total: "claude-sonnet-5",
   };
   const tiles = northStarTiles(metrics);
   const perPr = tiles.find((t) => t.label === "Cost / merged PR");
@@ -100,9 +98,9 @@ test("the per-PR tile and the lifetime tile derive from the same cost — they c
   assert.match(perPr.sub, /\$73\.58 spent · 13 merged/);
 });
 
-test("no tokens_used_total (an un-restarted server) → BOTH surfaces say '—', not two numbers", async () => {
+test("no cost_usd_total (an un-restarted server or an install with no attempts) → BOTH surfaces say '—', not two numbers", async () => {
   const { lifetimeCost, fmtCost } = await import("./cost.js");
-  const metrics = { prs_merged: 13, cache_economics: { cache_creation_total: 1, cache_read_total: 2 } };
+  const metrics = { prs_merged: 13 };
   assert.equal(lifetimeCost(metrics), null);
   assert.equal(fmtCost(lifetimeCost(metrics)), "—");
   assert.equal(northStarTiles(metrics).find((t) => t.label === "Cost / merged PR").value, "—");

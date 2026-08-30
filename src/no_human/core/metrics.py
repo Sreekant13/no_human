@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .cost import attempts_cost
 from .db import USAGE_ROLES, Store, usage_columns_for
 
 
@@ -320,6 +321,21 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
             "tokens_used": used, "cache_read": read,
             "cache_creation": creation, "total": used + read + creation,
         }
+    # Whole-install USD burn, priced by core.cost.attempts_cost — the SAME
+    # per-model function AttemptOut/TaskOut/TaskSummaryOut use, so this
+    # lifetime figure can never disagree with a per-task one about how a
+    # dollar is priced. One row per attempt, only the columns attempt_cost
+    # actually reads (not `SELECT *`: full_final_text etc. would be dragged
+    # along for nothing on an install with thousands of attempts).
+    cost_cols = ["models"]
+    for prefix in USAGE_ROLES:
+        tokens_col, read_col, creation_col = usage_columns_for(prefix)
+        output_col = "output_tokens" if prefix == "" else f"{prefix}output_tokens"
+        cost_cols += [tokens_col, read_col, creation_col, output_col]
+    rows = await store.query(f"SELECT {', '.join(cost_cols)} FROM attempts")
+    cost_usd_total, cost_model_total = attempts_cost(
+        [dict(zip(cost_cols, r)) for r in rows])
+
     return {
         "prs_opened": prs_opened or 0,
         "prs_merged": prs_merged or 0,
@@ -338,6 +354,12 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "aux_tokens_used_total": aux_used or 0,
         "aux_cache_read_total": aux_read or 0,
         "aux_cache_creation_total": aux_creation or 0,
+        # web/src/cost.js's lifetimeCost used to compute this itself at one
+        # flat Anthropic rate; the board now only formats what this key sends.
+        # None (not 0.0) when the install has no attempts yet — same "no
+        # attempts" vs "attempts spent $0" distinction as TaskOut.cost_usd.
+        "cost_usd_total": cost_usd_total,
+        "cost_model_total": cost_model_total,
         # Per-role burn across the whole install. `by_tier` beside it answers
         # a different question (which MODEL ran, from `attempts.models`); this
         # one answers which ROLE spent, which is what a cost target is set

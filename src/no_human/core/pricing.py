@@ -206,6 +206,17 @@ MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-5.6-terra": (2.00, 12.00),
 }
 
+#: The USD fallback for an unpriced or unrecorded model — `claude-sonnet-5`'s
+#: own published row, reused rather than a new number invented for this
+#: purpose. `output_extra_weight`'s fallback (`OUTPUT_EXTRA_WEIGHT` = 4.0)
+#: exists for the same reason: unknown must never price at 0.0, which is the
+#: inert-brake defect this whole module exists to keep out. `FALLBACK_PRICE_NAME`
+#: is the label a caller shows beside the number, so "priced at $3/Mtok
+#: because that's what claude-sonnet-5 costs" is never mistaken for "priced at
+#: $3/Mtok because that's what THIS model costs".
+FALLBACK_PRICING_MODEL = "claude-sonnet-5"
+FALLBACK_PRICE_NAME = f"fallback:{FALLBACK_PRICING_MODEL}"
+
 #: Every model id that reached `output_extra_weight` and was not in the table,
 #: with a hit count. This exists so an unpriced id is VISIBLE rather than
 #: silently absorbed into the fallback — the failure mode that made a
@@ -316,6 +327,73 @@ def weighted_tokens(
         + int(cache_read_tokens or 0) * CACHE_READ_WEIGHT
         + int(cache_creation_tokens or 0) * CACHE_CREATION_WEIGHT
     )
+
+
+def input_price_usd_per_mtok(model: str | None) -> tuple[float, str]:
+    """The fresh-input USD/Mtok rate for one model, and the label to show for it.
+
+    Keyed on the recorded id, exactly like ``output_extra_weight`` — never
+    live config, for the same reason: a historical row keeps the price it was
+    actually billed at even after `config.py`'s tiers move on.
+
+    Returns ``(rate, label)``. When ``model`` is priced, ``label`` is the bare
+    id — the honest "this is what it actually cost" case. When it is not
+    (``None``/empty, or a non-empty id absent from the table),
+    ``FALLBACK_PRICING_MODEL``'s own rate is returned under
+    ``FALLBACK_PRICE_NAME``, never a bare id and never 0.0 — a 0 here would
+    price real spend at nothing, the same inert-brake defect
+    ``output_extra_weight``'s fallback exists to prevent.
+
+    Recording an unpriced id into ``unknown_pricing_models()`` is
+    ``output_extra_weight``'s job, not this function's: ``usd_cost`` calls
+    both for the same model, and counting the same sighting twice would
+    double the hit counter for one attempt's one model.
+    """
+    if model:
+        priced = MODEL_PRICES_USD_PER_MTOK.get(model)
+        if priced is not None:
+            return priced[0], model
+    return MODEL_PRICES_USD_PER_MTOK[FALLBACK_PRICING_MODEL][0], FALLBACK_PRICE_NAME
+
+
+def usd_cost(
+    *,
+    tokens_used: int = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    output_tokens: int | None = None,
+    model: str | None = None,
+) -> float:
+    """Spend in USD — the float twin of ``weighted_tokens``, priced per model.
+
+    Same classes, same KEYWORD-ONLY shape, same reason: a positional call
+    could transpose two buckets that differ by up to 50x. The difference is
+    the unit — ``weighted_tokens`` returns a dimensionless, model-blind
+    fresh-input-equivalent count (see its docstring: "THE MODEL-BLINDNESS
+    THAT REMAINS"); this multiplies the identical weighted sum by
+    ``model``'s own published fresh-input rate, so two attempts with the same
+    weighted total can (correctly) show different dollars.
+
+    ``output_extra_weight(model)`` supplies the output premium exactly as
+    ``weighted_tokens`` does; ``input_price_usd_per_mtok(model)`` supplies the
+    rate that turns the weighted sum into dollars. Both are called once each,
+    on the same ``model``, so an unpriced id is recorded into
+    ``unknown_pricing_models()`` exactly once per call.
+
+    Never zero for nonzero tokens priced at an unknown model: the fallback
+    rate is ``claude-sonnet-5``'s published $3/Mtok, never 0.0.
+
+    Rounded to 6dp — dollars, not fresh-input-equivalent tokens, so an int
+    floor would be wrong (it would print $0.00 for a $0.40 attempt).
+    """
+    weighted = (
+        float(tokens_used or 0) * FRESH_WEIGHT
+        + float(output_tokens or 0) * output_extra_weight(model)
+        + float(cache_read_tokens or 0) * CACHE_READ_WEIGHT
+        + float(cache_creation_tokens or 0) * CACHE_CREATION_WEIGHT
+    )
+    rate, _label = input_price_usd_per_mtok(model)
+    return round(weighted * rate / 1_000_000.0, 6)
 
 
 #: Weighted spend as a fraction of raw token count, measured over this
