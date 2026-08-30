@@ -127,6 +127,25 @@ export function colorForStatus(status) {
   return STATUS_COLOR_VAR[status] || "var(--text-muted)";
 }
 
+// Coarse one-or-two-word status for the always-visible header chip — the
+// scannable "state at a glance" that the sentence narrative expands on. Plain
+// words only, never a raw enum; color reuses the board-lane semantic tokens so
+// one status → one color everywhere. (Redesign D-series: legible run.)
+export function coarseStatus(task) {
+  const s = task?.status;
+  const colorVar = colorForStatus(s);
+  let label = "Working";
+  if (isHumanStopped(task)) label = "Parked";
+  else if (s === "done") label = "Done";
+  else if (s === "failed") label = "Failed";
+  else if (s === "awaiting_approval") label = taskApprovedAt(task) ? "Merging" : "Ready for you";
+  else if (s === "awaiting_input" || s === "blocked" || s === "escalated") label = "Needs you";
+  else if (s === "paused_quota") label = "Paused";
+  else if (s === "compound_parent") label = "Coordinating";
+  else if (ACTIVE_STATUSES.has(s)) label = "Working";
+  return { label, colorVar };
+}
+
 // A task in a terminal state (done/failed — cancelled is failed + a flag,
 // see boardLanes.js) has nothing left to decide: any blocker it carries is
 // history, not a live ask. Single definition so the milestone timeline, the

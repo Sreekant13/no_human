@@ -2372,6 +2372,35 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   max-width: 68ch;
 }
 
+/* Coarse status chip — the scannable "state at a glance" at the top of the
+   drawer. One status → one color (--chip-c, a board-lane token); the sentence
+   narrative below expands on it. (Redesign: legible run.) */
+.so-status-chip {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--chip-c, var(--text-muted));
+  background: color-mix(in srgb, var(--chip-c, var(--text-muted)) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--chip-c, var(--text-muted)) 35%, transparent);
+}
+.so-status-chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--chip-c, var(--text-muted));
+  color: var(--chip-c, var(--text-muted));
+}
+.so-status-chip-dot.pulsing {
+  animation: so-status-pulse 2.6s var(--ease-standard) infinite;
+}
+
 .so-summary-phrase {
   font-weight: 600;
   display: inline-flex;
@@ -2567,12 +2596,34 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 
 /* tab content (still used inside each accordion section body) */
+/* Primary narrated stream — the always-visible live run, promoted out of the
+   old tab strip. Bounded height with its own scroll so the secondary inspector
+   below stays reachable. (Redesign: legible run.) */
+.so-primary-stream {
+  padding: var(--sp-4) var(--sp-6) 0;
+  max-height: 46vh;
+  overflow: auto;
+  flex-shrink: 0;
+}
+
 .so-body {
   flex: 1;
   overflow: auto;
   padding: 0 var(--sp-6);
   display: flex;
   flex-direction: column;
+}
+
+/* Label that marks the demoted detail sections as secondary to the stream. */
+.so-inspector-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: var(--sp-4) 0 var(--sp-2);
+  border-top: 1px solid var(--border);
+  margin-top: var(--sp-2);
 }
 
 .so-section-label {

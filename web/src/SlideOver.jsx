@@ -22,7 +22,7 @@ import { decisionFor } from "./blockerDecision.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import {
-  PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
+  PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary, coarseStatus,
   defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
@@ -502,12 +502,26 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           />
         )}
 
-        {/* body: lazy accordion sections, one open at a time. Each section
-            body is one of the original 8 tab components, unchanged — they
-            still mount (and fetch/SSE) only while their section is open. */}
+        {/* PRIMARY narrated stream — the redesign's answer to "no one
+            understands what's going on": the live, plain-language activity
+            (currently-doing-X status bar, turn counter, plan-file tracker,
+            grouped events) is now the always-visible primary pane, not a tab
+            the user has to find. The structured detail (Diff/Spec/Review/…)
+            drops to the secondary inspector below. */}
+        {task && (
+          <div className="so-primary-stream" data-testid="primary-stream">
+            <ActivityTab taskId={taskId} task={task} isActive={isLive} />
+          </div>
+        )}
+
+        {/* Secondary inspector: the remaining sections as a lazy accordion,
+            one open at a time. Activity is excluded — it is the primary pane
+            above. Each section still mounts (and fetch/SSEs) only when open. */}
         <div className="so-body">
+          <div className="so-inspector-label">Details &amp; tools</div>
           <div className="so-accordion">
             {SECTION_LIST
+              .filter((s) => s.key !== "activity")
               .filter((s) => s.key !== "subtasks" || task?.parent_id || task?.status === "compound_parent")
               .map((s) => {
                 const isOpen = openSection === s.key;
@@ -771,8 +785,14 @@ function TaskSummary({ task, isActive }) {
   const n = useMemo(() => narrativeFor(task), [task]);
   const chips = useMemo(() => chipsFor(task), [task]);
   const milestones = useMemo(() => milestonesFor(task), [task]);
+  const status = useMemo(() => coarseStatus(task), [task]);
   return (
     <div className="so-summary">
+      <div className="so-status-chip" data-testid="coarse-status"
+           style={{ "--chip-c": status.colorVar }}>
+        <span className={`so-status-chip-dot${isActive ? " pulsing" : ""}`} aria-hidden="true" />
+        {status.label}
+      </div>
       <p className="so-summary-narrative">
         {n.before}{" "}
         <span className="so-summary-phrase" style={{ color: n.colorVar }}>
@@ -1772,7 +1792,14 @@ function ActivityTab({ taskId, task, isActive }) {
       );
       return () => { cancelled = true; es.close(); };
     }
-    // Inactive: slow poll.
+    // A terminal task's events never change — fetch once, never poll. The
+    // redesign promoted this stream to always-mounted, so a done/failed drawer
+    // must not poll every 10s for events that can no longer move.
+    if (isTerminalStatus(task?.status)) {
+      fetchTaskEvents(taskId).then((evts) => { if (!cancelled) setEvents(evts); }).catch(() => {});
+      return () => { cancelled = true; };
+    }
+    // Inactive but not terminal (queued/parked — can still resume): slow poll.
     async function poll() {
       while (!cancelled) {
         try {

@@ -10,6 +10,7 @@ import {
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
   checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
   testResultVerdict, fxCountsLabel, mergeStepLabel, landFailureFeedback,
+  coarseStatus,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -643,6 +644,38 @@ test("SlideOver renders one accordion section per surviving tab component, close
 
 test("SlideOver uses defaultOpenSection (gate-aware) rather than always defaulting closed", () => {
   assert.match(slideOverSrc, /defaultOpenSection/);
+});
+
+test("the narrated activity stream is the PRIMARY pane, not one of the demoted tabs (redesign)", () => {
+  // The live run is promoted to an always-visible primary stream; the old
+  // tabs become a secondary inspector and activity is excluded from it, so it
+  // is never hidden behind a tab the user has to find.
+  assert.match(slideOverSrc, /so-primary-stream/);
+  assert.match(slideOverSrc, /<ActivityTab taskId=\{taskId\} task=\{task\} isActive=\{isLive\} \/>/);
+  assert.match(slideOverSrc, /\.filter\(\(s\) => s\.key !== "activity"\)/);
+});
+
+test("a coarse status chip renders at the top of the drawer summary (redesign)", () => {
+  assert.match(slideOverSrc, /coarse-status/);
+  assert.match(slideOverSrc, /coarseStatus\(task\)/);
+});
+
+test("coarseStatus gives a scannable plain-word label + a semantic color per status", () => {
+  const cases = [
+    ["implementing", "Working"], ["planning", "Working"], ["testing", "Working"],
+    ["awaiting_input", "Needs you"], ["blocked", "Needs you"], ["escalated", "Needs you"],
+    ["paused_quota", "Paused"], ["done", "Done"], ["failed", "Failed"],
+    ["compound_parent", "Coordinating"],
+  ];
+  for (const [status, label] of cases) {
+    const c = coarseStatus({ status });
+    assert.equal(c.label, label, `${status} → ${label}`);
+    assert.match(c.colorVar, /^var\(--/, "color is a semantic token, not a literal");
+    assert.doesNotMatch(c.label, /_|[A-Z]{2,}/, "label is plain words, never a raw enum");
+  }
+  // awaiting_approval splits on whether it was already approved
+  assert.equal(coarseStatus({ status: "awaiting_approval" }).label, "Ready for you");
+  assert.equal(coarseStatus({ status: "awaiting_approval", context: { approved_at: "2026-08-30T00:00:00Z" } }).label, "Merging");
 });
 
 test("SpecTab pairs the product understanding with the technical plan (D6/T6)", () => {
