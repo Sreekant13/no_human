@@ -854,14 +854,48 @@ async def split_task(
     if not (2 <= len(drafts) <= 8):
         raise HTTPException(
             422, "a split must create between 2 and 8 sub-tasks")
+    for d in drafts:
+        if not (d.title or "").strip():
+            raise HTTPException(422, "each sub-task needs a non-empty title")
 
+    # RESERVE the split before creating anything: flip the parent PENDING->FAILED
+    # with the STATUS-GUARDED CAS (never human_override — that would clobber a
+    # live claim). This closes a check-then-act race: the PENDING guard above is
+    # at function entry, but every `await store.create_task(child)` yields the
+    # event loop, and the scheduler (same loop) claims PENDING tasks. Creating
+    # children first and force-cancelling last would let the scheduler start a
+    # live orchestrator mid-loop, then get force-cancelled out from under it —
+    # double execution + duplicate PRs. Two concurrent /split POSTs would
+    # likewise both pass the entry guard and both create child sets. By moving
+    # the parent off PENDING FIRST, the loser of either race sees the CAS refuse
+    # (rowcount 0 -> None) and creates NO children.
+    from ..blockers import human_event
+    n = len(drafts)
+    reason = f"split into {n} sub-tasks"
+    prior_status = task.status
+    task.context = await store.merge_context(task.id, {"cancel_reason": reason})
+    moved = await store.set_status(
+        task, TaskStatus.FAILED, validate=True, human_override=False,
+        event=human_event("cancel", prior_status=prior_status,
+                          prior_blocker=None, reason=reason,
+                          actor="operator:api"),
+    )
+    if moved is None:
+        # Lost the race: a scheduler tick claimed it, or a concurrent split
+        # already moved it. Create nothing — the parent is no longer ours to
+        # split. (task.status was re-synced to the live value by set_status.)
+        raise HTTPException(
+            status_code=409,
+            detail=("task is no longer pending — it started running or was "
+                    "already split"),
+        )
+
+    # Won the reservation: the parent is now terminally cancelled and NOT
+    # claimable, so the children can be created without a live sibling.
     children: list[Task] = []
     for d in drafts:
-        title = (d.title or "").strip()
-        if not title:
-            raise HTTPException(422, "each sub-task needs a non-empty title")
         child = Task.new(
-            title=title,
+            title=(d.title or "").strip(),
             source="board",
             repo_path=task.repo_path,
             description=(d.description or "").strip() or None,
@@ -881,20 +915,10 @@ async def split_task(
         await store.create_task(child)
         children.append(child)
 
-    # Cancel the original — its scope now lives in the children. A PENDING task
-    # has no live orchestrator, so this is a plain status flip (no scheduler
-    # unwind, unlike cancel_task's running-task path).
-    from ..blockers import human_event
+    # Record the children on the cancel reason, for provenance.
     child_ids = ", ".join(c.id[:8] for c in children)
-    reason = f"split into {len(children)} sub-tasks: {child_ids}"
-    prior_status = task.status
-    task.context = await store.merge_context(task.id, {"cancel_reason": reason})
-    await store.set_status(
-        task, TaskStatus.FAILED, validate=False, human_override=True,
-        event=human_event("cancel", prior_status=prior_status,
-                          prior_blocker=None, reason=reason,
-                          actor="operator:api"),
-    )
+    await store.merge_context(
+        task.id, {"cancel_reason": f"{reason}: {child_ids}"})
 
     out = [TaskSummaryOut.from_task(c, max_pr_conflict_rounds=_max_pr_conflict_rounds())
            for c in children]

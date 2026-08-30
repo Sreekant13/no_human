@@ -188,7 +188,8 @@ FROZEN_FILE_LINES = {
     # 5488 -> 5489 (+1): PR #867 backend kwarg at the drawer pricing site.
     # 5489 -> 5572 (+83): POST /api/tasks/{id}/split — the 1-click feasibility
     # split creates the confirmed sub-task drafts as child tasks (feature #1).
-    "api/app.py": 5572,
+    # 5572 -> 5596 (+24): the /split reservation race-fix (cancel-parent-first CAS).
+    "api/app.py": 5596,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

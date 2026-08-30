@@ -3730,3 +3730,20 @@ async def test_split_requires_between_2_and_8_drafts(client, store):
     # A parent left un-split by a rejected request is still splittable.
     p = await store.get_task(parent.id)
     assert p.status == TaskStatus.PENDING
+
+
+async def test_a_second_split_creates_no_duplicate_children(client, store):
+    # The reservation (parent PENDING->FAILED via a guarded CAS) runs BEFORE any
+    # child is created, so a concurrent/repeat split loses the race: the parent
+    # is no longer pending, and NO second child set is created.
+    parent = await _seed_task(store, status=TaskStatus.PENDING, title="Big")
+    r1 = await client.post(f"/api/tasks/{parent.id}/split", json={
+        "drafts": [{"title": "A"}, {"title": "B"}]})
+    assert r1.status_code == 201
+    first = {c["id"] for c in r1.json()}
+    r2 = await client.post(f"/api/tasks/{parent.id}/split", json={
+        "drafts": [{"title": "C"}, {"title": "D"}]})
+    assert r2.status_code == 409
+    # Exactly the first two children exist — the second split added nothing.
+    subs = await store.list_subtasks(parent.id)
+    assert {s.id for s in subs} == first
