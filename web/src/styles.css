@@ -2599,19 +2599,30 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* Primary narrated stream — the always-visible live run, promoted out of the
    old tab strip. Bounded height with its own scroll so the secondary inspector
    below stays reachable. (Redesign: legible run.) */
+/* ONE scroll region between the pinned header and the pinned action bar, so
+   the primary stream AND the Details & tools inspector below it are always
+   reachable by a single scroll (FINDING G: the inspector used to collapse to a
+   0px sliver under the header + a 46vh-capped stream, and nothing scrolled it
+   into view). */
+.so-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
 .so-primary-stream {
   padding: var(--sp-4) var(--sp-6) 0;
-  max-height: 46vh;
-  overflow: auto;
   flex-shrink: 0;
 }
 
 .so-body {
-  flex: 1;
-  overflow: auto;
-  padding: 0 var(--sp-6);
+  padding: 0 var(--sp-6) var(--sp-4);
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
 }
 
 /* Label that marks the demoted detail sections as secondary to the stream. */

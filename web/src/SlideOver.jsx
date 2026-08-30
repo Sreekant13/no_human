@@ -467,6 +467,13 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         )}
 
+        {/* ONE scroll region: header + progress stay pinned above, the action
+            bar stays pinned below, and everything between — summary, decision,
+            the primary stream, and the Details & tools inspector — scrolls
+            together. Without this the inspector (a flex:1 child) collapsed to a
+            0px sliver under the tall header + the 46vh-capped stream, so its
+            sections were unreachable on any task with a live stream (FINDING G). */}
+        <div className="so-scroll">
         {/* Why it failed — the orchestrator's own failure_reason, verbatim. A
             failed task otherwise showed only a Retry button, so a quota stop
             ("...returned an error result: success") was indistinguishable from a
@@ -545,6 +552,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               })}
           </div>
         </div>
+        </div>{/* /so-scroll */}
 
         {/* The result of the last action, pinned OUTSIDE the scrolling body and
             directly above the buttons that cause it. Inside .so-body it scrolled
@@ -1814,7 +1822,15 @@ function ActivityTab({ taskId, task, isActive }) {
   }, [taskId, isActive]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = endRef.current;
+    if (!el) return;
+    // Only follow the live stream when the reader is already near the bottom.
+    // The stream shares one scroll container (.so-scroll) with the Details &
+    // tools inspector now, so an unconditional scroll-to-latest would yank a
+    // user who scrolled down to read Diff/Review back up on every ~10s event.
+    const sc = el.closest(".so-scroll");
+    if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight > 160) return;
+    el.scrollIntoView({ behavior: "smooth" });
   }, [events.length]);
 
   if (events.length === 0) {
