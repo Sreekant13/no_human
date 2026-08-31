@@ -4,8 +4,13 @@ Every PR no_human opens has the same shape. It is generated from a template
 the coder cannot author a top-level section in — its own headings are
 demoted below the template's, and every model-written cell is neutralised
 before it is interpolated. The shape is deliberately short: a reviewer meets
-the gate results first, and everything reference-grade is folded behind a
+the gate results first, and most reference-grade detail is folded behind a
 `<details>` disclosure — still in the body, one click away, never dropped.
+The one exception is the raw command log ("How I verified this" below): it
+does not fold into the body at all any more — it moves to this attempt's own
+artifact file and a PR comment, and the body keeps only a pointer to it and
+the recorded-command count; each test layer's own final result still renders
+exactly once, in the **Evidence** table above.
 
 ## What is in it, top to bottom
 
@@ -35,19 +40,36 @@ evidence: …` lines are rendered as a compact list with the verdict first; a
 top of the section, ahead of the coder's own order. Whole paragraphs are kept
 visible up to 1,500 characters and the remainder is folded, so a long report
 is delivered whole without burying the evidence above it. Coder-to-harness dialogue is filtered out and the
-removal is marked.
+removal is marked. If everything else in the body (Evidence, the verification
+pointer, the footer — never Acceptance criteria, which is the task's own
+text) would still put the body over a hard 6,000-visible-character budget
+even after that ordinary fold, **Changes is trimmed further**, with an
+explicit `(trimmed further to keep the PR body under its size budget)`
+marker — it is the only section this budget ever shrinks.
 
 **Assumptions** — folded behind a one-line count: the questions the intake
 step answered on the requester's behalf, the assumptions it recorded, and the
 original wording of any criterion it sharpened. An unresolved blocker or an
 open question is printed *above* the fold, as a callout.
 
-**How I verified this** — the command log, folded. Every entry is a command
-line a hook saw the coder's session submit to the shell and the text the
-harness returned; the model does not author an entry and cannot edit one.
-The log is capped (40 entries listed, 12 with output, 1,200 characters per
-excerpt, 200 receipts per attempt) and says so when a cap bit. It ends with
-six sentences on what the log cannot attest — the full list is below.
+**How I verified this** — a pointer, not a log (2026-08-31: the operator's
+"receipts out of the PR body" directive). The full command log — every
+command line a hook saw the coder's session submit to the shell and the text
+the harness returned; the model does not author an entry and cannot edit
+one — no longer lives in the body. It is written, in full, to this ATTEMPT's
+own artifact file (`~/.no_human/artifacts/<task-id>/verification-attempt-
+<n>.md` — attempt-scoped, so a later attempt's write can never overwrite the
+file an earlier, still-open PR body points a reader at) and posted, in full,
+as its own PR comment (below); the body carries one line naming that file —
+rendered `~`-relative, never as an absolute path that would leak the
+operator's local account name — plus `nh logs <task-id>`, which prints that
+same path and tails the file, and the recorded-command count. Per-layer test
+results are not repeated here: they render exactly once, in the **Evidence**
+table above. The log itself is still capped the same way it always was (40
+entries listed, 12 with output, 1,200 characters per excerpt, 200 receipts
+per attempt) and still says so when a cap bit, and it still ends with six
+sentences on what it cannot attest — the full list is below; only its
+LOCATION moved.
 
 **Footer** — attempt number, branch pair, and the standing rule: no_human
 never merges. A human reviews and merges, or runs `nh approve <task>`.
@@ -82,11 +104,17 @@ invites. So the log shows what ran and what came back, and the table
 above it carries the verdicts no_human *can* establish: the reviewer's and
 its own test run's. See `agent/verification_receipts.py`.
 
+This is now the artifact file's rationale, not the body's: the body never
+shows a command's raw output at all any more, so there is nothing in it a
+badge could be attached to. The reasoning still applies in full to the
+artifact file (`~/.no_human/artifacts/<task-id>/verification-attempt-<n>.md`)
+and to the PR comment, which carry the log this section describes.
+
 ## What the command log cannot attest — the full list
 
-The PR body carries these as six merged sentences. They were sixteen, and
-the sixteen are kept here verbatim so nothing the shorter form folds
-together is lost:
+The artifact file and the PR comment — never the body any more — carry
+these as six merged sentences. They were sixteen, and the sixteen are kept
+here verbatim so nothing the shorter form folds together is lost:
 
 1. no interactive UI check was performed. no_human never drives a browser at your change except `testing/ui_evidence.py`'s walk, which is reported as its own evidence and not as a receipt in this log; the only other page it drives is a CI server's login form, and the board it opens without driving, so any `e2e` entry above is the project's harness printing its result, not a human-style walkthrough
 

@@ -349,10 +349,17 @@ def test_no_gate_output_is_duplicated_in_the_rendered_body(store, tmp_path):
     body = orch._pr_body(task, _Commit(), _Result(),
                          test_evidence=test_evidence, receipts=receipts)
     assert body.count("**PASSED** — 2 rounds") == 1
-    # the folded log's one-line summary carries the count; the log's own
-    # first line repeats it (the receipts COMMENT ships that line uncollapsed)
-    assert body.count("commands recorded") == 2
+    # D1.1: the body no longer carries the full receipts log at all (it moved
+    # to the artifact file / PR comment) — the short pointer states the count
+    # exactly once.
+    assert body.count("commands recorded") == 1
     assert body.count("| Tests | ✅ PASS") == 1
+    # RESTORED, WIDER (review finding #5): the row-wrapped substring above
+    # would not have caught a duplicate rendered WITHOUT the `| Tests | … |`
+    # wrapper — which is exactly the shape an earlier `_verification_section`
+    # shipped (its own bullet, reusing the unwrapped verdict text). Assert
+    # the unwrapped verdict text itself is not duplicated anywhere in the body.
+    assert body.count("PASS — 5 passed, 0 failed, 0 errors") == 1
 
 
 def test_the_pr_body_char_count_drops_at_least_10_percent_when_collapsed(
@@ -361,13 +368,19 @@ def test_the_pr_body_char_count_drops_at_least_10_percent_when_collapsed(
     outside a `<details>` fold — what a reader sees without expanding
     anything, since GitHub renders `<details>` closed by default) drops by
     at least 10% relative to the raw total, on this module's representative
-    fixture (`_task()` / `_receipts()` above). The same fixture, measured
-    end-to-end before and after this change (reconstructing "before" from
-    the unwrapped `Orchestrator._verification_section` output, which this
-    change does not alter — see the commit message for the exact command):
-    6442 chars total/visible before (no `<details>` existed yet), 6536 total
-    (+1.5%) / 890 visible after — an 86.2% drop in what a reader actually
-    scans without expanding anything.
+    fixture (`_task()` / `_receipts()` above).
+
+    2026-08-21 (pre-D1.1): 6442 chars total/visible before this fixture had
+    any `<details>` fold at all, 6536 total (+1.5%) / 890 visible after —
+    an 86.2% drop, almost entirely the receipts appendix folding away.
+
+    2026-08-31 (D1.1): the receipts no longer reach the body at all — folded
+    or not (`_verification_appendix` still renders that same appendix
+    verbatim, but only to this attempt's artifact file / PR comment now, via
+    `_verification_section`'s short pointer) — so both totals shrink far
+    below the 2026-08-21 numbers: 999 total / 873 visible, a 12.6% drop from
+    what still folds on this fixture (the review-addressed list — the one
+    finding this fixture's first round raised and the second addressed).
     """
     orch = _orch(store, tmp_path)
     task = _task()
@@ -532,7 +545,15 @@ def test_a_real_pr_renders_under_300_visible_words_beyond_its_criteria(
     """no_human-private #574 shipped 2,791 words (771 before the first fold).
     The same inputs — its title, criteria, intake Q&A, review history, test
     run, ten receipts and the coder's report — must now render under 300
-    visible words on top of the criteria text, which is the task's own."""
+    visible words on top of the criteria text, which is the task's own.
+
+    D1.1 (2026-08-31): the ten receipts no longer reach the body AT ALL —
+    raw or folded — they move to this attempt's artifact file and the PR
+    comment; the body carries only the short pointer to them plus the FINAL
+    test verdict, which is why this fixture's `visible_chars` dropped from
+    6,536 (all `<details>` folds, receipts included) to well under 3,000
+    (see `test_the_short_section_carries_no_receipt_text` for the exact
+    per-receipt check)."""
     fx = json.loads(_FIXTURE_574.read_text())
     orch = _orch(store, tmp_path)
     t = Task.new(fx["title"], repo_path="/r")
@@ -545,9 +566,262 @@ def test_a_real_pr_renders_under_300_visible_words_beyond_its_criteria(
     crit_words = sum(len(c.split()) for c in t.acceptance_criteria)
     extra = _visible_words(body) - crit_words
     assert extra < 300, (extra, re.sub(r"<details>.*?</details>", "", body, flags=re.S))
-    # ...and nothing was dropped to get there: every receipt command and the
-    # report's last paragraph are still in the body, behind a fold.
+    assert visible_chars(body) < 3000, visible_chars(body)
+    # ...and what WAS dropped is exactly the raw receipts — nothing else:
+    # the report's evidence and the test verdict are still there, in full.
     for rec in fx["receipts"]:
-        assert rec["command"].split(" ")[0] in body
+        assert rec["command"] not in body, rec["command"]
+    assert "Full verification log:" in body
     assert "| Independent review | ✅ **PASSED** — 1 round |" in body
     assert "| Tests | ✅ PASS — 9380 passed, 0 failed, 0 errors |" in body
+
+
+# ══════ D1.1 (2026-08-31): receipts out of the PR body, final results only ══ #
+#
+# The operator's directive: `_verification_section` embedded up to 40 commands
+# with 12 raw fenced outputs of whatever the coder ran mid-work — "the endless
+# in-progress test runs" the operator sees. These four tests are the ones the
+# task brief names directly: (a) no fenced command output reaches the body;
+# (b) exactly one line per test layer, the FINAL run only; (c) a pointer to the
+# full log; (d) the body stays under the 6,000-char budget (measured as
+# `visible_chars` — everything a reader sees without expanding a fold, since a
+# later task's media section and any long folded content are explicitly
+# outside this budget).
+
+_MID_WORK_RECEIPT = {
+    "command": "uv run pytest tests/test_webhook_retry.py -q",
+    "output_excerpt": "2 failed, 3 passed in 0.81s", "kind": "test",
+    "truncated": False, "output_bytes": 27,
+}
+_FINAL_RECEIPT = {
+    "command": "uv run pytest tests/test_webhook_retry.py -q",
+    "output_excerpt": "5 passed in 1.02s", "kind": "test",
+    "truncated": False, "output_bytes": 18,
+}
+
+
+def _two_run_fixture():
+    """Two receipts of the SAME check: a failing run mid-work, then the run
+    that actually passed. `test_evidence` is what the orchestrator's OWN
+    layered test run recorded for this attempt — its FINAL state, the
+    5-passed run, exactly as `testing/plan_runner.py` only ever runs a layer
+    once per attempt."""
+    task = Task.new("fix the flaky retry", repo_path="/r")
+    task.acceptance_criteria = ["a 5xx retries up to 3 times before failing"]
+    receipts = [_MID_WORK_RECEIPT, _FINAL_RECEIPT]
+    test_evidence = {"layers": ["unit: ✅ PASS — 5 passed, 0 failed, 0 errors"]}
+    return task, receipts, test_evidence
+
+
+def test_the_body_carries_no_fenced_command_output(store, tmp_path):
+    """(a) Two pytest receipts — the first failing mid-work, the second
+    passing — and NEITHER's raw output reaches the body: no fenced block,
+    no excerpt text from either run."""
+    orch = _orch(store, tmp_path)
+    task, receipts, test_evidence = _two_run_fixture()
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts)
+    assert "```" not in body, "a fenced code block reached the PR body"
+    assert "2 failed, 3 passed in 0.81s" not in body
+    assert "5 passed in 1.02s" not in body
+
+
+def test_the_body_shows_only_the_final_layer_result(store, tmp_path):
+    """(b) Exactly one line per test layer, its FINAL PASS/FAIL/NOT-RUN — the
+    mid-work failure never appears anywhere, only the layer's last state.
+
+    D1.1 review finding #5: an earlier version of `_verification_section`
+    ALSO repeated this line as its own bullet, and the no-duplication guard
+    was narrowed to the table-row shape so it could not catch that. The
+    Evidence table is now the SINGLE one-line-per-layer surface — the final
+    line appears EXACTLY ONCE in the whole body, not merely once in its
+    `| Tests | … |` form."""
+    orch = _orch(store, tmp_path)
+    task, receipts, test_evidence = _two_run_fixture()
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts)
+    assert body.count("unit: ✅ PASS — 5 passed, 0 failed, 0 errors") == 1
+    assert "2 failed" not in body
+    assert "3 passed" not in body
+
+
+def test_the_body_points_to_the_full_log(store, tmp_path):
+    """(c) A pointer line naming `nh logs <id>` reaches the body."""
+    orch = _orch(store, tmp_path)
+    task, receipts, test_evidence = _two_run_fixture()
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts)
+    assert f"nh logs {task.id[:8]}" in body
+    assert "Full verification log:" in body
+
+
+def test_the_body_stays_under_the_6000_char_budget(store, tmp_path):
+    """(d) `visible_chars(body) <= 6000` on the standard two-receipt fixture —
+    the budget applies to what a reader sees before anything folded, per the
+    controller's ruling; a later task's media section is explicitly outside
+    it and is not exercised here."""
+    orch = _orch(store, tmp_path)
+    task, receipts, test_evidence = _two_run_fixture()
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts)
+    assert visible_chars(body) <= 6000, visible_chars(body)
+
+
+def test_the_short_section_carries_no_receipt_text(store, tmp_path):
+    """The short section itself (not just the whole body) never embeds a
+    receipt's command or output — direct unit-level pin, independent of the
+    end-to-end fixture above."""
+    receipts = [_MID_WORK_RECEIPT, _FINAL_RECEIPT]
+    section = Orchestrator._verification_section(
+        receipts, task_id="deadbeef")
+    for rec in receipts:
+        assert rec["command"] not in section
+        assert rec["output_excerpt"] not in section
+    assert "```" not in section
+    assert "nh logs deadbeef" in section
+
+
+# ═══ D1.1 review findings #2, #5, #7, #8 (2026-08-31 fix round) ════════════ #
+
+def test_the_pointer_never_leaks_an_absolute_home_path(store, tmp_path):
+    """Review finding #2: an absolute path
+    (`/Users/<local-username>/.no_human/...`) leaks the operator's local
+    account name into a document a stranger reviews. The pointer must carry
+    the `~`-relative form `docs/pr-body.md` already documents."""
+    from pathlib import Path
+
+    home = Path.home()
+    real_path = str(home / ".no_human" / "artifacts" / "deadbeef" / "verification-attempt-1.md")
+    section = Orchestrator._verification_section(
+        [_MID_WORK_RECEIPT], task_id="deadbeef", artifact_path=real_path)
+    assert real_path not in section, "the raw absolute path reached the pointer"
+    assert str(home) not in section, "the home directory leaked in some other form"
+    assert "~/.no_human/artifacts/deadbeef/verification-attempt-1.md" in section
+
+
+def test_display_path_falls_back_when_not_under_home():
+    """`_display_path`'s other branch: a path outside `$HOME` (a test
+    fixture, or a relocated `NO_HUMAN_HOME`) is returned as-is rather than
+    fabricating a `~` that would not resolve back to it."""
+    assert Orchestrator._display_path("") == ""
+    assert Orchestrator._display_path("/var/elsewhere/verification.md") == \
+        "/var/elsewhere/verification.md"
+
+
+def test_the_short_section_never_duplicates_a_layer_line(store, tmp_path):
+    """Review finding #5 RULING: the Evidence table is the single
+    one-line-per-layer surface; `_verification_section` shrinks to the
+    pointer line (+ command count) with NO duplicated layer bullets."""
+    section = Orchestrator._verification_section(
+        [_MID_WORK_RECEIPT], task_id="deadbeef")
+    assert "PASS" not in section and "FAIL" not in section and "NOT RUN" not in section, (
+        "the short section renders a test verdict — that belongs to the "
+        "Evidence table alone")
+
+
+def test_the_artifact_is_attempt_scoped_not_task_scoped(store, tmp_path):
+    """Review finding #7: a task's attempts run sequentially, each often on
+    its own branch/PR — attempt 2's write must never clobber the file
+    attempt 1's (still-open) PR body points a reader at."""
+    orch = _orch(store, tmp_path)
+    task = Task.new("t", repo_path="/r")
+    p1 = orch._write_verification_artifact(
+        task, [{"command": "pytest -q attempt1", "kind": "test",
+                "output_excerpt": "1 passed", "truncated": False, "output_bytes": 8}],
+        attempt_n=1)
+    p2 = orch._write_verification_artifact(
+        task, [{"command": "pytest -q attempt2", "kind": "test",
+                "output_excerpt": "2 passed", "truncated": False, "output_bytes": 8}],
+        attempt_n=2)
+    assert p1 and p2 and p1 != p2, (p1, p2)
+    from pathlib import Path
+    assert "pytest -q attempt1" in Path(p1).read_text(), (
+        "attempt 2's write clobbered attempt 1's artifact file")
+    assert "pytest -q attempt2" in Path(p2).read_text()
+
+
+def test_an_unknown_attempt_number_still_writes_something(store, tmp_path):
+    """A best-effort attempt-number lookup that comes back empty must not
+    crash the write — it falls back to a literal, still-unique-enough name
+    rather than raising."""
+    orch = _orch(store, tmp_path)
+    task = Task.new("t", repo_path="/r")
+    path = orch._write_verification_artifact(
+        task, [{"command": "pytest -q", "kind": "test", "output_excerpt": "1 passed",
+                "truncated": False, "output_bytes": 8}],
+        attempt_n=None)
+    assert path, "the write failed outright on a missing attempt number"
+    assert "unknown" in path
+
+
+# ─────────────────────── Finding #8: the hard size budget ─────────────────── #
+
+def _oversized_result():
+    """A normal-shaped report — several distinct paragraphs, no NOT-MET —
+    that reaches ~1,500 visible chars by `_summary_section`'s OWN ordinary
+    fold. Legally trimmable in full: nothing in it is exempt from a cap."""
+    r = _Result()
+    r.final_text = "\n\n".join(
+        f"Paragraph {i}: rewrote the retry path in fetcher.py so a 429 "
+        "backs off instead of failing the batch. " * 3
+        for i in range(10)
+    )
+    return r
+
+
+def _huge_verifiers_task():
+    """A task whose Evidence table alone is large: `verifiers_pin()` joins
+    EVERY failed verifier id into the row's own VISIBLE cell (never
+    folded — only the per-rule breakdown below the row is), which is a
+    realistic way a body's non-`## Changes` content grows large on its own.
+    Combined with an ordinary-sized `## Changes` report (see
+    `_oversized_result`), the two TOGETHER exceed 6,000 visible chars even
+    though NEITHER is individually pathological."""
+    t = _task()
+    head_sha = _Commit.sha
+    t.context["verifier_results"] = {
+        head_sha: [
+            _verifier_dict(verifier_id=f"rule-check-{i:04d}", passed=False)
+            for i in range(280)
+        ]
+    }
+    return t
+
+
+def test_the_body_budget_trims_the_changes_section_when_oversized(store, tmp_path):
+    """Review finding #8 (promoted from minor): the 6,000-visible-char
+    budget is ENFORCED, not merely asserted by a test against a fixture that
+    happens to be small. An oversized body — here, a large Evidence table
+    PLUS an ordinary-sized `## Changes` report, together over budget — must
+    be brought back under it by trimming `## Changes` further than its own
+    ordinary 1,500-char fold, with an explicit marker — and Evidence,
+    criteria and the verification pointer must survive intact."""
+    orch = _orch(store, tmp_path)
+    task = _huge_verifiers_task()
+    body = orch._pr_body(task, _Commit(), _oversized_result(),
+                         test_evidence={"ran": True, "ok": True, "passed": 5,
+                                        "failed": 0, "errors": 0},
+                         receipts=_receipts())
+    assert visible_chars(body) <= 6000, visible_chars(body)
+    assert "(trimmed further to keep the PR body under its size budget)" in body
+    # Evidence (including the huge Verifiers row), criteria and the pointer
+    # must be untouched by the trim — only `## Changes` may shrink.
+    assert "| Independent review | ✅ **PASSED** — 2 rounds |" in body
+    assert "280 of 280 failed" in body, "the Verifiers row itself was touched"
+    for c in task.acceptance_criteria:
+        assert c in body
+    assert "Full verification log:" in body
+
+
+def test_the_body_budget_never_trims_the_standard_fixture(store, tmp_path):
+    """The other direction: an ordinary, small report must NOT trigger the
+    extra trim — the marker (and the further-reduced cap) must appear ONLY
+    when the body genuinely would have exceeded the budget."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence={"ran": True, "ok": True, "passed": 5,
+                                        "failed": 0, "errors": 0},
+                         receipts=_receipts())
+    assert "(trimmed further to keep the PR body under its size budget)" not in body
+    assert visible_chars(body) <= 6000, visible_chars(body)

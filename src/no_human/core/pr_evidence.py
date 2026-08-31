@@ -175,25 +175,3 @@ def visible_chars(body: str) -> int:
     """
     return len(_DETAILS_RE.sub("", body))
 
-
-def collapse_appendix(section_text: str, *, heading: str, summary: str) -> str:
-    """Fold everything under a rendered ``## {heading}`` section behind a
-    `<details>` disclosure, leaving the heading itself live and scannable.
-
-    *section_text* must start with ``## {heading}\\n`` (every section builder
-    in `orchestrator.py` emits its own heading); if it does not — the shape
-    changed, or the section is empty — *section_text* is returned unchanged
-    rather than risk mangling something this function does not recognise.
-    Nothing is removed: every word of *section_text* still reaches the body,
-    just behind the fold instead of in front of it.
-    """
-    prefix = f"## {heading}\n"
-    if not section_text.startswith(prefix):
-        return section_text
-    rest = section_text[len(prefix):].strip("\n")
-    if not rest:
-        return section_text
-    return (
-        f"{prefix}\n<details><summary>{summary}</summary>\n\n"
-        f"{rest}\n\n</details>\n\n"
-    )

@@ -74,11 +74,21 @@ FROZEN_FUNCTION_LINES = {
     # 2108 -> 2118 (+10): the two `_consume_human_gate` call sites (revision
     # and fresh branch paths) that rearm-once the human resume_from gate.
     # Measured directly against the rebased tree with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2118,
+    # 2118 -> 2130 (+12): D1.1 (short PR bodies) fix round, review finding #6 —
+    # the shared first-blocking-failure excerpt feeding both stuck detection
+    # and failure_reason. Measured on the D1.1 squash-merge result.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2130,
     "core/orchestrator.py:Orchestrator._drive": 760,
     "core/db.py:Store._ensure_task_columns": 449,
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
-    "core/orchestrator.py:Orchestrator._finalize": 418,
+    # 429 -> 434 (+5): pre-existing red on main at 03b262d23 — e922e9b4's
+    # (#935 derived-artefact keystone) landing grew the conflict watcher
+    # without re-freezing; nh approve runs change-scoped tests only, so the
+    # ratchet never fired at land time. Repaired (measured) on this merge.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 434,
+    # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
+    # write wired into `_finalize` (review findings #1/#7). Measured on the
+    # D1.1 squash-merge result.
+    "core/orchestrator.py:Orchestrator._finalize": 424,
     # Pre-existing on main (measured red at d3d7d3a82a, this session's start):
     # an earlier fleet land grew stream() +6 without re-freezing it on its
     # merge result — the same "landed without measuring the ratchet" failure
@@ -108,7 +118,10 @@ FROZEN_FUNCTION_CC = {
     "core/orchestrator.py:Orchestrator._run_attempt": 250,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 73,
+    # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
+    # grew the conflict watcher; pre-existing red on main at 03b262d23,
+    # repaired (measured) on this merge.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 74,
     "core/orchestrator.py:Orchestrator._run_review": 73,
     # Crossed 60 (to 67) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py:Orchestrator._build_implement_prompt": 67,
@@ -150,7 +163,12 @@ FROZEN_FILE_LINES = {
     # `_honor_server_stop`/`_is_own_partial` routed through the shared
     # `human_gate_armed`/`is_human_provenance` predicates. Measured directly
     # against the rebased tree with the scanner below (19763 total lines).
-    "core/orchestrator.py": 19763,
+    # 19763 -> 20029 (+266): D1.1 (short PR bodies) — the split of
+    # `_verification_section` (short) from `_verification_appendix` (full),
+    # the attempt-scoped artifact writer + display-path helper, the runtime
+    # body-budget trim, and both rounds' anchored docstrings. Measured on the
+    # D1.1 squash-merge result (re-anchored on merge, per this file's note).
+    "core/orchestrator.py": 20029,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -180,7 +198,9 @@ FROZEN_FILE_LINES = {
     # constants, to keep this file's lazy `..eval` import convention) and the
     # aggregate/top-N/flagged rendering, each line escape()-wrapped per the
     # AST guard in `tests/_bench_ast_guard.py`. 2026-08-30.
-    "cli/commands.py": 8173,
+    # 8173 -> 8204 (+31): D1.1 — `nh logs` now names and tails the attempt's
+    # verification artifact (review finding #3). Measured on the merge result.
+    "cli/commands.py": 8204,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -238,7 +258,10 @@ FROZEN_FILE_LINES = {
     # of the first (closing the forged-early-block preemption hole), and the
     # missing-END recovery path scans START occurrences last-first to match.
     "review/reviewer.py": 2915,
-    "blockers/wake.py": 2706,
+    # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
+    # landing, change-scoped tests missed the ratchet) — repaired, measured,
+    # on this merge; same cause as the two function-level wake.py bumps above.
+    "blockers/wake.py": 2711,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies

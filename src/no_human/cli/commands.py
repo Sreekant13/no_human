@@ -5552,6 +5552,37 @@ def logs(task_id):
                     passed = tr.get("passed", 0)
                     failed = tr.get("failed", 0)
                     console.print(f"    tests:  {passed} passed / {failed} failed")
+                # D1.1: the PR body's "How I verified this" pointer (and
+                # docs/pr-body.md) tell a reader to run `nh logs <id>` for
+                # the full command log — this is the one place that promise
+                # must actually hold. The path is computed the SAME way the
+                # writer (`Orchestrator._write_verification_artifact`) did,
+                # so this can never disagree with what a PR body pointed at.
+                _verif_path = Orchestrator._verification_artifact_path(
+                    t.id, a.get("attempt_number"))
+                if _verif_path.exists():
+                    console.print(
+                        "    verification log: "
+                        f"{Orchestrator._display_path(str(_verif_path))}")
+                    try:
+                        _verif_lines = _verif_path.read_text(
+                            encoding="utf-8").splitlines()
+                    except OSError as exc:
+                        console.print(
+                            f"      [yellow]could not be read: {exc}[/]")
+                    else:
+                        _tail = _verif_lines[-20:]
+                        if len(_verif_lines) > len(_tail):
+                            console.print(
+                                f"      [dim]…{len(_verif_lines) - len(_tail)} "
+                                "earlier line(s) not shown; open the file "
+                                "for the rest[/]")
+                        for _ln in _tail:
+                            console.print(f"      [dim]{escape(_ln)}[/]")
+                else:
+                    console.print(
+                        "    [dim]verification log: not written for this "
+                        "attempt[/]")
                 if a.get("failure_reason"):
                     # Escaped for the same reason as the findings above: this
                     # string is largely the reviewer's own words, and it is

@@ -4932,13 +4932,21 @@ async def test_layered_test_plan_source_repo_none_when_not_a_worktree(
     assert captured["source_repo"] is None
 
 
-async def test_layered_test_plan_failure_detail_aggregates_traceback_blocks(
+async def test_layered_test_plan_failure_detail_keeps_only_the_root_cause(
     bare_repo, tmp_path, store,
 ):
-    """SCRUM-40 parity: a layered-plan failure appends every layer's
-    traceback_block into the attempt_failed detail, newline-separated, in
-    execution order, preserving original capitalization — a layer with no
-    excerpt (advisory-only layer, no failure) is skipped silently."""
+    """D1.1 (2026-08-31, superseding SCRUM-40 parity), CORRECTED by review
+    finding #6: a layered-plan failure appends only the FIRST failing
+    BLOCKING layer's traceback_block to the attempt_failed detail — that is
+    the layer whose failure actually explains `plan_result.ok=False`
+    (`PlanResult.ok` is "no blocking layer failed"), and it is also what the
+    adjacent stuck-detection lookup uses (one shared lookup now feeds both,
+    so they can never name different layers). A LATER layer's excerpt
+    (integration's, here — dependent on the same root cause) is dropped
+    entirely, not merely reordered: keeping the downstream failure and
+    dropping the root cause would bury the one traceback a human actually
+    needs. Concatenating every layer's block used to build a multi-KB
+    `failure_reason` on a multi-layer plan (SCRUM-40 parity)."""
     from no_human.testing.test_layers import Gating, TestLayer, TestPlan
     from no_human.testing.plan_runner import LayerResult, PlanResult
     from no_human.testing.runner import TestRunResult
@@ -4998,14 +5006,141 @@ async def test_layered_test_plan_failure_detail_aggregates_traceback_blocks(
     failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
     assert failed_events, "expected an attempt_failed event"
     detail = failed_events[0]["text"]
-    # Both layers' excerpts present, capitalization preserved verbatim.
+    # Only the FIRST failing BLOCKING layer's (unit's) excerpt survives —
+    # the root cause, not the downstream layer dependent on it.
     assert "AssertionError: Root Cause Here" in detail
-    assert "ValueError: Downstream Context" in detail
-    # Execution order: unit (first layer) precedes integration (second layer).
-    assert detail.index("Root Cause Here") < detail.index("Downstream Context")
+    assert "ValueError: Downstream Context" not in detail, (
+        "a LATER layer's traceback leaked into failure_reason — only the "
+        "first failing BLOCKING layer's excerpt (the root cause) may appear")
     # outcome.detail is the max_attempts escalation wrapper around the same
     # attempt text — containment, not equality (the wrapper adds its prefix).
     assert detail in outcome.detail
+
+
+async def test_layered_test_plan_failure_detail_caps_the_last_traceback(
+    bare_repo, tmp_path, store,
+):
+    """D1.1: the surviving (last) layer's traceback_block is ALSO tail-capped
+    to 1200 chars — a single layer's own excerpt can itself be large even
+    after `runner._cap_excerpt`'s per-test cap, when several tests failed in
+    the same layer."""
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="pytest -q", gating=Gating.BLOCKING),
+    ])
+    huge_traceback = "X" * 5000
+    tr_unit = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed",
+        traceback_excerpts={"test_unit.py::test_a": huge_traceback},
+    )
+    lr_unit = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr_unit)
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        return PlanResult(layer_results=[lr_unit])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        await orch.run_task(t)
+
+    failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
+    assert failed_events, "expected an attempt_failed event"
+    detail = failed_events[0]["text"]
+    assert huge_traceback not in detail, "the uncapped 5000-char excerpt reached failure_reason"
+    assert "X" * 1200 in detail, "the last 1200 chars of the excerpt must survive"
+    assert "X" * 1201 not in detail, "more than 1200 chars of the excerpt survived"
+
+
+async def test_layered_failure_excerpt_skips_an_earlier_failing_advisory_layer(
+    bare_repo, tmp_path, store,
+):
+    """D1.1 review finding #6: an ADVISORY layer can fail WITHOUT stopping
+    the plan or flipping `plan_result.ok` (only a BLOCKING failure does
+    that — see `PlanResult.ok`'s own docstring), so an advisory failure
+    earlier in `layer_results` must never be mistaken for the layer that
+    explains `plan_result.ok=False`. The excerpt must come from the
+    BLOCKING layer's own traceback, not the advisory one that failed first."""
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="lint", command="ruff check", gating=Gating.ADVISORY),
+        TestLayer(name="unit", command="pytest -q", gating=Gating.BLOCKING,
+                  depends_on=["lint"]),
+    ])
+    tr_lint = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="ruff check", output="1 failed",
+        traceback_excerpts={"lint": "AdvisoryNoise: this never stopped the plan"},
+    )
+    tr_unit = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed",
+        traceback_excerpts={
+            "test_unit.py::test_a": "AssertionError: The Real Blocking Failure",
+        },
+    )
+    lr_lint = LayerResult(layer_name="lint", gating=Gating.ADVISORY, result=tr_lint)
+    lr_unit = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr_unit)
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        return PlanResult(layer_results=[lr_lint, lr_unit])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        await orch.run_task(t)
+
+    failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
+    assert failed_events, "expected an attempt_failed event"
+    detail = failed_events[0]["text"]
+    assert "AssertionError: The Real Blocking Failure" in detail
+    assert "AdvisoryNoise" not in detail, (
+        "the earlier ADVISORY layer's failure was mistaken for the layer "
+        "that explains plan_result.ok=False")
 
 
 # --------------------------------------------------------------------------- #

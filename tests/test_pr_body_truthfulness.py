@@ -1195,6 +1195,87 @@ async def test_the_already_satisfied_gate_prompt_names_the_same_sha_the_round_st
         "even though the round it stamps cites one")
 
 
+async def test_the_already_satisfied_body_names_a_real_verification_artifact(
+    store, tmp_path, bare_repo, monkeypatch,
+):
+    """D1.1 review finding #1: `_gate_already_satisfied`'s body-refresh
+    block is a THIRD `_pr_body` caller (besides `_finalize` and the
+    pre-review draft) that rebuilds the body with REAL receipts. Before this
+    fix it never wrote the artifact file and never passed
+    `verification_artifact_path`, so a PR delivered ENTIRELY through the
+    already-satisfied gate (which never reaches `_finalize` at all) said
+    "Full verification log: (not written this run)" while genuinely never
+    writing one — the one delivery path where that pointer was always a lie.
+    """
+    from types import SimpleNamespace
+
+    import no_human.core.orchestrator as orch_mod
+    from no_human.agent.verification_receipts import VerificationReceipt
+    from no_human.review.reviewer import ReviewDecision as RD
+    from no_human.review.selfcheck import ChecklistItem as CI
+    from no_human.vcs.task_pr import ResolvedPR
+
+    repo = GitRepo(bare_repo)
+
+    class StubReviewer:
+        _on_event = None
+
+        async def review(self, task, **kw):
+            return RD(passed=True, checklist=[CI("it holds", True, "evidence")])
+
+    cfg = load_config(tmp_path / "config.yaml")
+    cfg.data.setdefault("reviewer", {})["allow_advisory"] = False
+    orch = Orchestrator(store, cfg.data, _Backend(),
+                        SlackNotifier(None), reviewer=StubReviewer())
+    task = Task.new("t", repo_path=str(bare_repo))
+    task.acceptance_criteria = ["mul(a,b) returns product"]
+    pr_url = "https://github.com/o/r/pull/9"
+    task.context = {"pr_draft_created": pr_url, "pr_draft_branch": "main"}
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+    await store.add_verification_receipt(attempt_id, VerificationReceipt(
+        kind="test", command="uv run pytest -q",
+        output_excerpt="9 passed in 1.1s", output_bytes=15,
+        truncated=False, seq=1))
+
+    async def fake_resolve_task_pr(store_, task_):
+        return ResolvedPR(url=pr_url, branch="main", source="draft")
+    monkeypatch.setattr(orch_mod, "resolve_task_pr", fake_resolve_task_pr)
+
+    captured: dict = {}
+
+    def fake_open_pr(repo_, branch_, title, body, **kw):
+        captured["body"] = body
+        return SimpleNamespace(url=pr_url, pushed_sha="", kind="github")
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    async def _noop_comment(*a, **k):
+        return None
+    monkeypatch.setattr(orch, "_post_review_checklist_comment", _noop_comment)
+
+    claim = (
+        "Verified every criterion against the existing code.\n"
+        "ALREADY-SATISFIED\n"
+        "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:4\n"
+    )
+    outcome = await orch._gate_already_satisfied(
+        task, repo, attempt_id, claim, branch="main", attempt_n=1,
+    )
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+
+    body = captured.get("body")
+    assert body, "the body was never rebuilt through open_pr"
+    assert "(not written this run)" not in body, (
+        "the pointer fell back to the empty-artifact text even though "
+        "receipts existed for this attempt")
+    artifact_path = Orchestrator._verification_artifact_path(task.id, 1)
+    assert Orchestrator._display_path(str(artifact_path)) in body, (
+        "the pointer does not name the real (display-form) artifact path")
+    assert artifact_path.exists(), (
+        "the already-satisfied gate never wrote the verification artifact")
+    assert "uv run pytest -q" in artifact_path.read_text()
+
+
 async def test_a_reviewed_passing_pr_shows_its_review_evidence(store, tmp_path):
     """The consequence a human sees, driven through BOTH real call sites: the
     gate records the round, and the body renders it instead of disowning it."""

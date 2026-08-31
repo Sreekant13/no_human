@@ -768,6 +768,53 @@ def test_logs_no_attempts(tmp_path, monkeypatch):
     assert "no attempts" in result.output.lower()
 
 
+def test_logs_shows_and_tails_the_verification_artifact_when_present(
+    tmp_path, monkeypatch,
+):
+    """D1.1 review finding #3: the PR body's pointer (and docs/pr-body.md)
+    tell a reader to run `nh logs <id>` for the full command log — this is
+    the one place that promise must actually hold. The path is computed the
+    SAME way `Orchestrator._write_verification_artifact` does, so it can
+    never disagree with what a PR body pointed at."""
+    from no_human.core.orchestrator import Orchestrator
+
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.AWAITING_APPROVAL, title="Hard task")
+    _seed_attempt(db, task_id, turns_used=5, status="succeeded")
+
+    artifact_path = Orchestrator._verification_artifact_path(task_id, 1)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        "## How I verified this\n1 command recorded - as recorded\n\n"
+        "### test\n- `uv run pytest -q`\n\n```\nTHE-DISTINCTIVE-TAIL-LINE\n```\n",
+        encoding="utf-8",
+    )
+
+    runner = _make_runner(db, monkeypatch)
+    result = runner.invoke(cli, ["logs", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert Orchestrator._display_path(str(artifact_path)) in result.output
+    assert "THE-DISTINCTIVE-TAIL-LINE" in result.output, result.output
+
+
+def test_logs_says_so_when_no_verification_artifact_was_written(
+    tmp_path, monkeypatch,
+):
+    """The other half: an attempt with no artifact file must say so, not
+    silently omit the line — the same honesty discipline as every other
+    absence this command already reports."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.ESCALATED, title="Hard task")
+    _seed_attempt(db, task_id, turns_used=5, status="failed")
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["logs", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert "verification log: not written for this attempt" in result.output
+
+
 def test_test_cmd_help():
     """nh test --help works without any bootstrap or auth."""
     runner = CliRunner()

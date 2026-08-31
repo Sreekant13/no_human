@@ -154,7 +154,7 @@ from .pricing import (
     raw_cap_as_weighted,
 )
 from .pricing import weighted_tokens as _weighted_tokens
-from .pr_evidence import PrEvidence, collapse_appendix
+from .pr_evidence import PrEvidence, visible_chars
 from .task import IllegalTransition, Task, TaskSpec, TaskStatus
 from .worktree import _LIVE_WORKTREES, reset_agent_workspace, teardown_worktree
 
@@ -5766,36 +5766,48 @@ class Orchestrator:
                 },
             )
             if any_ran and not plan_result.ok:
-                # Find the first failing blocking layer's output for stuck detection.
-                fail_output = ""
-                for lr in plan_result.layer_results:
-                    if lr.result and not lr.result.ok:
-                        fail_output = lr.result.output
-                        break
+                from ..testing.test_layers import Gating as _Gating
+
+                # `plan_result.ok` is False iff a BLOCKING layer failed
+                # (advisory failures never flip it) — so the layer that
+                # EXPLAINS the failure is the first BLOCKING one, not merely
+                # the first layer with a bad result (an earlier advisory
+                # layer may have failed too without stopping the plan). ONE
+                # lookup feeds both stuck detection and the excerpt below, so
+                # the two can never name different layers.
+                first_blocking_failure = next(
+                    (lr for lr in plan_result.layer_results
+                     if lr.gating == _Gating.BLOCKING and lr.result
+                     and not lr.result.ok),
+                    None,
+                )
+                fail_output = (first_blocking_failure.result.output
+                               if first_blocking_failure else "")
                 is_stuck = stuck.record(fail_output) if fail_output else False
                 detail = f"tests failed: {plan_result.summary}"
                 if failing_tests:
                     detail += " — " + ", ".join(failing_tests)
-                # SCRUM-40 parity: aggregate each layer's traceback_block (already
-                # capped per test — see runner._cap_excerpt) newline-separated, in
-                # execution order, skipping layers with no result/empty excerpt.
-                excerpt_blocks = [
-                    lr.result.traceback_block
-                    for lr in plan_result.layer_results
-                    if lr.result and getattr(lr.result, "traceback_block", "")
-                ]
                 if is_stuck:
                     self.emit("stuck", "same failure signature repeated; resetting context")
                 # The stuck note is the one-line triage summary — it must sit
-                # on the summary line, BEFORE the multi-KB excerpt block, or
-                # it is unreadable in every consumer that shows the head.
+                # on the summary line, BEFORE the excerpt, or it is unreadable
+                # in every consumer that shows the head.
                 stuck_note = stuck.stuck_reason
                 if stuck_note:
                     detail += f" — {stuck_note}"
                 elif is_stuck:
                     detail += " — same failure signature repeated across attempts"
-                if excerpt_blocks:
-                    detail += "\n" + "\n".join(excerpt_blocks)
+                # D1.1: the ROOT CAUSE only — the first failing BLOCKING
+                # layer's own traceback_block, tail-capped to 1200 chars
+                # (same discipline as `fail_tail` below). A downstream
+                # layer's traceback (dependent on the same failure) used to
+                # be concatenated in too, uncapped (SCRUM-40 parity) — the
+                # multi-KB, root-cause-buried `failure_reason` this replaces.
+                excerpt = (getattr(first_blocking_failure.result,
+                                   "traceback_block", "")
+                           if first_blocking_failure else "")
+                if excerpt:
+                    detail += "\n" + excerpt[-1200:]
                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
                 # Same handoff as the review-FAIL path above: the commit is
                 # real, coder-produced work — hand it to the next attempt.
@@ -6391,6 +6403,11 @@ class Orchestrator:
             receipts = await self.store.list_verification_receipts(attempt_id)
         except Exception as exc:  # noqa: BLE001
             self._advisory(f"verification receipts missing from PR body: {exc}")
+        # D1.1: full log to the artifact file, never the body — see
+        # `_write_verification_artifact`'s docstring.
+        verification_artifact_path = self._write_verification_artifact(
+            task, receipts, attempt_n=attempt_n, test_evidence=test_evidence,
+            observable=self._backend_is_observable())
         # Merge-ready policy verdict (core/merge_policy.py) — computed ONCE
         # here from a single `_gather_evidence` call, folded into that SAME
         # `PrEvidence` object, and threaded into `_pr_body` via its
@@ -6494,7 +6511,8 @@ class Orchestrator:
                              receipts=receipts,
                              repo=repo, base=base, branch=branch,
                              attempt_n=attempt_n, merge_policy=merge_policy_dict,
-                             evidence=policy_evidence)
+                             evidence=policy_evidence,
+                             verification_artifact_path=verification_artifact_path)
         # Refresh the body only if THIS TASK opened the draft that is sitting on THIS
         # branch. Durable (task.context), so it survives a park/resume and a process
         # restart; branch-scoped, so a revision onto a different branch cannot inherit it.
@@ -6744,7 +6762,7 @@ class Orchestrator:
             # Rendering is INSIDE the try: it walks coder-controlled text, and a
             # raise here would escape after the PR is already open, turning a
             # cosmetic failure into a failed delivery.
-            section = self._verification_section(
+            section = self._verification_appendix(
                 receipts, test_evidence=test_evidence,
                 observable=self._backend_is_observable())
             body = f"{self.VERIFICATION_COMMENT_MARKER}\n{section}"
@@ -6771,7 +6789,7 @@ class Orchestrator:
     REVIEW_CHECKLIST_MARKER = "<!-- no_human:review-checklist -->"
 
     #: Row cap for the checklist comment — same discipline as
-    #: `_verification_section`'s caps: state what was dropped, never hide it.
+    #: `_verification_appendix`'s caps: state what was dropped, never hide it.
     _CHECKLIST_MAX_ROWS = 40
 
     @staticmethod
@@ -8692,6 +8710,13 @@ class Orchestrator:
             try:
                 from types import SimpleNamespace
                 receipts = await self.store.list_verification_receipts(attempt_id)
+                # D1.1: same artifact write as `_finalize` — this is a THIRD
+                # `_pr_body` caller and was missed the first time around,
+                # leaving this delivery path's pointer naming a file that was
+                # never written.
+                already_satisfied_artifact_path = self._write_verification_artifact(
+                    task, receipts, attempt_n=attempt_n,
+                    observable=self._backend_is_observable())
                 evidence = self._gather_evidence(
                     task, test_evidence=None, receipts=receipts,
                     head_sha=reviewed_sha, repo=repo,
@@ -8700,7 +8725,8 @@ class Orchestrator:
                 body = self._pr_body(
                     task, SimpleNamespace(sha=reviewed_sha), result,
                     test_evidence=None, receipts=receipts, repo=repo, base=base,
-                    branch=branch, attempt_n=attempt_n, evidence=evidence)
+                    branch=branch, attempt_n=attempt_n, evidence=evidence,
+                    verification_artifact_path=already_satisfied_artifact_path)
                 await asyncio.to_thread(
                     open_pr, repo, branch, self._commit_message(task), body,
                     base=base or "main",
@@ -11029,9 +11055,27 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 self._advisory(
                     f"verification receipts missing from draft PR body: {exc}")
+            # D1.1: same artifact write as `_finalize` — the draft's pointer
+            # line must name a real file too, not just the eventual delivered
+            # body's. A fresh DB lookup rather than `self._active_attempt_
+            # number`: this orchestrator instance can run other tasks'
+            # attempts concurrently (Phase 7), so shared instance state is
+            # not safe to read across an `await`.
+            draft_attempt_n: int | None = None
+            try:
+                for a in await self.store.list_attempts(task.id):
+                    if a.get("id") == attempt_id:
+                        draft_attempt_n = a.get("attempt_number")
+                        break
+            except Exception as exc:  # noqa: BLE001 — falls back to "unknown" in the filename
+                self._advisory(f"attempt number missing for draft artifact: {exc}")
+            draft_artifact_path = self._write_verification_artifact(
+                task, draft_receipts, attempt_n=draft_attempt_n,
+                observable=self._backend_is_observable())
             body = self._pr_body(task, commit, result, test_evidence=None,
                                  receipts=draft_receipts,
-                                 repo=repo, base=base, branch=branch)
+                                 repo=repo, base=base, branch=branch,
+                                 verification_artifact_path=draft_artifact_path)
             # Ask the forge whether a PR is ALREADY open for this branch. If one is, this
             # run is not its author and must never rewrite its body (see below). The extra
             # `gh pr list` is one call per attempt on GitHub only, and it is the only way
@@ -18521,15 +18565,23 @@ SIX of them read a checkpoint and TWO do not — but do
             out.append(line)
         return "\n".join(out)
 
-    def _summary_section(self, result) -> str:
+    def _summary_section(
+        self, result, *, max_visible: int | None = None, trim_marker: str = "",
+    ) -> str:
         """The rendered body of `## Changes` (C1 + H13, then the 2026-08-21
         cap): the coder's report, cleaned, with its `CRITERION:` lines made a
-        compact list and everything past `_REPORT_VISIBLE_CHARS` folded."""
+        compact list and everything past `_REPORT_VISIBLE_CHARS` folded.
+
+        ``max_visible``/``trim_marker`` are D1.1's whole-body-budget escape
+        hatch — see `_fold_report`'s docstring; `_pr_body` is the only
+        caller that ever passes them.
+        """
         cleaned = self._clean_summary((getattr(result, "final_text", "") or "").strip())
         if self._is_non_report_summary(cleaned):
             return self._NO_SUMMARY_BLOCK
         return self._fold_report(
-            self._compact_criterion_lines(self._reformat_summary_markdown(cleaned)))
+            self._compact_criterion_lines(self._reformat_summary_markdown(cleaned)),
+            max_visible=max_visible, trim_marker=trim_marker)
 
     #: How much of the coder's report a reader meets WITHOUT expanding
     #: anything. Three real PRs (#570, #571, #574) carried 740-770 visible
@@ -18589,12 +18641,26 @@ SIX of them read a checkpoint and TWO do not — but do
         return paras
 
     @staticmethod
-    def _fold_report(text: str) -> str:
-        """Keep the first `_REPORT_VISIBLE_CHARS` of the report visible and
-        fold the rest behind `<details>`. Two rules make the cap honest:
-        a paragraph carrying `NOT-MET` is always visible (a folded failure
-        would be the one thing a reader must not miss), and a fence is never
-        split (see `_split_paragraphs_keeping_fences`)."""
+    def _fold_report(
+        text: str, *, max_visible: int | None = None, trim_marker: str = "",
+    ) -> str:
+        """Keep the first `_REPORT_VISIBLE_CHARS` (or `max_visible`, when the
+        whole-body budget enforcement below overrides it) of the report
+        visible and fold the rest behind `<details>`. Two rules make the cap
+        honest: a paragraph carrying `NOT-MET` is always visible (a folded
+        failure would be the one thing a reader must not miss), and a fence
+        is never split (see `_split_paragraphs_keeping_fences`).
+
+        ``max_visible``/``trim_marker`` exist ONLY for D1.1's runtime 6,000-
+        visible-char body budget (`_pr_body`): when the assembled body would
+        exceed it, `_pr_body` re-renders this ONE section — never Evidence,
+        criteria, or the verification pointer — with a smaller cap and
+        *trim_marker* appended right after the (now shorter) visible text,
+        so a reader sees why less of the report is in front of the fold. The
+        ordinary per-section fold (no caller overrides these) never shows a
+        marker — folding at 1,500 chars is normal, not a budget rescue.
+        """
+        cap = max_visible if max_visible is not None else Orchestrator._REPORT_VISIBLE_CHARS
         paras = Orchestrator._split_paragraphs_keeping_fences(text)
         keep = [p for p in paras if "NOT-MET" in p]
         rest = [p for p in paras if "NOT-MET" not in p]
@@ -18602,12 +18668,14 @@ SIX of them read a checkpoint and TWO do not — but do
         folded: list[str] = []
         used = sum(len(p) + 2 for p in keep)
         for p in rest:
-            if not folded and used + len(p) + 2 <= Orchestrator._REPORT_VISIBLE_CHARS:
+            if not folded and used + len(p) + 2 <= cap:
                 visible.append(p)
                 used += len(p) + 2
             else:
                 folded.append(p)
         body = "\n\n".join(visible)
+        if folded and trim_marker:
+            body += f"\n\n{trim_marker}"
         if folded:
             k = len(folded)
             body += ("\n\n<details><summary>Rest of the coder's report "
@@ -18677,6 +18745,7 @@ SIX of them read a checkpoint and TWO do not — but do
         branch: str | None = None, attempt_n: int | None = None,
         merge_policy: dict | None = None,
         evidence: PrEvidence | None = None,
+        verification_artifact_path: str = "",
     ) -> str:
         # Short and to the point: no boilerplate, no product name, no verbose
         # dump. The title is the PR title; the body is criteria + a brief summary
@@ -18738,37 +18807,65 @@ SIX of them read a checkpoint and TWO do not — but do
             )
         # ONE evidence area, decisive-first (the independent reviewer's verdict,
         # then the orchestrator's own test run) — see `_evidence_section`. The
-        # raw command receipts stay their own `## How I verified this` appendix
-        # after it: that section is a mechanical, deliberately exhaustive audit
-        # log with its own truthfulness contract, not part of the short
-        # "does it work" summary a reviewer reads first. It is folded behind a
-        # `<details>` disclosure (`collapse_appendix`) — every word still
-        # reaches the body, just behind the fold instead of in front of it,
-        # which is what keeps the SCANNABLE part of the body short per the
-        # operator's directive without dropping a single truth pin.
+        # raw command receipts no longer follow it as their own in-body
+        # appendix (D1.1, 2026-08-31 — the operator's "receipts out of the PR
+        # body" directive): `## How I verified this` is now a short pointer to
+        # where the full, mechanical log actually lives — this ATTEMPT's own
+        # `<artifacts>/verification-attempt-<n>.md` (`_write_verification_
+        # artifact`) and the PR comment `_post_verification_comment` posts.
+        # Per-layer test results render ONCE, in the Evidence table above —
+        # this section never repeats them. It needs no `<details>` fold: it
+        # carries no raw command text, so there is nothing in it that
+        # benefits from being hidden. See `_verification_section` /
+        # `_verification_appendix`.
         #
         # The `## Stats` line (files/diffstat/turns) was REMOVED: the forge shows
         # the diffstat itself, and the turn count is internal noise. `repo`/`base`
         # remain live — `base` scopes the merge-boundary footer and `repo` proves
         # the review rounds judged THIS head (C4).
         verification = self._verification_section(
-            receipts, test_evidence=test_evidence, observable=observable,
-            evidence=evidence,
+            receipts, observable=observable,
+            evidence=evidence, task_id=task.id,
+            artifact_path=verification_artifact_path,
         )
-        verification = collapse_appendix(
-            verification, heading="How I verified this",
-            summary=self._verification_summary(evidence),
-        )
-        return (
-            f"{self._ticket_line(task)}"
-            f"{self._evidence_section(task, head_sha=head_sha, repo=repo, evidence=evidence)}"
-            f"## Acceptance criteria\n{criteria}\n\n"
-            f"## Changes\n{self._summary_section(result)}\n\n"
-            f"{self._assumptions_section(task)}"
-            f"{self._superseded_section(task)}"
-            f"{verification}"
-            f"{self._merge_boundary_footer(task, branch=branch, base=base, attempt_n=attempt_n)}"
-        )
+        ticket_line = self._ticket_line(task)
+        evidence_section = self._evidence_section(
+            task, head_sha=head_sha, repo=repo, evidence=evidence)
+        criteria_block = f"## Acceptance criteria\n{criteria}\n\n"
+        assumptions = self._assumptions_section(task)
+        superseded = self._superseded_section(task)
+        footer = self._merge_boundary_footer(
+            task, branch=branch, base=base, attempt_n=attempt_n)
+
+        def _assemble(changes_text: str) -> str:
+            return (f"{ticket_line}{evidence_section}{criteria_block}"
+                    f"## Changes\n{changes_text}\n\n{assumptions}{superseded}"
+                    f"{verification}{footer}")
+
+        body = _assemble(self._summary_section(result))
+        # D1.1's hard size budget, ENFORCED — not merely asserted by a test
+        # against a fixture that happens to be small. Measured EXCLUDING
+        # `criteria_block`: acceptance criteria are the task's own verbatim
+        # text (see the comment above `criteria = ...` — `_pr_body` never
+        # edits it), so they are not a gap this code is allowed to close,
+        # and the one section left that this run actually authored freely —
+        # `## Changes` — is the only one ever trimmed for it. Evidence,
+        # criteria and the verification pointer are NEVER touched here.
+        _BODY_BUDGET = 6000
+        non_criteria_visible = visible_chars(body) - len(criteria_block)
+        if non_criteria_visible > _BODY_BUDGET:
+            over = non_criteria_visible - _BODY_BUDGET
+            marker = "_(trimmed further to keep the PR body under its size budget)_"
+            # A safety margin, not a precision instrument: `_fold_report`
+            # keeps whole paragraphs (never splits one) and ALWAYS keeps a
+            # NOT-MET paragraph regardless of the cap, so an oversized
+            # NOT-MET paragraph can still leave the body over budget even
+            # after this — the truthfulness rule (a folded failure must
+            # never hide) outranks the size budget on that one, rare shape.
+            trimmed_cap = max(0, self._REPORT_VISIBLE_CHARS - over - len(marker) - 50)
+            body = _assemble(self._summary_section(
+                result, max_visible=trimmed_cap, trim_marker=marker))
+        return body
 
     def _gather_evidence(
         self, task: Task, *, test_evidence: dict | None = None,
@@ -18863,18 +18960,6 @@ SIX of them read a checkpoint and TWO do not — but do
             (rows if line.startswith("| ") and line.endswith(" |") else rest).append(line)
         after = "\n".join(rest).strip("\n")
         return "\n".join(rows) + ("\n" if rows else ""), (after + "\n\n" if after else "")
-
-    @staticmethod
-    def _verification_summary(evidence: PrEvidence) -> str:
-        """The one line a reader sees on the folded command log."""
-        rows = [r for r in ((evidence.repro or {}).get("receipts") or [])
-                if isinstance(r, dict)]
-        n = len(rows)
-        if not n:
-            return "command log"
-        shown = min(n, Orchestrator._VERIFICATION_MAX_OUTPUTS)
-        return (f"{n} command{'s' if n != 1 else ''} recorded "
-                f"({shown} shown with output) — and what this log cannot attest")
 
     # ------------------------- PR body: the pieces ------------------------- #
 
@@ -19399,12 +19484,188 @@ SIX of them read a checkpoint and TWO do not — but do
         "covers only the coder session's own commands",
     )
 
+    #: Directory name every task's written artifacts (this section's full
+    #: verification log today) live under, inside `NO_HUMAN_HOME` — never
+    #: inside the target repo, so nothing here can be mistaken for a change
+    #: the coder made or reach the export allowlist by accident.
+    _ARTIFACTS_DIRNAME = "artifacts"
+
+    @staticmethod
+    def _verification_artifact_path(
+        task_id: str, attempt_n: int | str | None,
+    ) -> Path:
+        """Where a specific ATTEMPT's full verification log is written — a
+        plain path, never created here (the writer below creates it lazily).
+
+        ATTEMPT-SCOPED (`verification-attempt-<n>.md`, not one file per
+        task): a task's attempts run sequentially, each on its own branch
+        and often its own PR, and attempt 2's write must never clobber the
+        file attempt 1's (still-open, still-linked) PR body points a reader
+        at. ``attempt_n`` falsy (a lookup failed somewhere upstream — every
+        caller treats this as best-effort) falls back to the literal
+        ``"unknown"`` rather than raising: the log still gets written and is
+        still findable by listing the directory, just not attributable to a
+        specific attempt number in its name.
+
+        A `@staticmethod` (not `self`) and PUBLIC to this module's callers
+        for one reason: `cli/commands.py`'s `nh logs` needs this exact same
+        path without constructing an `Orchestrator` — kept as one method so
+        the pointer line, the writer below, and `nh logs` can never disagree
+        about where a given attempt's log lives.
+        """
+        n = attempt_n if attempt_n not in (None, "") else "unknown"
+        return (NO_HUMAN_HOME / Orchestrator._ARTIFACTS_DIRNAME / task_id
+                / f"verification-attempt-{n}.md")
+
+    @staticmethod
+    def _display_path(path_str: str) -> str:
+        """*path_str* rendered `~`-relative for anything that reaches a PR
+        body or a PR comment. The raw absolute form
+        (`/Users/<local-username>/.no_human/...`) leaks the operator's local
+        account name into a document a stranger reviews; `docs/pr-body.md`
+        already documents the `~` form. Falls back to the raw string when it
+        is not under the home directory (a test-supplied path, or a
+        differently-rooted `NO_HUMAN_HOME`) — never fabricates a `~` that
+        would not resolve back to *path_str*.
+        """
+        if not path_str:
+            return path_str
+        try:
+            rel = Path(path_str).relative_to(Path.home())
+        except ValueError:
+            return path_str
+        return f"~/{rel.as_posix()}"
+
+    def _write_verification_artifact(
+        self, task: Task, receipts: list[dict] | None, *,
+        attempt_n: int | str | None = None,
+        test_evidence: dict | None = None, observable: bool = True,
+    ) -> str:
+        """Write the FULL command-log appendix to THIS ATTEMPT's own artifact
+        file (attempt-scoped — see `_verification_artifact_path`) and return
+        the ABSOLUTE path — "" on any failure. Callers rendering a pointer
+        into a PR body/comment must pass the result through `_display_path`
+        first; `nh logs` and this method's own file I/O want the real path.
+
+        BEST-EFFORT, like every other evidence path in `_finalize`: a write
+        failure (a full disk, a permissions problem) is advisory and must
+        never cost the PR — the short body still opens, it just carries no
+        pointer to a file that was never written (`_verification_section`
+        renders "(not written this run)" for an empty path).
+        """
+        try:
+            path = self._verification_artifact_path(task.id, attempt_n)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = self._verification_appendix(
+                receipts, test_evidence=test_evidence, observable=observable)
+            path.write_text(content, encoding="utf-8")
+            return str(path)
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            self._advisory(f"verification artifact not written: {exc}")
+            return ""
+
     @staticmethod
     def _verification_section(
+        receipts: list[dict] | None, *,
+        observable: bool = True, evidence: PrEvidence | None = None,
+        task_id: str = "", artifact_path: str = "",
+    ) -> str:
+        """"How I verified this" — the SHORT, final-results-only form the PR
+        body carries (D1.1, 2026-08-31: the operator's "receipts out of the
+        PR body" directive).
+
+        WHAT CHANGED. This heading used to embed the mechanical command-log
+        render inline (up to 40 commands, 12 with raw fenced output) — that
+        render still exists, verbatim, as `_verification_appendix`; it is no
+        longer inlined here. This section instead carries ONE pointer to
+        where the full log actually lives (this ATTEMPT's own
+        `<artifacts>/verification-attempt-<n>.md`, written by
+        `_write_verification_artifact`, and the PR comment
+        `_post_verification_comment` posts) plus the recorded-command count.
+
+        THE EVIDENCE TABLE, NOT HERE, IS THE ONE PER-LAYER SURFACE. A prior
+        version of this section also repeated each test layer's FINAL line
+        as its own bullet — reused verbatim from `_test_evidence_section` so
+        it could not disagree with the Evidence table's own `| Tests | … |`
+        row, but a review found the two rows were nonetheless a real
+        duplicate (`test_no_gate_output_is_duplicated_in_the_rendered_body`
+        is the guard against exactly that shape). Per-layer results render
+        ONCE, in the Evidence table above; this section never repeats them.
+
+        WHAT DID NOT CHANGE. No entry anywhere in the full log asserts a pass
+        or a fail (see `_verification_appendix`'s docstring and
+        `docs/pr-body.md`'s "no PASS/FAIL badge" rationale, which now
+        describes the artifact file).
+
+        UNLIKE `_verification_appendix`, this section is never folded behind
+        a `<details>` disclosure: it carries no raw command text, so nothing
+        in it benefits from being hidden.
+
+        ``evidence.repro``, when given, is the single source for *receipts*
+        — the explicit param stays for this file's own standalone unit
+        tests, which call this method directly with neither (same
+        discipline as `_verification_appendix`). ``artifact_path`` is the
+        REAL absolute path `_write_verification_artifact` returned; this
+        method renders it `~`-relative (`_display_path`) so the body never
+        leaks the operator's local username.
+        """
+        if evidence is not None and evidence.repro is not None:
+            receipts = evidence.repro.get("receipts")
+            observable = evidence.repro.get("observable", observable)
+
+        rows = [r for r in (receipts or []) if isinstance(r, dict)]
+        header = "## How I verified this\n"
+        n = len(rows)
+
+        if not observable and not rows:
+            lines = [
+                "**This run's coding backend cannot be observed, so no "
+                "verification evidence could be captured.** The backend "
+                "exposes no per-tool-call hook, so no_human cannot see what "
+                "the session ran. This is NOT a report that nothing was "
+                "checked - it is a report that nothing could be recorded."
+            ]
+        elif not rows:
+            lines = [
+                "**No verification evidence was captured for this change.** "
+                "Nothing was recorded as having been run to check it - treat "
+                "every acceptance criterion as unverified and check it "
+                "yourself."
+            ]
+        else:
+            short_id = (task_id or "")[:8] or "<task-id>"
+            where = (Orchestrator._display_path(artifact_path) if artifact_path
+                     else "(not written this run)")
+            lines = [
+                f"Full verification log: {where} — `nh logs {short_id}`. "
+                f"{n} command{'' if n == 1 else 's'} recorded while working — "
+                f"the log's FINAL entries describe the tree that shipped; no "
+                f"in-progress command or its raw output reaches this body. "
+                f"See the **Evidence** table above for the orchestrator's own "
+                f"test run, by layer. No entry in the log asserts a pass or a "
+                f"fail: read the output there."
+            ]
+
+        return header + "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _verification_appendix(
         receipts: list[dict] | None, *, test_evidence: dict | None = None,
         observable: bool = True, evidence: PrEvidence | None = None,
     ) -> str:
-        """"How I verified this" - rendered MECHANICALLY from captured receipts.
+        """The FULL, mechanical command-log render — no longer inlined into a
+        PR body (D1.1, 2026-08-31). This is what `_verification_section`
+        (the short pointer a PR body now carries under the same
+        "## How I verified this" heading) used to BE, verbatim: every
+        recorded command, grouped by kind, up to 12 with their captured
+        output. Two consumers still render it in full: `_finalize`'s
+        `_write_verification_artifact` (dumped to this attempt's
+        `<artifacts>/verification.md`) and `_post_verification_comment` (the
+        same content, posted once as its own PR comment) — a reviewer or a
+        human who wants the transcript still gets every word of it, just not
+        inline in the body every delivery re-renders.
+
+        "How I verified this" - rendered MECHANICALLY from captured receipts.
 
         WHAT THIS SECTION IS. Every entry is a command LINE a PostToolUse
         observer saw SUBMITTED to the shell, and the text the harness returned
@@ -19642,8 +19903,13 @@ SIX of them read a checkpoint and TWO do not — but do
         if isinstance(test_evidence, dict) and (
             test_evidence.get("ran") or test_evidence.get("layers")
         ):
-            lines.append("See the **Evidence** table above for the orchestrator's "
-                         "own test run.\n")
+            # D1.1: this renders ONLY in the artifact file and the standalone
+            # PR comment now — neither has an Evidence table "above" it (that
+            # table lives in the PR body, a different document). Name it by
+            # LOCATION, not position, so the sentence stays true wherever
+            # this appendix actually renders.
+            lines.append("See the PR body's **Evidence** table for the "
+                         "orchestrator's own test run.\n")
 
         return header + "\n".join(lines) + "\n"
 
