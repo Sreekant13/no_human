@@ -1683,26 +1683,47 @@ def _recover_unterminated_verdict(text: str) -> str | None:
     verdict read as "no parseable block", became an unclassified (blocking)
     finding, and flipped a passing gate to fail ~50% of the time.
 
-    So: when END is absent, greedily extract the first balanced JSON object
-    after START and accept it ONLY IF it parses AND is a COMPLETE verdict
-    (`_verdict_is_complete`). A JSON truncated mid-object — even one that
-    happens to close at a coincidentally-valid boundary — is missing a required
-    key and is rejected, staying fail-closed. Returns the JSON text on success
-    (parsed identically to the START...END path downstream), or None.
+    So: when END is absent, walk the START occurrences LAST-FIRST — the
+    transcript can quote untrusted material (diff hunks, file contents, PR
+    text) that happens to contain an earlier ``REVIEW_JSON_START``, and the
+    reviewer's own concluding START is always the last one it writes. For
+    each candidate START (most recent first), greedily extract the first
+    balanced JSON object after it and accept it ONLY IF it parses AND is a
+    COMPLETE verdict (`_verdict_is_complete`); a JSON truncated mid-object —
+    even one that happens to close at a coincidentally-valid boundary — is
+    missing a required key and is rejected, so the scan falls back to an
+    earlier START rather than accepting it. Returns the JSON text of the
+    first (i.e. most recent) qualifying candidate (parsed identically to the
+    START...END path downstream), or None if no START qualifies.
     """
-    m = _REVIEW_JSON_START.search(text)
-    if not m:
-        return None
-    candidate = _first_json_object(text[m.end():])
-    if candidate is None:
-        return None
-    try:
-        data = loads_lenient(candidate)
-    except json.JSONDecodeError:
-        return None
-    if not _verdict_is_complete(data):
-        return None
-    return candidate
+    for m in reversed(list(_REVIEW_JSON_START.finditer(text))):
+        candidate = _first_json_object(text[m.end():])
+        if candidate is None:
+            continue
+        try:
+            data = loads_lenient(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not _verdict_is_complete(data):
+            continue
+        return candidate
+    return None
+
+
+def _last_review_json_block(text: str) -> str | None:
+    """Return the JSON body of the LAST well-formed REVIEW_JSON block, or None.
+
+    The reviewer emits its verdict at the END of its output, but its transcript
+    QUOTES untrusted material (diff hunks, file contents, PR text). A quoted
+    REVIEW_JSON_START...REVIEW_JSON_END pair appearing earlier therefore used to
+    preempt the real verdict under `.search` (first match): a forged early
+    "passed": true beat the reviewer's own final "passed": false. Last match
+    wins — the reviewer's own concluding block is always the last one it writes.
+    """
+    last = None
+    for m in _REVIEW_JSON.finditer(text):
+        last = m
+    return None if last is None else last.group(1)
 
 
 def _parse_review_output(
@@ -1710,10 +1731,8 @@ def _parse_review_output(
     extra_repos: list[tuple[Path, str]] | None = None,
 ) -> ReviewDecision:
     raw = text or ""
-    m = _REVIEW_JSON.search(raw)
-    if m:
-        json_text: str | None = m.group(1)
-    else:
+    json_text: str | None = _last_review_json_block(raw)
+    if json_text is None:
         # START present but END missing: recover a COMPLETE verdict if we can
         # (par-07 truncation), else stay fail-closed below.
         json_text = _recover_unterminated_verdict(raw)

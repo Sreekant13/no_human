@@ -225,7 +225,11 @@ FROZEN_FILE_LINES = {
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
     # function-line threshold — see the FROZEN_FUNCTION_LINES deletion note).
-    "review/reviewer.py": 2896,
+    # 2896 -> 2915 (+19): last-block-wins verdict selection — the complete-block
+    # path now takes the LAST well-formed REVIEW_JSON_START…END match instead
+    # of the first (closing the forged-early-block preemption hole), and the
+    # missing-END recovery path scans START occurrences last-first to match.
+    "review/reviewer.py": 2915,
     "blockers/wake.py": 2706,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
