@@ -88,7 +88,11 @@ FROZEN_FUNCTION_LINES = {
     # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
     # write wired into `_finalize` (review findings #1/#7). Measured on the
     # D1.1 squash-merge result.
-    "core/orchestrator.py:Orchestrator._finalize": 424,
+    # 424 -> 437 (+13): D1.2 (2026-08-31, "visual proof") adds the one
+    # best-effort call that runs the UI-evidence browser walk after tests
+    # pass and threads its rendered media section into `_pr_body`.
+    # Re-anchored on merge.
+    "core/orchestrator.py:Orchestrator._finalize": 437,
     # Pre-existing on main (measured red at d3d7d3a82a, this session's start):
     # an earlier fleet land grew stream() +6 without re-freezing it on its
     # merge result — the same "landed without measuring the ratchet" failure
@@ -168,7 +172,10 @@ FROZEN_FILE_LINES = {
     # the attempt-scoped artifact writer + display-path helper, the runtime
     # body-budget trim, and both rounds' anchored docstrings. Measured on the
     # D1.1 squash-merge result (re-anchored on merge, per this file's note).
-    "core/orchestrator.py": 20029,
+    # 20029 -> 20263 (+234): D1.2 (visual proof) — `_maybe_capture_ui_evidence`
+    # + `_deliver_ui_evidence` + the media-section renderer and their anchored
+    # docstrings. Measured on the D1.2 cherry-pick result with the scanner below.
+    "core/orchestrator.py": 20263,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -248,7 +255,9 @@ FROZEN_FILE_LINES = {
     # reload-verify and restore-on-failure), the _CONCURRENCY_HEADER_RE /
     # _splice_concurrency_scalar plumbing, and the concurrency config section.
     # Re-anchored in the same session it landed.
-    "config.py": 3240,
+    # +41: D1.2's `ui_evidence_should_run` (the diff-aware default) plus its
+    # docstring and the `UI_EVIDENCE_DEFAULT_GLOBS` constant.
+    "config.py": 3281,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

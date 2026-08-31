@@ -1161,8 +1161,15 @@ def ui_evidence_block(profile: Any) -> str:
     prompt prefix alongside ``build_profile_block``.
 
     The promise this text makes to the coder — that the harness runs the
-    walk after tests pass — is made true by part 2's attempt-time run step;
-    on this branch (part 1) that step is not wired.
+    walk after tests pass — is true as of D1.2 (2026-08-31):
+    `Orchestrator._maybe_capture_ui_evidence` runs `testing/ui_evidence.py`'s
+    `run()` from `_finalize`, once tests have passed, gated on the diff (not
+    the plan this block itself gates on — see that method's docstring for
+    why the two checks differ) actually touching UI paths. What it captures
+    is delivered on a side branch (`nh-evidence/<task-id>`, never the task
+    branch itself — a squash-land would carry an unclassified directory
+    committed there straight into main) and, on a GitHub remote, embedded
+    directly in the PR body as images plus a video link.
     """
     if not profile:
         return ""
@@ -1173,16 +1180,20 @@ def ui_evidence_block(profile: Any) -> str:
     ready_path = str(ui.get("ready_path", "/"))
     return (
         "UI EVIDENCE — this attempt touches UI code. After your tests pass, "
-        "the harness will start the app itself, wait for it to be ready at "
-        f"{base_url}{ready_path}, and drive a real browser through a walk "
-        "YOU define — write `.no_human/ui_evidence.json` (never committed) "
-        'as {"base_url": "...", "steps": [...]}, where each step is one of '
+        "the harness probes "
+        f"{base_url}{ready_path} once and, if a server answers there, "
+        "drives a real headless browser through a walk YOU define — write "
+        '`.no_human/ui_evidence.json` (never committed) as {"base_url": '
+        '"...", "steps": [...]}, where each step is one of '
         "goto/wait_for/click/fill/press/assert_text/shot (in order); use "
-        "`shot` at any point worth capturing. The harness runs this walk, "
-        "not you — it records whatever the page actually shows (screenshots, "
-        "a video, console errors) as evidence on the PR, proving nothing "
-        "beyond what each screenshot shows. Skipping this file means no "
-        "walk runs and no UI evidence is attached; either way this never "
+        "`shot` at any point worth capturing. The harness does NOT start "
+        "your dev server for you — leave it running at that base_url when "
+        "your tests finish, or the walk reports NOT RUN and nothing is "
+        "attached. When it runs, it records whatever the page actually "
+        "shows (screenshots, a video, console errors) — proving nothing "
+        "beyond what each screenshot shows — and delivers them on a "
+        "separate branch, embedded directly in the PR body. Skipping the "
+        "manifest file means no walk runs either; either way this never "
         "blocks the attempt.\n\n"
     )
 

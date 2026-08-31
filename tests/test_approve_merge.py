@@ -624,6 +624,56 @@ def test_manifest_reset_classification_preserved(land_env):
     assert classification == branch_classification
 
 
+def test_squash_lands_an_nh_evidence_directory_committed_on_the_branch(land_env):
+    """D1.2 DECISION GATE (step 1, planted red case): does a `.nh-evidence/
+    <task-id>/` directory committed ON THE TASK BRANCH survive `land_task`'s
+    squash onto main?
+
+    Read the code first: step 3 (`squash`, `git merge --squash <branch>`)
+    stages the branch's FULL diff into the worktree's index BEFORE step 4
+    (`manifest`) ever runs `export_guard.py`. Step 4 only ADDS
+    RELEASE_MANIFEST.txt and the re-approved ship-classified paths on top
+    (`git add -- RELEASE_MANIFEST.txt` and `git add -A -- shipped_changed`)
+    — it never unstages or filters what the squash already staged. Step 5
+    then runs a plain `git commit` with no pathspec, committing whatever is
+    currently staged. So an UNCLASSIFIED directory added on the branch (one
+    that matches no `ship`/`drop` rule in EXPORT_CLASSIFICATION.txt, exactly
+    the shape a `.nh-evidence/` directory would have) rides the squash
+    straight into the landed commit — nothing in the procedure ever
+    filters it back out.
+
+    This test proves that reading empirically, with a real git squash
+    against a real fixture repo (not just a code-reading argument): plant a
+    `.nh-evidence/<task-id>/x` file on a branch, land it, and check whether
+    it appears in the landed commit's tree.
+
+    RULING (recorded here, not just in the D1.2 report, so a future change
+    that alters this behavior fails a real test rather than going unnoticed):
+    the directory DOES leak into main. Committing evidence directly on the
+    task branch is therefore not a safe delivery mechanism — D1.2 uses a
+    side branch (`nh-evidence/<task-id>`, pushed alongside the PR, deleted
+    on close) instead of committing evidence on the task branch itself.
+    """
+    branch, head_sha = land_env.cut_branch(
+        "no-human/t-nh-evidence-leak",
+        extra_files={".nh-evidence/deadbeef/final.png": "not a real png, just a probe"},
+    )
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert result.ok, result.stderr
+    names = _git(land_env.origin, "show", "--name-only", "--format=",
+                 result.landed_sha).stdout.split()
+    assert ".nh-evidence/deadbeef/final.png" in names, (
+        "premise check FAILED: `.nh-evidence/` did NOT survive the squash "
+        "in this run. If this genuinely reproduces, the D1.2 ruling above "
+        "is stale and the delivery mechanism should be reconsidered — do "
+        "not silently accept this branch flipping without re-reading "
+        "vcs/approve_merge.py's squash/manifest steps.")
+
+
 def _commit_identity(land_env, sha) -> tuple[str, str]:
     out = _git(land_env.origin, "show", "-s", "--format=%an%x09%ae", sha).stdout.strip()
     name, _, email = out.partition("\t")

@@ -1,0 +1,306 @@
+"""D1.2 attempt-integration test: after tests pass on a task whose diff
+touches `web/`, the harness actually invokes `testing/ui_evidence.py`'s
+`run()` (the wiring `tests/test_ui_evidence_prompt.py`'s part-1 absence pin
+used to guarantee did NOT exist), delivers the captured shots + video to a
+side branch (never the task branch itself — see the D1.2 decision-gate test
+in `tests/test_approve_merge.py`), and embeds them in the PR body. A task
+whose diff never touches a UI path gets none of this.
+
+Real git end-to-end (bare origin + a working clone), a fake coding backend
+(no LLM spend), and a fake `ui_evidence.run` (no real browser/Playwright) —
+the same harness shape as `tests/test_e2e_orchestrator.py`, trimmed to only
+what this hook needs. `open_pr` is faked (mirrors that file's `0a` tests) so
+no real `gh` call is made; `GitRepo.remote_url` is faked to a github.com URL
+so the raw-image-embed path (github.com only, by design) is exercised for
+real, while the actual git push/branch-create/commit run against the real
+local bare repo underneath it.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from no_human.agent.claude_backend import AgentEvent, AgentResult
+from no_human.config import load_config
+from no_human.core import orchestrator as orch_mod
+from no_human.core.db import Store
+from no_human.core.orchestrator import Orchestrator
+from no_human.core.task import Task, TaskStatus
+from no_human.notify.slack import SlackNotifier
+from no_human.testing import ui_evidence
+from no_human.vcs import PrResult
+from no_human.vcs.git import GitRepo
+
+
+def _git(cwd, *args, check=True):
+    return subprocess.run(
+        ["git", "-c", "user.email=t@t.t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=str(cwd), capture_output=True, text=True, check=check,
+    )
+
+
+@pytest.fixture
+def repo_env(tmp_path):
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+
+    work = tmp_path / "work"
+    _git(tmp_path, "init", "-q", "-b", "main", str(work))
+    (work / "web").mkdir()
+    (work / "web" / "App.jsx").write_text("export default function App() { return null; }\n")
+    (work / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (work / "test_calc.py").write_text(
+        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    )
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "init")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-q", "origin", "main")
+    return {"origin": origin, "work": work, "tmp_path": tmp_path}
+
+
+@pytest.fixture
+async def store(tmp_path):
+    s = await Store(tmp_path / "nh.db").connect()
+    yield s
+    await s.close()
+
+
+class FakeBackend:
+    def __init__(self, mutate):
+        self.mutate = mutate
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        if on_event:
+            on_event(AgentEvent("tool_use", tool_name="Edit",
+                                tool_input={"file_path": "calc.py"}))
+        self.mutate(cwd)
+        return AgentResult(final_text="done", num_turns=2, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+def _config(tmp_path):
+    cfg = load_config(tmp_path / "config.yaml")
+    cfg.data.setdefault("planning", {})["enabled"] = False
+    cfg.data.setdefault("reviewer", {})["allow_advisory"] = True
+    cfg.data.setdefault("blockers", {})["challenge"] = False
+    cfg.data["isolation"]["enabled"] = False  # repo IS repo_env["work"]
+    return cfg
+
+
+def _fake_open_pr(url="https://github.com/acme/widget/pull/1"):
+    opens = []
+
+    def fake_open_pr(repo, branch, title, body, **kwargs):
+        opens.append({"body": body, "branch": branch})
+        return PrResult(url=url, kind="github", branch=branch, pushed_sha=repo.head_sha())
+
+    return fake_open_pr, opens
+
+
+def _fake_ui_evidence_run(calls, shots=("loaded", "final"), video="walk.webm"):
+    async def fake_run(repo_path, out_dir, **kwargs):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        calls.append({"repo_path": Path(repo_path), "out_dir": out_dir})
+        shot_dicts = []
+        for name in shots:
+            (out_dir / f"{name}.png").write_bytes(b"\x89PNGDATA" + name.encode())
+            shot_dicts.append({"name": name, "path": f"{name}.png", "step_index": 0})
+        if video:
+            (out_dir / video).write_bytes(b"WEBMDATA")
+        return ui_evidence.UiEvidenceResult(
+            verdict="ran", shots=shot_dicts, video=video,
+            steps_run=len(shots), steps_total=len(shots),
+        )
+
+    return fake_run
+
+
+async def test_ui_touching_diff_invokes_the_walk_and_embeds_the_pr_media(
+        repo_env, tmp_path, store, monkeypatch):
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"x\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": "http://127.0.0.1:5173", "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    # The walk actually ran, against THIS attempt's own repo checkout.
+    assert len(calls) == 1, f"expected exactly one ui_evidence.run() call, got {calls}"
+    assert calls[0]["repo_path"] == repo_env["work"]
+
+    # Delivered on a SIDE branch, never the task branch: the D1.2 ruling,
+    # checked here against a real git remote rather than merely asserted.
+    evidence_branch = f"nh-evidence/{t.id}"
+    branches = _git(repo_env["origin"], "branch", "--list").stdout
+    assert evidence_branch in branches, branches
+    names = _git(repo_env["origin"], "ls-tree", "-r", "--name-only",
+                evidence_branch).stdout
+    assert f".nh-evidence/{t.id}/loaded.png" in names, names
+    assert f".nh-evidence/{t.id}/final.png" in names, names
+    assert f".nh-evidence/{t.id}/walk.webm" in names, names
+
+    # The task branch itself never carries the evidence directory. Checked
+    # against the LOCAL clone's object database, not origin: `open_pr` is
+    # faked here (no `gh` in this test environment), so the task branch's
+    # own push never happens — only `_deliver_ui_evidence`'s side-branch
+    # push is real, which is exactly the mechanism under test.
+    task_branch = opens[-1]["branch"]
+    task_names = _git(repo_env["work"], "ls-tree", "-r", "--name-only",
+                      task_branch).stdout
+    assert ".nh-evidence" not in task_names, task_names
+
+    # The PR body embeds the media, via github.com raw URLs on the evidence
+    # branch — never an absolute local filesystem path.
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    expected_prefix = (
+        f"https://raw.githubusercontent.com/acme/widget/{evidence_branch}/"
+        f".nh-evidence/{t.id}/")
+    assert f"![loaded]({expected_prefix}loaded.png)" in body, body
+    assert f"[walk video]({expected_prefix}walk.webm)" in body, body
+
+    # The working tree is left on the task branch, not stranded on the side
+    # branch, once the attempt finishes.
+    assert _git(repo_env["work"], "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() \
+        == task_branch
+
+
+async def test_non_ui_diff_never_invokes_the_walk_or_adds_a_media_section(
+        repo_env, tmp_path, store, monkeypatch):
+    def mutate(cwd):
+        (Path(cwd) / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (Path(cwd) / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+        # No `.no_human/ui_evidence.json` manifest either — a non-UI task
+        # would not have been shown the coder prompt block that suggests one.
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert calls == [], f"ui_evidence.run() must not run for a non-UI diff: {calls}"
+    branches = _git(repo_env["origin"], "branch", "--list").stdout
+    assert f"nh-evidence/{t.id}" not in branches, branches
+    assert "## UI evidence" not in opens[-1]["body"], opens[-1]["body"]
+
+
+async def test_a_second_attempts_delivery_does_not_lose_evidence_to_a_non_fast_forward(
+        repo_env, tmp_path, store, monkeypatch):
+    """`_deliver_ui_evidence` recreates `nh-evidence/<task-id>` from the task
+    branch's CURRENT tip every call (`create_branch` is `checkout -B`) — a
+    task's second attempt produces history unrelated to the first under the
+    SAME branch name. A plain push would be a non-fast-forward rejection on
+    every retry, silently losing evidence from attempt 2 onward (caught by
+    `_deliver_ui_evidence`'s own `except Exception`, so nothing crashes —
+    the delivery just quietly returns no evidence). `force_with_lease` on
+    that push is what this test pins directly, calling the delivery method
+    twice against the same real repo without going through a full attempt."""
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    repo = GitRepo(repo_env["work"])
+    task_id = "cafef00d00000000"
+
+    out_dir1 = ui_evidence.default_out_dir(task_id)
+    (out_dir1 / "loaded.png").write_bytes(b"FIRST-ATTEMPT")
+    section1 = orch._deliver_ui_evidence(
+        repo, task_id, out_dir1,
+        ui_evidence.UiEvidenceResult(verdict="ran",
+                                     shots=[{"name": "loaded", "path": "loaded.png"}]),
+    )
+    assert section1, "the first attempt's delivery must succeed"
+
+    out_dir2 = ui_evidence.default_out_dir(task_id)
+    (out_dir2 / "loaded.png").write_bytes(b"SECOND-ATTEMPT")
+    section2 = orch._deliver_ui_evidence(
+        repo, task_id, out_dir2,
+        ui_evidence.UiEvidenceResult(verdict="ran",
+                                     shots=[{"name": "loaded", "path": "loaded.png"}]),
+    )
+    assert section2, (
+        "the second attempt's re-delivery must not be silently lost to a "
+        "non-fast-forward push rejection")
+
+    evidence_branch = f"nh-evidence/{task_id}"
+    content = _git(repo_env["origin"], "show",
+                   f"{evidence_branch}:.nh-evidence/{task_id}/loaded.png").stdout
+    assert content == "SECOND-ATTEMPT", (
+        "the branch must reflect the LATEST attempt's content, not be stuck "
+        f"on the first: {content!r}")
+    assert _git(repo_env["work"], "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() \
+        == "main", "the working tree must be back on the original branch"
+
+
+async def test_ui_touching_diff_with_no_manifest_written_skips_the_walk(
+        repo_env, tmp_path, store, monkeypatch):
+    """The gate is the DIFF (web/**), but `ui_evidence.run()` is only worth
+    calling when the coder actually left a manifest — see
+    `_maybe_capture_ui_evidence`'s cheap early-out."""
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"y\" />; }\n"
+        )
+        # UI file touched, but no `.no_human/ui_evidence.json` written.
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("tweak the UI, no walk", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["it renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert calls == [], f"no manifest was written; run() must not be called: {calls}"
+    assert "## UI evidence" not in opens[-1]["body"], opens[-1]["body"]

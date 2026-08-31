@@ -204,8 +204,31 @@ def is_fixture_content(path: str) -> bool:
     return bool(_FIXTURE_CONTENT_RE.search(path))
 
 
+# D1.2's UI-evidence delivery directory (`Orchestrator._deliver_ui_evidence`):
+# screenshots + a walk video the HARNESS writes to a `.nh-evidence/<task-id>/`
+# side branch after tests pass — never test source, and never on the branch
+# this guard actually diffs (the side branch is a separate ref that never
+# merges). Root-anchored (`^`), like `_FIXTURE_CONTENT_RE` above: the delivery
+# always writes to `<repo-root>/.nh-evidence/<task-id>/`, never nested, so a
+# lookalike an agent parks deeper in the tree (`vendor/.nh-evidence/...`) is
+# NOT exempted — the shape is this module's own writer's actual output, not a
+# bare substring. None of a `.png`/`.webm` under a task-id directory
+# realistically matches `_TEST_FILE_RE` today, but a coder-chosen shot NAME is
+# otherwise unconstrained (`ui_evidence.py`'s `_SHOT_RE` permits `test-flow`,
+# `e2e-2`, ...), and this module's own `is_fixture_content` exists because a
+# path shape nobody excluded silently diluted the tamper count once already
+# (see its comment block). Excluded explicitly and tested, not left to an
+# accident of today's filenames.
+_NH_EVIDENCE_RE = re.compile(r"^\.nh-evidence/")
+
+
+def is_nh_evidence_content(path: str) -> bool:
+    """True for D1.2's UI-evidence delivery directory."""
+    return bool(_NH_EVIDENCE_RE.search(path))
+
+
 def is_test_file(path: str) -> bool:
-    if is_fixture_content(path):
+    if is_fixture_content(path) or is_nh_evidence_content(path):
         return False
     return bool(_TEST_FILE_RE.search(path))
 

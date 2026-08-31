@@ -41,6 +41,7 @@ import json
 import os
 import re
 import struct
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -65,6 +66,25 @@ _MAX_CONSOLE = 50
 _CONSOLE_CHARS = 300
 _DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
 _FINAL_SHOT_TIMEOUT_S = 10.0
+
+
+def default_out_dir(task_id: str) -> Path:
+    """A fresh scratch directory for one `run()` call's raw artifacts
+    (shots, video, `manifest.json`/`console.json`/`result.json`) — never
+    inside the target repo (this module's docstring: "never touches
+    ``~/.no_human``"; a caller does not need it to, either — it is a plain
+    OS temp directory, cleaned up by the caller once it has read back
+    whatever it wants to keep, e.g. `core/orchestrator.py`'s attempt-time
+    delivery step, which copies out only the specific shot/video files it
+    is about to commit elsewhere and never trusts this directory to
+    persist).
+
+    Centralized here (D1.2) rather than left to each caller's own
+    `tempfile.mkdtemp` call so there is exactly one place that decides the
+    naming convention — a caller can still pass any `out_dir` it likes
+    directly to :func:`run`; this is a convenience, not a requirement.
+    """
+    return Path(tempfile.mkdtemp(prefix=f"nh-ui-evidence-{task_id[:8]}-"))
 
 
 @dataclass(frozen=True)

@@ -71,6 +71,21 @@ per attempt) and still says so when a cap bit, and it still ends with six
 sentences on what it cannot attest — the full list is below; only its
 LOCATION moved.
 
+**UI evidence** — present only on a task whose diff touched `web/`/`desktop/`
+(or a repo-declared `ui_evidence.ui_paths` glob) AND left a coder-authored
+`.no_human/ui_evidence.json` walk. After tests pass, the harness (never the
+coder) drives a real headless browser through that walk and, when it captured
+at least one screenshot, delivers everything to a `nh-evidence/<task-id>`
+SIDE branch — never the task branch itself (`git merge --squash` would carry
+an unclassified directory on the task branch straight into main). On a
+GitHub remote, up to 6 screenshots are embedded inline via that branch's raw
+URLs, plus one video link; on any other remote the branch is still pushed
+(so a human can look directly) but nothing embeds — building a raw-content
+URL for GitLab or a GitHub Enterprise host is out of scope today. This
+section is exempt from the 6,000-visible-character body budget above: it is
+capped on its own terms (≤6 shots + 1 video link), not folded against
+`## Changes`.
+
 **Footer** — attempt number, branch pair, and the standing rule: no_human
 never merges. A human reviews and merges, or runs `nh approve <task>`.
 

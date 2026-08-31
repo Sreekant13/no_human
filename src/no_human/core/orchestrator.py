@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import quote as _url_quote
 
 from ..agent.advisory import advisory_backend
 from ..agent.backend import AgentEvent, CodingBackend, resolve_backend_name
@@ -77,7 +78,7 @@ from ..blockers import (
     user_pause_blocker,
 )
 from ..ci.base import CIResult, HumanGatedCI
-from ..config import NO_HUMAN_HOME, active_auth_profile
+from ..config import NO_HUMAN_HOME, active_auth_profile, ui_evidence_should_run
 from ..history.skills import discover_skills
 from ..intake.classify import kind_criteria_mismatch
 from ..intake.split_proposal import generate_split_proposal
@@ -103,7 +104,7 @@ from ..review.verifiers import (
     summary_line as verifiers_summary_line,
     to_checklist_item as verifier_to_checklist_item,
 )
-from ..testing import ownership, runner
+from ..testing import ownership, runner, ui_evidence
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
 from .prompt_blocks import (
@@ -6408,6 +6409,18 @@ class Orchestrator:
         verification_artifact_path = self._write_verification_artifact(
             task, receipts, attempt_n=attempt_n, test_evidence=test_evidence,
             observable=self._backend_is_observable())
+        # D1.2: visual proof. Tests have already passed by this point (the
+        # only path into `_finalize`) — the one moment `prompt_blocks.
+        # ui_evidence_block`'s promise to the coder ("after your tests pass,
+        # the harness will ... drive a real browser") can actually be kept.
+        # Best-effort like every other evidence block in this method: a
+        # failure here is advisory and must never cost the PR.
+        ui_evidence_section = ""
+        try:
+            ui_evidence_section = await self._maybe_capture_ui_evidence(
+                task, repo, branch, base)
+        except Exception as exc:  # noqa: BLE001 — evidence never blocks delivery
+            self._advisory(f"UI evidence not captured: {exc}")
         # Merge-ready policy verdict (core/merge_policy.py) — computed ONCE
         # here from a single `_gather_evidence` call, folded into that SAME
         # `PrEvidence` object, and threaded into `_pr_body` via its
@@ -6512,7 +6525,8 @@ class Orchestrator:
                              repo=repo, base=base, branch=branch,
                              attempt_n=attempt_n, merge_policy=merge_policy_dict,
                              evidence=policy_evidence,
-                             verification_artifact_path=verification_artifact_path)
+                             verification_artifact_path=verification_artifact_path,
+                             ui_evidence_section=ui_evidence_section)
         # Refresh the body only if THIS TASK opened the draft that is sitting on THIS
         # branch. Durable (task.context), so it survives a park/resume and a process
         # restart; branch-scoped, so a revision onto a different branch cannot inherit it.
@@ -18746,6 +18760,7 @@ SIX of them read a checkpoint and TWO do not — but do
         merge_policy: dict | None = None,
         evidence: PrEvidence | None = None,
         verification_artifact_path: str = "",
+        ui_evidence_section: str = "",
     ) -> str:
         # Short and to the point: no boilerplate, no product name, no verbose
         # dump. The title is the PR title; the body is criteria + a brief summary
@@ -18840,7 +18855,7 @@ SIX of them read a checkpoint and TWO do not — but do
         def _assemble(changes_text: str) -> str:
             return (f"{ticket_line}{evidence_section}{criteria_block}"
                     f"## Changes\n{changes_text}\n\n{assumptions}{superseded}"
-                    f"{verification}{footer}")
+                    f"{verification}{ui_evidence_section}{footer}")
 
         body = _assemble(self._summary_section(result))
         # D1.1's hard size budget, ENFORCED — not merely asserted by a test
@@ -18851,8 +18866,13 @@ SIX of them read a checkpoint and TWO do not — but do
         # and the one section left that this run actually authored freely —
         # `## Changes` — is the only one ever trimmed for it. Evidence,
         # criteria and the verification pointer are NEVER touched here.
+        # `ui_evidence_section` (D1.2) is ALSO excluded — the controller's
+        # ruling was that visual proof lives outside this budget entirely
+        # (it is capped on its own terms: <=6 shots + 1 video link), so its
+        # length is subtracted out here rather than counted against Changes.
         _BODY_BUDGET = 6000
-        non_criteria_visible = visible_chars(body) - len(criteria_block)
+        non_criteria_visible = (
+            visible_chars(body) - len(criteria_block) - len(ui_evidence_section))
         if non_criteria_visible > _BODY_BUDGET:
             over = non_criteria_visible - _BODY_BUDGET
             marker = "_(trimmed further to keep the PR body under its size budget)_"
@@ -19483,6 +19503,220 @@ SIX of them read a checkpoint and TWO do not — but do
         "CI, and the independent review are separate signals - this section "
         "covers only the coder session's own commands",
     )
+
+    #: The coder-facing manifest promises "up to `_MAX_SHOTS`" (12) shots;
+    #: the PR BODY caps embedded images tighter than that — a body is read
+    #: at a glance, not scrolled through like the branch it links to.
+    _UI_EVIDENCE_MAX_EMBEDDED_SHOTS = 6
+
+    #: `owner/repo` from a github.com remote, https or ssh form, optional
+    #: `.git` suffix and trailing slash. GitHub Enterprise hosts (`git.
+    #: github_hosts`) are recognized as GitHub for PR purposes elsewhere in
+    #: this file, but their raw-content URL shape differs (and varies by
+    #: GHE version) — out of scope here, so a GHE remote gets no embedded
+    #: images, same as GitLab or a local/bare remote (`_pr_body`'s media
+    #: section is simply "" for all three; the evidence branch itself is
+    #: still pushed, so a human can still look at it directly).
+    _GITHUB_HTTPS_RE = re.compile(
+        r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+    _GITHUB_SSH_RE = re.compile(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$")
+
+    @classmethod
+    def _github_owner_repo(cls, remote_url: str) -> "tuple[str, str] | None":
+        for rx in (cls._GITHUB_HTTPS_RE, cls._GITHUB_SSH_RE):
+            m = rx.match((remote_url or "").strip())
+            if m:
+                return m.group(1), m.group(2)
+        return None
+
+    async def _maybe_capture_ui_evidence(
+        self, task: Task, repo: "GitRepo", branch: str, base: str | None,
+    ) -> str:
+        """D1.2: after tests pass, run the coder-authored browser walk
+        (`testing/ui_evidence.py`) for real and return a rendered PR-body
+        media section — "" for every case where there is nothing to show
+        (non-UI change, no manifest, unreachable dev server, no shots).
+
+        Gating is `config.ui_evidence_should_run`: the diff vs *base* (best-
+        effort; an unreadable diff reads as "no UI paths touched", the same
+        fail-closed direction `_safe_changed_files` already takes for CI
+        triage) plus the confirmed profile's own `ui_paths` globs, if any.
+        This is deliberately a SEPARATE decision from the coder-prompt gate
+        in `_build_implement_prompt` (which looks at the PLANNED files
+        before the coder starts) — this one looks at what the coder
+        actually changed, the only signal that exists at this point in the
+        attempt.
+
+        Never raises (the caller wraps this too, but every failure inside
+        is also caught locally so one bad shot can't cost the others).
+        """
+        try:
+            changed_paths = repo.changed_files(base or "HEAD~1")
+        except Exception:  # noqa: BLE001 — fail closed: no evidence of UI work
+            changed_paths = []
+        prof = getattr(self, "_active_profile", None)
+        ui_conf = getattr(prof, "ui_evidence", None) if prof else None
+        extra_globs = list((ui_conf or {}).get("ui_paths") or [])
+        if not ui_evidence_should_run(self.config, changed_paths, extra_globs=extra_globs):
+            return ""
+
+        manifest_path = Path(repo.path) / ui_evidence.MANIFEST
+        if not manifest_path.is_file():
+            # The coder never wrote a walk — `ui_evidence.run` would say so
+            # too (verdict "not_run", reason "no manifest"), but skipping
+            # the temp dir + subprocess dance entirely here is cheaper and
+            # every bit as honest: nothing ran, nothing to report.
+            return ""
+
+        out_dir = ui_evidence.default_out_dir(task.id)
+        try:
+            result = await ui_evidence.run(Path(repo.path), out_dir)
+        except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
+            # "never raises", but this call site does not re-derive that
+            # promise; it fails the same way every other evidence gather here
+            # does — advisory, never a reason the PR doesn't ship.
+            self._advisory(f"ui evidence run raised: {exc}")
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return ""
+
+        if not result.shots:
+            # `not_run` (no reachable dev server, bad manifest) or a `failed`
+            # walk that broke before its first shot — nothing to embed.
+            # `result.reason` already reaches `nh logs`/the walk's own
+            # `result.json`; repeating it in the PR body is not this
+            # section's job (mirrors `_verification_section` staying silent
+            # rather than growing a NOT-RUN row for every possible gate).
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return ""
+
+        try:
+            return self._deliver_ui_evidence(repo, task.id, out_dir, result)
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    def _deliver_ui_evidence(
+        self, repo: "GitRepo", task_id: str, out_dir: Path,
+        result: "ui_evidence.UiEvidenceResult",
+    ) -> str:
+        """Commit the captured shots + video to a SIDE branch
+        (`nh-evidence/<task_id>`), push it, and return the rendered media
+        section — "" on any delivery failure.
+
+        NOT a commit on the task branch itself. D1.2's own decision-gate
+        test (`tests/test_approve_merge.py::
+        test_squash_lands_an_nh_evidence_directory_committed_on_the_branch`)
+        proved empirically that `vcs/approve_merge.py`'s squash-land carries
+        an unclassified directory on the task branch straight into main —
+        `git merge --squash` stages the branch's full diff before
+        export-guard classification ever runs, and nothing downstream
+        unstages what it staged. A side branch never enters that squash at
+        all, so it can never leak.
+
+        The working tree is left exactly as `repo.current_branch()` found
+        it: this checks out a NEW branch from the task branch's tip, commits
+        the evidence there, pushes, and checks back out to the original
+        branch in a `finally` — a later step in `_finalize` (the real push,
+        `open_pr`) must see the task branch, not this one.
+        """
+        try:
+            original_branch = repo.current_branch()
+        except Exception as exc:  # noqa: BLE001
+            self._advisory(f"ui evidence not delivered: {exc}")
+            return ""
+
+        evidence_branch = f"nh-evidence/{task_id}"
+        dest_root = Path(repo.path) / ".nh-evidence" / task_id
+        committed_paths: list[str] = []
+        delivered_names: list[dict] = []
+        video_name: str | None = None
+        try:
+            repo.create_branch(evidence_branch, base=original_branch)
+            dest_root.mkdir(parents=True, exist_ok=True)
+            for shot in result.shots:
+                rel = shot.get("path") if isinstance(shot, dict) else None
+                if not rel:
+                    continue
+                src = out_dir / rel
+                if not src.is_file():
+                    continue
+                dst = dest_root / rel
+                dst.write_bytes(src.read_bytes())
+                committed_paths.append(str(dst))
+                delivered_names.append({"name": shot.get("name", rel), "path": rel})
+            if result.video:
+                src = out_dir / result.video
+                if src.is_file():
+                    dst = dest_root / result.video
+                    dst.write_bytes(src.read_bytes())
+                    committed_paths.append(str(dst))
+                    video_name = result.video
+            if not committed_paths:
+                return ""
+            # Through `commit_with_manifest_repair`, NEVER a raw
+            # `repo.commit_paths(...)`: `tests/test_checkpoint_commit_seam.py`
+            # statically enforces that every commit call in this file funnels
+            # through the one manifest-repair-aware seam (`_checkpoint_commit`
+            # for `[WIP-*]` checkpoints; this direct call for everything
+            # else), so a delivery that lands on an ALREADY-pinned path (e.g.
+            # a repo whose export guard classifies `.nh-evidence/**` as ship,
+            # unlike this product's own) survives the gate's retry instead of
+            # silently losing the commit to a raw refusal.
+            commit_with_manifest_repair(
+                repo, committed_paths, f"UI evidence for {task_id[:8]}",
+                on_repair=lambda paths, note: self._advisory(
+                    f"ui evidence branch: manifest repaired for {paths} ({note})"),
+            )
+            # `force_with_lease`, not a plain push: `evidence_branch` is
+            # recreated from the task branch's CURRENT tip every call
+            # (`create_branch` above is `checkout -B`, resetting the local
+            # ref), so a task's SECOND attempt produces unrelated history
+            # under the SAME branch name — a plain push is a non-fast-
+            # forward rejection every retry, silently losing evidence from
+            # attempt 2 onward. Safe to force unconditionally: this branch
+            # is written by nothing but this method, on every task, so there
+            # is never a human or another attempt's commit on it to lose.
+            repo.push(branch=evidence_branch, force_with_lease=True)
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            self._advisory(f"ui evidence delivery failed: {exc}")
+            return ""
+        finally:
+            with contextlib.suppress(Exception):
+                repo.checkout(original_branch)
+
+        try:
+            remote_url = repo.remote_url() or ""
+        except Exception:  # noqa: BLE001
+            remote_url = ""
+        owner_repo = self._github_owner_repo(remote_url)
+        if owner_repo is None:
+            # The branch is pushed and real either way — only the inline
+            # image embed needs a GitHub raw-content URL to build.
+            return ""
+        owner, repo_name = owner_repo
+        raw_base = (f"https://raw.githubusercontent.com/{owner}/{repo_name}/"
+                    f"{_url_quote(evidence_branch, safe='/')}")
+
+        def _raw_url(rel_path: str) -> str:
+            return f"{raw_base}/{_url_quote(f'.nh-evidence/{task_id}/{rel_path}', safe='/')}"
+
+        lines = [
+            "## UI evidence",
+            "The harness drove a real headless browser through the coder's "
+            "`.no_human/ui_evidence.json` walk after this attempt's tests "
+            f"passed ({ui_evidence.summary_line(result)}). Screenshots and "
+            f"the walk video are committed to the `{evidence_branch}` "
+            "branch — proof of what the page rendered at each step, "
+            "nothing more.\n",
+        ]
+        shown = delivered_names[: self._UI_EVIDENCE_MAX_EMBEDDED_SHOTS]
+        for shot in shown:
+            lines.append(f"![{shot['name']}]({_raw_url(shot['path'])})")
+        omitted = len(delivered_names) - len(shown)
+        if omitted > 0:
+            lines.append(f"_(+{omitted} more shot(s) on `{evidence_branch}`)_")
+        if video_name:
+            lines.append(f"[walk video]({_raw_url(video_name)})")
+        return "\n".join(lines) + "\n\n"
 
     #: Directory name every task's written artifacts (this section's full
     #: verification log today) live under, inside `NO_HUMAN_HOME` — never

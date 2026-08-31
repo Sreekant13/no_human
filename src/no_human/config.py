@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import ctypes
+import fnmatch
 import ipaddress
 import logging
 import math
@@ -1705,10 +1706,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "advisory",
     },
     # UI evidence (testing/ui_evidence.py): the harness drives a real browser
-    # at the attempt's own dev server from a coder-written walk manifest.
-    # OFF by default — it is a per-repo opt-in, and the egress allowlist
-    # charges the browser channel against this key.
-    "ui_evidence": {"enabled": False},
+    # at the attempt's own dev server from a coder-written walk manifest,
+    # after this attempt's tests pass (D1.2, 2026-08-31). `enabled` is a
+    # three-state switch, read by `ui_evidence_should_run` below — the
+    # egress allowlist charges the browser channel against this key. `None`
+    # (the default) means "decide per attempt from the diff": ON for a
+    # change that touches `web/**`/`desktop/**` (or a repo-declared
+    # `ui_paths` glob), OFF otherwise. `True`/`False` are an operator's
+    # explicit override, forcing every attempt the same way regardless of
+    # the diff.
+    "ui_evidence": {"enabled": None},
     "tamper_adjudication": {
         # When the test-tampering guard fires, ask ONE fresh-context reviewer
         # whether the ticket REQUIRED those test changes, instead of ending the
@@ -2261,6 +2268,40 @@ def worktree_isolation_enabled(config: dict[str, Any]) -> bool:
 def parallelism_enabled(config: dict[str, Any]) -> bool:
     """True when more than one task may run at a time. Default FALSE."""
     return bool((config.get("concurrency") or {}).get("enabled", False))
+
+
+#: Paths the harness always treats as UI work, regardless of any per-repo
+#: profile — a bare install with no confirmed `ui_evidence.ui_paths` still
+#: gets the walk on the two conventional UI directories this product itself
+#: ships (`web/`, `desktop/`).
+UI_EVIDENCE_DEFAULT_GLOBS = ("web/**", "desktop/**")
+
+
+def ui_evidence_should_run(
+    config: dict[str, Any], changed_paths: list[str] | None = None,
+    *, extra_globs: "list[str] | tuple[str, ...]" = (),
+) -> bool:
+    """True when the harness should run the UI-evidence browser walk
+    (`testing/ui_evidence.py`) after this attempt's tests pass (D1.2).
+
+    ``ui_evidence.enabled`` is a three-state switch. Left at its default
+    (``None`` — see ``DEFAULT_CONFIG``), the decision follows the diff: ON
+    when *changed_paths* touches ``web/**`` or ``desktop/**`` (plus any
+    repo-declared ``ui_evidence.ui_paths`` globs the caller threads through
+    as ``extra_globs``), OFF otherwise — a change that never touches UI
+    code never pays for a browser launch. An operator who sets the key
+    explicitly (``True``/``False``) forces that answer for EVERY attempt
+    regardless of the diff: the master kill switch this feature needed
+    before it could run unattended (the egress allowlist cites this same
+    key as the browser channel's gate).
+    """
+    raw = (config.get("ui_evidence") or {}).get("enabled")
+    if raw is not None:
+        return bool(raw)
+    globs = tuple(UI_EVIDENCE_DEFAULT_GLOBS) + tuple(extra_globs or ())
+    return any(
+        fnmatch.fnmatch(p, g) for p in (changed_paths or []) for g in globs
+    )
 
 
 def worktree_root(config: dict[str, Any]) -> Path:

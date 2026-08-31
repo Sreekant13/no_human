@@ -667,6 +667,27 @@ def test_the_body_stays_under_the_6000_char_budget(store, tmp_path):
     assert visible_chars(body) <= 6000, visible_chars(body)
 
 
+def test_ui_evidence_media_section_is_excluded_from_the_body_budget(store, tmp_path):
+    """D1.2: the controller's ruling that visual proof lives OUTSIDE the
+    6,000-visible-char budget, exercised directly (the test this module's
+    own D1.1 comment above flagged as not yet covered). A media section big
+    enough to blow the budget on its own must still leave `## Changes`
+    UNTRIMMED — only `criteria_block` and `ui_evidence_section` are meant to
+    be subtracted before the comparison, so a media section by itself must
+    never trigger the trim marker."""
+    orch = _orch(store, tmp_path)
+    task, receipts, test_evidence = _two_run_fixture()
+    huge_media = "## UI evidence\n" + ("![shot](https://raw.githubusercontent.com/"
+                                       "acme/widget/nh-evidence/x/shot.png)\n" * 200)
+    assert len(huge_media) > 6000, "premise: the media section alone must exceed the budget"
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=receipts,
+                         ui_evidence_section=huge_media)
+    assert "(trimmed further to keep the PR body under its size budget)" not in body, (
+        "a media section alone must never trigger the Changes-section trim")
+    assert huge_media in body, "the full, untrimmed media section must reach the body"
+
+
 def test_the_short_section_carries_no_receipt_text(store, tmp_path):
     """The short section itself (not just the whole body) never embeds a
     receipt's command or output — direct unit-level pin, independent of the

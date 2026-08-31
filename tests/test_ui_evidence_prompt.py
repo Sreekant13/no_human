@@ -163,21 +163,16 @@ def test_enabled_but_missing_start_cmd_or_base_url_hides_the_block():
     assert _MARKER not in prompt
 
 
-def test_part1_does_not_wire_the_attempt_time_walk():
-    """Part 1 ships the profile key and the coder prompt block only — the
-    attempt-time browser walk (booting the app, polling for readiness,
-    running the manifest, recording an 'e2e' receipt) is part 2's, and is
-    not on this branch. The property under test is "no attempt-path handle
-    on the walk exists": no bound method on `Orchestrator` can start it, and
-    the module holds no reference to the runner it would call.
-
-    Part 2 deletes this test in the same commit that adds the step back.
-    """
+def test_part2_wires_the_attempt_time_walk():
+    """D1.2 ("part 2") replaces the part-1 absence pin above: the
+    attempt-time browser walk now has a real caller. `orchestrator_module.
+    ui_evidence` is the module `_maybe_capture_ui_evidence`/
+    `_deliver_ui_evidence` call `.run()`/`.default_out_dir()`/`.MANIFEST`
+    on — see tests/test_ui_evidence_attempt_hook.py for the behavioral
+    (not just hasattr) proof that it actually runs after tests pass."""
     from no_human.core import orchestrator as orchestrator_module
     from no_human.core.orchestrator import Orchestrator
 
-    assert not hasattr(Orchestrator, "_capture_ui_evidence")
-    assert not hasattr(Orchestrator, "_run_ui_evidence")
-    assert not hasattr(Orchestrator, "_wait_for_ui_ready")
-    assert not hasattr(Orchestrator, "_stop_ui_evidence_process")
-    assert not hasattr(orchestrator_module, "ui_evidence")
+    assert hasattr(Orchestrator, "_maybe_capture_ui_evidence")
+    assert hasattr(Orchestrator, "_deliver_ui_evidence")
+    assert hasattr(orchestrator_module, "ui_evidence")

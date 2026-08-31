@@ -666,6 +666,33 @@ async def test_run_writes_result_json_artifact(tmp_path, monkeypatch):
     assert console_on_disk == {"errors": []}
 
 
+# ─────────────────── D1.2: out_dir plumbing (default_out_dir) ─────────────── #
+
+
+def test_default_out_dir_is_fresh_writable_and_named_from_task_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    d1 = ui_evidence.default_out_dir("deadbeef12345678")
+    d2 = ui_evidence.default_out_dir("deadbeef12345678")
+    assert d1.is_dir() and d2.is_dir()
+    assert d1 != d2, "two calls for the same task must not collide"
+    assert "deadbeef" in d1.name
+    (d1 / "probe.txt").write_text("ok")
+    assert (d1 / "probe.txt").read_text() == "ok"
+
+
+async def test_default_out_dir_works_as_runs_out_dir(tmp_path, monkeypatch):
+    """`default_out_dir` is a convenience, not a requirement `run()` enforces
+    — a caller passing it through must see exactly the same behavior as any
+    other `out_dir`."""
+    monkeypatch.setattr(ui_evidence, "_reachable", lambda url: True)
+    write_manifest(tmp_path, VALID)
+    out_dir = ui_evidence.default_out_dir("cafebabe00000000")
+    page = FakePage()
+    result = await ui_evidence.run(tmp_path, out_dir, launch=make_launch(page))
+    assert result.verdict == "ran"
+    assert (out_dir / "result.json").is_file()
+
+
 # ─────────────── the readiness probe never follows a redirect ─────────────── #
 
 

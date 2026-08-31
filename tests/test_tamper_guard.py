@@ -707,6 +707,65 @@ def test_fixture_snapshots_do_not_dilute_a_real_reduction():
     assert r.tampered, f"a real reduction must survive 200 added fixture tests: {r}"
     assert any("tests/test_x.py" in x for x in r.reasons), r.reasons
 
+
+# --- D1.2: the UI-evidence delivery directory is not the project's own tests --
+#
+# `.nh-evidence/<task-id>/` is where `Orchestrator._deliver_ui_evidence` commits
+# screenshots + a walk video for D1.2's PR-body visual proof, on a side branch
+# that never merges. A coder-chosen shot NAME is otherwise unconstrained prose
+# (`ui_evidence.py`'s `_SHOT_RE` permits `test-flow`, `e2e-2`, ...), so this is
+# an explicit path-shape exclusion, same style as `is_fixture_content` above —
+# not left to an accident of today's filenames never happening to say "test".
+
+_NH_EVIDENCE_DIR = ".nh-evidence/deadbeef00000000"
+
+
+def test_nh_evidence_directory_is_excluded_by_path_shape_only():
+    assert tamper_guard.is_nh_evidence_content(f"{_NH_EVIDENCE_DIR}/final.png")
+    assert not tamper_guard.is_test_file(f"{_NH_EVIDENCE_DIR}/final.png")
+    assert not tamper_guard.is_test_file(f"{_NH_EVIDENCE_DIR}/walk.webm")
+    # The adversarial case: a shot NAME that looks test-shaped. `_SHOT_RE`
+    # permits this; it must still never be counted.
+    assert not tamper_guard.is_test_file(f"{_NH_EVIDENCE_DIR}/test-flow.png")
+    assert not tamper_guard.is_test_file(f"{_NH_EVIDENCE_DIR}/e2e-check.png")
+    assert not tamper_guard.is_test_file(
+        f"{_NH_EVIDENCE_DIR}/conftest.py")  # not real code either way
+
+    # Everything one step off the shape stays GUARDED.
+    still_guarded = [
+        # No leading dot: an ordinary directory, never blanket-excluded.
+        "nh-evidence/deadbeef/tests/test_x.py",
+        # The literal shape buried under another directory: anchored, not
+        # a free pass wherever it appears.
+        "vendor/.nh-evidence/deadbeef/tests/test_x.py",
+        # A lookalike prefix.
+        ".nh-evidence-extra/deadbeef/tests/test_x.py",
+        # The project's own tests, unchanged.
+        "tests/test_vcs.py",
+        "conftest.py",
+    ]
+    for path in still_guarded:
+        assert tamper_guard.is_test_file(path), f"expected still guarded: {path}"
+        assert not tamper_guard.is_nh_evidence_content(path), path
+
+
+def test_nh_evidence_directory_does_not_dilute_a_real_reduction():
+    """Same dilution hazard `is_fixture_content` closes, replayed for D1.2's
+    directory: a branch that adds a pile of `.nh-evidence/` shots alongside a
+    real test-count reduction must still be flagged tampered."""
+    real_before = "def test_a():\n    assert f()\n\ndef test_b():\n    assert g()\n"
+    real_after = "def test_a():\n    assert f()\n"          # one test, one assert gone
+
+    before = {"tests/test_x.py": real_before}
+    after = {
+        "tests/test_x.py": real_after,
+        f"{_NH_EVIDENCE_DIR}/step-0.png": "not source, just probe content\n" * 50,
+        f"{_NH_EVIDENCE_DIR}/step-1.png": "def test_padding():\n    assert True\n" * 50,
+    }
+    r = tamper_guard.check(before, after)
+    assert r.tampered, f"a real reduction must survive added .nh-evidence/ shots: {r}"
+    assert any("tests/test_x.py" in x for x in r.reasons), r.reasons
+
     # Closed, not moved: the aggregate must equal the no-fixture control exactly.
     control = tamper_guard.check(before, {"tests/test_x.py": real_after})
     assert (r.tests_before, r.tests_after) == (control.tests_before, control.tests_after)
