@@ -7,9 +7,14 @@ Two artifacts, two homes:
 | `no_human-<version>.dmg` (~145 MB) | the macOS desktop app, with the frozen `nh` server inside it | **GitHub Releases** | free, unmetered bandwidth, `electron-updater` speaks it natively |
 | `no_human-<version>-py3-none-any.whl` / `.tar.gz` (~1 MB) | the `nh` command line | **PyPI** (`pip install no-human`) | free, the only place `pip` looks |
 
-Nothing here has been published. Every build script passes `--publish never`,
-and `desktop/packagedFiles.test.mjs` fails the suite if one stops doing so.
-The exact publish commands are in [§5](#5-the-commands-that-actually-publish).
+Both artifacts have a real home today. Desktop releases are published on the
+public [`no-human-ai/no_human`](https://github.com/no-human-ai/no_human)
+GitHub Releases page — `README.md`'s release badge and download buttons point
+there. Every `electron-builder` invocation still passes `--publish never`
+(`desktop/packagedFiles.test.mjs`'s `"no script publishes anything"` test
+fails the suite if one stops doing so), so a build never uploads anything by
+itself — publishing is always the separate, deliberate step in
+[§5](#5-the-commands-that-actually-publish).
 
 ---
 
@@ -38,7 +43,9 @@ Arithmetic for the two that are not zero:
 
 GitHub Releases wins on everything that is not cost: no account to provision,
 no DNS, no bucket policy, no credentials in CI beyond the `GITHUB_TOKEN` that
-already exists, and `electron-updater` has a first-class GitHub provider.
+already exists, and `electron-updater` has a first-class GitHub provider — the
+one actually configured today (`desktop/electron-builder.config.cjs:366`:
+`publish: [{ provider: "github", owner: "no-human-ai", repo: "no_human" }]`).
 Release assets are capped at **2 GiB** each (we are at 0.145 GiB) and GitHub
 states there is *"no limit on the total size of a release, nor bandwidth
 usage."* The only backstop is the Acceptable Use Policy's discretionary
@@ -53,7 +60,9 @@ of downloads.
   ~100k/month**, where GitHub's AUP clause starts to matter and R2 stays $0.
   Migration is a config change, not a rearchitecture: `electron-updater`
   supports a `generic` provider (a plain static host) and a native `r2`
-  provider. The client gains no dependency either way.
+  provider. The client gains no dependency either way. Avoid the `r2.dev` URL
+  if this is ever exercised — Cloudflare rate-limits it and documents it as
+  development-only.
 - **S3 + CloudFront** — the most expensive option and the most moving parts.
   Rejected. ⚠️ One number here is unverified: AWS now leads with flat-rate
   CloudFront plans (Free = 100 GB, Pro = $15/mo for 50 TB) and no fetchable AWS
@@ -64,25 +73,22 @@ of downloads.
   the internal program lane (installer/frontend/a11y). It is already merged and
   superseded by `main`; there is nothing to revive.
 
-### The blocker: the repo is private
+### Why the repo had to go public
 
 GitHub Releases on a **private** repo require an authenticated token to
-download an asset. There is no unauthenticated public URL. `electron-updater`
-supports private repos only by shipping a `GH_TOKEN` **to every end user**,
-which its own documentation calls "not intended and not suitable for all
-users". That is not a distribution channel.
+download an asset. There is no unauthenticated public URL, and
+`electron-updater` supports private repos only by shipping a `GH_TOKEN` **to
+every end user**, which its own documentation calls "not intended and not
+suitable for all users". That was never a viable distribution channel — it is
+the reason the repo could not stay private and still ship desktop releases
+through GitHub.
 
-**So public downloads are gated on the repo going public** — a separate,
-in-flight workstream.
-
-**Interim answer, if a working download is needed before go-public:** upload
-the DMG to a **Cloudflare R2 bucket with a public custom domain** and point
-`electron-updater` at it with `provider: "generic"`. It is ~$0/month, requires
-no repo visibility change, and is a two-line change in
-`desktop/electron-builder.config.cjs`. Do not use the `r2.dev` URL — Cloudflare
-rate-limits it and documents it as development-only. The alternative interim —
-emailing a DMG — is fine for a handful of friends and needs no infrastructure
-at all, but gives up the update feed.
+**Resolved:** `no-human-ai/no_human` is the public repo. `README.md`'s release
+badge and macOS download button both point at
+`github.com/no-human-ai/no_human/releases/latest`, and that is exactly where
+`electron-updater`'s configured `github` provider
+(`desktop/electron-builder.config.cjs:366`) looks — no token required to
+download a release or check for an update.
 
 ### PyPI
 
@@ -92,12 +98,17 @@ Free, no bandwidth terms, and the name `no-human` is **available** (verified:
 binds. Note the DMG **cannot** ship via PyPI — it exceeds the per-file cap, and
 it does not belong in a wheel regardless.
 
-⚠️ **The wheel does not contain the web board.** `[tool.hatch.build.targets.wheel]`
-packages `src/no_human` only, and `web/dist` is gitignored and built separately.
-`pip install no-human` therefore gives a working CLI whose `nh start` has no UI
-to serve. That is a real gap, out of scope for this change, and it must be
-resolved before the CLI is published — either by adding `web/dist` to the wheel
-via a build hook, or by documenting the CLI as headless.
+**The wheel does contain the web board.** `web/dist` is gitignored and built
+separately, but `hatch_build.py`'s build hook force-includes it (plus
+`migrations/*.sql`, via `pyproject.toml`'s
+`[tool.hatch.build.targets.wheel.force-include]`) into every build, and a
+standard (non-editable) wheel or sdist build refuses to complete without a
+fresh board — `hatch_build.py`'s `BoardNotBuiltError`/`BoardStaleError`. An
+editable install (`uv sync`) warns and proceeds instead of failing, so local
+development stays installable without a browser build. What this repo cannot
+confirm: which specific versions are currently live on pypi.org — the publish
+path is `.github/workflows/publish-pypi.yml`, but the index's contents are not
+tracked here; check pypi.org/project/no-human/ directly.
 
 ---
 
@@ -141,7 +152,7 @@ Honest limitation: a command that exits faster than an HTTPS round trip
 cache write is lost and the next one retries. That is the deliberate trade for
 never adding latency.
 
-### The desktop half — built, and blocked on signing
+### The desktop half — signed and notarized on macOS, fail-loud elsewhere
 
 `desktop/updater.mjs` drives `electron-updater` with **`autoDownload: false`**
 and **`autoInstallOnAppQuit: false`**. Both default to the wrong value:
@@ -166,12 +177,17 @@ This is a requirement of Squirrel.Mac."* Unsigned, `SQRLUpdater` throws
 `Could not get code signature for running application`, which surfaces late and
 opaquely.
 
-So the unsigned build **fails loudly and early instead**: `signing.cjs` records
-at build time that this artifact cannot auto-update, the verdict is stamped
-into the packaged app (`extraMetadata.nhCanAutoUpdate`), and the updater still
-*reports* that a new version exists while refusing the install with a sentence
-that names the cause and points at the manual download. It never silently does
-nothing.
+The macOS release path signs and notarizes the DMG (§3), so a fully `signed`
+build stamps `nhCanAutoUpdate: true` into the packaged app
+(`extraMetadata.nhCanAutoUpdate`, set from `desktop/signing.cjs`'s verdict) and
+step 4 works end-to-end. Windows and Linux are unsigned by decision (no
+Authenticode certificate for Windows; `.deb`/AppImage packages carry no
+equivalent signature — `docs/WINDOWS.md`, `docs/LINUX.md`), so
+`nhCanAutoUpdate` stays `false` there. For those builds — and for any macOS
+build missing notarization credentials (`signed-not-notarized` or
+`unsigned`) — the updater still **fails loudly instead of silently doing
+nothing**: it *reports* that a new version exists while refusing the install
+with a sentence that names the cause and points at the manual download.
 
 Also load-bearing: `mac.target` **must include `zip`**. Squirrel.Mac updates
 from a ZIP, and electron-builder only emits `latest-mac.yml` — the file
@@ -195,12 +211,11 @@ Assume you have never done this. Do these in order.
 4. You must be the **Account Holder** of the membership to create a Developer
    ID certificate. Enrolling as an individual makes you that automatically.
 
-> ⚠️ Verify before relying on it: Apple lists "Notarization & Developer ID for
-> Mac apps" as a $99-tier benefit, but no Apple page explicitly confirms that an
-> *individual* (non-organisation) membership can issue Developer ID
-> certificates. If this matters, ask Apple Developer Support before paying.
-> The $299 Enterprise Program is **not** what you want — it is internal-
-> distribution only and never grants Developer ID.
+> An **individual** membership does issue Developer ID certificates in
+> practice: this project's notarization credentials were stored and validated
+> by Apple under one (`docs/INSTALLER.md:418`). The $299 Enterprise Program is
+> **not** what you want — it is internal-distribution only and never grants
+> Developer ID.
 
 ### 3.2 Create the right certificate
 
@@ -302,24 +317,23 @@ NH_REQUIRE_SIGNED=1 npm run dist:bundled
 Run all three. Any deviation means it is **not** shippable.
 
 ```sh
-codesign -dv --verbose=2 packaging/dist/no_human-0.1.0.dmg
+codesign -dv --verbose=2 packaging/dist/no_human-<version>.dmg
 ```
 Expect `Authority=Developer ID Application: <NAME> (<TEAMID>)`,
 `Authority=Developer ID Certification Authority`, `Authority=Apple Root CA`,
-and a `Timestamp=` line.
-*Today this prints `code object is not signed at all`.*
+and a `Timestamp=` line — this is what a `signed` release build produces.
 
 ```sh
-spctl -a -t open --context context:primary-signature -v packaging/dist/no_human-0.1.0.dmg
+spctl -a -t open --context context:primary-signature -v packaging/dist/no_human-<version>.dmg
 ```
-Expect `accepted` and `source=Notarized Developer ID`.
-*Today this prints `rejected`.*
+Expect `accepted` and `source=Notarized Developer ID` — this is what a
+`signed` release build produces.
 `accepted` with `source=Developer ID` (no "Notarized") means signing worked but
 notarization did not — the artifact will still be refused on a machine that has
-never seen it.
+never seen it. `rejected`, or no `Timestamp=` line above, means do not ship.
 
 ```sh
-xcrun stapler validate packaging/dist/no_human-0.1.0.dmg
+xcrun stapler validate packaging/dist/no_human-<version>.dmg
 ```
 Expect `The validate action worked!`.
 An unstapled DMG can still fail on a machine with no network even when
@@ -333,14 +347,21 @@ told you what is missing.
 
 ## 4. Current state
 
+| Platform | Artifacts | Signing | Auto-update |
+|---|---|---|---|
+| macOS | DMG + ZIP | Signed and notarized when the credential set is present (`desktop/signing.cjs`); the filename carries the verdict — plain `no_human-<version>.dmg` only when fully `signed`, else `-UNSIGNED`/`-UNNOTARIZED` | `nhCanAutoUpdate: true` for a `signed` build |
+| Windows | NSIS installer + ZIP | Unsigned by decision — no Authenticode certificate purchased; SmartScreen warns on first run (`docs/WINDOWS.md`) | `nhCanAutoUpdate` stays `false` |
+| Linux | `.deb` + AppImage (x64) | Unsigned by decision — packages carry no code signature by convention; integrity travels as `SHA256SUMS-linux.txt` on the release (`docs/LINUX.md`) | `nhCanAutoUpdate` stays `false` |
+
 - The DMG builds and launches, and the bundled server starts from inside the
   `.app`.
-- It is **unsigned**: `codesign -dv` → `code object is not signed at all`;
-  `spctl` → `rejected`. Expected until §3 is done.
-- Desktop auto-update is fully implemented and inert until a signature exists.
-- The CLI update check works now.
-- No application icon is set — electron-builder logs *"default Electron icon is
-  used"*. Cosmetic, but a shipped app should not wear the Electron logo.
+- The CLI update check (§2, CLI half) works on every platform, independently
+  of any of the above.
+- Icons are no longer a gap: `packaging/derive-icons.mjs` derives
+  `icon.ico`/`icon.png`/`icon.icns` from the brand master at package time, and
+  `desktop/electron-builder.config.cjs`'s `requireFreshIcon()` refuses to build
+  if a derived icon is missing or older than that master — so a shipped app
+  cannot silently ship wearing the stock Electron icon.
 
 ## 4a. Gotcha: a user-level `~/.npmrc` can rewrite the lockfile
 
@@ -363,29 +384,45 @@ foreign registry is a pass-through proxy, so only the URL differs.
 
 ## 5. The commands that actually publish
 
-Not run. Listed so publishing is one reviewed command, and so nobody has to
-reconstruct it under pressure.
+Publishing is deliberately manual. No build step publishes on its own — every
+`electron-builder` invocation runs with `--publish never`
+(`desktop/package.json`'s dist scripts, pinned by
+`desktop/packagedFiles.test.mjs`'s `"no script publishes anything"` test) — so
+a release is exactly these commands, run by a human. Listed so publishing is
+one reviewed command, and so nobody has to reconstruct it under pressure.
 
-**CLI to PyPI** (irreversible — a version number can never be reused):
+**CLI to PyPI** (irreversible — a version number can never be reused). The
+actual path is `.github/workflows/publish-pypi.yml`: a manual
+`workflow_dispatch` that requires typing `"publish"` to confirm and uses PyPI
+Trusted Publishing (OIDC), so no token lives in the repo or its secrets. It
+defaults to the `testpypi` index so a rehearsal cannot hit the real index by
+accident — the real index must be chosen explicitly. The local equivalent:
 
 ```sh
 uv build
 uv publish            # or: python -m twine upload dist/*
 ```
 
-**Desktop to GitHub Releases** — requires the repo to be public to be useful:
+Which versions are currently live on pypi.org is not recorded in this repo —
+check pypi.org/project/no-human/ directly.
+
+**Desktop to GitHub Releases** — the public `no-human-ai/no_human` repo is
+where `electron-updater`'s configured `github` provider looks
+(`desktop/electron-builder.config.cjs:366`):
 
 ```sh
-gh release create v0.1.0 \
-  packaging/dist/no_human-0.1.0.dmg \
-  desktop/dist/no_human-0.1.0-arm64-mac.zip \
+gh release create v<version> \
+  packaging/dist/no_human-<version>.dmg \
+  desktop/dist/no_human-<version>-arm64-mac.zip \
   desktop/dist/latest-mac.yml \
-  --title "no_human 0.1.0" --notes-file CHANGELOG.md
+  --title "no_human <version>" --notes-file CHANGELOG.md
 ```
 
 All three files are required: the DMG is what a human downloads, and the ZIP +
 `latest-mac.yml` are what `electron-updater` reads. A release missing the ZIP
-produces an updater that fails for every user.
+produces an updater that fails for every user. A Windows or Linux release adds
+that platform's own installer/package, plus (for Linux) `SHA256SUMS-linux.txt`
+for integrity, per `docs/LINUX.md`.
 
 > ⚠️ `electron-builder`'s GitHub provider defaults `releaseType` to **draft**,
 > and a draft release is invisible to the updater — it looks exactly like "no
