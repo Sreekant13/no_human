@@ -723,6 +723,29 @@ def test_every_new_config_key_is_documented(tmp_path):
         f"these keys are documented now — drop them from the baseline: {sorted(stale)}")
 
 
+def test_configuration_md_local_model_line_uses_a_real_yaml_comment():
+    """The `llm:` sample's `local_model: null` line used an em dash
+    (`—`) instead of `#` to introduce its trailing note, which is not a YAML
+    comment marker at all — it would parse as part of the scalar value,
+    making the shipped sample invalid to copy-paste. One character, but it
+    breaks the sample."""
+    from pathlib import Path
+
+    docs = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md"
+            ).read_text(encoding="utf-8")
+    line = next(
+        ln for ln in docs.splitlines() if ln.strip().startswith("local_model:"))
+    assert "#" in line, (
+        f"docs/configuration.md's local_model sample line has no `#` "
+        f"comment marker: {line!r}"
+    )
+    trailer = line.split("local_model:", 1)[1].split("null", 1)[1]
+    assert "—" not in trailer, (
+        f"docs/configuration.md's local_model line still uses an em dash "
+        f"instead of `#` for its trailing comment: {line!r}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Local model backend (part 1: config keys + assert_local_backend_mode).      #
 # --------------------------------------------------------------------------- #

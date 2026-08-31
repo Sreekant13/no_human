@@ -113,7 +113,7 @@ llm:
   review_timeout_seconds: 1500    # wall-clock per review session; a round that
                                   # dies on this wall escalates UNREVIEWED
   code_review_timeout_seconds: 1800  # same, for `nh review` on a whole PR diff
-  local_model: null              — see llm.local_* below
+  local_model: null              # see llm.local_* below
   local_base_url: null            # e.g. http://localhost:8000
   local_cli_path: null            # null ⇒ the SDK-bundled CLI
 

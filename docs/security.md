@@ -229,8 +229,11 @@ named here.
 
   **A check at the ACT sits behind this one. It is implemented, and it is a
   BETTER-PLACED layer of the same kind — not a closed door.**
-  `agent/session_mark.py` stamps every subprocess the two coding backends
-  launch (`ClaudeBackend._options()`, `CodexBackend._child_env()`) with an
+  `agent/session_mark.py` stamps every subprocess the coding backends
+  launch — all three of them: `ClaudeBackend._options()` (which is also the
+  harness the `local` backend runs on — `make_backend`'s `local` branch in
+  `agent/backend.py` returns a `ClaudeBackend`, so the mark covers it too)
+  and `CodexBackend._child_env()` — with an
   env-var mark that is inherited by every descendant of that session, no
   matter how it is invoked. `nh approve` and `nh merge-stack run`
   (`_refuse_agent_gate_act`, `cli/commands.py:approve:4955`, `:merge_stack_run:2777`) refuse before

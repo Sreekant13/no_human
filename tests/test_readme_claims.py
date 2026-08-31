@@ -505,6 +505,25 @@ SECURITY_MD = REPO / "docs" / "security.md"
 PRODUCT_MD = REPO / "PRODUCT.md"
 REVIEWER_CLAIM_SURFACES = {"security": SECURITY_MD, "product": PRODUCT_MD}
 
+
+def test_security_md_session_mark_covers_all_three_backends():
+    """§7's ACT-layer paragraph used to say the session mark covers "the two
+    coding backends" — true back when there were two, false once `local`
+    shipped as a third (`agent/backend.py`'s `SUPPORTED_BACKENDS`). `local`'s
+    `make_backend` branch returns a `ClaudeBackend`
+    (`agent/backend.py:536-548`), so `ClaudeBackend._options()` already marks
+    it; the doc must say so, not undercount and leave a reader thinking a
+    `local` run is unmarked."""
+    text = SECURITY_MD.read_text(encoding="utf-8")
+    assert "the two coding backends" not in text, (
+        "docs/security.md still claims only two coding backends stamp the "
+        "session mark; there are three (claude, codex, local)."
+    )
+    assert "all three of them" in text and "`local` backend runs on" in text, (
+        "docs/security.md's session-mark paragraph should name all three "
+        "backends and explain `local` is covered via ClaudeBackend."
+    )
+
 # Section boundaries: (line the section starts with, line the NEXT section
 # starts with). Sliced rather than whole-file so a legitimate `read-only` use
 # elsewhere in either file (there is none today, but nothing prevents one)
