@@ -1395,6 +1395,164 @@ def _bump_count(root: Path, pattern: str, new: int) -> None:
     (root / "EXPORT_CLASSIFICATION.txt").write_text(text, encoding="utf-8")
 
 
+def _bump_drop_count(root: Path, pattern: str, new: int) -> None:
+    text = (root / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    import re as _re
+    text = _re.sub(rf"^(drop\s+)\d+(\s+{_re.escape(pattern)})$", rf"\g<1>{new}\2", text, flags=_re.M)
+    (root / "EXPORT_CLASSIFICATION.txt").write_text(text, encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# A manifest-only conflict must PRUNE a stale pin, not escalate finished work #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_only_conflict_with_a_stale_pin_is_pruned_not_escalated(
+    store, tmp_path, monkeypatch,
+):
+    """Defect 1: a shipped file removed on one side of a finished PR leaves
+    the OTHER side's regenerated manifest still pinning it -- `export_guard.
+    py approve <paths>` only ever writes pins for the paths it is given, it
+    never drops one for a path that stopped shipping. Base tip's export gate
+    never ran `approve --prune` for src/old_ship.py's removal (a wholly
+    ordinary, pre-existing state -- exactly what auto-pruning on conflict
+    exists to make unnecessary to fix by hand), so the merged tree's
+    regenerated manifest still pins a file that no longer exists anywhere.
+    `verify`'s "pinned but not shipped" refusal is real and correct -- the
+    fix is not to weaken that gate, it is to prune BEFORE verify runs so a
+    finished, correctly-reviewed PR does not escalate over a mechanical
+    artefact. RED today: escalates at step 'verify'. src/base.py's pin (it
+    still ships) must survive untouched -- prune must never drop a live pin."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    (work / "src" / "old_ship.py").write_text("old ship\n", encoding="utf-8")
+    _git(work, "add", "src/old_ship.py")
+    _git(work, "commit", "-qm", "add old_ship.py")
+    _approve(work, ["src/old_ship.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin old_ship.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "src" / "feat_a.py").write_text("feature a\n", encoding="utf-8")
+    _git(wt_a, "add", "src/feat_a.py")
+    _git(wt_a, "commit", "-qm", "add feat_a.py")
+    _approve(wt_a, ["src/feat_a.py"])
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "pin feat_a.py")
+    _push_branch(work, wt_a, "branch-a")
+
+    _git(work, "rm", "-q", "src/old_ship.py")
+    (work / "src" / "feat_b.py").write_text("feature b\n", encoding="utf-8")
+    _git(work, "add", "src/feat_b.py")
+    _git(work, "commit", "-qm", "remove old_ship.py, add feat_b.py")
+    _approve(work, ["src/feat_b.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin feat_b.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert paths == {"RELEASE_MANIFEST.txt"}
+    assert dc.all_derived(paths)
+
+    events = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resolved_pr_conflict"
+    kinds = [k for k, _ in events]
+    assert "pr_conflict_resolved" in kinds and "resumed" not in kinds
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL
+
+    wt_check = tmp_path / "wt_check"
+    _worktree(work, wt_check, "check", "branch-a")
+    manifest = (wt_check / "RELEASE_MANIFEST.txt").read_text(encoding="utf-8")
+    assert "src/old_ship.py" not in manifest, manifest       # stale pin pruned
+    assert "src/base.py" in manifest                         # still-shipping pin survives
+    assert "src/feat_a.py" in manifest and "src/feat_b.py" in manifest
+    v = _verify(wt_check)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_only_conflict_reconciles_a_cleanly_merged_count_drift(
+    store, tmp_path, monkeypatch,
+):
+    """Defect 2, the DROP-classified counterpart of
+    `test_two_concurrent_count_bumps_are_reconciled_by_merge_arithmetic`
+    above. Neither branch adds a ship-classified file (both add a file under
+    the COUNTED `drop 1 tests/**` rule instead), so `shipped_changed` is
+    empty and step 5's existing reconcile hook never runs at all -- and
+    because neither side touches EXPORT_CLASSIFICATION.txt differently (the
+    identical "1" -> "2" bump auto-merges cleanly, exactly like the
+    ship-classified case), the classification file is never itself a
+    conflicting path either. So each side also makes an unrelated, distinct
+    manifest edit (as a real coder's re-approve comment would) to force
+    RELEASE_MANIFEST.txt itself to conflict -- the only conflicting path,
+    eligible for mechanical resolution. RED today: the merged tree holds 3
+    files matching `tests/**` (test_x.py + test_y.py + test_w.py) against a
+    declared count of 2 -- correct merge arithmetic, base (2) + branch (2) -
+    merge-base (1) == 3 -- but because the classification file itself was
+    never part of the conflict, today's step-7 backstop is gated off
+    (`CLASSIFICATION_NAME in eligible` is False for a manifest-only
+    conflict), so this finished, correctly-arithmetic PR escalates instead
+    of being reconciled the same way the ship-classified case already is."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_a = tmp_path / "wt_branch_a"
+    _worktree(work, wt_a, "branch-a")
+    (wt_a / "tests" / "test_y.py").write_text("test y\n", encoding="utf-8")
+    _git(wt_a, "add", "tests/test_y.py")
+    _bump_drop_count(wt_a, "tests/**", 2)
+    _git(wt_a, "add", "EXPORT_CLASSIFICATION.txt")
+    pins = wt_a / "RELEASE_MANIFEST.txt"
+    pins.write_text(pins.read_text(encoding="utf-8") + "# re-approved on branch-a\n", encoding="utf-8")
+    _git(wt_a, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_a, "commit", "-qm", "add tests/test_y.py, bump counted drop rule 1 -> 2")
+    _push_branch(work, wt_a, "branch-a")
+
+    (work / "tests" / "test_w.py").write_text("test w\n", encoding="utf-8")
+    _git(work, "add", "tests/test_w.py")
+    _bump_drop_count(work, "tests/**", 2)
+    _git(work, "add", "EXPORT_CLASSIFICATION.txt")
+    pins = work / "RELEASE_MANIFEST.txt"
+    pins.write_text(pins.read_text(encoding="utf-8") + "# main re-approved\n", encoding="utf-8")
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "add tests/test_w.py, bump counted drop rule 1 -> 2")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    # sanity: the identical count bump auto-merges -- EXPORT_CLASSIFICATION.txt
+    # is not a conflicting path, only the manifest is (forced by the two
+    # distinct re-approve comments), and it IS eligible.
+    paths = await dc.conflicting_paths(str(work), "main", "branch-a")
+    assert paths == {"RELEASE_MANIFEST.txt"}
+    assert dc.all_derived(paths)
+
+    events = []
+    t = await _approval_task(store, str(work), branch="branch-a")
+    w = _watcher(store, events=events)
+    result = await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/26", "DIRTY", branch="branch-a")
+
+    assert result == "resolved_pr_conflict"
+    kinds = [k for k, _ in events]
+    assert "pr_conflict_resolved" in kinds and "resumed" not in kinds
+    text = next(txt for k, txt in events if k == "pr_conflict_resolved")
+    assert "EXPORT_CLASSIFICATION.txt count reconciled" in text and "2 -> 3" in text, text
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.AWAITING_APPROVAL
+    wt_check = tmp_path / "wt_check"
+    _worktree(work, wt_check, "check", "branch-a")
+    assert "drop   3  tests/**" in (wt_check / "EXPORT_CLASSIFICATION.txt").read_text(encoding="utf-8")
+    v = _verify(wt_check)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
 @pytest.mark.asyncio
 async def test_a_count_drift_that_is_not_merge_arithmetic_still_refuses(store, tmp_path, monkeypatch):
     """Negative control: main added a file WITHOUT bumping the count (a stale
@@ -1817,13 +1975,20 @@ def test_approve_pending_pins_reuses_the_shared_count_drift_reconciler():
 @pytest.mark.asyncio
 async def test_a_drift_that_skips_approve_is_caught_by_verify_and_escalates(store, tmp_path, monkeypatch):
     """The branch touches ONLY its manifest (a coder's re-approve comment), so
-    `base..branch` names nothing ship-classified, `approve` never runs and the
-    reconcile never runs; main meanwhile added tests/test_z.py under the
-    COUNTED drop rule without bumping it. Step-7 `verify` is the last gate:
-    it must refuse at step 'verify', the task must escalate, and nothing may
-    be pushed. RED when `check_counts` is removed from the fixture guard's
-    `verify` (the mutant pushes the drifted tree) — the proof that gate is
-    live. Also the reconcile's known limit: it rides on `approve`."""
+    `base..branch` names nothing ship-classified; main meanwhile added
+    tests/test_z.py under the COUNTED drop rule without bumping it — a real
+    human bug (the extra file is NOT explained by merge arithmetic: real 2 !=
+    base 1 + (branch 1 - merge-base 1) = 1), not a mechanical count-merge.
+    Step 5 now always runs an `approve --prune` pass (even with nothing
+    ship-classified to pin) so it catches this drift itself and attempts
+    `reconcile_merge_count_drift`, which correctly refuses (fails closed) and
+    reports it at step 'regenerate' — one step earlier than before this
+    module always ran a prune pass, but the outcome is identical: the task
+    must still escalate and nothing may be pushed. RED when `check_counts` is
+    removed from the fixture guard's `verify` (the mutant pushes the drifted
+    tree) — the proof that gate is live. Also the reconcile's known limit: a
+    drift that is not merge arithmetic always fails closed, wherever it is
+    first observed."""
     _use_stub_export_guard(monkeypatch)
     work = _repo(tmp_path)
     wt_a = tmp_path / "wt_branch_a"
@@ -1852,7 +2017,7 @@ async def test_a_drift_that_skips_approve_is_caught_by_verify_and_escalates(stor
     stored = await store.get_task(t.id)
     assert stored.status == TaskStatus.ESCALATED
     evidence = (stored.blocker.get("evidence") or "") + (stored.blocker.get("question") or "")
-    assert "step 'verify'" in evidence and "actually wins" in evidence, stored.blocker
+    assert "step 'regenerate'" in evidence and "actually wins" in evidence, stored.blocker
     assert _git(work, "rev-parse", "origin/branch-a").stdout.strip() == before, "verify refused but something was pushed"
 
 

@@ -60,6 +60,7 @@ from .approve_merge import (
     reconcile_merge_count_drift,
 )
 from .git import GitError, GitRepo, ProtectedBranch
+from .manifest_repair import _PRUNED_RE
 from .pr_watcher import (
     _base_tips,
     _git_rc,
@@ -453,6 +454,10 @@ class DerivedResolution:
     #: module otherwise never touches — was rewritten by merge arithmetic;
     #: the human gate must see that, so the caller puts it in the event.
     reconciled: str = ""
+    #: Paths `export_guard.py approve --prune` dropped a stale pin for (a
+    #: path that stopped shipping on one side of the merge) — the human gate
+    #: must see that too, so the caller puts it in the event.
+    pruned: list[str] = field(default_factory=list)
 
 
 def _run_export_guard(worktree_path: Path, subargs: list[str], *,
@@ -501,6 +506,17 @@ def _parse_not_ship_classified(text: str) -> list[str]:
         else:
             break
     return found
+
+
+def _approve_argv(targets: list[str]) -> list[str]:
+    """`export_guard.py approve` argv for `targets`, always with `--prune` so
+    a pin for a path that stopped shipping on either side of the merge (e.g.
+    deleted, or reclassified as drop) is dropped from RELEASE_MANIFEST.txt
+    rather than surviving into a tree that then fails `verify` with "pinned
+    but not shipped" — see the module docstring. Legal with `targets == []`:
+    a prune-only pass, still worth running because a stale pin can exist even
+    when the branch's own diff pins nothing new."""
+    return ["approve", "--prune", *targets]
 
 
 def resolve_derived_conflict(repo_path: str, branch: str, base_tip_sha: str,
@@ -663,73 +679,82 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     shipped_changed = _ship_classified_paths(worktree_path, changed)
     unpinned = sorted(set(changed) - set(shipped_changed))
     reconciled = ""
+    pruned_paths: list[str] = []
 
+    # Always run an approve pass — even when `shipped_changed` is empty — so
+    # a pin for a path that stopped shipping on either side of the merge
+    # (deleted, or reclassified as drop) is pruned via `--prune` before
+    # step-7 `verify` runs. Without this, a finished PR whose ONLY conflict
+    # is the manifest can still escalate on a stale pin `verify` correctly
+    # refuses (see `_approve_argv`).
     if shipped_changed:
         _sh(["git", "add", "-A", "--", *shipped_changed], cwd=worktree_path)
+    approve_proc = _run_export_guard(
+        worktree_path, _approve_argv(shipped_changed), timeout=_APPROVE_TIMEOUT_S)
+    if approve_proc is None:
+        return DerivedResolution(
+            ok=False, step="regenerate", unpinned=unpinned,
+            detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s")
+
+    if approve_proc.returncode == 2 and COUNT_DRIFT_RE.search(
+            approve_proc.stdout + approve_proc.stderr):
+        ok, note = reconcile_merge_count_drift(
+            worktree_path, base_tip_sha, branch_tip_sha,
+            approve_proc.stdout + approve_proc.stderr)
+        if not ok:
+            return DerivedResolution(
+                ok=False, step="regenerate", unpinned=unpinned,
+                detail=_cap(f"{CLASSIFICATION_NAME} count drift is not merge "
+                            f"arithmetic ({note}):\n"
+                            + approve_proc.stdout + approve_proc.stderr))
+        reconciled = note
+        # Wherever a repo SHIPS its classification file it is pinned, and
+        # the rewrite stales that pin — re-pin it or step-7 verify refuses.
+        # (This repo drops the file, so here it is a no-op; the land
+        # fixture ships it and covers the path.)
+        retry_targets = list(dict.fromkeys(
+            [*shipped_changed,
+             *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))
         approve_proc = _run_export_guard(
-            worktree_path, ["approve", *shipped_changed], timeout=_APPROVE_TIMEOUT_S)
+            worktree_path, _approve_argv(retry_targets), timeout=_APPROVE_TIMEOUT_S)
         if approve_proc is None:
             return DerivedResolution(
                 ok=False, step="regenerate", unpinned=unpinned,
-                detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s")
+                detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s "
+                       f"(after count reconcile: {note})")
 
-        if approve_proc.returncode == 2 and COUNT_DRIFT_RE.search(
-                approve_proc.stdout + approve_proc.stderr):
-            ok, note = reconcile_merge_count_drift(
-                worktree_path, base_tip_sha, branch_tip_sha,
-                approve_proc.stdout + approve_proc.stderr)
-            if not ok:
-                return DerivedResolution(
-                    ok=False, step="regenerate", unpinned=unpinned,
-                    detail=_cap(f"{CLASSIFICATION_NAME} count drift is not merge "
-                                f"arithmetic ({note}):\n"
-                                + approve_proc.stdout + approve_proc.stderr))
-            reconciled = note
-            # Wherever a repo SHIPS its classification file it is pinned, and
-            # the rewrite stales that pin — re-pin it or step-7 verify refuses.
-            # (This repo drops the file, so here it is a no-op; the land
-            # fixture ships it and covers the path.)
-            retry_targets = list(dict.fromkeys(
-                [*shipped_changed,
-                 *_ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])]))
+    if approve_proc.returncode == 2:
+        combined = approve_proc.stdout + approve_proc.stderr
+        refused = _parse_not_ship_classified(combined)
+        if refused:
+            # Belt-and-braces: a drop-classified path in the branch's own
+            # diff — not a failure, just nothing to pin. Retry with those
+            # paths removed — always, even if nothing is left (a prune-only
+            # pass is still worth running).
+            unpinned = sorted(set(unpinned) | set(refused))
+            retry_targets = [p for p in shipped_changed if p not in refused]
             approve_proc = _run_export_guard(
-                worktree_path, ["approve", *retry_targets], timeout=_APPROVE_TIMEOUT_S)
+                worktree_path, _approve_argv(retry_targets),
+                timeout=_APPROVE_TIMEOUT_S)
             if approve_proc is None:
                 return DerivedResolution(
                     ok=False, step="regenerate", unpinned=unpinned,
-                    detail=f"export_guard approve timed out after {_APPROVE_TIMEOUT_S}s "
-                           f"(after count reconcile: {note})")
+                    detail="export_guard approve timed out after "
+                           f"{_APPROVE_TIMEOUT_S}s (retry)")
 
-        if approve_proc.returncode == 2:
-            combined = approve_proc.stdout + approve_proc.stderr
-            refused = _parse_not_ship_classified(combined)
-            if refused:
-                # Belt-and-braces: a drop-classified path in the branch's own
-                # diff — not a failure, just nothing to pin. Retry once with
-                # those paths removed.
-                unpinned = sorted(set(unpinned) | set(refused))
-                retry_targets = [p for p in shipped_changed if p not in refused]
-                if retry_targets:
-                    approve_proc = _run_export_guard(
-                        worktree_path, ["approve", *retry_targets],
-                        timeout=_APPROVE_TIMEOUT_S)
-                    if approve_proc is None:
-                        return DerivedResolution(
-                            ok=False, step="regenerate", unpinned=unpinned,
-                            detail="export_guard approve timed out after "
-                                   f"{_APPROVE_TIMEOUT_S}s (retry)")
-                else:
-                    approve_proc = None  # nothing left that is ship-classified
+    if approve_proc is not None and approve_proc.returncode != 0:
+        # exit 1 (scan-hit refusal) is never retried.
+        why = ("scan-hit refusal" if approve_proc.returncode == 1
+               else "refused before writing pins")
+        return DerivedResolution(
+            ok=False, step="regenerate", unpinned=unpinned,
+            detail=_cap(f"export_guard approve {why} "
+                        f"({approve_proc.returncode}):\n"
+                        + approve_proc.stdout + approve_proc.stderr))
 
-        if approve_proc is not None and approve_proc.returncode != 0:
-            # exit 1 (scan-hit refusal) is never retried.
-            why = ("scan-hit refusal" if approve_proc.returncode == 1
-                   else "refused before writing pins")
-            return DerivedResolution(
-                ok=False, step="regenerate", unpinned=unpinned,
-                detail=_cap(f"export_guard approve {why} "
-                            f"({approve_proc.returncode}):\n"
-                            + approve_proc.stdout + approve_proc.stderr))
+    if approve_proc is not None:
+        pruned_paths.extend(
+            _PRUNED_RE.findall(approve_proc.stdout + approve_proc.stderr))
 
     # -- step 6: commit --------------------------------------------------- #
     names_to_add = set(DERIVED_ARTEFACTS)
@@ -761,15 +786,21 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
             detail=f"export_guard verify timed out after {_VERIFY_TIMEOUT_S}s")
     if verify_proc.returncode != 0:
         combined = verify_proc.stdout + verify_proc.stderr
-        # Backstop reconcile hop: this fires only when the classification
-        # file was ITSELF a conflicted path (so step 4 took `--ours` on it
-        # and the resulting declared count is stale) and the step-5
-        # approve-step hook above never ran (e.g. `shipped_changed` was
-        # empty). `verify` is the last gate before push, so it is the last
-        # place left to catch a count drift that is still merge arithmetic.
-        # Bounded to exactly one pass — `reconciled` guards against looping.
-        if (not reconciled and CLASSIFICATION_NAME in eligible
-                and COUNT_DRIFT_RE.search(combined)):
+        # Backstop reconcile hop: this fires whenever step 5 never caught a
+        # still-outstanding count drift — either because the classification
+        # file was ITSELF a conflicted path and step 4 took `--ours` on it
+        # (declared count now stale), or because the conflict was
+        # manifest-only so `shipped_changed` never included any path that
+        # would have surfaced the drift there (e.g. a clean auto-merge of
+        # EXPORT_CLASSIFICATION.txt that is nonetheless not merge-arithmetic
+        # correct against the regenerated tree). Not gated on
+        # `CLASSIFICATION_NAME in eligible` — a manifest-only conflict is
+        # eligible too, and a finished PR must not escalate just because the
+        # drift was only ever detectable here. `verify` is the last gate
+        # before push, so it is the last place left to catch a count drift
+        # that is still merge arithmetic. Bounded to exactly one pass —
+        # `reconciled` guards against looping.
+        if not reconciled and COUNT_DRIFT_RE.search(combined):
             ok, note = reconcile_merge_count_drift(
                 worktree_path, base_tip_sha, branch_tip_sha, combined)
             if not ok:
@@ -781,7 +812,7 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
             retry_targets = _ship_classified_paths(worktree_path, [CLASSIFICATION_NAME])
             if retry_targets:
                 approve_proc = _run_export_guard(
-                    worktree_path, ["approve", *retry_targets], timeout=_APPROVE_TIMEOUT_S)
+                    worktree_path, _approve_argv(retry_targets), timeout=_APPROVE_TIMEOUT_S)
                 if approve_proc is None:
                     return DerivedResolution(
                         ok=False, step="regenerate", unpinned=unpinned,
@@ -795,6 +826,8 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                                     f"verify count reconcile "
                                     f"({approve_proc.returncode}):\n"
                                     + approve_proc.stdout + approve_proc.stderr))
+                pruned_paths.extend(
+                    _PRUNED_RE.findall(approve_proc.stdout + approve_proc.stderr))
             add = _sh(["git", "add", "--", CLASSIFICATION_NAME], cwd=worktree_path)
             if add.returncode != 0:
                 return DerivedResolution(ok=False, step="verify", unpinned=unpinned,
@@ -847,11 +880,13 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
 
     return DerivedResolution(
         ok=True, step="ok", pushed_sha=merge_sha, unpinned=unpinned,
-        reconciled=reconciled,
+        reconciled=reconciled, pruned=pruned_paths,
         detail=f"regenerated derived artefact(s) from the merged tree, "
                f"pushed {merge_sha[:8]}"
                + (f"; unpinned (drop-classified): {', '.join(unpinned)}"
                   if unpinned else "")
                + (f"; {CLASSIFICATION_NAME} count reconciled by merge "
-                  f"arithmetic: {reconciled}" if reconciled else ""),
+                  f"arithmetic: {reconciled}" if reconciled else "")
+               + (f"; pruned stale pin(s): {', '.join(pruned_paths)}"
+                  if pruned_paths else ""),
     )

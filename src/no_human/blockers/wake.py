@@ -2212,11 +2212,16 @@ class WakeWatcher:
                     f"; EXPORT_CLASSIFICATION.txt count reconciled by merge "
                     f"arithmetic: {reconciled}" if reconciled else ""
                 )
+                pruned = getattr(result, "pruned", None)
+                pruned_note = (
+                    f"; pruned stale pin(s): {', '.join(pruned)}" if pruned else ""
+                )
                 await self._emit(
                     task, "pr_conflict_resolved",
                     f"{task.id[:8]} PR CONFLICTING — resolved mechanically "
                     f"(derived artefact(s) only: {conflict_desc}), pushed "
-                    f"{result.pushed_sha[:8]}{unpinned_note}{reconciled_note}",
+                    f"{result.pushed_sha[:8]}{unpinned_note}{reconciled_note}"
+                    f"{pruned_note}",
                 )
                 return "resolved_pr_conflict"
 

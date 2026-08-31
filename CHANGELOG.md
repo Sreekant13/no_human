@@ -74,6 +74,17 @@ Server/fleet reliability + cost-observability work landed after the 0.1.6 cut
 
 ### Fixed — the review loop and PR body
 
+- **A finished PR that conflicts only in the derived export artefacts
+  (`RELEASE_MANIFEST.txt` / `EXPORT_CLASSIFICATION.txt`) no longer escalates
+  to a human.** The mechanical resolver now always runs `export_guard.py
+  approve --prune` (even when the branch's own diff pins nothing new), so a
+  stale pin for a path that stopped shipping on either side of the merge is
+  dropped before `verify` runs instead of failing it with "pinned but not
+  shipped". The `verify`-time count-reconcile backstop is no longer gated on
+  the classification file itself having been part of the conflict, so a
+  manifest-only conflict with a clean-merge count drift is reconciled the
+  same way a classification-file conflict already was. A conflict touching
+  any non-derived source file still escalates exactly as before.
 - **The reviewer-worktree integrity guard no longer discards a verdict on a
   benign `.git/common/config` reserialization.** Concurrent writers of the
   shared common dir rewrite that file with the same *effective* keys (different
