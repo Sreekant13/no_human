@@ -46,6 +46,7 @@ from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
 from ..agent.verification_receipts import KINDS
 from ..blockers import (
+    CONSUMED_HUMAN_PROVENANCE,
     MACHINE_REQUEUE_PROVENANCE,
     PENDING_KEY,
     REFUSED_AT_KEY,
@@ -59,6 +60,8 @@ from ..blockers import (
     fallback_blocker,
     find_stored_answer,
     human_event,
+    human_gate_armed,
+    is_human_provenance,
     mark_send_back_refused,
     missing_access,
     notification_line,
@@ -68,6 +71,7 @@ from ..blockers import (
     refusal_note,
     remedy_text,
     render_report,
+    resume_provenance,
     reuse_record,
     triage,
     user_pause_blocker,
@@ -2638,7 +2642,6 @@ class Orchestrator:
         zero-diff honesty gate treats the resumed run like an orphan
         recovery: a claim on top of this unreviewed WIP goes to a full review.
         """
-        from ..blockers import resume_provenance
         wip_sha = ""
         committed_now = False
         if repo is not None and attempt_id:
@@ -2657,13 +2660,12 @@ class Orchestrator:
                             task.id[:8], exc)
                 wip_sha = ""
         ctx = task.context or {}
-        prior = ctx.get("resume_from") or {}
-        # Identical to `Scheduler._inherited_checkpoint`: a human's gate is
-        # executed, never decided over; a stamp-less legacy resume is a human's.
-        human_gated = bool(prior.get("sha")) and (
-            prior.get("by") == "human"
-            or (not prior.get("by")
-                and ctx.get("resume_reason") != "wake_condition_satisfied"))
+        # Identical to `Scheduler._inherited_checkpoint` / `salvage_dead_worktrees`:
+        # a human's gate is executed, never decided over — but only while still
+        # ARMED. Once an attempt has consumed it (`_consume_human_gate`), this
+        # checkpoint is exactly the ordinary machine stamping the gate was always
+        # meant to allow again.
+        human_gated = human_gate_armed(ctx)
         stamped = ""
         if wip_sha and not human_gated:
             task.context = await self.store.merge_context(
@@ -4203,6 +4205,9 @@ class Orchestrator:
             # as fabrication: two burnt attempts and a human paged.
             branched_from_own_partial = self._is_own_partial(
                 repo, ctx, repo.head_sha())
+            # The workspace now exists at whatever `resume_from` named — the
+            # human's choice, if there was one, has been EXECUTED.
+            ctx = await self._consume_human_gate(task, ctx)
         else:
             # Include attempt_n so each attempt uses a distinct branch. This avoids
             # non-fast-forward rejection when pushing attempt 2+ (the remote already
@@ -4353,6 +4358,13 @@ class Orchestrator:
                 repo.create_branch(branch, base=effective_base)
             except ProtectedBranch as exc:
                 return await self._escalate(task, str(exc))
+            # The workspace now exists — whatever `resume_from` named (human's
+            # gate or not) has been EXECUTED by this branch. Consumed even when
+            # the checkpoint above was unreadable (`resume_checkpoint_lost`):
+            # the human's sha had its shot regardless, and leaving it armed
+            # would block every future checkpoint forever on a commit nobody
+            # can read.
+            ctx = await self._consume_human_gate(task, ctx)
         await self.store.update_attempt(attempt_id, branch_name=branch)
         # So a cancellation honoured from the attempt loop can name the branch
         # its [WIP-BLOCKED] checkpoint landed on.
@@ -16578,6 +16590,33 @@ class Orchestrator:
             candidate = ""
         return candidate or resume_sha
 
+    async def _consume_human_gate(self, task: Task, ctx: dict) -> dict:
+        """CONSUME-ONCE. This attempt's workspace now exists at the human's
+        chosen branch point, so their choice has been EXECUTED — rewrite
+        ``resume_from.by`` from ``"human"`` to `CONSUMED_HUMAN_PROVENANCE`.
+        sha/branch are left untouched, so the audit trail still shows a human
+        chose this branch point, and the zero-diff honesty gate
+        (`_is_own_partial`, via `is_human_provenance`) still credits it as
+        theirs. But the gate itself (`human_gate_armed`) is unarmed by the
+        rewrite, so the next AUTOMATIC checkpoint — server stop, orphan
+        requeue, hard-kill salvage — may stamp a newer WIP over it instead of
+        being blocked forever on a run that already happened. A fresh
+        ``nh task resume`` writes ``"human"`` again and re-arms it.
+
+        A no-op when the gate is not armed (unstamped ctx, machine-stamped
+        ctx, or an already-consumed one) — idempotent by construction, since
+        callers on both the revision and fresh branch paths reach this after
+        the workspace exists regardless of whether a gate was ever set.
+        """
+        if not human_gate_armed(ctx):
+            return ctx
+        rf = ctx.get("resume_from") or {}
+        task.context = await self.store.merge_context(
+            task.id, {"resume_from": resume_provenance(
+                {"sha": rf.get("sha"), "branch": rf.get("branch") or ""},
+                CONSUMED_HUMAN_PROVENANCE)})
+        return task.context or {}
+
     def _is_own_partial(self, repo, ctx: dict, branch_point: str) -> bool:
         """Is the work already ahead of base THIS LOOP's own abandoned partial?
 
@@ -16692,14 +16731,14 @@ SIX of them read a checkpoint and TWO do not — but do
         # human resume after ANY machine resume was failed as fabrication: two
         # burnt attempts and a human paged, the D15 regression, reopened by the
         # commit that claimed to close it.
+        # `consumed_human` is the SAME rule as `by == "human"` here: the gate
+        # being unarmed (`human_gate_armed`) is an overwrite question, not a
+        # credit one — the work at this sha is still the human's, so crediting
+        # it must not flip the moment `_consume_human_gate` rewrites `by`.
+        # `is_human_provenance` folds both stamped cases and the legacy
+        # no-`by` tail (below the old two-branch split) into one rule.
         by = resume.get("by")
-        if by:
-            return by != "human"      # a fresh stamp always wins over a stale one
-        # No stamp at all: a row written before provenance existed. `wake.py` has
-        # ALWAYS set `resume_reason`, so a legacy MACHINE resume is still
-        # identifiable; anything else is a legacy human resume and keeps its
-        # pre-existing behaviour rather than silently losing credit.
-        return ctx.get("resume_reason") == "wake_condition_satisfied"
+        return not is_human_provenance(by, ctx)
 
     @staticmethod
     def _is_wip_partial(repo, sha: str) -> bool:

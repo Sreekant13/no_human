@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from ..agent.worker_context import WorkerContext, set_worker_context
+from ..blockers import human_gate_armed
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
                       pid_alive, process_start_token, worktree_isolation_enabled)
@@ -1401,10 +1402,20 @@ class Scheduler:
         machine decision. A HUMAN's ``resume_from`` is INHERITED untouched —
         stamping over their gated sha relabels it as the machine's and fails
         their resume as fabrication, which is the bug that gate keeps
-        re-learning; the human is identified by the SAME rule that gate uses,
-        including its legacy fallback, so the two cannot drift apart. A sha the
-        object store can no longer read needs no check here: the orchestrator
-        already falls back to base and says so (`resume_checkpoint_lost`).
+        re-learning; the human is identified by the SAME rule that gate uses
+        (`human_gate_armed`), including its legacy fallback, so the two cannot
+        drift apart. A sha the object store can no longer read needs no check
+        here: the orchestrator already falls back to base and says so
+        (`resume_checkpoint_lost`).
+
+        An armed gate is untouched; a CONSUMED one is not — once an attempt has
+        actually branched from a human's sha (`Orchestrator._consume_human_gate`
+        rewrites ``by`` to ``consumed_human``), their choice has already been
+        executed, and this sha is exactly the ordinary machine-checkpoint
+        inheritance below was always meant to allow. Requeuing onto a stale
+        `commit_sha` there would repeat the original bug in the other
+        direction — a dead run's later work discarded because a long-since-
+        executed human stamp still read as armed.
 
         🔴 TWO THINGS THIS MUST NOT DO, both found by review of the first cut.
 
@@ -1412,7 +1423,8 @@ class Scheduler:
         THREE restarts. Bailing on any existing ``resume_from`` cannot tell a
         human's gate from the machine's last one, so restart 2 resumed onto
         restart 1's sha and discarded everything the run in between committed —
-        the same loss, one restart later. Only ``human`` is inherited.
+        the same loss, one restart later. Only an ARMED ``human`` gate is
+        inherited untouched.
 
         And the candidate is the attempt that actually DIED —
         `Store.latest_open_attempt`, the most recently STARTED row still
@@ -1437,14 +1449,7 @@ class Scheduler:
         """
         ctx = t.context or {}
         resume = ctx.get("resume_from") or {}
-        by = resume.get("by")
-        if resume.get("sha") and (
-                by == "human"
-                # No stamp at all is a row written before provenance existed;
-                # `wake.py` has always set `resume_reason`, so anything else is
-                # a legacy HUMAN resume. Identical to `_is_own_partial`'s tail.
-                or (not by
-                    and ctx.get("resume_reason") != "wake_condition_satisfied")):
+        if human_gate_armed(ctx):
             return ""                    # a human gated it — execute, don't decide
         sha = (await self.store.latest_open_attempt(t.id) or {}).get("commit_sha") or ""
         if not sha:

@@ -306,6 +306,13 @@ def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, A
     base**. That is still the right side to fail on — the alternative is a PR
     opened on work nobody did — but a caller that HAS a checkpoint must pass it
     rather than None, or it pays that price for nothing.
+
+    ``by=CONSUMED_HUMAN_PROVENANCE`` is a distinct case worth naming here: it
+    is a HUMAN-provenance value for `is_human_provenance`'s credit question
+    (the work is still theirs), but `human_gate_armed` reads it as NOT armed —
+    the two questions are answered by two different helpers on purpose, and
+    conflating them re-opens the D15 regression this docstring describes
+    above.
     """
     cp = checkpoint or {}
     return {"sha": cp.get("sha") or None,
@@ -412,6 +419,65 @@ SERVER_STOP_REASON = "__server_stop__"
 MACHINE_REQUEUE_PROVENANCE = frozenset(
     {"orphan_recovery", "server_stop", "hard_kill_salvage"}
 )
+
+#: ``resume_from.by`` once a human's gate has been EXECUTED. `nh task resume`
+#: (and its API twin) still write ``"human"`` verbatim — that write is what
+#: (re-)ARMS the gate — but the attempt that actually branches from the
+#: human's sha rewrites it to this value (`Orchestrator._consume_human_gate`),
+#: so later AUTOMATIC checkpoints (server stop, orphan requeue, hard-kill
+#: salvage) may stamp over it instead of being blocked forever. sha/branch are
+#: preserved untouched — only ``by`` changes — so the audit trail still shows
+#: a human chose this branch point, and the zero-diff honesty gate
+#: (`Orchestrator._is_own_partial`) still credits it as theirs.
+CONSUMED_HUMAN_PROVENANCE = "consumed_human"
+
+#: Every ``resume_from.by`` value that names a HUMAN's choice, armed or
+#: already consumed. One frozenset instead of the ad hoc ``by == "human"``
+#: check inlined three times (`_honor_server_stop`, `_inherited_checkpoint`,
+#: `salvage_dead_worktrees`) before this module gave the rule one home.
+HUMAN_GATE_PROVENANCE = frozenset({"human", CONSUMED_HUMAN_PROVENANCE})
+
+
+def is_human_provenance(by: str | None, ctx: dict | None) -> bool:
+    """Did a HUMAN choose this branch point — armed or already consumed?
+
+    Answers a different question than `human_gate_armed`: this is the credit
+    question (`_is_own_partial`'s "is the work ahead of base a human's?"),
+    that is the overwrite question ("must an automatic checkpoint refuse to
+    stamp?"). A ``consumed_human`` row answers YES here and NO there —
+    conflating the two re-opens the D15 regression (a correct "nothing to
+    add" over a human's own sha failed as fabrication).
+
+    Legacy rows (written before provenance existed) have no ``by`` at all;
+    `blockers/wake.py` has always set ``resume_reason``, so a legacy MACHINE
+    resume is still identifiable and anything else is a legacy human one.
+    """
+    if by:
+        return by in HUMAN_GATE_PROVENANCE
+    return (ctx or {}).get("resume_reason") != "wake_condition_satisfied"
+
+
+def human_gate_armed(ctx: dict | None) -> bool:
+    """Is a human's ``resume_from`` still UNCONSUMED — i.e. must an AUTOMATIC
+    checkpoint refuse to overwrite it?
+
+    Consume-once: the immediately-next attempt after `nh task resume`
+    executes the human's sha (`_resume_branch_point`, `_is_own_partial`), and
+    once it has, `Orchestrator._consume_human_gate` rewrites ``by`` to
+    `CONSUMED_HUMAN_PROVENANCE` — a HUMAN provenance value for credit
+    purposes (`is_human_provenance`) but no longer an armed gate, so ordinary
+    machine stamping (server stop, orphan requeue, hard-kill salvage) resumes.
+    A fresh ``nh task resume`` writes ``"human"`` again and re-arms it.
+
+    A legacy stamp-less row (no ``by`` at all) is armed exactly like
+    ``by == "human"`` — `is_human_provenance`'s legacy fallback — so an old
+    row is not silently exempted from the protection this gate exists to give.
+    """
+    rf = (ctx or {}).get("resume_from") or {}
+    if not rf.get("sha"):
+        return False
+    by = rf.get("by")
+    return by == "human" or (not by and is_human_provenance(by, ctx))
 
 
 @dataclass

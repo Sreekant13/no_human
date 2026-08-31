@@ -24,7 +24,9 @@ from .actions import (
     is_terminal_action,
 )
 from .taxonomy import (
+    CONSUMED_HUMAN_PROVENANCE,
     HARNESS_ONLY_CATEGORIES,
+    HUMAN_GATE_PROVENANCE,
     MACHINE_REQUEUE_PROVENANCE,
     SERVER_STOP_REASON,
     Blocker,
@@ -33,6 +35,8 @@ from .taxonomy import (
     Route,
     carried_checkpoint,
     human_event,
+    human_gate_armed,
+    is_human_provenance,
     process_actor,
     resume_checkpoint,
     resume_provenance,
@@ -54,7 +58,9 @@ from .send_back import (
 )
 
 __all__ = [
+    "CONSUMED_HUMAN_PROVENANCE",
     "HARNESS_ONLY_CATEGORIES",
+    "HUMAN_GATE_PROVENANCE",
     "MACHINE_REQUEUE_PROVENANCE",
     "SERVER_STOP_REASON",
     "ActionError",
@@ -72,6 +78,8 @@ __all__ = [
     "Route",
     "carried_checkpoint",
     "human_event",
+    "human_gate_armed",
+    "is_human_provenance",
     "process_actor",
     "resume_checkpoint",
     "resume_provenance",

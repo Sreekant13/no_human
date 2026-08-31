@@ -1473,6 +1473,17 @@ def test_a_human_gated_checkpoint_still_disarms_the_gate():
         assert _gate_armed(ctx, "a" * 40, subject) is False
 
 
+def test_a_consumed_human_gate_still_disarms_the_gate():
+    """Same control, once an attempt has actually branched from the human's
+    sha (`Orchestrator._consume_human_gate` rewrites `by` to
+    `consumed_human`): the work at this sha is still the human's, so credit
+    must not flip the moment the gate is consumed — see
+    tests/test_human_gate_consume_once.py for the full consume-once story."""
+    for subject in ("fix: work a human gated", "[WIP-PARTIAL] half a feature"):
+        ctx = {"resume_from": {"sha": "a" * 40, "by": "consumed_human"}}
+        assert _gate_armed(ctx, "a" * 40, subject) is False
+
+
 def test_the_gate_still_reads_the_subject_when_no_provenance_names_the_sha():
     """Control: on the `handoff.wip_sha` / reused-`pr_branch` paths nothing
     records who produced the branch point, so the SUBJECT remains the signal —

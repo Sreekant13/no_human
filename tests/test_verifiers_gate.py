@@ -13,15 +13,22 @@ pass or are skipped). Counting both separately is what lets these tests
 assert "the reviewer never ran" while a verifier judge call still did.
 """
 
+import ast
 import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
+import no_human.core.orchestrator as orchestrator_module
 from no_human.agent.backend import AgentResult
 from no_human.core.db import Store
-from no_human.core.orchestrator import Orchestrator
+from no_human.core.orchestrator import (
+    Orchestrator,
+    _VERIFIER_RETRY_MIN_TIMEOUT,
+    _VERIFIER_RETRY_TIMEOUT,
+    _VERIFIER_TIMEOUT,
+)
 from no_human.core.task import Task
 from no_human.notify.slack import SlackNotifier
 from no_human.review.reviewer import ReviewDecision as RD
@@ -101,9 +108,11 @@ class FakeReviewer:
             passed=True, checklist=[CI("it holds", True, "evidence")])
         self.bounded_calls = 0
         self.review_calls = 0
+        self.bounded_timeouts = []
 
     async def _run_bounded(self, prompt, repo_path, *, max_turns, timeout, on_event):
         self.bounded_calls += 1
+        self.bounded_timeouts.append(timeout)
         outcome = self.bounded_outcome
         if isinstance(outcome, list):
             idx = min(self.bounded_calls - 1, len(outcome) - 1)
@@ -424,3 +433,98 @@ async def test_verifier_results_persist_on_the_attempt_row_and_in_task_context(
     stored = json.loads(row[0])
     assert stored[0]["verifier_id"] == "no-todo"
     assert stored[0]["passed"] is True
+
+
+# --------------------------------------------------------------------------
+# Retry-window arithmetic (`_VERIFIER_TIMEOUT` / `_VERIFIER_RETRY_MIN_TIMEOUT`
+# / `_VERIFIER_RETRY_TIMEOUT`) — advisory from the independent review of
+# b4db79d66: the halving and the floor were both unpinned, and nothing
+# proved `retry_judge` actually uses the shorter window rather than the
+# full first-call timeout.
+# --------------------------------------------------------------------------
+
+
+def test_verifier_retry_window_is_half_the_first_call_window():
+    """Pins the halve-don't-double retry policy (mirroring `reviewer.py`'s
+    own `_REVIEW_MIN_RETRY_TIMEOUT` model): `_VERIFIER_RETRY_TIMEOUT` is half
+    of `_VERIFIER_TIMEOUT` whenever that half is above the floor. A retry
+    that reused or DOUBLED the first-call window would defeat the point of a
+    bounded retry — it would be no shorter, or even longer, than the call
+    that already timed out."""
+    assert _VERIFIER_TIMEOUT // 2 > _VERIFIER_RETRY_MIN_TIMEOUT, (
+        "this test's premise: at today's real constants, halving lands "
+        "above the floor, so this test actually exercises the halving "
+        "branch and not the floor branch")
+    assert _VERIFIER_RETRY_TIMEOUT == _VERIFIER_TIMEOUT // 2
+
+
+def _verifier_retry_timeout_expr() -> ast.Expression:
+    """The `ast.Expression` for the real `_VERIFIER_RETRY_TIMEOUT = ...`
+    source line, parsed rather than monkeypatched: the constant is computed
+    ONCE at module import time, so neither `monkeypatch.setattr` on
+    `_VERIFIER_TIMEOUT` nor `importlib.reload` (which just re-reads the same
+    real source) can exercise the floor branch. Parsing the source and
+    re-evaluating it under a substituted `_VERIFIER_TIMEOUT` is what lets a
+    test reach the floor without touching production constants — a future
+    reader must not "simplify" this into monkeypatching, which would make
+    the floor branch untestable again."""
+    tree = ast.parse(Path(orchestrator_module.__file__).read_text(encoding="utf-8"))
+    matches = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "_VERIFIER_RETRY_TIMEOUT"
+    ]
+    assert len(matches) == 1, (
+        "expected exactly one module-level `_VERIFIER_RETRY_TIMEOUT = ...` "
+        "assignment in core/orchestrator.py — if this is zero the constant "
+        "was renamed or moved and this test no longer pins anything")
+    return ast.Expression(matches[0].value)
+
+
+def test_verifier_retry_window_floors_at_the_minimum_when_half_is_too_short():
+    """Evaluates the actual policy expression from the source under a
+    substituted, deliberately-short `_VERIFIER_TIMEOUT` to prove the 60s
+    floor wins when half of the first-call window would be trivially
+    short."""
+    code = compile(
+        _verifier_retry_timeout_expr(), filename="<_VERIFIER_RETRY_TIMEOUT>", mode="eval")
+
+    floored = eval(code, {  # noqa: S307 - trusted source, own repo file
+        "max": max, "min": min,
+        "_VERIFIER_RETRY_MIN_TIMEOUT": 60, "_VERIFIER_TIMEOUT": 100,
+    })
+    assert floored == 60, "100 // 2 = 50 < 60 — the 60s floor must win"
+
+    # Guards against the test evaluating the wrong node: re-run the same
+    # evaluator with today's real constants and confirm it reproduces the
+    # imported `_VERIFIER_RETRY_TIMEOUT` exactly.
+    real = eval(code, {  # noqa: S307 - trusted source, own repo file
+        "max": max, "min": min,
+        "_VERIFIER_RETRY_MIN_TIMEOUT": _VERIFIER_RETRY_MIN_TIMEOUT,
+        "_VERIFIER_TIMEOUT": _VERIFIER_TIMEOUT,
+    })
+    assert real == _VERIFIER_RETRY_TIMEOUT
+
+
+async def test_the_retry_judge_call_uses_the_shorter_retry_window(store, tmp_path):
+    """Pins `core/orchestrator.py`'s `retry_judge` closure: the bounded
+    retry must be called with `_VERIFIER_RETRY_TIMEOUT`, never with the full
+    `_VERIFIER_TIMEOUT` — a retry that reuses the first-call window is not a
+    BOUNDED retry, it's the same call twice."""
+    work = _repo_with_a_verifier(tmp_path, VERIFIER_YAML)
+    repo = GitRepo(work)
+    reviewer = FakeReviewer([(None, "timed out"), _ok_json(passed=True)])
+    orch = _orch(store, tmp_path, reviewer)
+
+    task = Task.new("t", repo_path=str(work))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    await orch._run_review(task, repo, attempt_id, base="main")
+
+    assert reviewer.bounded_timeouts == [_VERIFIER_TIMEOUT, _VERIFIER_RETRY_TIMEOUT]
+    assert reviewer.bounded_timeouts[1] != _VERIFIER_TIMEOUT, (
+        "a retry that reuses the full first-call window is not a bounded "
+        "retry — the exact bug this test exists to catch")

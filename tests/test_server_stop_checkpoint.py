@@ -50,6 +50,11 @@ def test_server_stop_is_a_machine_requeue_provenance():
     assert {"orphan_recovery", "server_stop"} <= set(MACHINE_REQUEUE_PROVENANCE)
     assert "human" not in MACHINE_REQUEUE_PROVENANCE
     assert "wake" not in MACHINE_REQUEUE_PROVENANCE
+    # `consumed_human` is a HUMAN-provenance value for the credit question
+    # (see `is_human_provenance`), not a machine one — it must not be added
+    # here. See tests/test_human_gate_consume_once.py for the gate-armed vs
+    # credited distinction this constant is not part of.
+    assert "consumed_human" not in MACHINE_REQUEUE_PROVENANCE
 
 
 async def test_already_satisfied_gate_treats_server_stop_like_orphan_recovery(

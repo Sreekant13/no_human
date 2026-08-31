@@ -2234,8 +2234,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
         "the traceback no longer cites db.py:1866 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:4356" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4356 — this test is "
+    assert "orchestrator.py:4368" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:4368 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -2254,13 +2254,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
-    assert 1 <= 4356 <= len(orch_lines), "orchestrator.py is now shorter than line 4356"
-    assert "self.store.update_attempt(" in orch_lines[4355], (
-        f"orchestrator.py:4356 is now {orch_lines[4355]!r}, not the "
+    assert 1 <= 4368 <= len(orch_lines), "orchestrator.py is now shorter than line 4368"
+    assert "self.store.update_attempt(" in orch_lines[4367], (
+        f"orchestrator.py:4368 is now {orch_lines[4367]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (
-        "line 4356 is no longer inside _run_attempt's body"
+        "line 4368 is no longer inside _run_attempt's body"
     )
 
 

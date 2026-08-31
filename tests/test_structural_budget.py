@@ -71,7 +71,10 @@ FROZEN_FUNCTION_LINES = {
     # 2099 -> 2108 (+9): PR #877 widens the tamper base to three-dot
     # origin/<base>...HEAD so a sanctioned merge isn't charged with main's own
     # landed test edits (attempt-authored gutting still fires). Re-anchored on merge.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2108,
+    # 2108 -> 2118 (+10): the two `_consume_human_gate` call sites (revision
+    # and fresh branch paths) that rearm-once the human resume_from gate.
+    # Measured directly against the rebased tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2118,
     "core/orchestrator.py:Orchestrator._drive": 760,
     "core/db.py:Store._ensure_task_columns": 449,
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 429,
@@ -142,7 +145,12 @@ FROZEN_FILE_LINES = {
     # +9 lines as the function bump above). Re-anchored on merge.
     # 19659 -> 19724 (+65): PR #867 threads a backend kwarg through the budget/
     # pricing sites (output_extra_weight/weighted_tokens/class_breakdown callers).
-    "core/orchestrator.py": 19724,
+    # 19724 -> 19763 (+39): consume-once semantics for the human resume_from
+    # gate — `_consume_human_gate` (+ two call sites in `_run_attempt`),
+    # `_honor_server_stop`/`_is_own_partial` routed through the shared
+    # `human_gate_armed`/`is_human_provenance` predicates. Measured directly
+    # against the rebased tree with the scanner below (19763 total lines).
+    "core/orchestrator.py": 19763,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -240,7 +248,9 @@ FROZEN_FILE_LINES = {
     # never-shorten-a-live-wall guard in _run — the quota-wall storm cost fix.
     # +129: `HarvestJob` — the cadence job (`due()`/`maybe_run()`) that runs
     # both harvest passes from inside `nh serve`'s existing wake-watcher loop.
-    "core/scheduler.py": 2695,
+    # 2695 -> 2700 (+5): `_inherited_checkpoint` routed through the shared
+    # `human_gate_armed` predicate for consume-once human resume_from gates.
+    "core/scheduler.py": 2700,
 }
 
 

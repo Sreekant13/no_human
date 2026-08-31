@@ -13,8 +13,8 @@ single-turn model call per verifier over only the matching diff hunks, with
 a recorded verdict either way — pass, fail, or (fail-closed) no verdict. It
 is deliberately narrow: one judgment, no tools, no stages, and it fails
 closed on any ambiguous input (a user-authored YAML file, an arbitrary
-diff, or a model's free text). It is not yet wired into the review gate —
-that is a follow-up ticket.
+diff, or a model's free text). It is wired into the review gate by
+``core.orchestrator``, which runs the verifiers before the agentic reviewer.
 
 A ``no_verdict`` result gets exactly ONE bounded retry (mirroring
 ``reviewer.py``'s own retry-then-``ReviewerUnavailable`` pattern rather than

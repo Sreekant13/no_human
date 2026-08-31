@@ -509,13 +509,20 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         # ctypes is charged as a channel because in general it can name any
         # DLL; this module loads exactly kernel32, for GetProcessTimes — the
         # pool-lease pid-reuse start-token read (`_win_start_token_from_
-        # kernel32` / `_windows_start_token`). Same shape as cli/commands.py's
-        # kernel32 use above, different call (times, not liveness).
+        # kernel32` / `_windows_start_token`) — and for OpenProcess /
+        # GetExitCodeProcess — the liveness probe that replaces the
+        # `os.kill(pid, 0)` idiom, which on Windows TERMINATES the probed
+        # process instead of testing it (`_windows_pid_alive`, moved here
+        # from cli/commands.py to sit next to `pid_alive`, one source of
+        # truth for `_kernel32`/`_windows_pid_alive`).
         "pkg:ctypes": Allowed(
             "nothing off this machine — kernel32 process-creation-time query "
-            "for the scheduler pool-lease start token (`process_start_token`)",
-            _ON + "every same-pid lease comparison, on Windows only; the "
-            "POSIX paths read /proc or shell out to `ps` instead"),
+            "for the scheduler pool-lease start token (`process_start_token`) "
+            "and kernel32 process-liveness queries for the instance lock and "
+            "`nh stop` (`_windows_pid_alive`)",
+            _ON + "every same-pid lease comparison, and the pidfile lock "
+            "check and `nh stop`, on Windows only; the POSIX paths read "
+            "/proc or shell out to `ps`, or keep os.kill(pid, 0)"),
     },
     "cli/commands.py": {
         "http:urllib.request": Allowed(

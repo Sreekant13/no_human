@@ -836,6 +836,12 @@ async def test_run_verifiers_no_verdict_twice_is_unavailable_not_a_high_severity
     assert item.severity == "low", (
         "unavailable is advisory, not a blocking high-severity finding — "
         "the exact anti-pattern this fix exists to stop")
+    assert "judge unavailable" in result.evidence, (
+        "a transport-style no-verdict (no text on either call) must be worded "
+        "as the judge being unavailable, not as a malformed rule")
+    assert "never produced a parseable verdict" not in result.evidence, (
+        "the transport wording and the malformed-response wording are "
+        "mutually exclusive — this call never produced any raw text at all")
 
 
 async def test_run_verifiers_no_verdict_once_then_a_verdict_uses_the_retry():
@@ -891,6 +897,12 @@ async def test_run_verifiers_no_marker_twice_names_the_verifier_id_and_source_fi
     assert result.passed is False, "an unavailable rule must never read as satisfied"
     assert "weird-rule" in result.evidence
     assert ".no_human/verifiers.yaml" in result.evidence
+    assert "never produced a parseable verdict" in result.evidence, (
+        "a responded-but-unparseable no-verdict must be worded as a "
+        "malformed rule, not as the judge being unavailable")
+    assert "judge unavailable" not in result.evidence, (
+        "the transport wording and the malformed-response wording are "
+        "mutually exclusive — this call always produced raw text")
 
     # TEST (d): the rendered checklist row, not just the raw flag.
     item = to_checklist_item(result)

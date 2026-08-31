@@ -346,7 +346,7 @@ async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
     its reason). Never raises — the caller wraps this in its own
     try/except, but every internal failure here is also caught so the log
     line names the real reason rather than a generic "error inspecting"."""
-    from ..blockers import resume_provenance
+    from ..blockers import human_gate_armed, resume_provenance
     from ..vcs.git import ProtectedBranch
     from ..vcs.manifest_repair import commit_with_manifest_repair
 
@@ -367,15 +367,12 @@ async def _salvage_one(entry: Path, task, attempt, config, store) -> bool:
         return False
 
     ctx = task.context or {}
-    prior = ctx.get("resume_from") or {}
     # Identical to `Orchestrator._honor_server_stop` /
     # `Scheduler._inherited_checkpoint`: a human's gate is executed, never
-    # decided over; a stamp-less legacy resume reads as a human's too.
-    human_gated = bool(prior.get("sha")) and (
-        prior.get("by") == "human"
-        or (not prior.get("by")
-            and ctx.get("resume_reason") != "wake_condition_satisfied"))
-    if human_gated:
+    # decided over — but only while still ARMED. A consumed gate
+    # (`Orchestrator._consume_human_gate`) is exactly the ordinary machine
+    # salvage this skip was always meant to allow again.
+    if human_gate_armed(ctx):
         log.info("worktree salvage: skipping %s — resume_from is human-gated, "
                  "not overwriting it", entry)
         return False
