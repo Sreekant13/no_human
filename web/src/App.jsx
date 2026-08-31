@@ -4,7 +4,7 @@ import FinishSetupCard from "./FinishSetupCard.jsx";
 import { initTelemetry, captureScreen } from "./telemetry.js";
 import Board from "./Board.jsx";
 import Backlog from "./Backlog.jsx";
-import SettingsOverlay, { LearningsPanel } from "./Settings.jsx";
+import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { isAiConfigDone, markAiConfigDone } from "./aiConfigNudge.js";
@@ -970,7 +970,7 @@ export default function App() {
     const off = window.nhDesktop?.onMenu?.((action) => {
       if (action === "new-task") setShowNewTask(true);
       else if (action === "settings") openSettings();
-      else if (action === "board" || action === "backlog" || action === "stats" || action === "learnings") setPage(action);
+      else if (action === "board" || action === "backlog" || action === "stats") setPage(action);
     });
     return off;
   }, []);
@@ -1156,14 +1156,6 @@ export default function App() {
               current={page === "stats"}
               onClick={() => setPage("stats")}
             />
-            <NavRow
-              icon={<IconBrain />}
-              label="Second brain"
-              active={page === "learnings"}
-              current={page === "learnings"}
-              onClick={() => setPage("learnings")}
-              title="Rules, skills and learnings captured from your tasks"
-            />
           </NavGroup>
         </nav>
         <NightLedger tasks={tasks} authMode={authMode} />
@@ -1324,7 +1316,6 @@ export default function App() {
             : page === "done" ? "Done tasks"
             : page === "failed" ? "Failed tasks"
             : page === "stats" ? "Performance"
-            : page === "learnings" ? "Second brain"
             : page === "about" ? "About no_human"
             : "Settings"}
         </h1>
@@ -1355,7 +1346,6 @@ export default function App() {
         {page === "done" && <Outcomes tasks={tasks} lane="done" onFollowUp={openFollowUp} />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" onFollowUp={openFollowUp} />}
         {page === "stats" && <Stats tasks={tasks} />}
-        {page === "learnings" && <div className="nh-page"><LearningsPanel /></div>}
         {page === "about" && <About onShowShortcuts={() => setShowShortcuts(true)} />}
       </main>
       {showNewTask && (

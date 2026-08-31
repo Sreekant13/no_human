@@ -67,28 +67,30 @@ test("Backlog is a Work-group nav row that routes to its own page and is rendere
   assert.match(appJsx, /page === "backlog" \? "Backlog"/, "the sr-only h1 must name the page");
 });
 
-// Must-have #2: the learning queue ("second brain") is a first-class page in
-// the Insights group, not buried in the Settings overlay. It reuses the
-// already-tested LearningsPanel (imported from Settings.jsx) as the page body.
-test("the Insights group has a 'Second brain' row that routes to setPage('learnings') and renders LearningsPanel", () => {
+// Hotfix 2026-09-01 (operator directive): the "Second brain" surface must
+// live ONLY in Settings — the sidebar row, the "learnings" page mount, and
+// every other route into it were removed from App.jsx. This test used to pin
+// the row's PRESENCE; it now pins its ABSENCE, plus that Settings.jsx (the one
+// remaining surface, via SettingsOverlay's `section === "learnings"`) is
+// untouched.
+test("the Insights group has no 'Second brain' row; the sidebar/page route to 'learnings' is gone from App.jsx", () => {
   const insights = appJsx.match(/<NavGroup title="Insights">[\s\S]*?<\/NavGroup>/)?.[0];
-  assert.ok(insights, "the Insights group must be found");
-  assert.match(insights, /label="Second brain"/, "a 'Second brain' row must sit in the Insights group");
-  // Stats stays first; Second brain follows it.
-  assert.ok(insights.indexOf('label="Stats"') < insights.indexOf('label="Second brain"'));
-  const row = insights.match(/<NavRow\s+icon=\{<IconBrain \/>\}[\s\S]*?\/>/)?.[0];
-  assert.ok(row, "the Second brain NavRow must use the IconBrain icon");
-  assert.match(row, /active=\{page === "learnings"\}/);
-  assert.match(row, /current=\{page === "learnings"\}/);
-  assert.match(row, /setPage\(\s*["']learnings["']\s*\)/);
-  // The page it routes to actually renders the reused, already-tested panel.
-  assert.match(appJsx, /import SettingsOverlay,\s*\{\s*LearningsPanel\s*\}\s*from\s*["']\.\/Settings\.jsx["']/, "LearningsPanel must be imported from Settings.jsx");
-  assert.match(appJsx, /page === "learnings" &&[\s\S]{0,60}<LearningsPanel \/>/, "the learnings page must render LearningsPanel");
-  assert.match(appJsx, /page === "learnings" \? "Second brain"/, "the sr-only h1 must name the page");
-  // IconBrain is a real inline <svg> (CSP forbids remote icons).
-  const iconFn = appJsx.match(/function IconBrain\([^)]*\)\s*\{[^]*?\n\}/);
-  assert.ok(iconFn, "IconBrain must be defined");
-  assert.match(iconFn[0], /<svg/i, "IconBrain must render an inline <svg>");
+  assert.ok(insights, "the Insights group must still be found");
+  assert.match(insights, /label="Stats"/, "Stats must remain in the Insights group");
+  assert.doesNotMatch(insights, /label="Second brain"/, "no 'Second brain' row may remain in the Insights group");
+  assert.equal((insights.match(/<NavRow/g) || []).length, 1, "Insights must contain exactly one NavRow (Stats) now that Second brain is removed");
+  // No control anywhere in App.jsx may still route to the removed "learnings" page.
+  assert.doesNotMatch(appJsx, /setPage\(\s*["']learnings["']\s*\)/, "no control may still call setPage('learnings')");
+  assert.doesNotMatch(appJsx, /action === "learnings"/, "the desktop-menu action switch must not still recognize 'learnings'");
+  assert.doesNotMatch(appJsx, /page === "learnings"/, "no page-state branch (mount or title) may still check for the removed 'learnings' page");
+  // LearningsPanel is no longer mounted or imported by App.jsx — it is Settings-only now.
+  assert.doesNotMatch(appJsx, /<LearningsPanel/, "App.jsx must not mount LearningsPanel directly — it is Settings-only now");
+  assert.doesNotMatch(appJsx, /LearningsPanel/, "App.jsx must not import or reference LearningsPanel at all");
+  assert.doesNotMatch(appJsx, /"Second brain"/, "no 'Second brain' string may remain in App.jsx");
+  // Settings.jsx remains the one true home, untouched by this hotfix.
+  const settingsJsx = readFileSync(here + "Settings.jsx", "utf8");
+  assert.match(settingsJsx, /section === "learnings"/, "the Settings pane must still own the learnings section");
+  assert.match(settingsJsx, /export function LearningsPanel/, "the LearningsPanel component itself must remain exported from Settings.jsx, untouched");
 });
 
 test("every sidebar nav row (Board/Backlog/Done/Failed/Stats/Settings) pairs an inline-SVG icon with a text label — never icon-only", () => {
