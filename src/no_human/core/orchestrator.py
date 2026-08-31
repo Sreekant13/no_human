@@ -85,7 +85,7 @@ from ..intake.split_proposal import generate_split_proposal
 from ..intake.surface_advisory import surface_advisory
 from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
 from ..learning.ranking import rank_and_select
-from ..learning.triggers import filter_triggered
+from ..learning.triggers import filter_triggered, trigger_reason
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck, tamper_adjudication
 from ..review.reviewer import (
@@ -15852,6 +15852,36 @@ class Orchestrator:
                     injected_ids, task_id=task.id, attempt_id=attempt_id)
             except Exception as exc:  # noqa: BLE001
                 log.warning("could not record memory use ledger: %s", exc)
+            # D3 (2026-09-01 effectiveness study): the `learning_events`
+            # audit trail must record WHICH TAGS FIRED for each injection —
+            # `use_count`/`last_used_at` already cover the undifferentiated
+            # count, and neither can answer "why did this rule show up
+            # here". Best-effort, same reasoning as the two calls above: a
+            # locked database must not stop a task from starting.
+            haystack = self._trigger_haystack(task)
+            for m in self._active_memories:
+                mem_id = m.get("id")
+                if not mem_id:
+                    continue
+                try:
+                    await self.store.record_learning_event(
+                        mem_id, "inject",
+                        detail={
+                            "task_id": task.id,
+                            "attempt_id": attempt_id,
+                            # `trigger_reason`, not a bare `matched_tags(...)`
+                            # call: an untagged (unconditional) memory has no
+                            # tag to name, and `matched_tags` returns `[]` for
+                            # it — its own docstring warns a caller must not
+                            # read that back as "no reason". `trigger_reason`
+                            # writes `{"unconditional": True}` for that case
+                            # instead of the false `"tags": []` claim.
+                            **trigger_reason(m, haystack),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not record learning_events inject "
+                                "row for %s: %s", mem_id, exc)
         return all_scoped, triggered
 
     # `_active_memories` is a PROPERTY, not a plain attribute, and the screen

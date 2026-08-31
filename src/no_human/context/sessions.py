@@ -94,7 +94,17 @@ class SessionsSource:
             # module's docstring above), so it needs its own quarantine
             # clause exactly like `archived`'s, mirroring
             # `Store.list_memories`'s default filter.
-            f"(quarantined IS NULL OR quarantined = 0) AND ({clauses}) AND "
+            f"(quarantined IS NULL OR quarantined = 0) AND "
+            # D3 (2026-08-31 operator directive): same reasoning, for the
+            # SAME structural reason — this bypass route must honour every
+            # one of `Store.list_memories`'s default-excluded flags, not just
+            # `archived`/`quarantined`. Without this clause a paused rule
+            # (recoverable, "never injected") still reached the implement
+            # prompt through this second channel whenever a keyword matched —
+            # `_load_active_memories` is not "the one prompt-injection
+            # chokepoint" this module's own docstring already says it isn't.
+            f"(paused IS NULL OR paused = 0) AND "
+            f"({clauses}) AND "
             f"{scope_clause} LIMIT ?",
             (*params, self.limit),
         )

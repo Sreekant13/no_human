@@ -2167,6 +2167,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # reachable regardless (CLI `--triage-templated`, tests) — this only
         # turns off the unattended daily tick.
         "sweep_enabled": True,
+        # D3 (2026-08-31 operator directive — recorded in `learning/
+        # curator.py`'s and `core/scheduler.py` `HarvestJob`'s rewritten
+        # docstrings): auto-activation of a harvested learning that passes
+        # the dedupe/PII/provenance/term screens
+        # (`LearningQueue.auto_activate`), REVERSING the previous "a human
+        # confirms every learning" contract — deliberately, and recorded
+        # here rather than silently flipped. Default True is the flipped
+        # default the directive calls for. `False` is the KILL SWITCH FOR
+        # THIS WRITE PATH: it must exist before the default flips, and it
+        # restores the pre-D3 harvest/confirm-queue behaviour exactly —
+        # `HarvestJob` calls `auto_activate` not at all, every proposal
+        # stays `confirmed=False`/`source="proposed"`, inert until a human
+        # runs `nh learnings --confirm <id>`. It does NOT touch the
+        # 2026-09-01 word-boundary trigger-matching fix or `reject()`
+        # aliasing `pause()` for an already-confirmed row — both are
+        # correctness fixes, not gated by this key.
+        "auto_manage": True,
+        # D3: the ceiling on how many proposals `HarvestJob` may
+        # auto-activate per rolling 24h window (`Store.
+        # count_auto_activated_since`, checked inside
+        # `LearningQueue.auto_activate`). The compensating control for
+        # `auto_manage`'s flipped default — even with the human gate
+        # reversed, no tick (or run of ticks inside one day) can flood the
+        # active rule set unattended. An 11th otherwise-eligible proposal in
+        # the same window stays pending, not activated and not archived.
+        "auto_activate_daily_cap": 10,
     },
     # The scheduled learning-harvest pass (`core/scheduler.py` `HarvestJob`):
     # supervisor corrections + escalations + reviewer FAIL findings + tamper

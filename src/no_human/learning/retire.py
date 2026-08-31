@@ -13,7 +13,14 @@ This module is the retirement half:
 - `retirement_candidates` — a SUGGEST-only report of stale ACTIVE
   (confirmed) rows. Nothing here archives a confirmed row; that always
   requires a human's explicit `nh learnings --retire <id>` /
-  `POST /api/learnings/{id}/retire`.
+  `POST /api/learnings/{id}/retire` — UNLESS it is auto-activated (below).
+- `sweep_auto_activated` (D3, 2026-08-31 operator directive) — the ONE
+  exception to the "always requires a human" line above: an
+  auto-activated row (`confirmed_by = 'auto'`) retires itself after 90
+  days unused, the same way it activated itself. An operator-pinned or
+  manually-added row can never match its query (`activated_at IS NOT
+  NULL` is the whole exemption), so `curator.py`'s pinned-exempt rule
+  survives unchanged.
 - `find_superseded` / `near_duplicate_key` — the supersede-on-confirm
   mechanism (AC3): when a human confirms a proposal that duplicates an
   existing active rule, the old row is archived with a `superseded_by`
@@ -67,6 +74,14 @@ class SweepReport:
     reason: str
 
 
+# D3 (2026-08-31 operator directive): auto-activated rows retire
+# automatically after this many days unused — the SAME window
+# `retire_suggest_days`/`DEFAULT_RETIRE_SUGGEST_DAYS` already uses for the
+# human SUGGEST report, deliberately: it is the one retirement window this
+# product has already chosen, not a second number to keep in sync with it.
+DEFAULT_AUTO_RETIRE_DAYS = DEFAULT_RETIRE_SUGGEST_DAYS
+
+
 async def sweep_unconfirmed(
     store: Store, *, days: int = DEFAULT_ARCHIVE_UNCONFIRMED_DAYS,
     limit: int = 500, dry_run: bool = False,
@@ -89,6 +104,54 @@ async def sweep_unconfirmed(
         log.warning(
             "unconfirmed-proposal sweep hit its limit (%d) — more may still "
             "be eligible; re-run to continue", limit,
+        )
+    return SweepReport(
+        archived_ids=ids, scanned=len(ids), dry_run=dry_run, reason=reason)
+
+
+async def sweep_auto_activated(
+    store: Store, *, days: int = DEFAULT_AUTO_RETIRE_DAYS,
+    limit: int = 500, dry_run: bool = False,
+) -> SweepReport:
+    """D3 (2026-08-31 operator directive): the 90-day AUTOMATIC retirement
+    sweep for AUTO-ACTIVATED rows only. Thin, documented wrapper around
+    `Store.archive_stale_auto_activated` — see that method for the exact
+    WHERE-clause reasoning (why `confirmed_by = 'auto'` is the whole
+    exemption for a pinned/manually-added row, why the unused window is
+    measured off `activated_at`, not `created_at`).
+
+    UNLIKE `retirement_candidates` (which stays SUGGEST-only for every
+    confirmed row, human-added or auto-activated), this one ARCHIVES —
+    that asymmetry is the D3 design, not an oversight: an operator-pinned or
+    manually-added rule keeps needing a human's explicit
+    `nh learnings --retire`/`POST /api/learnings/{id}/retire`; a rule
+    nobody ever reviewed can retire itself the same way it activated
+    itself. Writes a `learning_events` 'auto_retire' row per id archived
+    (`dry_run` writes neither the archive nor the audit row) — the D3 audit
+    trail, same as `LearningQueue.auto_activate`'s.
+    """
+    reason = f"unused for {days}d — automatic auto-activation retirement"
+    ids = await store.archive_stale_auto_activated(
+        days=days, limit=limit, reason=reason, dry_run=dry_run)
+    if not dry_run:
+        for mem_id in ids:
+            # Best-effort, per id: the archive for THIS id already committed
+            # (`archive_stale_auto_activated` is one statement over the whole
+            # batch), so a failed audit write here must never raise out of
+            # the loop and abandon auditing every id still to come — the
+            # same "a completed transition must not read as a failure"
+            # guarantee `LearningQueue._audit` gives every queue-level
+            # transition.
+            try:
+                await store.record_learning_event(
+                    mem_id, "auto_retire", detail={"days": days})
+            except Exception:  # noqa: BLE001
+                log.warning("learning_events write failed for auto_retire %s",
+                            mem_id, exc_info=True)
+    if len(ids) >= limit:
+        log.warning(
+            "auto-activated retirement sweep hit its limit (%d) — more may "
+            "still be eligible; re-run to continue", limit,
         )
     return SweepReport(
         archived_ids=ids, scanned=len(ids), dry_run=dry_run, reason=reason)
@@ -142,7 +205,14 @@ async def find_superseded(
     key = near_duplicate_key(confirmed_row)
     my_scope = confirmed_row.get("project_scope")
     my_project = confirmed_row.get("project")
-    candidates = await store.list_memories(confirmed=True)
+    # D3 (2026-08-31 operator directive): `include_paused=True` — a paused
+    # row is a candidate too. Without this, a confirm's near-duplicate scan
+    # would be blind to a rule the operator just paused, the same dedupe gap
+    # `LearningQueue._auto_activation_screen` closes on its own read of this
+    # table: the row still carries the same lesson, and excluding it here
+    # would let it and a freshly confirmed duplicate coexist as two active
+    # copies the moment the pause is lifted.
+    candidates = await store.list_memories(confirmed=True, include_paused=True)
     out = []
     for row in candidates:
         if row["id"] == confirmed_row.get("id"):

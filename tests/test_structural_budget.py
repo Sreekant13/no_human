@@ -79,7 +79,12 @@ FROZEN_FUNCTION_LINES = {
     # and failure_reason. Measured on the D1.1 squash-merge result.
     "core/orchestrator.py:Orchestrator._run_attempt": 2130,
     "core/orchestrator.py:Orchestrator._drive": 760,
-    "core/db.py:Store._ensure_task_columns": 449,
+    # 449 -> 457 (+8): D3.1 (2026-08-31, auto-activation pipeline) adds the
+    # one call (plus its explanatory comment) that hands `paused`/
+    # `activated_at`/`learning_events` schema work to a new sibling method,
+    # `_ensure_d3_learning_columns` — split out specifically so the three new
+    # columns' worth of ALTERs did NOT land inline here. Re-anchored on merge.
+    "core/db.py:Store._ensure_task_columns": 457,
     # 429 -> 434 (+5): pre-existing red on main at 03b262d23 — e922e9b4's
     # (#935 derived-artefact keystone) landing grew the conflict watcher
     # without re-freezing; nh approve runs change-scoped tests only, so the
@@ -101,6 +106,12 @@ FROZEN_FUNCTION_LINES = {
     "agent/claude_backend.py:ClaudeBackend.stream": 407,
     "core/orchestrator.py:Orchestrator._run_review": 386,
     "cli/commands.py:bench_run": 377,
+    # Grew to 304 (> 300) when D3.1 (2026-08-31, auto-activation pipeline)
+    # threaded `learning.auto_manage`/`learning.auto_activate_daily_cap`
+    # through `nh serve`'s `HarvestJob` construction — the kill switch's own
+    # config must reach the CLI-driven scheduling path, not just the API
+    # server's embedded one. Reviewed on its merits; frozen here.
+    "cli/commands.py:serve": 304,
     # Grew to 371 when the UI-evidence prompt block landed (task 389210fa):
     # an inline enable+glob gate + the ui_evidence_block call. Reviewed on
     # its merits (the block is inert until a profile opts in); frozen here.
@@ -175,7 +186,10 @@ FROZEN_FILE_LINES = {
     # 20029 -> 20263 (+234): D1.2 (visual proof) — `_maybe_capture_ui_evidence`
     # + `_deliver_ui_evidence` + the media-section renderer and their anchored
     # docstrings. Measured on the D1.2 cherry-pick result with the scanner below.
-    "core/orchestrator.py": 20263,
+    # 20263 -> 20293 (+30): D3.1 (auto-activation) — the per-injection
+    # learning_events audit loop + trigger_reason call in the injection site.
+    # Measured on the D3.1 landing result.
+    "core/orchestrator.py": 20293,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -207,7 +221,10 @@ FROZEN_FILE_LINES = {
     # AST guard in `tests/_bench_ast_guard.py`. 2026-08-30.
     # 8173 -> 8204 (+31): D1.1 — `nh logs` now names and tails the attempt's
     # verification artifact (review finding #3). Measured on the merge result.
-    "cli/commands.py": 8204,
+    # 8204 -> 8214 (+10): D3.1 — `nh serve` threads learning.auto_manage /
+    # auto_activate_daily_cap into HarvestJob (kill-switch wiring). Measured
+    # on the D3.1 landing result.
+    "cli/commands.py": 8214,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -238,13 +255,23 @@ FROZEN_FILE_LINES = {
     # contract-fold into child descriptions (feature #1 UI backend).
     # 5639 -> 5648 (+9): GET /split-drafts PENDING guard (review A1 — no paid
     # draft call for a task that can never be split).
-    "api/app.py": 5657,
+    # 5657 -> 5714 (+57): D3.1 — the `/api/learnings/{id}/pause` and
+    # `.../delete` routes, `restore`'s pause-aware rewrite (undoes archive
+    # AND pause in one call), and the `RetirementSweepJob` construction's
+    # `auto_manage`/`auto_retire_days` config threading. Re-anchored on merge.
+    "api/app.py": 5714,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
     # 4388 -> 4411 (+23): Store.done_rate_by_tier — per-tier done-rate
     # calibration for the feasibility hint (feature #1).
-    "core/db.py": 4412,
+    # 4412 -> 4656 (+244): D3.1 — the auto-activation pipeline's schema
+    # (`_ensure_d3_learning_columns`: `paused`/`activated_at`/
+    # `learning_events`) and store methods (`activate_memory_auto`,
+    # `count_auto_activated_since`, `set_paused`, `record_learning_event`,
+    # `list_learning_events`, `archive_stale_auto_activated`). Re-anchored
+    # on merge.
+    "core/db.py": 4656,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.
@@ -257,7 +284,14 @@ FROZEN_FILE_LINES = {
     # Re-anchored in the same session it landed.
     # +41: D1.2's `ui_evidence_should_run` (the diff-aware default) plus its
     # docstring and the `UI_EVIDENCE_DEFAULT_GLOBS` constant.
-    "config.py": 3281,
+    # 3281 -> 3305 (+24): D3.1 — `learning.auto_manage` and
+    # `learning.auto_activate_daily_cap` defaults, with the docstring
+    # explaining the kill switch. Re-anchored on merge.
+    # 3305 -> 3307 (+2): D3.1 review fix round — scoped the `auto_manage`
+    # comment to the auto-activation write path specifically (it does not
+    # revert the trigger-matching fix or reject-aliases-pause). Re-anchored
+    # on merge.
+    "config.py": 3307,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
@@ -282,7 +316,10 @@ FROZEN_FILE_LINES = {
     # both harvest passes from inside `nh serve`'s existing wake-watcher loop.
     # 2695 -> 2700 (+5): `_inherited_checkpoint` routed through the shared
     # `human_gate_armed` predicate for consume-once human resume_from gates.
-    "core/scheduler.py": 2700,
+    # 2700 -> 2776 (+76): D3.1 — HarvestJob auto-activation branch,
+    # RetirementSweepJob 90-day auto-retire branch, and the rewritten
+    # operator-directive docstrings. Measured on the D3.1 landing result.
+    "core/scheduler.py": 2776,
 }
 
 

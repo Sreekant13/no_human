@@ -706,7 +706,11 @@ async def test_retirement_sweep_archives_old_unconfirmed_proposals(store):
 
     job = RetirementSweepJob(store, interval_seconds=60, archive_after_days=45)
     result = await job.maybe_run()
-    assert result == {"archived": 1}
+    # D3 (2026-08-31 operator directive): `auto_manage` defaults True, so
+    # every tick also runs the 90-day auto-activated retirement sweep — a
+    # no-op here (nothing in this test is auto-activated), but its (zero)
+    # counter still rides the result dict.
+    assert result == {"archived": 1, "auto_retired": 0}
 
     row = await store._fetchone(
         "SELECT archived FROM memories WHERE id = ?", (old_id,))

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -288,6 +289,19 @@ def _sig(*parts: str) -> str:
     """Stable dedupe signature so the same lesson isn't proposed twice."""
     raw = "\x1f".join(p.strip().lower() for p in parts if p)
     return "learn:" + hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+@dataclass
+class AutoActivateReport:
+    """What one `LearningQueue.auto_activate` call did (D3, 2026-08-31)."""
+
+    activated: list[str] = field(default_factory=list)
+    # Screen-failing rows, archived rather than left pending — 'low-quality
+    # or screen-failing proposals are archived, not queued' (D3 design).
+    archived: list[str] = field(default_factory=list)
+    # True iff at least one otherwise-eligible row stayed pending because the
+    # daily cap had no budget left this tick.
+    cap_hit: bool = False
 
 
 @dataclass
@@ -1131,6 +1145,10 @@ class LearningQueue:
         confirmed = await self.store.confirm_memory(mem_id)
         if not confirmed:
             return confirmed
+        # Audit is best-effort (`_audit`) — never undo a real confirm over a
+        # failed audit write, same reasoning as the supersede-on-confirm
+        # guard right below.
+        await self._audit(mem_id, "confirm", detail={"confirmed_by": "human"})
         try:
             from .retire import find_superseded
             row = await self.store.find_memory(mem_id)
@@ -1158,6 +1176,24 @@ class LearningQueue:
         from .retire import retirement_candidates
         return await retirement_candidates(self.store, days=days)
 
+    async def _audit(
+        self, mem_id: str, event: str, *, detail: dict[str, Any] | None = None,
+    ) -> None:
+        """The ONE place every D3 transition writes its `learning_events`
+        row — best-effort, always: a failed audit write must never turn an
+        already-COMPLETED transition (the row is already paused/archived/
+        confirmed/activated) into something that reads as a failure to the
+        caller, and must never abort a caller that is mid-loop over several
+        rows (`auto_activate`, `sweep_auto_activated`). `confirm()` proved
+        this pattern first; every other transition method uses THIS helper
+        rather than its own copy, so "the audit write is best-effort" is one
+        guarantee instead of a claim each method has to keep re-earning."""
+        try:
+            await self.store.record_learning_event(mem_id, event, detail=detail)
+        except Exception:  # noqa: BLE001
+            log.warning("learning_events write failed for %s %s", event,
+                        mem_id, exc_info=True)
+
     async def retire(self, mem_id: str) -> bool:
         """The human's explicit yes to a retirement suggestion (AC2's only
         door). Verifies the row is confirmed (retirement is for ACTIVE
@@ -1165,14 +1201,19 @@ class LearningQueue:
         like any other archive: reversible, no `superseded_by` (this is not a
         duplicate collapsing onto a survivor, it is one rule going quiet).
 
-        NEVER called by any scheduled job — see `RetirementSweepJob`, which
-        only ever calls `sweep_unconfirmed`. Dismissal of a suggestion writes
-        nothing here or anywhere; it is purely a client-side "not now"."""
+        NEVER called by any scheduled job — this stays true after D3:
+        `RetirementSweepJob` calls `sweep_unconfirmed` and (D3, auto-activated
+        rows only) `sweep_auto_activated`, both in `learning/retire.py`,
+        never this method. Dismissal of a suggestion writes nothing here or
+        anywhere; it is purely a client-side "not now"."""
         row = await self.store.find_memory(mem_id)
         if row is None or not row.get("confirmed"):
             return False
-        return await self.store.archive_memory(
+        ok = await self.store.archive_memory(
             mem_id, "retired at the human gate (unused >90d)")
+        if ok:
+            await self._audit(mem_id, "retire")
+        return ok
 
     async def reject(self, mem_id: str) -> bool:
         """A human's "no".
@@ -1217,9 +1258,187 @@ class LearningQueue:
         Archiving keeps the row (``confirmed=0``, ``archived=1``), so it leaves
         `pending()` exactly as a delete did, and `memory_dedupe_key_exists`
         still sees its key. That is what makes the "no" stick.
+
+        D3 (2026-08-31 operator directive): the table above was built for a
+        PENDING proposal's queue exit, and it still governs one — but with
+        auto-activation on, the common row `reject()` is called on is
+        already CONFIRMED (auto- or human-activated), and neither verb in
+        that table is right for one: deleting an active rule outright is not
+        "the human said no to a proposal", and the per-origin archive/delete
+        split was never about an active row's lifecycle at all. A confirmed
+        row therefore does not reach the table below; it is PAUSED instead
+        (see ``pause()``) — recoverable, never injected, exactly the "no"
+        this method's callers actually want for the Second-brain UI's
+        Pause/Reject action. This is "reject aliases pause" from the D3
+        design, and it changes nothing for the unconfirmed case every
+        existing caller and test below exercises.
         """
         row = await self.store.find_memory(mem_id)
-        if row is not None and row.get("origin") in ARCHIVE_ON_REJECT:
+        if row is None:
+            return False
+        if row.get("confirmed"):
+            return await self.pause(mem_id)
+        if row.get("origin") in ARCHIVE_ON_REJECT:
             return await self.store.archive_memory(
                 row["id"], "rejected at the human confirm gate")
         return await self.store.delete_memory(mem_id)
+
+    # --------------------------- D3: pause / delete ------------------------- #
+
+    async def pause(self, mem_id: str) -> bool:
+        """D3 (2026-08-31 operator directive): PAUSE a learning. The row
+        stays (recoverable — the curator's never-deletes invariant extends
+        here), ``paused=1``, and it is never injected again
+        (`Store.list_memories`'s default excludes a paused row, so
+        `Orchestrator._load_active_memories` respects it with no extra
+        filtering of its own). Works on any row regardless of confirmed
+        status. Records a ``learning_events`` audit row."""
+        ok = await self.store.set_paused(mem_id, True)
+        if ok:
+            await self._audit(mem_id, "pause")
+        return ok
+
+    async def unpause(self, mem_id: str) -> bool:
+        """The reverse of `pause` — the Second-brain UI's Restore action on a
+        paused (not archived) row."""
+        ok = await self.store.set_paused(mem_id, False)
+        if ok:
+            await self._audit(mem_id, "unpause")
+        return ok
+
+    async def delete(self, mem_id: str) -> bool:
+        """D3: DELETE, from the Second-brain UI's perspective. Archives the
+        row — never a real ``DELETE FROM`` — mirroring `curator.py`'s
+        never-deletes invariant; recoverable via `restore`. Distinct from
+        the legacy `reject()`'s per-origin archive/delete dispatch: this is
+        the explicit, always-archive verb the new UI's Delete button uses,
+        on a row of any status. Records a ``learning_events`` audit row."""
+        ok = await self.store.archive_memory(
+            mem_id, "deleted via the Second brain UI")
+        if ok:
+            await self._audit(mem_id, "delete")
+        return ok
+
+    # --------------------------- D3: auto-activation ------------------------ #
+
+    async def _auto_activation_screen(self, m: dict[str, Any]) -> str | None:
+        """None when *m* passes every D3 auto-activation screen (dedupe ->
+        PII -> provenance -> term, in that order); else the name of the one
+        that failed, for the audit event and the archive reason.
+
+        - **dedupe**: a near-duplicate ACTIVE row already covers this lesson
+          (`curator.dedupe_key`, scoped exactly like `retire.find_superseded`)
+          — auto-activating it would add a redundant active row nobody asked
+          for. Includes PAUSED rows (`include_paused=True`): a paused lesson
+          is still the same lesson, and excluding it here would let a
+          re-harvested near-duplicate silently undo a pause.
+        - **pii**: title/content/evidence carries personal data. Defense in
+          depth: every proposer already gates this before writing
+          (`learning/pii.py`), but a row can reach the queue by a path that
+          does not (a board-added or `nh reply`-mined row).
+        - **provenance**: no `origin` AND no `evidence.task_id` — nothing
+          says where this proposal came from, so it cannot auto-activate
+          unattended.
+        - **term**: title/content carries a banned vendor term — the same
+          matcher `Orchestrator._screen_memories_for_terms` uses on the
+          injection side (`eval.vendor_terms.find_banned_terms`).
+        """
+        from .curator import dedupe_key as near_duplicate_key
+        from .pii import contains_pii
+
+        evidence = m.get("evidence")
+        if isinstance(evidence, str):
+            try:
+                evidence = json.loads(evidence)
+            except (ValueError, TypeError):
+                evidence = None
+        if not isinstance(evidence, dict):
+            evidence = None
+
+        key = near_duplicate_key(m)
+        my_scope, my_project = m.get("project_scope"), m.get("project")
+        # `include_paused=True`: a PAUSED row is still an existing lesson, not
+        # a gone one — `pause()` never deletes or archives it. Without this,
+        # pausing a rule and then re-harvesting a near-duplicate would pass
+        # dedupe (the paused row is invisible to the default query) and
+        # auto-activate the exact lesson the operator just silenced — the
+        # same treadmill `reject()`'s docstring names for a batch producer
+        # that re-reads its whole input on every run.
+        for row in await self.store.list_memories(
+                confirmed=True, include_paused=True):
+            if near_duplicate_key(row) != key:
+                continue
+            row_scope, row_project = row.get("project_scope"), row.get("project")
+            if my_scope or row_scope:
+                if my_scope == row_scope:
+                    return "dedupe"
+            elif my_project == row_project:
+                return "dedupe"
+
+        if contains_pii(str(m.get("title") or ""), str(m.get("content") or ""),
+                         *_evidence_strings(evidence)) is not None:
+            return "pii"
+
+        if not m.get("origin") and not (evidence and evidence.get("task_id")):
+            return "provenance"
+
+        from ..eval.vendor_terms import find_banned_terms
+        text = f"{m.get('title', '')}\n{m.get('content', '')}"
+        try:
+            hits = find_banned_terms(text)
+        except Exception:  # noqa: BLE001 — a screen that errors must not block
+            hits = []       # a proposal; fall through to activating it
+        if hits:
+            return "term"
+        return None
+
+    async def auto_activate(self, *, cap: int = 10) -> AutoActivateReport:
+        """D3 (2026-08-31 operator directive, overriding this module's prior
+        "a human confirms every learning" contract — see `learning/
+        curator.py`'s module docstring for the same reversal stated there):
+        promote every PENDING proposal that passes
+        `_auto_activation_screen` straight to the active set
+        (``confirmed=1``, ``source="auto"``), capped at *cap* proposals per
+        rolling 24h window (`Store.count_auto_activated_since`) — the
+        compensating control for the flipped default, so no single tick, or
+        run of ticks inside one day, can flood the active rule set
+        unattended.
+
+        A row that FAILS a screen is ARCHIVED immediately, never left
+        pending — "low-quality or screen-failing proposals are archived,
+        not queued" (D3 design); there is no human queue left in the UI to
+        hold it. Oldest-first, so the cap is applied in a stable,
+        deterministic order across repeated ticks.
+
+        Every activation and every screen-failing archive writes a
+        ``learning_events`` row (`Store.record_learning_event`) — the D3
+        audit trail. Callers: `core.scheduler.HarvestJob`, gated on
+        ``config learning.auto_manage`` (the kill switch — see that job's
+        docstring).
+        """
+        report = AutoActivateReport()
+        pending = await self.pending()
+        if not pending:
+            return report
+        already = await self.store.count_auto_activated_since(hours=24)
+        budget = max(0, cap - already)
+        ordered = sorted(pending, key=lambda m: str(m.get("created_at") or ""))
+        for m in ordered:
+            reason = await self._auto_activation_screen(m)
+            if reason is not None:
+                if await self.store.archive_memory(
+                        m["id"], f"auto-activation screen failed: {reason}"):
+                    report.archived.append(m["id"])
+                    await self._audit(
+                        m["id"], "auto_archive", detail={"reason": reason})
+                continue
+            if budget <= 0:
+                report.cap_hit = True
+                continue  # stays pending — inert until the cap has room again
+            if await self.store.activate_memory_auto(m["id"]):
+                report.activated.append(m["id"])
+                budget -= 1
+                await self._audit(
+                    m["id"], "activate",
+                    detail={"origin": m.get("origin"), "source": "auto"})
+        return report

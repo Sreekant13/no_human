@@ -5,9 +5,37 @@ store nobody can read is a store nobody confirms, so learnings stop
 compounding. The curator maintains it under broker' invariants:
 
 - **never deletes** — archive only (recoverable, audit-trailed);
-- **pinned exempt** — confirmed memories are the operator's; never touched;
-- **the human gate stands** — confirming (applying) a learning remains the
-  ONLY way it takes effect; the curator only tidies the unconfirmed queue.
+- **pinned exempt** — confirmed memories are the operator's; never touched
+  by the curator, whether they got there by a human's click or by
+  auto-activation. This is what makes the 90-day auto-retirement sweep
+  (`learning/retire.py:sweep_auto_activated`) safe to leave unattended: it
+  can only ever select a row `LearningQueue.auto_activate` itself wrote
+  (`confirmed_by = 'auto'`), so an operator-pinned or manually-added row is
+  excluded BY CONSTRUCTION, not by a second exemption list this module
+  would have to keep in sync with that one.
+- **auto-management is bounded, not ungated** (2026-08-31 operator
+  directive — this REPLACES the "a human confirms every learning" contract
+  this bullet used to state here; the reversal is deliberate and recorded,
+  not a regression). A harvested proposal that passes the dedupe/PII/
+  provenance/term screens (`LearningQueue.auto_activate`,
+  `_auto_activation_screen`) is promoted straight to the active set
+  without a click, capped at `config learning.auto_activate_daily_cap`
+  proposals per rolling day, with every activation, screen-failing
+  archive, pause, delete and retirement recorded in `learning_events` for
+  audit. `config learning.auto_manage: false` is the kill switch FOR THE
+  AUTO-ACTIVATION WRITE PATH SPECIFICALLY: it restores the pre-D3
+  harvest/confirm-queue behaviour exactly — nothing here, or in
+  `HarvestJob`, auto-confirms anything, and every proposal stays
+  `confirmed=0` until a human runs `nh learnings --confirm <id>`. It does
+  NOT revert the 2026-09-01 word-boundary trigger-matching fix
+  (`learning/triggers.py`) or `reject()` aliasing `pause()` for an
+  already-confirmed row (`learning/queue.py`) — both are correctness
+  fixes independent of the auto-activation default, unaffected by this
+  switch either way. The curator itself is unchanged by any of this: it
+  still only tidies the UNCONFIRMED queue (dedupe + advisory archive/
+  consolidate) and never itself confirms, activates or retires a row —
+  that machinery lives entirely in `learning/queue.py` and
+  `learning/retire.py`.
 
 Two passes:
 1. deterministic dedupe (free): identical normalized title+content prefix →

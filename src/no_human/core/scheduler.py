@@ -2448,10 +2448,21 @@ class RetirementSweepJob:
     (see ``api/app.py``'s lifespan) — same pattern as ``reanalysis``/
     ``wiki_refresh`` being ``None``-able on ``Scheduler``.
 
-    Never touches a confirmed row (`Store.archive_unconfirmed_older_than`'s
-    ``confirmed = 0`` clause is a literal equality, not this job's job to
-    enforce) and never raises out of `maybe_run` — a failing sweep must not
-    take the dispatch loop down with it.
+    Never touches a confirmed row that was NOT auto-activated
+    (`Store.archive_unconfirmed_older_than`'s ``confirmed = 0`` clause is a
+    literal equality) and never raises out of `maybe_run` — a failing sweep
+    must not take the dispatch loop down with it.
+
+    D3 (2026-08-31 operator directive): also runs the 90-day AUTOMATIC
+    retirement sweep for AUTO-ACTIVATED rows (`learning/
+    retire.py:sweep_auto_activated`) — the one exception to "a confirmed row
+    always needs a human's explicit retire", scoped so it can only ever
+    select a row `LearningQueue.auto_activate` itself wrote
+    (`confirmed_by = 'auto'`); an operator-pinned or manually-added row is
+    excluded by construction, not by a second exemption list. Gated on
+    ``auto_manage`` — the same kill switch `HarvestJob` reads — so with
+    ``learning.auto_manage: false`` this job's behaviour is exactly what it
+    was before D3: the 45-day unconfirmed sweep, and nothing else.
     """
 
     def __init__(
@@ -2461,11 +2472,15 @@ class RetirementSweepJob:
         interval_seconds: float = 86400,  # default: once per day
         archive_after_days: int = 45,
         max_per_run: int = 500,
+        auto_manage: bool = True,
+        auto_retire_days: int = 90,
     ):
         self.store = store
         self.interval = max(60, interval_seconds)
         self.archive_after_days = archive_after_days
         self.max_per_run = max_per_run
+        self.auto_manage = auto_manage
+        self.auto_retire_days = auto_retire_days
         # 0.0 means "never run" — the first `due()` check after boot is
         # therefore always True, so the first tick after startup IS the
         # startup sweep. There is no separate startup-only code path to test.
@@ -2493,7 +2508,7 @@ class RetirementSweepJob:
             self._last_run = time.time()
 
     async def _run(self) -> dict:
-        from ..learning.retire import sweep_unconfirmed
+        from ..learning.retire import sweep_auto_activated, sweep_unconfirmed
 
         report = await sweep_unconfirmed(
             self.store, days=self.archive_after_days,
@@ -2501,7 +2516,20 @@ class RetirementSweepJob:
         log.info("memory retirement sweep: archived %d unconfirmed "
                  "proposal(s) older than %d day(s)",
                  len(report.archived_ids), self.archive_after_days)
-        return {"archived": len(report.archived_ids)}
+        result = {"archived": len(report.archived_ids)}
+        # D3: kill-switched with `HarvestJob`'s own `auto_manage` — with it
+        # off, no row can ever carry `confirmed_by='auto'` in the first
+        # place, so this branch would always be a no-op query; skipping it
+        # keeps the result dict's shape identical to the pre-D3 one too.
+        if self.auto_manage:
+            auto_report = await sweep_auto_activated(
+                self.store, days=self.auto_retire_days,
+                limit=self.max_per_run)
+            log.info("auto-activation retirement sweep: archived %d "
+                     "auto-activated learning(s) unused for %d day(s)",
+                     len(auto_report.archived_ids), self.auto_retire_days)
+            result["auto_retired"] = len(auto_report.archived_ids)
+        return result
 
 
 # --------------------------------------------------------------------------- #
@@ -2527,16 +2555,33 @@ class HarvestJob:
 
     ``distill=None`` by default: the scheduled pass never calls a model. It
     proposes the verbatim-clustered lesson, exactly like an un-configured
-    ``nh learnings --harvest``. Nothing here spends a token, opens a PR, or
-    confirms a proposal — every learning row lands with ``source="proposed"``,
-    ``confirmed=False``, inert until a human runs ``nh learnings --confirm
-    <id>``; every bench candidate lands with ``runnable: false``, inert until
-    a human edits it. See ``learning/failures.py``'s module docstring (and
-    ``eval/harvest.py``'s, for the bench side) for why this stays reviewable
-    entries rather than something more automatic — Tessl's loop proposes PRs;
-    this one proposes entries a human reviews. That reasoning is exactly as
-    true of the scheduled pass as of the manual one; do not "upgrade" this to
-    auto-apply or auto-PR.
+    ``nh learnings --harvest``. Nothing here spends a token or opens a PR —
+    every bench candidate lands with ``runnable: false``, inert until a
+    human edits it (see ``eval/harvest.py``'s module docstring for the
+    bench side, unchanged by D3).
+
+    LEARNING PROPOSALS ARE DIFFERENT (2026-08-31 operator directive,
+    overriding what this docstring said here before — see
+    ``learning/curator.py``'s module docstring for the same reversal stated
+    there). With ``config learning.auto_manage`` at its default (``True``),
+    every proposal this tick writes that passes
+    ``LearningQueue.auto_activate``'s dedupe/PII/provenance/term screens is
+    promoted straight into the active set (``confirmed=1``,
+    ``source="auto"``) — capped at ``learning.auto_activate_daily_cap``
+    proposals per rolling 24h window, and every activation (and every
+    screen-failing archive) is written to ``learning_events`` for audit.
+    A proposal that FAILS a screen is archived immediately, not left
+    pending — there is no human queue left in the UI to hold it.
+    ``learning.auto_manage: false`` is the kill switch FOR THIS WRITE PATH
+    SPECIFICALLY: it restores the pre-D3 harvest/confirm-queue behaviour
+    exactly — every row lands ``source="proposed"``, ``confirmed=False``,
+    inert until a human runs ``nh learnings --confirm <id>``, and this job
+    never calls ``auto_activate`` at all. It is NOT a global "everything is
+    as it was" switch: the 2026-09-01 word-boundary trigger-matching fix
+    (``learning/triggers.py``) and ``reject()`` aliasing ``pause()`` for an
+    already-confirmed row (``learning/queue.py``) are both correctness
+    fixes independent of D3's auto-activation default, and neither is
+    gated by ``auto_manage`` — flipping it off does not revert either.
 
     UNLIKE its neighbors (``ReanalysisJob``/``WikiRefreshJob``/
     ``RetirementSweepJob``), this job's caller reports the ZERO case too
@@ -2554,11 +2599,25 @@ class HarvestJob:
         interval_seconds: float = 43200,  # default: once per 12 hours
         distill: "DistillFn | None" = None,
         out_dir: "Path | None" = None,
+        auto_manage: bool = True,
+        auto_activate_daily_cap: int = 10,
     ):
         self.store = store
         self.interval = max(60, interval_seconds)
         self._distill = distill
         self.out_dir = out_dir
+        # D3 (2026-08-31 operator directive): `config learning.auto_manage`
+        # and `learning.auto_activate_daily_cap`, read via constructor
+        # kwargs rather than this job reaching into `config` itself — the
+        # same shape `RetirementSweepJob` already uses for its own
+        # `learning.*` values. Threaded through by `nh serve`'s
+        # construction (`cli/commands.py`) — the live scheduling path.
+        # NOTE: `api/app.py`'s lifespan (the API server's OWN embedded
+        # worker) constructs `RetirementSweepJob` but never `HarvestJob` at
+        # all — a pre-existing gap this change does not close (out of
+        # D3.1's file list); see the task report for detail.
+        self.auto_manage = auto_manage
+        self.auto_activate_daily_cap = max(0, int(auto_activate_daily_cap))
         # 0.0 means "never run" — same first-tick-after-boot convention as
         # `RetirementSweepJob`.
         self._last_run: float = 0.0
@@ -2603,6 +2662,23 @@ class HarvestJob:
             "failures": len(fail),
             "notes": notes[:20],
         }
+        # D3 (2026-08-31 operator directive): auto-activate whatever this
+        # tick's (and any earlier tick's) pending queue holds, subject to the
+        # daily cap. `auto_manage=False` is the kill switch — this branch is
+        # skipped entirely, so nothing here ever calls `auto_activate`, and
+        # the result dict carries no D3 keys, matching the pre-D3 shape
+        # byte-for-byte.
+        if self.auto_manage:
+            activation = await q.auto_activate(cap=self.auto_activate_daily_cap)
+            result["activated"] = len(activation.activated)
+            result["auto_archived"] = len(activation.archived)
+            result["cap_hit"] = activation.cap_hit
+            log.info(
+                "auto-activation: %d activated, %d screen-failing archived, "
+                "cap_hit=%s",
+                len(activation.activated), len(activation.archived),
+                activation.cap_hit,
+            )
         log.info(
             "harvest: %d bench candidate(s), %d learning proposal(s) "
             "(%d supervisor, %d escalation/review-fail/tamper)",

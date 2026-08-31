@@ -541,8 +541,10 @@ same way the table above is:
 | `learning.sweep_interval_seconds` | `86400` | How often the retirement sweep ticks; the first tick runs immediately at boot |
 | `learning.sweep_enabled` | `true` | Kill switch for the unattended daily sweep (the CLI triage path stays reachable either way) |
 | `learning.propose_on_success` | `false` | The flood-kill: the per-success templated skill proposal only fires when this is explicitly turned on |
+| `learning.auto_manage` | `true` | D3 (2026-08-31 operator directive): auto-activate a harvested proposal that passes the dedupe/PII/provenance/term screens — `confirmed=1`, `source="auto"` — instead of queuing it for a human. `false` is the KILL SWITCH for this write path specifically: it restores the pre-D3 harvest/confirm-queue behaviour exactly, and also turns off the 90-day auto-activated retirement sweep below. It does NOT revert the word-boundary trigger-matching fix or `reject()` aliasing `pause()` for an already-confirmed row — see mechanism 4 below |
+| `learning.auto_activate_daily_cap` | `10` | The ceiling on how many proposals `HarvestJob` may auto-activate per rolling 24h window — the compensating control for `auto_manage`'s flipped default |
 
-Three mechanisms, concretely:
+Four mechanisms, concretely:
 
 1. **45-day auto-archive.** `Store.archive_unconfirmed_older_than` sweeps
    unconfirmed, `source="proposed"` rows past `archive_unconfirmed_days`
@@ -558,6 +560,30 @@ Three mechanisms, concretely:
    `LearningQueue.confirm`, archives the oldest matching *active* row with
    `superseded_by` pointing at the newly confirmed survivor when a confirmed
    near-duplicate exists — never more than one hop, never a chain.
+4. **Auto-activation (D3, 2026-08-31 operator directive).** With
+   `auto_manage` at its default (`true`), `HarvestJob` promotes a harvested
+   proposal that passes dedupe/PII/provenance/term screens
+   (`LearningQueue.auto_activate`) straight into the active set, capped at
+   `auto_activate_daily_cap` per rolling day; a screen-failing proposal is
+   archived immediately rather than queued. Every activation, screen-failing
+   archive, pause, delete and retirement is written to the `learning_events`
+   audit table. `nh learnings`/`POST /api/learnings/{id}/confirm` still work
+   for compatibility; `reject`/`POST .../reject` now PAUSES an already-active
+   learning rather than deleting it (a still-pending proposal keeps its old
+   per-origin archive/delete behaviour). `POST /api/learnings/{id}/pause` and
+   `POST /api/learnings/{id}/delete` (which archives, never a real delete)
+   are the Second-brain UI's direct actions; `POST .../restore` undoes either.
+   An auto-activated row (`confirmed_by = 'auto'`) also retires itself
+   automatically after `retire_suggest_days` (default 90) unused — an
+   operator-pinned or manually-added row can never match that query and so
+   is never auto-retired. `auto_manage: false` is the kill switch for the
+   AUTO-ACTIVATION WRITE PATH — harvested proposals stop auto-confirming and
+   the auto-retirement sweep stops, byte-for-byte the pre-D3 harvest
+   behaviour. It is NOT a global revert: the word-boundary trigger-matching
+   fix (a memory tagged `fact` no longer fires inside "artefact") and
+   `reject()` aliasing `pause()` for an already-confirmed row are both
+   correctness fixes that apply unconditionally, whatever `auto_manage` is
+   set to.
 
 The Rules/Skills panel surfaces all three: an **Archived**/**Superseded**
 badge, a "Show archived" filter, and **Restore**/**Dismiss** triage actions —

@@ -145,8 +145,12 @@ async def test_harvest_job_not_due_until_interval_elapses(store, tmp_path):
     assert job.due()  # _last_run == 0.0 at construction — always due at boot
     result = await job.maybe_run()
     assert result is not None
+    # D3 (2026-08-31 operator directive): `auto_manage` defaults True, so
+    # every tick also runs `LearningQueue.auto_activate` — a no-op on an
+    # empty store, but the result dict carries its (zero) counters too.
     assert result == {"candidates": 0, "proposals": 0, "supervisor": 0,
-                       "failures": 0, "notes": []}
+                       "failures": 0, "notes": [],
+                       "activated": 0, "auto_archived": 0, "cap_hit": False}
     assert not job.due()
     assert await job.maybe_run() is None
 
@@ -427,7 +431,13 @@ async def test_untripped_tamper_check_is_not_mined(store):
 # --------------------------------------------------------------------------- #
 
 
-async def test_scheduled_harvest_applies_nothing(store, tmp_path):
+async def test_scheduled_harvest_applies_nothing_with_the_kill_switch_off(store, tmp_path):
+    """D3 (2026-08-31 operator directive) flipped the DEFAULT: with
+    `auto_manage` at its default (True), this exact scenario auto-activates
+    both proposals (see `test_learning_auto_activation.py`). This test now
+    pins the KILL SWITCH (`auto_manage=False`) instead — the pre-D3
+    behaviour this file's name always described, still reachable and still
+    exact, one config flip away."""
     from no_human.eval.bench_task import NORTHSTAR_DIR
 
     corpus_before = len(list(NORTHSTAR_DIR.glob("*.yaml"))) if NORTHSTAR_DIR.exists() else 0
@@ -442,7 +452,7 @@ async def test_scheduled_harvest_applies_nothing(store, tmp_path):
     await _seed_escalations(store, ["which token should it use for CI?"] * 2)
 
     out_dir = tmp_path / "harvest"
-    job = HarvestJob(store, interval_seconds=60, out_dir=out_dir)
+    job = HarvestJob(store, interval_seconds=60, out_dir=out_dir, auto_manage=False)
     result = await job.maybe_run()
     assert result["candidates"] == 1
     assert result["proposals"] == 2

@@ -1245,6 +1245,14 @@ class Store:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN superseded_by TEXT")
 
+        # D3 (2026-08-31 operator directive): auto-activation's `paused`/
+        # `activated_at` columns and the `learning_events` audit table — a
+        # separate method (not inlined here) so this already-long function
+        # doesn't grow past the structural-budget ratchet
+        # (`tests/test_structural_budget.py`) for three columns' worth of
+        # ALTERs.
+        await self._ensure_d3_learning_columns(mem_existing)
+
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
                          for row in await self._fetchall(
@@ -1345,6 +1353,67 @@ class Store:
             await self.db.execute(
                 "ALTER TABLE scheduler_heartbeat ADD COLUMN start_token TEXT"
             )
+
+    async def _ensure_d3_learning_columns(self, mem_existing: set[str]) -> None:
+        """D3 (2026-08-31 operator directive): the auto-activation pipeline's
+        own schema additions — `memories.paused`, `memories.activated_at`,
+        and the `learning_events` audit table. Split out of
+        `_ensure_task_columns` (which calls this with the `memories` PRAGMA
+        it already fetched) purely to keep that function under the
+        structural-size ratchet; there is no other reason this couldn't be
+        inlined there like every other `memories` column above it.
+        """
+        # `paused=1` keeps the row exactly where it already is (curator.py's
+        # never-deletes invariant) and is the wall `list_memories`'s default
+        # excludes, mirroring `archived`/`quarantined` — so
+        # `Orchestrator._load_active_memories` (the one prompt-injection
+        # chokepoint) never sees a paused row without any caller having to
+        # remember to filter it out itself. `NOT NULL DEFAULT 0` is legal for
+        # SQLite `ADD COLUMN` and backfills every existing row to "not
+        # paused", which is correct: nothing here retroactively pauses a
+        # pre-D3 row.
+        if "paused" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN paused INTEGER NOT NULL "
+                "DEFAULT 0")
+        # WHEN a row was auto-activated (`confirmed_by='auto'`) —
+        # `LearningQueue.activate_memory_auto`'s own timestamp, distinct from
+        # `created_at`/`updated_at`. This is the column the 90-day
+        # auto-retirement sweep keys on: an operator-pinned/manually-added
+        # row was never auto-activated, so it never has a value here, and
+        # that absence IS `curator.py`'s pinned-exempt guarantee — a query
+        # keyed on `activated_at IS NOT NULL` cannot select a pinned row by
+        # construction, not by a second exemption list that could drift from
+        # the first. NO DEFAULT, same reasoning as `origin`/`evidence`/
+        # `confirmed_by` in `_ensure_task_columns` above: a pre-D3 row
+        # genuinely was never auto-activated, and NULL says so honestly.
+        if "activated_at" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN activated_at TEXT")
+
+        # The audit trail for every learning lifecycle transition (activate /
+        # auto_archive / pause / delete / confirm / retire / restore /
+        # inject) — one append-only table rather than one column per
+        # transition, so "what happened to this row, in order" is a single
+        # query instead of reading `updated_at` against five flags. `detail`
+        # is JSON: for `inject` it MUST carry which tags fired (2026-09-01
+        # effectiveness study) — the one thing a bare "this memory was used"
+        # row cannot answer. `CREATE TABLE IF NOT EXISTS` replays safely on
+        # every connect, same idiom as `scheduler_heartbeat`/
+        # `unattributed_usage` in `_ensure_task_columns`.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_learning_events_memory "
+            "ON learning_events(memory_id)"
+        )
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -3171,7 +3240,7 @@ class Store:
         mem_type: str | None = None, project: str | None = None,
         scope: str | None = None,
         include_global: bool = True, include_archived: bool = False,
-        include_quarantined: bool = False,
+        include_quarantined: bool = False, include_paused: bool = False,
     ) -> list[dict[str, Any]]:
         """List memories, optionally scoped to a project.
 
@@ -3195,6 +3264,12 @@ class Store:
         ``Orchestrator._load_active_memories``, the learning queue, the
         curator) honour quarantine without any of them touching this method's
         callers individually.
+
+        ``include_paused`` defaults OFF the same way (D3, 2026-08-31): a
+        paused learning stays in the store, but no caller sees it as live
+        unless it explicitly asks — which is what makes
+        ``_load_active_memories`` respect a pause without itself filtering
+        for it.
         """
         clauses, params = [], []
         if not include_archived:
@@ -3203,6 +3278,11 @@ class Store:
         if not include_quarantined:
             # quarantined is NULL on rows that predate the column — treat as live
             clauses.append("(quarantined IS NULL OR quarantined = 0)")
+        if not include_paused:
+            # D3: paused is NOT NULL DEFAULT 0, but treat NULL as live too —
+            # same defensive shape as its siblings above, for a row written
+            # through any path that predates this filter being added here.
+            clauses.append("(paused IS NULL OR paused = 0)")
         if confirmed is not None:
             clauses.append("confirmed = ?")
             params.append(1 if confirmed else 0)
@@ -3604,6 +3684,68 @@ class Store:
         return ids
 
     @serialized_write
+    async def archive_stale_auto_activated(
+        self, *, days: int, limit: int = 500,
+        reason: str = "", dry_run: bool = False,
+    ) -> list[str]:
+        """D3 (2026-08-31 operator directive): the automatic-retirement half
+        of auto-management. AC2's `retirement_candidates` stays SUGGEST-only
+        for every confirmed row — this is the one exception, and it is
+        scoped so narrowly it cannot become a second door onto a pinned row:
+
+        - ``confirmed_by = 'auto' AND activated_at IS NOT NULL`` — the ONLY
+          rows this can ever select are ones `LearningQueue.auto_activate`
+          itself wrote. An operator-pinned or manually-added row (``nh
+          rules add``, the board, ``nh reply``, a human's ``confirm``) never
+          has ``confirmed_by = 'auto'``/``activated_at`` set, so it cannot
+          match this WHERE clause BY CONSTRUCTION — the same "absence is the
+          exemption" reasoning ``activated_at``'s own column comment states,
+          not a second exemption list that could drift from the first. This
+          is `curator.py`'s pinned-exempt rule surviving auto-management.
+        - unused for *days*: ``activated_at`` (not merely `created_at`) is at
+          least *days* old, AND ``last_used_at`` is either NULL or also at
+          least *days* old — a row auto-activated yesterday cannot be
+          retired today just because it has not been injected YET; it must
+          have HAD the full window to prove itself.
+        - ``confirmed = 1 AND (archived IS NULL OR archived = 0)`` — never
+          touches an already-archived or (defensively) an unconfirmed row.
+
+        Same shape as `archive_unconfirmed_older_than` otherwise: reversible
+        (archive, never delete), `datetime()` comparisons run in SQL for the
+        same two-live-format reason, select-then-chunked-update, ``dry_run``
+        returns the ids without writing, and ``days < 1`` raises.
+        """
+        if days < 1:
+            raise ValueError(f"days must be >= 1, got {days}")
+        window = f"-{days} days"
+        rows = await self._fetchall(
+            "SELECT id FROM memories WHERE confirmed = 1 "
+            "AND confirmed_by = 'auto' AND activated_at IS NOT NULL "
+            "AND (archived IS NULL OR archived = 0) "
+            "AND datetime(activated_at) IS NOT NULL "
+            "AND datetime(activated_at) <= datetime('now', ?) "
+            "AND (last_used_at IS NULL OR ("
+            "     datetime(last_used_at) IS NOT NULL "
+            "     AND datetime(last_used_at) <= datetime('now', ?))) "
+            "ORDER BY activated_at ASC LIMIT ?",
+            (window, window, limit),
+        )
+        ids = [r["id"] for r in rows]
+        if not ids or dry_run:
+            return ids
+        suffix = f"\n\n[archived: {reason}]" if reason else ""
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            await self.db.execute(
+                f"UPDATE memories SET archived = 1, content = content || ? "
+                f"WHERE id IN ({marks})",
+                (suffix, *chunk),
+            )
+        await self.db.commit()
+        return ids
+
+    @serialized_write
     async def supersede_memory(
         self, old_id: str, new_id: str, reason: str = "",
     ) -> bool:
@@ -3965,6 +4107,108 @@ class Store:
         cur = await self.db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
         await self.db.commit()
         return cur.rowcount > 0
+
+    @serialized_write
+    async def activate_memory_auto(self, mem_id: str) -> bool:
+        """D3 (2026-08-31 operator directive): the auto-activation write.
+
+        Deliberately NOT ``confirm_memory`` — that method always writes
+        ``source = 'confirmed'``, the literal that (with `confirm_memory`
+        as its only writer) means "a human clicked confirm". Auto-activation
+        writes ``source = 'auto'`` instead, so a row's `source` alone tells
+        the difference the D3 design calls for, and `confirmed_by = 'auto'`
+        keeps the D3-M1 wall intact (the reviewer's confirmed-rules channel
+        already excludes ``origin='review' AND confirmed_by='auto'``).
+
+        ``activated_at`` is stamped here and NOWHERE else — it is the column
+        the 90-day auto-retirement sweep keys on, and the auto-activation
+        pipeline is its only writer. ``WHERE ... AND confirmed = 0`` makes
+        this refuse to re-stamp (or downgrade) an already-confirmed row —
+        a human's prior confirm, or a second auto-activation attempt on the
+        same row, both no-op rather than overwrite.
+        """
+        now = _now()
+        cur = await self.db.execute(
+            "UPDATE memories SET confirmed = 1, source = 'auto', "
+            "confirmed_by = 'auto', activated_at = ?, updated_at = ? "
+            "WHERE id = ? AND confirmed = 0",
+            (now, now, mem_id),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def count_auto_activated_since(self, *, hours: int = 24) -> int:
+        """How many rows this store auto-activated in the last *hours* — the
+        D3 daily-cap check (`LearningQueue.auto_activate`). A ROLLING window
+        on ``activated_at``, not a calendar-day count: `HarvestJob` ticks on
+        an interval that need not align to midnight, and a rolling window is
+        the only shape that can never be reset early by a tick landing just
+        after 00:00."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM memories WHERE confirmed_by = 'auto' "
+            "AND activated_at IS NOT NULL AND activated_at >= ?", (cutoff,))
+        return int(row["n"]) if row else 0
+
+    @serialized_write
+    async def set_paused(self, mem_id: str, on: bool) -> bool:
+        """D3: PAUSE / un-pause a learning without archiving it. The row
+        stays exactly where the confirm queue or the active set already
+        found it — `archived`/`confirmed`/`source` are all untouched; only
+        whether it is ever INJECTED changes (`list_memories`'s default
+        excludes a paused row)."""
+        cur = await self.db.execute(
+            "UPDATE memories SET paused = ?, updated_at = ? WHERE id = ?",
+            (1 if on else 0, _now(), mem_id),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    @serialized_write
+    async def record_learning_event(
+        self, memory_id: str, event: str, *, detail: dict[str, Any] | None = None,
+    ) -> str:
+        """Append-only audit row for one learning lifecycle transition —
+        D3's 'every auto-activated learning records provenance ...
+        `learning_events` audit trail for activate/pause/retire',
+        generalised to every transition this module makes (a human's
+        confirm/retire/restore included, and an `inject` event from
+        `Orchestrator._load_active_memories`) so the trail lives in ONE
+        place rather than being audited here and not there.
+
+        ``detail`` is stored as JSON. For an ``inject`` event it MUST carry
+        WHICH TAGS FIRED (2026-09-01 effectiveness study) — a bare "this
+        memory was used" row cannot answer that, and `last_used_at`/
+        `use_count` already cover the undifferentiated count. Returns the
+        new event id.
+        """
+        event_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO learning_events (id, memory_id, event, detail, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            (event_id, memory_id, event,
+             json.dumps(detail) if detail is not None else None, _now()),
+        )
+        await self.db.commit()
+        return event_id
+
+    async def list_learning_events(
+        self, *, memory_id: str | None = None, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """The audit trail, newest first — optionally scoped to one memory.
+        Read-only; nothing here mutates a `memories` row."""
+        if memory_id is not None:
+            rows = await self._fetchall(
+                "SELECT * FROM learning_events WHERE memory_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (memory_id, limit),
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM learning_events ORDER BY created_at DESC, "
+                "rowid DESC LIMIT ?", (limit,),
+            )
+        return [dict(r) for r in rows]
 
     # ----------------------- task events (persisted) ----------------------- #
 

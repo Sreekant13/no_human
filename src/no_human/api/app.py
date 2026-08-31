@@ -255,6 +255,14 @@ async def lifespan(app: FastAPI):
                     learning_cfg.get("sweep_interval_seconds", 86400)),
                 archive_after_days=int(
                     learning_cfg.get("archive_unconfirmed_days", 45)),
+                # D3 (2026-08-31 operator directive): the same kill switch
+                # `learning.auto_manage` gates on the HarvestJob side —
+                # threaded here too so `False` turns off BOTH the
+                # auto-activation write path and its 90-day auto-retirement
+                # read path in one config flip.
+                auto_manage=bool(learning_cfg.get("auto_manage", True)),
+                auto_retire_days=int(
+                    learning_cfg.get("retire_suggest_days", 90)),
             )
         except (TypeError, ValueError) as exc:
             log.error("bad learning.* sweep config — retirement sweep "
@@ -3933,12 +3941,48 @@ async def confirm_learning(mem_id: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/learnings/{mem_id}/reject")
 async def reject_learning(mem_id: str, request: Request) -> dict[str, Any]:
+    """Kept for CLI/API compat (D3, 2026-08-31 operator directive). On a
+    still-PENDING proposal this is unchanged — the per-origin archive/delete
+    dispatch `LearningQueue.reject` has always done. On an already-CONFIRMED
+    learning (the common case now that most proposals auto-activate) it
+    ALIASES `pause` instead: see `LearningQueue.reject`'s docstring for why
+    deleting/archiving an active rule by the old per-origin table was never
+    the right behaviour for one."""
     store = _store(request)
     m = await store.find_memory(mem_id)
     if not m:
         raise HTTPException(status_code=404, detail=f"proposal {mem_id!r} not found")
     from ..learning import LearningQueue
     await LearningQueue(store).reject(m["id"])
+    return {"ok": True, "id": m["id"]}
+
+
+@app.post("/api/learnings/{mem_id}/pause")
+async def pause_learning(mem_id: str, request: Request) -> dict[str, Any]:
+    """D3: the Second-brain UI's Pause action. The row stays (recoverable),
+    ``paused=1``, never injected again. Works on any row regardless of
+    confirmed status; idempotent (pausing an already-paused row is a no-op
+    200, not an error)."""
+    store = _store(request)
+    m = await store.find_memory(mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"learning {mem_id!r} not found")
+    from ..learning import LearningQueue
+    await LearningQueue(store).pause(m["id"])
+    return {"ok": True, "id": m["id"]}
+
+
+@app.post("/api/learnings/{mem_id}/delete")
+async def delete_learning(mem_id: str, request: Request) -> dict[str, Any]:
+    """D3: the Second-brain UI's Delete action. Archives the row — never a
+    real ``DELETE FROM`` — mirroring `curator.py`'s never-deletes invariant;
+    recoverable via ``POST /api/learnings/{id}/restore``."""
+    store = _store(request)
+    m = await store.find_memory(mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"learning {mem_id!r} not found")
+    from ..learning import LearningQueue
+    await LearningQueue(store).delete(m["id"])
     return {"ok": True, "id": m["id"]}
 
 
@@ -3970,17 +4014,30 @@ async def retire_learning(mem_id: str, request: Request) -> dict[str, Any]:
 async def restore_learning(mem_id: str, request: Request) -> dict[str, Any]:
     """Memory lifecycle C part B: the Rules/Skills UI's triage action — a
     human's explicit undo of an archive, whatever produced it (the 45-day
-    sweep, a supersede-on-confirm, or a manual retire). 404 unknown id;
-    idempotent on a row that is already live (``already_active: True``, 200
-    — the same double-click contract `retire_learning` chose, so a stale
-    button never surfaces as a failure)."""
+    sweep, a supersede-on-confirm, a manual or auto-retire, or the D3 Delete
+    action). 404 unknown id; idempotent on a row that is already live
+    (``already_active: True``, 200 — the same double-click contract
+    `retire_learning` chose, so a stale button never surfaces as a failure).
+
+    D3: ALSO undoes a Pause — `archived` and `paused` are independent flags
+    (a row can be paused without ever being archived), and this is the
+    Second-brain UI's one Restore button for both, so a caller never has to
+    know which inert state a row is in before clicking it. A row that is
+    BOTH archived and paused (possible: retire, then pause it while it sits
+    archived) is restored on both axes in one call.
+    """
     store = _store(request)
     m = await store.find_memory(mem_id)
     if not m:
         raise HTTPException(status_code=404, detail=f"learning {mem_id!r} not found")
-    if not m.get("archived"):
+    was_archived, was_paused = bool(m.get("archived")), bool(m.get("paused"))
+    if not was_archived and not was_paused:
         return {"ok": True, "id": m["id"], "already_active": True}
-    await store.unarchive_memory(m["id"])
+    from ..learning import LearningQueue
+    if was_archived:
+        await store.unarchive_memory(m["id"])
+    if was_paused:
+        await LearningQueue(store).unpause(m["id"])
     return {"ok": True, "id": m["id"]}
 
 

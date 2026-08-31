@@ -9,6 +9,7 @@ from .queue import (
     ORIGIN_REPLY,
     ORIGIN_REVIEW,
     ORIGIN_SUPERVISOR,
+    AutoActivateReport,
     LearningQueue,
     Proposal,
     TYPE_ANTI_PATTERN,
@@ -20,6 +21,7 @@ from .queue import (
 __all__ = [
     "LearningQueue",
     "Proposal",
+    "AutoActivateReport",
     "TYPE_SKILL",
     "TYPE_FACT",
     "TYPE_RULE",

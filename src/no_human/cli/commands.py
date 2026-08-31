@@ -3772,9 +3772,19 @@ def serve(max_workers, until_empty, no_harvest):
             harvest_cfg = config.data.get("harvest", {})
             if harvest_cfg.get("enabled", True) and not no_harvest:
                 from ..core.scheduler import HarvestJob
+                # D3 (2026-08-31 operator directive): `learning.auto_manage`/
+                # `learning.auto_activate_daily_cap` threaded through here too
+                # — without this, `nh serve`'s HarvestJob would silently keep
+                # the constructor defaults (auto-management ON) regardless of
+                # what an operator set in `config.yaml`, and the kill switch
+                # would be inert on this, the CLI-driven scheduling path.
+                learning_cfg = config.data.get("learning", {})
                 harvest = HarvestJob(
                     store,
                     interval_seconds=float(harvest_cfg.get("interval_seconds", 43200)),
+                    auto_manage=bool(learning_cfg.get("auto_manage", True)),
+                    auto_activate_daily_cap=int(
+                        learning_cfg.get("auto_activate_daily_cap", 10)),
                 )
                 console.print("[green]learning harvest[/] enabled "
                               f"(every {harvest_cfg.get('interval_seconds', 43200)}s)")

@@ -3486,6 +3486,101 @@ async def test_restore_unknown_id_is_404(client):
     assert r.status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# D3 (2026-08-31 operator directive): pause / delete, and reject-aliases-pause #
+# --------------------------------------------------------------------------- #
+
+async def test_pause_holds_the_row_without_archiving_it(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    r = await client.post(f"/api/learnings/{mem_id}/pause")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    m = await store.find_memory(mem_id)
+    assert m["paused"] == 1
+    assert m["archived"] == 0  # pause is not archive
+    assert m["confirmed"] == 1  # the row is not unconfirmed either
+
+    # A paused row is invisible to the default (injectable) view...
+    active = await store.list_memories(confirmed=True)
+    assert mem_id not in {row["id"] for row in active}
+    # ...but still exists, on request.
+    with_paused = await store.list_memories(confirmed=True, include_paused=True)
+    assert mem_id in {row["id"] for row in with_paused}
+
+    events = await store.list_learning_events(memory_id=mem_id)
+    assert any(e["event"] == "pause" for e in events)
+
+
+async def test_delete_archives_rather_than_deletes(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    r = await client.post(f"/api/learnings/{mem_id}/delete")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    m = await store.find_memory(mem_id)
+    assert m is not None, "delete must archive, never DELETE FROM"
+    assert m["archived"] == 1
+
+    events = await store.list_learning_events(memory_id=mem_id)
+    assert any(e["event"] == "delete" for e in events)
+
+
+async def test_pause_unknown_id_is_404(client):
+    r = await client.post("/api/learnings/does-not-exist/pause")
+    assert r.status_code == 404
+
+
+async def test_delete_unknown_id_is_404(client):
+    r = await client.post("/api/learnings/does-not-exist/delete")
+    assert r.status_code == 404
+
+
+async def test_reject_on_a_confirmed_row_pauses_it_instead_of_deleting(client, store):
+    """D3: 'reject aliases pause'. The old per-origin archive/delete
+    dispatch (`ARCHIVE_ON_REJECT`) stays exactly as it was for a still-
+    PENDING proposal (test_learning.py pins that unchanged); a CONFIRMED
+    row — the common case now that most proposals auto-activate — is
+    PAUSED, never deleted or archived by this route."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    r = await client.post(f"/api/learnings/{mem_id}/reject")
+    assert r.status_code == 200
+
+    m = await store.find_memory(mem_id)
+    assert m is not None, "reject on a confirmed row must never delete it"
+    assert m["paused"] == 1
+    assert m["archived"] == 0
+    assert m["confirmed"] == 1
+
+
+async def test_restore_also_unpauses(client, store):
+    """The Second-brain UI's one Restore button undoes BOTH archive and
+    pause — a caller never needs to know which inert state a row is in."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    await client.post(f"/api/learnings/{mem_id}/pause")
+
+    r = await client.post(f"/api/learnings/{mem_id}/restore")
+    assert r.status_code == 200
+    assert r.json().get("already_active") is not True
+
+    m = await store.find_memory(mem_id)
+    assert m["paused"] == 0
+    active = await store.list_memories(confirmed=True)
+    assert mem_id in {row["id"] for row in active}
+
+
 @pytest.mark.asyncio
 async def test_pause_on_inflight_task_requests_cancel_and_leaves_status_to_the_worker(
         client, store):
