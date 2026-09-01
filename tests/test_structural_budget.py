@@ -189,7 +189,14 @@ FROZEN_FILE_LINES = {
     # 20263 -> 20293 (+30): D3.1 (auto-activation) — the per-injection
     # learning_events audit loop + trigger_reason call in the injection site.
     # Measured on the D3.1 landing result.
-    "core/orchestrator.py": 20293,
+    # 20293 -> 20296 (+3): `_gate_already_satisfied` docstring rewrite
+    # (falsified-comment fix, PR #940) — comments only, no behaviour change.
+    # Measured on this rebased tree with the scanner below (the scanner's
+    # own `str.splitlines()` metric, not `wc -l`: the file's pre-existing
+    # `_LINE_BREAKS` regex embeds literal U+0085/U+2028/U+2029 line-separator
+    # characters that `splitlines()` treats as breaks and `wc -l` does not,
+    # a 3-line difference between the two counts that predates this PR).
+    "core/orchestrator.py": 20296,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

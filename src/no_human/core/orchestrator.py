@@ -8579,7 +8579,10 @@ class Orchestrator:
         per-criterion evidence table. Never take the coder's word for it: the
         fresh-context reviewer opens each cited file and tries to refute the
         claim — the same trust chain as a code diff. PASS → the human gate
-        (awaiting_approval; the claim is the deliverable, there is no PR).
+        (awaiting_approval; the claim is still the deliverable, and there may
+        be no PR — but when this run's own pre-gate draft IS the PR, the body
+        is refreshed through the same evidence chain `_finalize` uses and the
+        review-checklist comment is posted, all best-effort).
         FAIL → a normal failed attempt whose findings feed the bounded loop."""
         self._emit_review(
             "review_start",

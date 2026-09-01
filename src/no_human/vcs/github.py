@@ -64,7 +64,13 @@ def open_pr(
             # REVISION flow (a task resuming onto an existing PR branch) and would have
             # OVERWRITTEN a description a human had edited — behaviour main never had. A
             # review caught it. Only the run that opened the draft itself may rewrite the
-            # body, so `_finalize` passes True and nothing else does.
+            # body. Two callers pass `update_existing_body=True`, both gated on ownership:
+            # `_finalize` (orchestrator.py) passes `may_refresh_body` — `bool(pr_draft_created)
+            # and pr_draft_branch == branch`, durable via task.context, branch-scoped — on
+            # both its first open and its force-with-lease retry; `_gate_already_satisfied`
+            # passes a literal True, but only inside a block guarded by that same predicate
+            # plus the stricter identity check `pr_url == str(pr_draft_created).strip()`.
+            # Nothing else does.
             #
             # Best-effort: a failed body update must not fail a PR that exists. The URL is
             # the delivery; the body is evidence, and losing it loudly beats escalating a

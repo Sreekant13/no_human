@@ -275,6 +275,23 @@ def test_is_github_remote_detects_github_and_ghe():
     assert not github.is_github_remote("https://gitlab.com/org/repo.git", ["code.example.com"])
 
 
+def test_open_pr_caller_inventory_comment_names_both_callers():
+    """The "OPT-IN ONLY" comment above `update_existing_body` narrates who is
+    allowed to pass True. It used to claim ``_finalize`` was the only caller,
+    which the already-satisfied gate landing (`_gate_already_satisfied` also
+    passes True, guarded by its own stricter identity check) made false — a
+    review caught the stale inventory. Pin the fix: the comment must name
+    both callers, not just `_finalize`.
+    """
+    import inspect
+    from no_human.vcs import github
+    src = inspect.getsource(github.open_pr)
+    assert "_finalize" in src
+    assert "_gate_already_satisfied" in src, (
+        "the caller-inventory comment must enumerate _gate_already_satisfied "
+        "as a second update_existing_body=True caller, not just _finalize")
+
+
 # --------------------------------------------------------------------------- #
 # PR labels: the pr_labels feature (attach labels when opening a PR/MR) was   #
 # removed — operator directive 2026-08-15. Opening a PR/MR must never send    #

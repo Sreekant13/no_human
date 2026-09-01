@@ -506,6 +506,20 @@ def _task_state(db, task_id):
     return asyncio.run(_go())
 
 
+def test_gate_already_satisfied_docstring_describes_the_pr_refresh():
+    """The docstring's PASS clause used to read "the claim is the deliverable,
+    there is no PR" — true when this gate was written, false once the gate
+    grew a PR-refresh terminal (rebuild the body via the same evidence chain
+    `_finalize` uses, post the review-checklist comment, promote the draft) —
+    a review caught the stale claim. Pin the fix: the false absolute must be
+    gone and the refresh behavior must be named.
+    """
+    doc = Orchestrator._gate_already_satisfied.__doc__ or ""
+    assert "there is no PR" not in doc
+    assert "refresh" in doc.lower()
+    assert "checklist" in doc.lower()
+
+
 def test_restore_approval_accepts_pr_draft_only_evidence(tmp_path):
     """The stranded shape this fix closes: an ESCALATED task whose only PR
     evidence is a `pr_draft` event (the PR was opened pre-review per the 0a
