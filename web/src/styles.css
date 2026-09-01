@@ -1723,6 +1723,11 @@ a.card-pr-badge:focus-visible,
    <span>, which cannot receive focus at all) — it needs the same ring every
    other custom-styled control in this list gets. */
 .nh-navrow-badge-btn:focus-visible,
+/* P3: the create-time feasibility toast's dismiss — new control, so it needs
+   the same ring every other custom-styled button in this list gets (falls
+   back to no visible ring otherwise, same class of gap the "focus coverage
+   probe" comments above already describe fixing for older controls). */
+.nh-toast-dismiss:focus-visible,
 .card-action:focus-visible {
   outline: 2px solid var(--accent-500);
   outline-offset: 2px;
@@ -3886,6 +3891,17 @@ a.so-chip-value:hover { color: var(--accent-300); }
   line-height: 1;
   padding: 0;
 }
+
+/* P3: the create-time feasibility toast — reuses .feasibility-card's ACCENT
+   tint (advisory, never the alarm red .nh-toast-error carries) so the two
+   surfaces read as one language, but as a uniform tinted border rather than
+   the card's own accent border-left. */
+.nh-toast-feasibility {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel) 88%);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+.nh-toast-feasibility .nh-toast-dismiss { color: var(--accent); }
 
 .card-approve-error {
   display: flex;

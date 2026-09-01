@@ -612,6 +612,14 @@ class TaskSummaryOut(BaseModel):
     # source and same "None means no attempts yet" contract as TaskOut.cost_usd.
     cost_usd: float | None = None
     cost_model: str | None = None
+    # Feature #1's pre-flight hint (core/feasibility.py), same dict the create
+    # handler stashes on task.context — {band, tier, offer, done_rate_pct,
+    # message}. Read straight off THIS field, on THIS response, so a caller
+    # that only sees the create response (the board's create-time toast, P3)
+    # need not wait for dispatch and a follow-up GET to see it. None when the
+    # create found nothing worth flagging, mirroring `estimate_feasibility`'s
+    # own fail-open contract.
+    feasibility_hint: dict | None = None
 
     @classmethod
     def from_task(
@@ -717,6 +725,7 @@ class TaskSummaryOut(BaseModel):
             merge_ready=merge_ready,
             cost_usd=cost_usd,
             cost_model=cost_model,
+            feasibility_hint=(task.context or {}).get("feasibility_hint"),
         )
 
 

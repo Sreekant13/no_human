@@ -4033,6 +4033,37 @@ async def test_create_of_a_simple_task_stashes_no_hint(client, store):
     assert (full.context or {}).get("feasibility_hint") is None
 
 
+async def test_create_response_carries_the_feasibility_hint_immediately(client, store):
+    # P3: dispatch takes ~9s and the SlideOver card only renders while
+    # status == "pending", so a client that waits for a later GET rarely sees
+    # the hint before the status moves on. The create-time toast must read the
+    # hint straight off THIS response, not a follow-up GET — so the response
+    # body itself (not just the persisted task.context) must carry it.
+    r = await client.post("/api/tasks", json={
+        "title": "A big multi-part task",
+        "description": "x" * 2100,
+        "acceptance_criteria": ["a", "b", "c", "d", "e", "f"],
+    })
+    assert r.status_code == 201
+    hint = r.json().get("feasibility_hint")
+    assert hint is not None
+    assert hint["tier"] == "complex"
+    assert hint["offer"] == "split"
+    assert "message" in hint
+
+
+async def test_create_response_carries_no_hint_for_a_simple_task(client, store):
+    # Fail-open mirror: nothing large → the create response's feasibility_hint
+    # is exactly None, not omitted or a falsy placeholder — the frontend toast
+    # renders nothing rather than something empty.
+    r = await client.post("/api/tasks", json={
+        "title": "tiny", "description": "small",
+        "acceptance_criteria": ["do the thing"],
+    })
+    assert r.status_code == 201
+    assert r.json().get("feasibility_hint") is None
+
+
 async def test_split_drafts_refuses_a_non_pending_task_without_a_paid_call(client, store):
     # The GET generates drafts via a utility-model call; a running/terminal task
     # can never be split, so it must 409 BEFORE spending that call.

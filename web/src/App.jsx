@@ -38,7 +38,12 @@ import {
   backlogQueueReducer, initialQueue, queueHead, queueNotice, queueRemaining,
 } from "./backlogSelection.js";
 import QueueNotice from "./QueueNotice.jsx";
+import { feasibilityCreateToast } from "./feasibilityToast.js";
 
+// P3: how long the create-time feasibility toast stays up — long enough to
+// read one sentence, short enough not to pile up. Mirrors Board.jsx's own
+// APPROVE_TOAST_MS constant (same idiom, different toast).
+const FEASIBILITY_TOAST_MS = 8_000;
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
 // The mark is the way home, the way it is on every other product: clicking it
@@ -445,7 +450,10 @@ function NewTaskModal({
         try { await uploadAttachment(created.id, f); }
         catch (err) { console.error("attachment upload failed", f.name, err); }
       }
-      onCreated();
+      // P3: hand the raw create response up so App can surface its
+      // feasibility_hint as a toast — this modal unmounts right after
+      // onClose(), so nothing here can render the hint itself.
+      onCreated(created);
       onClose();
     } catch (err) {
       setError(err.message);
@@ -761,6 +769,22 @@ export default function App() {
     setNewTaskSeed(seed);
     setShowNewTask(true);
   }
+  // P3: the create-time feasibility toast (feature #1). Dispatch takes ~9s
+  // and SlideOver's FeasibilityCard only renders while status === "pending",
+  // so an operator opening the drawer after that almost never sees the hint.
+  // This reads it straight off the CREATE RESPONSE instead, so it shows
+  // immediately regardless of what the task's live status becomes — lifted
+  // to App (not NewTaskModal state) because the modal that created the task
+  // unmounts on success, before there is anywhere left to render it.
+  const [createToast, setCreateToast] = useState(null);
+  useEffect(() => {
+    if (!createToast) return undefined;
+    const t = setTimeout(
+      () => setCreateToast((cur) => (cur?.id === createToast.id ? null : cur)),
+      FEASIBILITY_TOAST_MS,
+    );
+    return () => clearTimeout(t);
+  }, [createToast]);
   const [page, setPage] = useState("board");
   // ── Backlog → intake queue ────────────────────────────────────────────────
   // The tickets the operator selected on the Backlog page, still to be started.
@@ -1430,7 +1454,10 @@ export default function App() {
         <NewTaskModal
           initial={newTaskSeed}
           onClose={() => { setShowNewTask(false); setNewTaskSeed(null); }}
-          onCreated={() => fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }))}
+          onCreated={(created) => {
+            setCreateToast(feasibilityCreateToast(created));
+            fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }));
+          }}
           onOpenBacklog={() => { setShowNewTask(false); setPage("backlog"); }}
         />
       )}
@@ -1444,7 +1471,8 @@ export default function App() {
           notice={queueNotice(backlog)}
           queueLeft={queueRemaining(backlog)}
           onStopQueue={stopQueue}
-          onCreated={() => {
+          onCreated={(created) => {
+            setCreateToast(feasibilityCreateToast(created));
             setBacklogNonce((n) => n + 1);
             fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }));
           }}
@@ -1488,6 +1516,23 @@ export default function App() {
         />
       )}
       {showShortcuts && <ShortcutsDialog isDesktop={Boolean(window.nhDesktop)} onClose={() => setShowShortcuts(false)} />}
+      {/* P3: the create-time feasibility toast — advisory (role="status", not
+          "alert"), so it never reads as an error. Reuses the accent-tinted
+          visual language of SlideOver's FeasibilityCard rather than a second
+          style; the card itself still gates on live pending status, unchanged. */}
+      {createToast && (
+        <div className="nh-toast nh-toast-feasibility" role="status" aria-label="Task size hint">
+          <span className="nh-toast-text ph-no-capture">{createToast.message}</span>
+          <button
+            type="button"
+            className="nh-toast-dismiss"
+            aria-label="Dismiss task size hint"
+            onClick={() => setCreateToast(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
     </div>
   );
 }
