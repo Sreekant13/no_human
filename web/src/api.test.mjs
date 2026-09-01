@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import {
   uploadAttachment, finishReview, replyTask, chooseBlockerOption, sendBack,
   approveTask, createTask, fetchIntegrations, fetchModels, saveModels,
+  fetchWindowSpend,
 } from "./api.js";
 
 /** Make the next fetch answer with `status` and the given JSON body. */
@@ -479,4 +480,33 @@ test("the attempt-details cache is bounded — inserting more than the cap evict
   }
   assert.equal(_attemptDetailsCacheSizeForTests(), 50,
     "a long board session must not grow the cache unbounded");
+});
+
+// fetchWindowSpend is `makeEndpointGate` over GET /api/metrics/window — the
+// attempt-attributed "last 24h" figure the board's ledger must consume
+// verbatim (core/metrics.py:window_spend). Exercised here as a real call
+// against a stubbed fetch, same convention as every other endpoint above;
+// makeEndpointGate's own latch mechanics are unit-tested in
+// queueHealthGate.test.mjs. fetchWindowSpend is a module-level singleton
+// (built once at import), so a 404 permanently latches it for the REST of
+// this test file's run — the success case must run first.
+test("fetchWindowSpend GETs the window endpoint and returns the parsed body", async () => {
+  const calls = stubFetch({
+    status: 200,
+    body: { hours: 24, since: "2026-07-16T06:00:00+00:00", cost_usd: 1.25, cost_model: "claude-sonnet-5", tokens: 40, attempts: 2 },
+  });
+  const out = await fetchWindowSpend();
+  assert.equal(calls[0].url, "/api/metrics/window?hours=24");
+  assert.deepEqual(out, { hours: 24, since: "2026-07-16T06:00:00+00:00", cost_usd: 1.25, cost_model: "claude-sonnet-5", tokens: 40, attempts: 2 });
+});
+
+test("fetchWindowSpend latches to null on 404 (old daemon) and stops fetching", async () => {
+  const calls = stubFetch({ status: 404, body: {} });
+  const first = await fetchWindowSpend();
+  const second = await fetchWindowSpend();
+  assert.equal(first, null);
+  assert.equal(second, null);
+  // The gate short-circuits once latched — a second call must not issue a
+  // second network request.
+  assert.equal(calls.length, 1);
 });

@@ -3712,6 +3712,16 @@ async def metrics(request: Request) -> dict[str, Any]:
     return data
 
 
+@app.get("/api/metrics/window")
+async def metrics_window(request: Request, hours: float = 24.0) -> dict[str, Any]:
+    """Spend that OCCURRED in the trailing window — attempt-attributed, so
+    closing/cancelling an old task (bumping only `updated_at`) adds zero."""
+    from ..core.metrics import window_spend
+    if not (0 < hours <= 168):
+        raise HTTPException(status_code=400, detail="hours must be in (0, 168]")
+    return await window_spend(_store(request), hours=hours)
+
+
 @app.get("/api/autonomy")
 async def autonomy_report(request: Request, days: int | None = None) -> dict[str, Any]:
     """Autonomy telemetry (megaplan P0): mid-flight-touchpoint rate vs.

@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, fetchConfig, grillStep, grillStepSSE, fetchDeferred, markDeferredDone } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, fetchConfig, grillStep, grillStepSSE, fetchDeferred, markDeferredDone, fetchWindowSpend } from "./api.js";
 import FinishSetupCard from "./FinishSetupCard.jsx";
 import { initTelemetry, captureScreen } from "./telemetry.js";
 import Board from "./Board.jsx";
@@ -24,8 +24,8 @@ import { matchShortcut } from "./shortcuts.js";
 import ShortcutsDialog from "./ShortcutsDialog.jsx";
 import { isNeedsYou, isRealFailure, deriveCounts } from "./boardLanes.js";
 import { overviewState } from "./overviewStrip.js";
-import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
-import { fmtCost, taskBurn } from "./cost.js";
+import { ledgerSummary } from "./nightLedger.js";
+import { fmtCost } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
 import { createReconnector } from "./wsReconnect.js";
@@ -248,24 +248,27 @@ function fmtAge(seconds) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-function NightLedger({ tasks, authMode }) {
+function NightLedger({ tasks, authMode, spend }) {
   // The signature module: what no_human did in the last 24h, in the sidebar's
-  // dead space. Derived from the same task list as the lanes (one source, one
-  // truth) — a quiet board should read "calm instrument", never "dead app".
-  const s = ledgerSummary(tasks);
-  // Same 24h window ledgerSummary uses, so the token burn line can never
-  // disagree with the shipped/failed/parked counts beside it.
-  const since = Date.now() - LEDGER_WINDOW_MS;
-  const tokensSpent = (tasks || [])
-    .filter((t) => new Date(t.updated_at || t.created_at || 0).getTime() >= since)
-    .reduce((sum, t) => sum + taskBurn(t), 0);
-  const perPr = perShippedCost(s.done, s.cost);
+  // dead space. Counts are derived from the same task list as the lanes (one
+  // source, one truth) — a quiet board should read "calm instrument", never
+  // "dead app". The dollar/token figures are NOT re-derived here: `spend` is
+  // the server's attempt-attributed window total (`/api/metrics/window`,
+  // fetched by the caller on the existing 10s poll) — consuming it verbatim
+  // is the fix for the board sweeping a closed task's lifetime cost into
+  // "last 24h" on a bare `updated_at` touch. `spend` is null before the first
+  // fetch resolves or on an old server (fetchWindowSpend's 404 gate); either
+  // way the figures below fall back to zero and the row simply hides.
+  const s = ledgerSummary(tasks, undefined, undefined, spend);
+  const tokensSpent = s.tokens;
+  const windowCost = s.cost;
+  const perPr = perShippedCost(s.done, windowCost);
   const perPrCost = perPr != null ? fmtCost(perPr) : null;
   // In subscription/OAuth mode (default/absent) the dollar figure is an
   // API-rate ESTIMATE, never money that changed hands — only api_key mode
   // pays Anthropic per token for real (SCRUM-20).
-  const spend = deriveSpendDisplay(tokensSpent, s.cost, s.cost, authMode);
-  const showSpend = s.cost > 0 || tokensSpent > 0;
+  const spendDisplay = deriveSpendDisplay(tokensSpent, windowCost, windowCost, authMode);
+  const showSpend = spend != null && (windowCost > 0 || tokensSpent > 0);
   return (
     <div className="nh-ledger" aria-label="last 24 hours summary">
       <div className="nh-ledger-title">last 24h</div>
@@ -286,7 +289,7 @@ function NightLedger({ tasks, authMode }) {
               <div className="nh-ledger-row nh-ledger-bad"><b>{s.failed}</b> failed</div>
             )}
             {showSpend && (
-              <div className="nh-ledger-row nh-ledger-cost"><b>{spend.primary}</b> {spend.secondary}</div>
+              <div className="nh-ledger-row nh-ledger-cost"><b>{spendDisplay.primary}</b> {spendDisplay.secondary}</div>
             )}
           </div>
         )}
@@ -860,6 +863,11 @@ export default function App() {
   const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
+  // Attempt-attributed "last 24h" spend (core/metrics.py:window_spend), fetched
+  // on the existing 10s poll below — no second interval. null before the first
+  // resolve, or forever on an old server (fetchWindowSpend's 404 gate); the
+  // sidebar's spend line just hides in either case.
+  const [windowSpend, setWindowSpend] = useState(null);
   // SCRUM-67 3/3: the header drain chip's own view of the SAME poll (reuses
   // fetchQueueHealth below rather than adding a second poller) — kept
   // separate from queueHealth above so a poll failure can flip the chip to
@@ -965,6 +973,7 @@ export default function App() {
       fetchQueueHealth()
         .then((h) => { setQueueHealth(h); setDrainReadout((s) => nextDrainReadout(s, h)); })
         .catch(() => setDrainReadout((s) => nextDrainReadout(s, "error")));
+      fetchWindowSpend().then(setWindowSpend).catch(() => {});
     }
     poll();
     const id = setInterval(poll, 10000);
@@ -1249,7 +1258,7 @@ export default function App() {
             />
           </NavGroup>
         </nav>
-        <NightLedger tasks={tasks} authMode={authMode} />
+        <NightLedger tasks={tasks} authMode={authMode} spend={windowSpend} />
         <div className="nh-sidebar-foot">
           {/* SCRUM-16: render-gate and figure share ONE source (deriveCounts
               over the websocket board payload) — gating on the polled

@@ -17,6 +17,16 @@ function _jsonSafe(r, fallback) {
   return r.json();
 }
 
+// Attempt-attributed "last 24h" spend (core/metrics.py:window_spend) — the
+// board's ledger must consume this server figure verbatim, never re-derive a
+// window total client-side from task timestamps (that re-derivation is the
+// exact bug this endpoint fixes: closing an old task bumps `updated_at` with
+// no new spend, sweeping its lifetime cost into "last 24h"). A 404 (older
+// server) latches to null forever via makeEndpointGate — the sidebar simply
+// hides the spend line rather than retrying every poll.
+export const fetchWindowSpend = makeEndpointGate(() =>
+  fetch(`${BASE}/api/metrics/window?hours=24`));
+
 export async function fetchTasks() {
   const r = await fetch(`${BASE}/api/tasks`);
   if (!r.ok) throw new Error(`GET /api/tasks → ${r.status}`);

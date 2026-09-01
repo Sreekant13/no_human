@@ -318,7 +318,11 @@ FROZEN_FILE_LINES = {
     # 5760 -> 5797 (+37): P5 — opt-in ?limit/?offset pagination on GET
     # /api/tasks (validated Query params + docstring rationale). Measured on
     # the P5 merge result.
-    "api/app.py": 5797,
+    # 5797 -> 5807 (+10): GET /api/metrics/window — attempt-attributed "last
+    # 24h" spend (core/metrics.py:window_spend), fixing the board banner
+    # sweeping a closed task's LIFETIME cost into the window on a bare
+    # `updated_at` touch. Re-anchored on rebase onto the P5 merge result.
+    "api/app.py": 5807,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
