@@ -218,7 +218,13 @@ test("every button in a Second-brain row carries an aria-label; the origin-task 
 
 test("SettingsOverlay accepts and forwards onOpenTask to LearningsPanel", () => {
   assert.match(settingsJsx, /export default function SettingsOverlay\(\{[^}]*onOpenTask[^}]*\}\)/);
-  assert.match(settingsJsx, /<LearningsPanel onOpenTask=\{onOpenTask\}\s*\/>/);
+  // D2.1 added onFirstOpen/onNavigateSection to this same element (see
+  // secondBrainBadge.test.mjs), so this no longer requires onOpenTask to sit
+  // immediately before the closing "/>" — only that it is actually forwarded.
+  const idx = settingsJsx.indexOf("<LearningsPanel");
+  assert.ok(idx > -1, "<LearningsPanel> element must be found");
+  const el = settingsJsx.slice(idx, settingsJsx.indexOf("/>", idx) + 2);
+  assert.match(el, /onOpenTask=\{onOpenTask\}/);
 });
 
 test("App.jsx wires onOpenTask to close Settings and open the task on the board", () => {

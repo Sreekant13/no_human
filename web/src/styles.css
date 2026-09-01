@@ -398,6 +398,22 @@ html, body, #root {
 .nh-navrow-badge-warn  { background: var(--c-answer); color: #1A1D27; }
 [data-theme="light"] .nh-navrow-badge-warn { color: #FFFFFF; }
 
+/* D2.1: the Settings row's "!" badge is its own click target (opens the
+   Second-brain pane directly, without clearing the nudge itself) — a
+   <button> cannot nest inside the row's <button>, so NavRow renders the row
+   body and the badge as flex SIBLINGS here instead of the badge-as-span
+   layout above, while still reading as one row. */
+.nh-navrow-split { display: flex; align-items: center; gap: var(--sp-1); }
+.nh-navrow-split .nh-navrow { flex: 1; min-width: 0; }
+.nh-navrow-badge-btn {
+  cursor: pointer;
+  /* .nh-navrow-badge (above) already sets a 20px×20px pill — comfortably
+     over the 12px hit-target floor — and this class rides alongside it, so
+     only the button-specific resets belong here. */
+  border: none; font: inherit;
+}
+.nh-navrow-badge-btn:hover { filter: brightness(1.1); }
+
 /* One-time AI-config nudge popup, anchored above the Settings nav row. */
 .nh-settings-navwrap { position: relative; }
 .nh-aiconfig-nudge {
@@ -426,6 +442,30 @@ html, body, #root {
 /* Settings, pinned at the very bottom (Claude-app placement) — a hairline
    divider separates it from the status/connection rows above it. */
 .nh-settings-row { border-top: 1px solid var(--border); padding-top: var(--sp-3); margin-top: var(--sp-1); }
+/* D2.1: when the "!" badge splits the row into two sibling buttons, the
+   divider/spacing move to the WRAPPER (.nh-navrow-split) so the hairline
+   spans the whole row — button AND badge — instead of stopping short at the
+   button's own right edge, and so the badge is vertically centered against
+   the row rather than against a button whose own top padding it doesn't
+   share. `:has()` lets the wrapper react to which button it contains without
+   a second className on the wrapper (aria-haspopup/aria-expanded must stay
+   on the actual disclosure control, i.e. .nh-settings-row itself — see
+   mobile-nav.mjs, which reads them off that exact selector).
+   Review fix (I2): scoped to desktop (min-width: 641px, the mirror of the
+   sidebar's own max-width:640px mobile breakpoint below). The
+   badge is `display: none` on mobile (that block, `.nh-navrow-badge`), so on
+   a phone the split branch must render IDENTICALLY to the plain row — this
+   rule used to apply unconditionally, adding a stray top border/padding to
+   the WRAPPER inside the mobile foot's row layout (which uses border-LEFT,
+   never border-top), and `.nh-navrow-split .nh-settings-row` (0,2,0) beat the
+   mobile block's own `.nh-settings-row` padding rule (0,1,0) regardless of
+   which loaded second, zeroing out its padding-top on every phone. */
+@media (min-width: 641px) {
+  .nh-navrow-split:has(.nh-settings-row) {
+    border-top: 1px solid var(--border); padding-top: var(--sp-3); margin-top: var(--sp-1);
+  }
+  .nh-navrow-split .nh-settings-row { border-top: none; padding-top: 0; margin-top: 0; }
+}
 
 .nh-sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: var(--sp-3); }
 .nh-sidebar-row { display: flex; align-items: center; gap: var(--sp-2); }
@@ -1679,6 +1719,10 @@ a.card-pr-badge:focus-visible,
    in this list gets — the base <a>/<button> UA outline would otherwise be
    the only thing distinguishing it from the plain-text meta beside it. */
 .second-brain-task-link:focus-visible,
+/* D2.1: the Settings row's "!" is now its own <button> (previously a plain
+   <span>, which cannot receive focus at all) — it needs the same ring every
+   other custom-styled control in this list gets. */
+.nh-navrow-badge-btn:focus-visible,
 .card-action:focus-visible {
   outline: 2px solid var(--accent-500);
   outline-offset: 2px;
@@ -5262,6 +5306,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .second-brain-panel {
   max-width: 800px;
 }
+
+/* D2 review addenda: the two setup actions the explainer above them refers
+   to ("pick models per role", "seed rules") — plain secondary buttons, same
+   shape/vocabulary as every other .btn in this panel (Restore/Dismiss use the
+   identical .btn.btn-sm), not a bespoke CTA style invented for these two. */
+.second-brain-setup-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin: 0 0 12px; }
 
 /* Auto-managed line: a fact ("here's the cap, here's the retirement rule"),
    not a warning — so it gets the same tint-card treatment as the explainer

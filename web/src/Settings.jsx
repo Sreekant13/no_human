@@ -477,7 +477,7 @@ function CodexSection({ codex, onStatus }) {
 // left section list and the section's panel content on the right — not a
 // routed page. Mirrors the SlideOver focus/Escape pattern (SlideOver.jsx),
 // so it behaves like the app's other modal surfaces.
-export default function SettingsOverlay({ onClose, initialTab, onOpenTask }) {
+export default function SettingsOverlay({ onClose, initialTab, onOpenTask, onSecondBrainOpened }) {
   // A Finish-setup deep link (App passes initialTab) opens the overlay on the
   // matching pane. An unknown tab (e.g. "docs"/"history", which have no pane of
   // their own yet) falls back to Projects rather than a blank content area.
@@ -636,7 +636,13 @@ export default function SettingsOverlay({ onClose, initialTab, onOpenTask }) {
             {section === "projects"  && <ProjectsPanel />}
             {section === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
             {section === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
-            {section === "learnings" && <LearningsPanel onOpenTask={onOpenTask} />}
+            {section === "learnings" && (
+              <LearningsPanel
+                onOpenTask={onOpenTask}
+                onFirstOpen={onSecondBrainOpened}
+                onNavigateSection={setSection}
+              />
+            )}
             {section === "integrations" && <IntegrationsPanel />}
             {section === "models"      && <ModelsPanel />}
             {section === "account"     && <AuthPanel />}
@@ -918,10 +924,24 @@ function AddMemoryModal({ kind, onClose, onSaved, addFn }) {
 //     pre-D3 confirm queue, byte-for-byte unchanged, so flipping the switch
 //     back really does "restore the confirm queue" the directive names, not
 //     just the write path behind it.
-export function LearningsPanel({ onOpenTask } = {}) {
+export function LearningsPanel({ onOpenTask, onFirstOpen, onNavigateSection } = {}) {
   const [autoManage, setAutoManage] = useState(true);
   const [dailyCap, setDailyCap] = useState(10);
 
+  // D2.1: the "!" nudge on the Settings sidebar row clears only once the
+  // REAL Second-brain pane — SecondBrainPanel, the one with the explainer —
+  // has actually rendered, not merely because Settings opened on some other
+  // section (that clear used to live, unconditionally, in App.jsx's
+  // openSettings()). Review fix (M4): a bare mount-only effect here fired
+  // regardless of which of the two panels below ends up rendering, so a
+  // kill-switched install (`auto_manage: false`, LegacyLearningQueuePanel —
+  // no explainer at all) spent the flag on a pane the operator never saw. So
+  // the call is folded into the SAME decision that picks the panel below,
+  // gated on the very `isAutoManaged` value that decision reads — in the
+  // success path when it resolves true, and in the failure path too (a fetch
+  // failure keeps the auto-managed DEFAULT, matching `setAutoManage`'s own
+  // documented fallback, so the flag is spent there as well — never left
+  // permanently un-spendable just because the network hiccuped).
   useEffect(() => {
     let alive = true;
     fetchConfig()
@@ -932,15 +952,21 @@ export function LearningsPanel({ onOpenTask } = {}) {
         // only an explicit `false` restores the legacy queue; a missing key
         // (older config, or a fetch that raced ahead of a default merge)
         // must not be misread as the kill switch being armed.
-        setAutoManage(lc.auto_manage !== false);
+        const isAutoManaged = lc.auto_manage !== false;
+        setAutoManage(isAutoManaged);
         setDailyCap(Number(lc.auto_activate_daily_cap) || 10);
+        if (isAutoManaged) onFirstOpen?.();
       })
-      .catch(() => { /* best-effort: keep the auto-managed default */ });
+      .catch(() => {
+        // best-effort: keep the auto-managed default — and spend the flag to
+        // match, since that default is exactly what renders below.
+        if (alive) onFirstOpen?.();
+      });
     return () => { alive = false; };
   }, []);
 
   return autoManage
-    ? <SecondBrainPanel dailyCap={dailyCap} onOpenTask={onOpenTask} />
+    ? <SecondBrainPanel dailyCap={dailyCap} onOpenTask={onOpenTask} onNavigateSection={onNavigateSection} />
     : <LegacyLearningQueuePanel />;
 }
 
@@ -956,7 +982,7 @@ export function LearningsPanel({ onOpenTask } = {}) {
 // operator-pinned/manually-added row is exempt by construction (never
 // selected by that sweep) — so there is no "retire?" decision left for
 // either kind of row to ask the human about.
-function SecondBrainPanel({ dailyCap, onOpenTask }) {
+function SecondBrainPanel({ dailyCap, onOpenTask, onNavigateSection }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -1068,6 +1094,24 @@ function SecondBrainPanel({ dailyCap, onOpenTask }) {
         broke, your repo's rules — and applies it automatically to the next
         task. Nothing to approve. Review or pause anything here.
       </p>
+      {/* D2 review addenda: the setup actions the "!" nudge used to promise
+          ("pick models per role", "seed rules") belong here, one click from
+          the explainer that sent the operator to this pane — not buried back
+          behind a second navigation. Both deep-link via the same section
+          switch the overlay's own left nav uses (setSection, threaded down
+          as onNavigateSection), not a new nav mechanism. */}
+      <div className="second-brain-setup-actions">
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={() => onNavigateSection?.("models")}
+        >Pick models per role</button>
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={() => onNavigateSection?.("rules")}
+        >Seed rules</button>
+      </div>
       <p className="learning-auto-line">
         Auto-managed — up to{" "}
         <strong className="second-brain-cap">{dailyCap}</strong> new learnings

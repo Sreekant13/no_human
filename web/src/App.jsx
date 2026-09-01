@@ -7,7 +7,9 @@ import Backlog from "./Backlog.jsx";
 import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
-import { isAiConfigDone, markAiConfigDone } from "./aiConfigNudge.js";
+import {
+  isAiConfigDone, markAiConfigDone, isPopupDismissed, markPopupDismissed,
+} from "./aiConfigNudge.js";
 import TaskComposer from "./TaskComposer.jsx";
 import Outcomes from "./Outcomes.jsx";
 import About from "./About.jsx";
@@ -150,7 +152,55 @@ function IconGear() {
 // icon-only row is never rendered (label is not conditionally hidden). The
 // active row gets a soft filled pill (see .nh-navrow.active in styles.css),
 // animated on --dur-fast/--ease-out and prefers-reduced-motion guarded.
-function NavRow({ icon, label, active, current, haspopup, expanded, badge, badgeVariant, onClick, title, className = "" }) {
+function NavRow({
+  icon, label, active, current, haspopup, expanded, badge, badgeVariant, badgeAriaLabel,
+  onClick, onBadgeClick, title, className = "",
+}) {
+  // D2.1: when the badge is given its own click handler (the Settings row's
+  // "!"), it must be its own click target — opening the Second-brain pane
+  // directly, distinct from the row body's own destination — and must not
+  // fire the row's onClick too. A <button> cannot nest inside another
+  // <button> (invalid HTML, and the nested control would be unreachable to
+  // assistive tech), so that case renders two SIBLING buttons instead of the
+  // badge-as-span layout below; every other caller (Done/Failed/Finish-setup
+  // counts) is untouched.
+  if (onBadgeClick) {
+    // `className` carries the caller's own layout rules, targeting ".nh-navrow"
+    // specifically — including a mobile breakpoint that flips this row from
+    // column to row layout — so it stays on the ROW button,
+    // not the wrapper; the wrapper only carries the split's own flex layout.
+    //
+    // Review fix (M3): no e.stopPropagation() here — the badge is a SIBLING
+    // of the row button (never nested inside it, see the structural test in
+    // secondBrainBadge.test.mjs), so its click has nothing to bubble into;
+    // the wrapper <div> below carries no onClick of its own to intercept.
+    return (
+      <div className="nh-navrow-split">
+        <button
+          className={`nh-navrow${active ? " active" : ""}${className ? ` ${className}` : ""}`}
+          aria-current={current ? "page" : undefined}
+          aria-haspopup={haspopup || undefined}
+          aria-expanded={expanded === undefined ? undefined : expanded}
+          onClick={onClick}
+        >
+          <span className="nh-navrow-icon" aria-hidden="true">{icon}</span>
+          <span className="nh-navrow-label">{label}</span>
+        </button>
+        {badge != null && (
+          <button
+            type="button"
+            className={`nh-navrow-badge nh-navrow-badge-btn${badgeVariant ? ` nh-navrow-badge-${badgeVariant}` : ""}`}
+            aria-label={badgeAriaLabel}
+            title={title}
+            onClick={onBadgeClick}
+          >
+            {badge}
+          </button>
+        )}
+      </div>
+    );
+  }
+
   return (
     <button
       className={`nh-navrow${active ? " active" : ""}${className ? ` ${className}` : ""}`}
@@ -752,17 +802,34 @@ export default function App() {
   // Which Settings pane to open on — set when a Finish-setup item is clicked so
   // the overlay lands on the matching pane; null means "wherever it last was".
   const [settingsTab, setSettingsTab] = useState(null);
-  // The Settings "!" nudge (AI-learnings left onboarding 2026-08-30): shown
-  // until the user first opens Settings. Every entry into Settings clears it.
+  // The Settings "!" nudge (AI-learnings left onboarding 2026-08-30) is TWO
+  // separate acknowledgements, each its own localStorage bit (aiConfigNudge.js)
+  // — review fix round, 2026-09-01: collapsing them into one made the popup
+  // nag forever, because a user who opens Settings via the row body or a
+  // Finish-setup deep link and never visits the Second-brain pane would keep
+  // seeing the popup on every subsequent visit.
+  //   - `aiConfigDone` (the BADGE): shown until the Second-brain pane has
+  //     actually been opened once (D2.1) — NOT merely because Settings opened
+  //     on some other pane. Settings.jsx clears it from that pane's own
+  //     first-mount effect, which calls handleSecondBrainOpened below so the
+  //     badge disappears immediately without a reload.
+  //   - `popupDismissed` (the POPUP): shown until Settings opens on ANY pane,
+  //     or its own × is clicked — a one-time prompt pointing at Settings, a
+  //     strictly weaker condition than the badge's.
   const [aiConfigDone, setAiConfigDone] = useState(() => isAiConfigDone());
+  const [popupDismissed, setPopupDismissed] = useState(() => isPopupDismissed());
   const openSettings = (tab = null) => {
     if (tab !== null) setSettingsTab(tab);
     setSettingsOpen(true);
+    if (!popupDismissed) { markPopupDismissed(); setPopupDismissed(true); }
+  };
+  const handleSecondBrainOpened = () => {
     if (!aiConfigDone) { markAiConfigDone(); setAiConfigDone(true); }
   };
-  // Dismissing the "!" popup without opening Settings still counts as
-  // acknowledged — the nudge is a one-time prompt, not a gate.
-  const dismissAiConfig = () => { markAiConfigDone(); setAiConfigDone(true); };
+  // The popup's own × — dismissing it without opening Settings still counts
+  // as acknowledged (a one-time prompt, not a gate), but must NOT satisfy the
+  // badge's stricter "the Second-brain pane was actually seen" condition.
+  const dismissAiConfig = () => { markPopupDismissed(); setPopupDismissed(true); };
   // The onboarding steps deferred by the minimal path (spec §3 B1). The board's
   // FinishSetupCard renders them; empty once every step is done.
   const [deferred, setDeferred] = useState([]);
@@ -1279,14 +1346,25 @@ export default function App() {
               expanded={settingsOpen}
               badge={aiConfigDone ? null : "!"}
               badgeVariant="warn"
+              // D2.1: the badge is its OWN click target — it opens Settings
+              // straight on the Second-brain pane, distinct from a click on
+              // the row body (which still opens on whatever pane was last
+              // shown, and no longer clears the flag itself — see
+              // handleSecondBrainOpened).
+              badgeAriaLabel="Complete AI configuration — open the Second-brain pane"
+              onBadgeClick={aiConfigDone ? undefined : () => openSettings("learnings")}
               title={aiConfigDone ? undefined : "Complete AI configuration"}
               onClick={() => openSettings()}
               className="nh-settings-row"
             />
-            {/* One-time nudge from the "!" — shown after onboarding until the
-                user opens Settings or dismisses it. Not while onboarding is
-                still checking (null) or in progress (false). */}
-            {!aiConfigDone && onboarded === true && !settingsOpen && (
+            {/* One-time nudge from the "!" — shown after onboarding until
+                Settings opens on ANY pane or the popup is dismissed
+                (`popupDismissed`, a strictly weaker condition than the
+                badge's own `aiConfigDone` above — the badge needs the
+                Second-brain pane specifically; this popup does not). Not
+                while onboarding is still checking (null) or in progress
+                (false). */}
+            {!popupDismissed && onboarded === true && !settingsOpen && (
               <div className="nh-aiconfig-nudge" role="dialog" aria-label="Complete AI configuration">
                 <button
                   type="button"
@@ -1302,7 +1380,7 @@ export default function App() {
                 <button
                   type="button"
                   className="btn btn-approve nh-aiconfig-nudge-cta"
-                  onClick={() => openSettings("models")}
+                  onClick={() => openSettings("learnings")}
                 >Open Settings</button>
               </div>
             )}
@@ -1403,6 +1481,10 @@ export default function App() {
             setPage("board");
             setPendingOpenId(id);
           }}
+          // D2.1: the AI-config nudge clears only once the Second-brain pane
+          // has actually rendered — called from that pane's own first-mount
+          // effect in Settings.jsx, not from openSettings() here.
+          onSecondBrainOpened={handleSecondBrainOpened}
         />
       )}
       {showShortcuts && <ShortcutsDialog isDesktop={Boolean(window.nhDesktop)} onClose={() => setShowShortcuts(false)} />}
