@@ -24,6 +24,7 @@ import no_human.core.orchestrator as orchestrator_module
 from no_human.agent.backend import AgentResult
 from no_human.core.db import Store
 from no_human.core.orchestrator import (
+    REVIEWER_ROLE,
     Orchestrator,
     _VERIFIER_RETRY_MIN_TIMEOUT,
     _VERIFIER_RETRY_TIMEOUT,
@@ -108,7 +109,7 @@ class FakeReviewer:
             passed=True, checklist=[CI("it holds", True, "evidence")])
         self.bounded_calls = 0
         self.review_calls = 0
-        self.bounded_timeouts = []
+        self.bounded_timeouts: list[int] = []
 
     async def _run_bounded(self, prompt, repo_path, *, max_turns, timeout, on_event):
         self.bounded_calls += 1
@@ -138,14 +139,17 @@ async def store(tmp_path):
     await s.close()
 
 
-def _orch(store, tmp_path, reviewer, *, tests_cmd="true"):
+def _orch(store, tmp_path, reviewer, *, tests_cmd="true", events=None):
     cfg = _config(tmp_path)
     cfg.data["reviewer"]["allow_advisory"] = False
     cfg.data.setdefault("tests", {})["command"] = tests_cmd
     from no_human.core.orchestrator import Orchestrator as _Orch
     from .test_e2e_orchestrator import FakeBackend
+    kwargs = {}
+    if events is not None:
+        kwargs["event_sink"] = events.append
     return _Orch(store, cfg.data, FakeBackend(lambda cwd: None),
-                 SlackNotifier(None), reviewer=reviewer)
+                 SlackNotifier(None), reviewer=reviewer, **kwargs)
 
 
 async def test_all_satisfied_runs_the_agentic_reviewer_and_records_every_verdict(
@@ -208,13 +212,14 @@ async def test_no_verdict_escalates_instead_of_failing_the_round(store, tmp_path
     work = _repo_with_a_verifier(tmp_path, VERIFIER_YAML)
     repo = GitRepo(work)
     reviewer = FakeReviewer((None, "timed out"))
-    orch = _orch(store, tmp_path, reviewer)
+    events: list[dict] = []
+    orch = _orch(store, tmp_path, reviewer, events=events)
 
     task = Task.new("t", repo_path=str(work))
     await store.create_task(task)
     attempt_id = await store.create_attempt(task.id, 1)
 
-    with pytest.raises(ReviewerUnavailable):
+    with pytest.raises(ReviewerUnavailable) as excinfo:
         await orch._run_review(task, repo, attempt_id, base="main")
 
     assert reviewer.bounded_calls == 2, (
@@ -222,6 +227,20 @@ async def test_no_verdict_escalates_instead_of_failing_the_round(store, tmp_path
         "(would keep retrying an unavailable judge forever)")
     assert reviewer.review_calls == 0, (
         "an unavailable verifier must never reach the agentic reviewer")
+
+    # Both strings are user-facing (PR/stream text) — pinned in full on
+    # purpose, so a reword is a conscious edit, not an accidental drift.
+    assert str(excinfo.value) == (
+        "1 verifier(s) reached no verdict after a bounded retry, and none "
+        "of the other verifiers this round failed: no-todo. Escalating "
+        "instead of charging the coder for a defect nobody found.")
+
+    (unavailable_event,) = [e for e in events if e["kind"] == "verifiers_unavailable"]
+    assert unavailable_event["text"] == (
+        "1 verifier(s) reached no verdict after a bounded retry, and no "
+        "other verifier this round failed: no-todo")
+    assert unavailable_event["advisory"] is True
+    assert unavailable_event["source"] == REVIEWER_ROLE
 
 
 async def test_no_verdict_then_a_real_verdict_uses_the_retry_result(store, tmp_path):
@@ -248,6 +267,52 @@ async def test_no_verdict_then_a_real_verdict_uses_the_retry_result(store, tmp_p
     assert decision.verifiers[0]["passed"] is True
     assert decision.verifiers[0]["unavailable"] is False
     assert decision.verifiers[0]["no_verdict"] is False
+
+
+async def test_the_bounded_retry_window_is_one_shorter_call_both_ways(store, tmp_path):
+    """Pins the retry-window arithmetic itself (the retry timeout must be
+    shorter than the first call's, and never trivially short) AND that
+    exactly two bounded calls are made in either direction — a retry that
+    recovers a verdict, and a retry that stays unavailable. A widened or
+    narrowed retry count (0, 1, or 3 calls) would fail this test."""
+    assert _VERIFIER_RETRY_TIMEOUT == max(
+        _VERIFIER_RETRY_MIN_TIMEOUT, _VERIFIER_TIMEOUT // 2)
+    assert _VERIFIER_RETRY_TIMEOUT < _VERIFIER_TIMEOUT, (
+        "a retry window must be shorter than the first call, and never "
+        "trivially short")
+
+    # Leg 1: the retry produces a verdict.
+    work = _repo_with_a_verifier(tmp_path, VERIFIER_YAML)
+    repo = GitRepo(work)
+    reviewer = FakeReviewer([(None, "timed out"), _ok_json(passed=True)])
+    orch = _orch(store, tmp_path, reviewer)
+    task = Task.new("t", repo_path=str(work))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    await orch._run_review(task, repo, attempt_id, base="main")
+
+    assert reviewer.bounded_calls == 2
+    assert reviewer.review_calls == 1
+    assert reviewer.bounded_timeouts == [_VERIFIER_TIMEOUT, _VERIFIER_RETRY_TIMEOUT]
+
+    # Leg 2: the retry ALSO reaches no verdict — a third window would appear
+    # here if the retry count ever changed, so this fails the test.
+    leg2_root = tmp_path / "leg2"
+    leg2_root.mkdir()
+    work2 = _repo_with_a_verifier(leg2_root, VERIFIER_YAML)
+    repo2 = GitRepo(work2)
+    reviewer2 = FakeReviewer((None, "timed out"))
+    orch2 = _orch(store, tmp_path, reviewer2)
+    task2 = Task.new("t2", repo_path=str(work2))
+    await store.create_task(task2)
+    attempt_id2 = await store.create_attempt(task2.id, 1)
+
+    with pytest.raises(ReviewerUnavailable):
+        await orch2._run_review(task2, repo2, attempt_id2, base="main")
+
+    assert reviewer2.bounded_calls == 2
+    assert reviewer2.bounded_timeouts == [_VERIFIER_TIMEOUT, _VERIFIER_RETRY_TIMEOUT]
 
 
 MIXED_VERIFIER_YAML = (

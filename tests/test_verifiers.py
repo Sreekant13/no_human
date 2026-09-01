@@ -872,6 +872,39 @@ async def test_run_verifiers_no_verdict_once_then_a_verdict_uses_the_retry():
     assert result.passed is True
 
 
+async def test_run_verifiers_a_no_verdict_consumes_exactly_one_retry_and_no_more():
+    """Arithmetic guard: the judge would return a real verdict on a THIRD
+    call, yet `run_verifiers` must stop after the first call plus its one
+    bounded retry — a policy widening (looping until success) would flip
+    `unavailable` to False and `calls` to 3. Also pins that the retry's
+    token spend is additive with the first call's, not overwritten."""
+    v = Verifier(id="a", statement="s", paths=("src/**/*.py",))
+    calls = 0
+
+    async def judge(prompt):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "", 5
+        if calls == 2:
+            return "", 7
+        return _ok_json("a", passed=True), 100  # would succeed if ever reached
+
+    results = await run_verifiers(
+        judge,
+        verifiers=[v],
+        diff_text=DIFF,
+        read_file=lambda p: None,
+        changed_paths=["src/a.py"],
+    )
+    assert calls == 2, "must stop after the bounded retry, never a third call"
+    (result,) = results
+    assert result.unavailable is True
+    assert result.no_verdict is True
+    assert result.tokens_used == 12, (
+        "the retry's token spend (7) must add to the first call's (5)")
+
+
 async def test_run_verifiers_no_marker_twice_names_the_verifier_id_and_source_file():
     """TEST (c): when the judge DOES respond (non-empty text) but never emits
     a parseable marker, on both the first call and the retry, that is a

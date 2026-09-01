@@ -13,8 +13,22 @@ single-turn model call per verifier over only the matching diff hunks, with
 a recorded verdict either way — pass, fail, or (fail-closed) no verdict. It
 is deliberately narrow: one judgment, no tools, no stages, and it fails
 closed on any ambiguous input (a user-authored YAML file, an arbitrary
-diff, or a model's free text). It is wired into the review gate by
-``core.orchestrator``, which runs the verifiers before the agentic reviewer.
+diff, or a model's free text).
+
+WIRING: ``core/orchestrator.py`` imports ``load_verifiers``, ``run_verifiers``,
+``select`` (as ``select_verifiers``), ``summary_line`` (as
+``verifiers_summary_line``) and ``to_checklist_item`` (as
+``verifier_to_checklist_item``). ``Orchestrator._run_review`` runs this gate
+BEFORE the agentic reviewer: it loads the repo's verifiers, skips with an
+advisory ``verifiers_skipped`` event when none are configured or none are
+selected for the changed paths, then calls ``run_verifiers`` with a judge
+that is the reviewer's own ``_run_bounded`` bound to a single turn. Each
+result is persisted onto the attempt (``attempts.verifier_results``) and the
+task's context, keyed by the reviewed commit sha. A genuinely failing
+verifier ends the round with a failing ``ReviewDecision`` — built via
+``to_checklist_item`` — without the agentic reviewer ever running; a round
+whose only failures are ``unavailable`` raises ``ReviewerUnavailable``
+instead, so it escalates rather than reads as a coder-facing finding.
 
 A ``no_verdict`` result gets exactly ONE bounded retry (mirroring
 ``reviewer.py``'s own retry-then-``ReviewerUnavailable`` pattern rather than
