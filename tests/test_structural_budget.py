@@ -238,7 +238,7 @@ FROZEN_FILE_LINES = {
     # writes through `carry_human_hold` so a durable human pause survives a
     # machine blocker rewrite. Re-anchored on this rebased tree (main had
     # independently grown the file to 20513 lines by the time this landed).
-    "core/orchestrator.py": 20547,
+    "core/orchestrator.py": 20577,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

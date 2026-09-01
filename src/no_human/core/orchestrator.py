@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterable, Literal
 from urllib.parse import quote as _url_quote
 
 from ..agent.advisory import advisory_backend
-from ..agent.backend import AgentEvent, CodingBackend, resolve_backend_name
+from ..agent.backend import AgentEvent, CodingBackend, local_run_without_subscription, resolve_backend_name
 from ..agent.claude_backend import ClaudeBackend
 from ..agent.claude_backend import (
     TRANSPORT_DIAGNOSIS_MARKER as _TRANSPORT_BLOCKER_MARKER,
@@ -1462,6 +1462,9 @@ class Orchestrator:
         # `_raise_blocker` reads this to add the caveat to the persisted
         # blocker's evidence — the checkpoint succeeded, but unverified.
         self._last_checkpoint_unverified: str = ""
+        # `_park_local_infra`'s evidence fallback when `AgentResult.final_text`
+        # is empty; reset per attempt in `_arm_attempt_budget`.
+        self._last_coder_error_text: str = ""
         # Latched by `_build_supervisor`'s `on_decision` closure the moment
         # the supervisor's own side-channel LLM call observes a subscription
         # session/weekly-limit wall (`agent.supervisor`'s `quota_park`
@@ -2174,6 +2177,10 @@ class Orchestrator:
                         f"crossed {ceiling[2]} ({ceiling[1]:,})"
                     )
             return
+        # A zero-token SDK death returns no `final_text`; the error prose
+        # arrives via an event instead, so keep it for `_park_local_infra`.
+        if event.text and event.kind in ("text", "assistant", "result", "error"):
+            self._last_coder_error_text = event.text[:1000]
         # Feed assistant prose to the supervisor so it sees what the agent SAYS
         # (where "I can't access X" / unverified assumptions surface), not just
         # the tools it runs. Best-effort; the hook only acts on its check cadence.
@@ -5170,9 +5177,9 @@ class Orchestrator:
                     "quota_pause",
                     "fleet paused — 3 consecutive zero-token/auth SDK "
                     "failures across distinct tasks")
-            # `infra=True`: the park spares the attempt, the breaker above
-            # decides the fleet — the pool clock is NOT armed by this park.
-            raise QuotaExhausted(infra_reason, infra=True)
+            return await self._park_local_infra(
+                task, infra_reason, repo=repo, branch=branch,
+                attempt_id=attempt_id, evidence=result.final_text or "")
 
         # Refusal → fail-fast (Broker). A model refusal is a COMPLETED turn the
         # agent declined (stop_reason="refusal", is_error False, no diff) — so it
@@ -7813,6 +7820,21 @@ class Orchestrator:
             outcome = replace(outcome, detail=f"{outcome.detail} Last: {tried[-1]}")
         return outcome
 
+    async def _park_local_infra(self, task: Task, reason: str, *, repo: GitRepo | None = None, branch: str | None = None, attempt_id: str | None = None, evidence: str = "") -> TaskOutcome:
+        """Zero-token SDK death against `backend=local` -> TRANSIENT_INFRA, never `paused_quota`; else re-raise `QuotaExhausted(infra=True)` for the ordinary park."""
+        if not local_run_without_subscription(self.config, backend_name=self._task_backend(task)):
+            raise QuotaExhausted(reason, infra=True)
+        detail = (evidence or self._last_coder_error_text or reason)[:1000]
+        backend_name = self._task_backend(task) or "local"
+        blocker = Blocker(
+            category=BlockerCategory.TRANSIENT_INFRA, transient=True, confidence=0.8,
+            wake_condition=f"after:{_INFRA_SESSION_WAKE_AFTER}", goal=task.title,
+            root_cause_hypothesis=f"backend: {backend_name} — died before producing tokens ({reason}); no local subscription to reset.",
+            question="Check the local server/proxy is reachable and supports the requested capabilities, then resume.",
+            evidence=f"local backend said: {detail}" if detail else reason,
+        )
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch, attempt_id=attempt_id)
+
     async def _escalate_timeout_streak(
         self, task: Task, repo: GitRepo, branch: str | None
     ) -> TaskOutcome:
@@ -9677,6 +9699,13 @@ class Orchestrator:
 
     async def _park_quota(self, task: Task, exc: QuotaExhausted, *,
                           repo: GitRepo | None = None) -> TaskOutcome:
+        # Defence in depth: a raise site other than the coder call site
+        # (planner, repro corrective round) must not land a local-backend
+        # infra death here waiting on a quota reset that can't help.
+        if getattr(exc, "infra", False) and local_run_without_subscription(
+            self.config, backend_name=self._task_backend(task)
+        ):
+            return await self._park_local_infra(task, str(exc), repo=repo)
         # Name the exhausted subscription: a wall park stops the whole pool, and with
         # more than one profile configured "quota exhausted" alone does not tell
         # the operator which token to top up or switch away from.
@@ -13131,6 +13160,7 @@ class Orchestrator:
         still holds `task` and can resolve it once for both of them.
         """
         self._attempt_backend = self._task_backend(task)
+        self._last_coder_error_text = ""
         remaining = await self._attempt_spendable_tokens(task)
         self._begin_attempt_accounting(
             task.id, remaining_tokens=remaining,

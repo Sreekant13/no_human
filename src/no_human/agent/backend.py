@@ -372,6 +372,52 @@ def _local_child_env(llm_cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def local_run_without_subscription(
+    config: dict[str, Any] | None, *, role: str = "coder",
+    backend_name: str | None = None,
+) -> bool:
+    """True iff this run's child env carries no subscription credential AND
+    the resolved backend is ``local``.
+
+    Both conditions are required (intake decision, 2026-09-01): a bare
+    ``backend == "local"`` check would be sufficient on its own today, but the
+    AND makes the predicate a *measurement* of the actual child env
+    (:func:`_local_child_env`) rather than a restatement of the config value —
+    if ``_local_child_env`` ever stops blanking ``CLAUDE_CODE_OAUTH_TOKEN``,
+    this predicate stops firing and the classifier reverts to today's
+    (quota) behaviour instead of silently misclassifying a real subscription
+    run as infra-only.
+
+    ``backend_name``, when given, is used INSTEAD of resolving the backend
+    from ``config`` — the coder session a task actually runs on can be a
+    PER-TASK override (``task.config["backend"]``, honoured by
+    ``core.runtime.task_backend_override`` /
+    ``Orchestrator._task_backend`` ahead of the global ``worker.backend``), so
+    a caller that has a task in scope must resolve through that and pass the
+    result here; passing only ``config`` would see the global backend and
+    miss a `--backend local` task filed against a `claude`-global install (or
+    the inverse: a `--backend claude` task filed against a `local`-global
+    install must NOT take this path). Callers with no task in scope (unit
+    tests of this predicate) fall back to resolving from ``config`` alone.
+
+    Used to route a zero-token SDK death away from ``paused_quota``: in local
+    mode there is no subscription to reset, so a quota pause would wait
+    forever for a reset that means nothing.
+    """
+    name = backend_name if backend_name is not None else resolve_backend_name(config, role=role)
+    if name != "local":
+        return False
+    llm_cfg = (config or {}).get("llm") or {}
+    try:
+        token = _local_child_env(llm_cfg).get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+    except Exception:
+        # Fail BACK to today's behaviour (quota path), not forward into the
+        # new one: an exception here must never fail OPEN into treating an
+        # unreadable env as "definitely no subscription".
+        return False
+    return not token.strip()
+
+
 #: YAML spellings a human plausibly writes for a boolean. Hand-written; a
 #: config file is text, and `bool("false")` is True.
 _FALSEY_CONFIG_STRINGS = frozenset({"false", "no", "off", "0", ""})
@@ -640,6 +686,7 @@ __all__ = [
     "SUPPORTED_BACKENDS",
     "LOCAL_CAPABILITIES",
     "LOCAL_BACKEND_FALLBACK_API_KEY",
+    "local_run_without_subscription",
     "make_backend",
     "resolve_backend_name",
 ]

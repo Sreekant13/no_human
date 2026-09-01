@@ -302,6 +302,19 @@ Claude harness:
   task's `--backend`, so a `local` run still bills Anthropic for everything
   except the implementer.
 
+**A dead local server parks as infra, never as a quota wall.** If the coder's
+SDK session dies before producing any tokens (a proxy/server 500, a model that
+rejects a capability the CLI requested, an unreachable base URL), the
+classifier used to route this into `paused_quota` — which names a
+*subscription* reset. `local`'s child env has no subscription (`_local_child_env`
+always blanks `CLAUDE_CODE_OAUTH_TOKEN`), so that park would sit forever
+waiting on a reset that can never come. `local_run_without_subscription`
+(`agent/backend.py`) detects this — true only when the resolved backend is
+`local` **and** the actual child env carries no OAuth token — and routes the
+death to a `TRANSIENT_INFRA` park instead, with a 30-minute auto-retry wake and
+the local server's own error text (its stderr/500 body) carried in the
+blocker's evidence. `backend=claude` quota routing is unchanged.
+
 ## Adding a fourth backend
 
 `agent/backend.py` is the seam: implement `CodingBackend`, declare a
