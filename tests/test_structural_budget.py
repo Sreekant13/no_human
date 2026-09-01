@@ -100,7 +100,14 @@ FROZEN_FUNCTION_LINES = {
     # (#935 derived-artefact keystone) landing grew the conflict watcher
     # without re-freezing; nh approve runs change-scoped tests only, so the
     # ratchet never fired at land time. Repaired (measured) on this merge.
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 434,
+    # 434 -> 441 (+7): 2026-09-01 trust-the-local-merge fix (forge-vs-local
+    # mergeability flip-flop) — the empty-conflict-set branch now zeroes the
+    # stale-flags counter, records the observability-only
+    # `pr_conflict_local_clean_checks` counter, and emits a named
+    # `pr_conflict_local_clean` event instead of deferring/escalating at a
+    # bound; the docstring also gained a paragraph explaining why the local
+    # merge is authoritative. Measured on this merge.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 441,
     # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
     # write wired into `_finalize` (review findings #1/#7). Measured on the
     # D1.1 squash-merge result.
@@ -419,11 +426,11 @@ FROZEN_FILE_LINES = {
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.
-    # 2711 -> 2733 (+22): human-hold durability fix (SCRUM-22 regression) —
-    # the `human_stopped` guard hoisted above the `AWAITING_APPROVAL` branch
-    # in `_evaluate` and the new hold check in `_resume` (returns
-    # `"skipped_human_stopped"`). Measured on this change.
-    "blockers/wake.py": 2733,
+    # 2711 -> 2718 (+7): 2026-09-01 trust-the-local-merge fix, same cause as
+    # the FROZEN_FUNCTION_LINES entry above — the whole-file delta equals the
+    # function's delta since no other function in the file changed. Measured
+    # on this merge.
+    "blockers/wake.py": 2740,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies

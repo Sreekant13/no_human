@@ -2108,13 +2108,17 @@ def _clean_feature(tmp_path):
     return work
 
 
-async def test_a_forge_conflict_with_no_local_conflicting_path_defers_instead_of_a_coder_round(
+async def test_a_forge_conflict_with_a_locally_clean_merge_trusts_the_local_merge(
         store, tmp_path, monkeypatch):
-    """2026-08-21 06:02Z, tasks 265a9e06 and b404b872: every landing moved
-    RELEASE_MANIFEST.txt, the forge flipped both open PRs to CONFLICTING, the
-    watcher's local merge (against refs it had already fetched past the
-    conflict) found nothing — and each task was resumed into a paid coder
-    round labelled "could not enumerate". RED on main: result == "resumed"."""
+    """2026-09-01: 4/4 review-passed deliveries in one day (99e67f5e,
+    a9c4f0f4, a5753a8a, 11d5ff46) needed a human takeover because every
+    landing moved RELEASE_MANIFEST.txt, the forge flipped every OTHER open
+    PR to CONFLICTING, and the watcher's local merge (against refs fetched
+    THIS tick) found nothing — yet the old behavior deferred and then
+    escalated once the disagreement persisted past a bound. A *definite*
+    empty local conflict-path set is now trusted outright: no escalation,
+    no coder round, the tick falls through exactly like MERGEABLE and the
+    task stays reachable by `nh approve`."""
     _use_stub_export_guard(monkeypatch)
     work = _clean_feature(tmp_path)
     assert await dc.conflicting_paths(str(work), "main", "feature") == set()
@@ -2136,17 +2140,20 @@ async def test_a_forge_conflict_with_no_local_conflicting_path_defers_instead_of
     result = await w._check_pr_conflict(
         t, "https://code.example.com/dev/x/pull/40", "DIRTY", branch="feature")
 
-    assert result == "deferred_pr_conflict", result
+    assert result is None, result
     assert fetches == [("main", "feature")]      # it asked again on fresh refs
     assert resolver_calls == []
     kinds = [k for k, _ in events]
-    assert "pr_conflict_deferred" in kinds
+    assert "pr_conflict_local_clean" in kinds
+    assert "escalated_pr_conflict" not in kinds
     assert "resumed" not in kinds and "pr_conflict" not in kinds
     stored = await store.get_task(t.id)
-    assert stored.status == TaskStatus.AWAITING_APPROVAL   # untouched
+    assert stored.status == TaskStatus.AWAITING_APPROVAL   # untouched, reachable by nh approve
+    assert stored.blocker is None
     ctx = stored.context or {}
-    assert ctx.get("pr_conflict_rounds", 0) == 0, "a deferral is not a rebase round"
-    assert ctx.get("pr_conflict_stale_flags") == 1
+    assert ctx.get("pr_conflict_rounds", 0) == 0, "trusting the local merge is not a rebase round"
+    assert ctx.get("pr_conflict_stale_flags") in (0, None)
+    assert ctx.get("pr_conflict_local_clean_checks") == 1
 
 
 async def test_a_conflict_that_appears_after_the_fetch_opens_the_coder_round_as_today(
@@ -2184,12 +2191,15 @@ async def test_a_conflict_that_appears_after_the_fetch_opens_the_coder_round_as_
     del real_paths
 
 
-async def test_persistent_forge_local_disagreement_escalates_with_both_facts(
+async def test_persistent_forge_local_disagreement_never_escalates_no_matter_how_many_checks_disagree(
         store, tmp_path, monkeypatch):
-    """Bounded like the rebase rounds: after max_pr_conflict_rounds + 1
-    consecutive empty checks the watcher stops deferring and escalates,
-    naming both the forge's state and the local merge's — never a coder
-    round, never forever."""
+    """Mirror of the repro above, run past the old bound:
+    `max_pr_conflict_rounds + 2` consecutive ticks where the forge keeps
+    saying CONFLICTING and the local merge keeps finding nothing must
+    NEVER escalate — the old code stopped deferring and escalated once the
+    disagreement persisted; the fix removes that bound for this class
+    entirely, since a definite empty local set can never be a real
+    conflict a coder round could act on."""
     _use_stub_export_guard(monkeypatch)
     work = _clean_feature(tmp_path)
     events = []
@@ -2199,18 +2209,24 @@ async def test_persistent_forge_local_disagreement_escalates_with_both_facts(
     url = "https://code.example.com/dev/x/pull/42"
 
     results = []
-    for _ in range(w.max_pr_conflict_rounds):
+    for _ in range(w.max_pr_conflict_rounds + 2):
         results.append(await w._check_pr_conflict(t, url, "DIRTY", branch="feature"))
         t = await store.get_task(t.id)
-    assert results == ["deferred_pr_conflict"] * w.max_pr_conflict_rounds
+        assert t.status == TaskStatus.AWAITING_APPROVAL, "must never escalate mid-loop"
 
-    final = await w._check_pr_conflict(t, url, "DIRTY", branch="feature")
-    assert final == "escalated_pr_conflict", final
+    assert results == [None] * (w.max_pr_conflict_rounds + 2), results
     stored = await store.get_task(t.id)
-    assert stored.status == TaskStatus.ESCALATED
-    assert "no conflicting path" in stored.blocker["evidence"]
-    assert "CONFLICTING" in stored.blocker["evidence"]
-    assert "resumed" not in [k for k, _ in events]
+    assert stored.status == TaskStatus.AWAITING_APPROVAL
+    assert stored.blocker is None
+    kinds = [k for k, _ in events]
+    assert "escalated_pr_conflict" not in kinds
+    assert "resumed" not in kinds
+    clean_texts = [txt for k, txt in events if k == "pr_conflict_local_clean"]
+    assert len(clean_texts) == w.max_pr_conflict_rounds + 2
+    assert all("CONFLICTING" in txt and "no conflicting path" in txt for txt in clean_texts)
+    ctx = stored.context or {}
+    assert ctx.get("pr_conflict_local_clean_checks") == w.max_pr_conflict_rounds + 2
+    assert ctx.get("pr_conflict_stale_flags") in (0, None)
 
 
 async def test_a_definite_mergeable_clears_the_disagreement_streak(
@@ -2221,7 +2237,10 @@ async def test_a_definite_mergeable_clears_the_disagreement_streak(
     w = _watcher(store, events=[], derived_resolver=lambda *a, **k: None)
     await w._check_pr_conflict(t, "https://code.example.com/dev/x/pull/43", "DIRTY", branch="feature")
     t = await store.get_task(t.id)
-    assert (t.context or {}).get("pr_conflict_stale_flags") == 1
+    # Trusting the local merge zeroes the streak immediately (there is no
+    # bound left to feed) instead of counting up toward one.
+    assert (t.context or {}).get("pr_conflict_stale_flags") in (0, None)
+    assert (t.context or {}).get("pr_conflict_local_clean_checks") == 1
 
     w_ok = _watcher(store, mergeable="MERGEABLE", merge_state="CLEAN", events=[])
     assert await w_ok._check_pr_conflict(t, "https://code.example.com/dev/x/pull/43", "CLEAN", branch="feature") is None
@@ -2229,9 +2248,143 @@ async def test_a_definite_mergeable_clears_the_disagreement_streak(
     assert (t.context or {}).get("pr_conflict_stale_flags") == 0
 
 
-# --------------------------------------------------------------------------- #
-# A rule line MAIN gained after the fork is main's decision, not the branch's  #
-# --------------------------------------------------------------------------- #
+async def test_a_real_source_conflict_past_the_bound_still_escalates(
+        store, tmp_path, monkeypatch):
+    """Mirror of the trust-the-local-merge fix: a GENUINE source conflict
+    (both sides edit the same line of src/base.py) must still open a coder
+    round each tick and escalate once it survives `max_pr_conflict_rounds`
+    rebase-round send-backs — trusting the local merge on the honest
+    empty-set class must never leak into a class where the local
+    enumeration names a real path."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+    wt = tmp_path / "wt_feature"
+    _worktree(work, wt, "feature")
+    (wt / "src" / "base.py").write_text("base\nfeature change\n", encoding="utf-8")
+    _git(wt, "commit", "-qam", "feature edits base.py")
+    _push_branch(work, wt, "feature")
+
+    (work / "src" / "base.py").write_text("base\nmain change\n", encoding="utf-8")
+    _git(work, "commit", "-qam", "main also edits base.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "feature")
+    assert paths == {"src/base.py"}
+
+    events = []
+    url = "https://code.example.com/dev/x/pull/44"
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events, derived_resolver=lambda *a, **k: None)
+
+    for n in range(1, w.max_pr_conflict_rounds + 1):
+        t = await store.get_task(t.id)
+        await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+        result = await w._check_pr_conflict(t, url, "DIRTY", branch="feature")
+        assert result == "resumed", f"round {n}: {result}"
+
+    t = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    final = await w._check_pr_conflict(t, url, "DIRTY", branch="feature")
+    assert final == "escalated_pr_conflict", final
+    stored = await store.get_task(t.id)
+    assert stored.status == TaskStatus.ESCALATED
+    kinds = [k for k, _ in events]
+    assert "escalated_pr_conflict" in kinds
+    assert "pr_conflict_local_clean" not in kinds
+
+
+async def test_the_generated_pair_reuses_the_landed_derived_resolver(
+        store, tmp_path, monkeypatch):
+    """AC3: the generated-pair-only conflict (RELEASE_MANIFEST.txt) must
+    route through the EXISTING resolver landed in commit 26dc16248
+    (`derived_conflict.resolve_derived_conflict`), reached via the same
+    `derived_resolver` seam the rung has always called — this bugfix adds
+    no new resolver, it only stops the empty-set branch from escalating."""
+    _use_stub_export_guard(monkeypatch)
+    work = _repo(tmp_path)
+
+    wt_f = tmp_path / "wt_feature"
+    _worktree(work, wt_f, "feature")
+    (wt_f / "src" / "on_feature.py").write_text("on feature\n", encoding="utf-8")
+    _git(wt_f, "add", "src/on_feature.py")
+    _git(wt_f, "commit", "-qm", "add on_feature.py")
+    _approve(wt_f, ["src/on_feature.py"])
+    _git(wt_f, "add", "RELEASE_MANIFEST.txt")
+    _git(wt_f, "commit", "-qm", "pin on_feature.py")
+    _push_branch(work, wt_f, "feature")
+
+    (work / "src" / "on_main.py").write_text("on main\n", encoding="utf-8")
+    _git(work, "add", "src/on_main.py")
+    _git(work, "commit", "-qm", "add on_main.py")
+    _approve(work, ["src/on_main.py"])
+    _git(work, "add", "RELEASE_MANIFEST.txt")
+    _git(work, "commit", "-qm", "pin on_main.py")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+    paths = await dc.conflicting_paths(str(work), "main", "feature")
+    assert paths == {"RELEASE_MANIFEST.txt"}
+
+    resolver_calls = []
+
+    def spying_resolver(repo_path, branch, base_tip_sha, remote="origin",
+                         eligible=dc.DERIVED_ARTEFACTS):
+        resolver_calls.append((repo_path, branch, base_tip_sha))
+        return dc.resolve_derived_conflict(repo_path, branch, base_tip_sha,
+                                            remote=remote, eligible=eligible)
+
+    events = []
+    t = await _approval_task(store, str(work))
+    w = _watcher(store, events=events, derived_resolver=spying_resolver)
+    result = await w._check_pr_conflict(
+        t, "https://code.example.com/dev/x/pull/45", "DIRTY", branch="feature")
+
+    assert result == "resolved_pr_conflict"
+    assert len(resolver_calls) == 1, "the landed resolver, not a new one, must be invoked"
+
+    # no new resolver-shaped symbol was added to wake.py by this bugfix.
+    import no_human.blockers.wake as wake_module
+    pre_existing_resolver_names = {
+        "resolve_derived_conflict", "resolve_base_tip",
+        "resolve_task_pr",  # unrelated: `vcs.task_pr.resolve_task_pr` finds a task's PR URL
+    }
+    resolver_like = {
+        name for name in dir(wake_module)
+        if (name.startswith("resolve_") or name.startswith("_resolve"))
+        and name not in pre_existing_resolver_names
+    }
+    assert resolver_like == set(), f"new resolver symbol(s) added to wake.py: {resolver_like}"
+
+    # membership is still exactly the landed rule -- no new eligible artefact.
+    assert dc.DERIVED_ARTEFACTS | {dc.CLASSIFICATION_NAME} == {
+        "RELEASE_MANIFEST.txt", dc.CLASSIFICATION_NAME,
+    }
+
+
+async def test_the_local_clean_path_touches_neither_the_review_gate_nor_push_to_main(
+        store):
+    """AC4 (scope): the rung this bugfix changes must not gain a push-to-main
+    call or a review-gate call. `push`/`review`/`land_task` appear as plain
+    English in the docstring and comments (the rung's own commentary talks
+    ABOUT the approve path and about GitHub recomputing `mergeable` after a
+    push) -- that prose is fine and expected. What must never appear is an
+    actual CALL SHAPE that performs one: a literal ``git push`` argv, a
+    push targeting ``refs/heads/main``/``refs/heads/master``, or a direct
+    invocation of the review-gate/approve-path functions."""
+    import inspect
+    from no_human.blockers.wake import WakeWatcher
+
+    src = inspect.getsource(WakeWatcher._check_pr_conflict)
+    banned_call_shapes = (
+        '"git", "push"',
+        "'git', 'push'",
+        "refs/heads/main",
+        "refs/heads/master",
+        "_review_pass_evidence(",
+        "land_task(",
+        "never_push_to",
+    )
+    for banned in banned_call_shapes:
+        assert banned not in src, f"{banned!r} must not appear in _check_pr_conflict"
 
 
 async def test_a_count_only_conflict_still_resolves_when_main_gained_a_rule_line(
