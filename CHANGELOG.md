@@ -4,6 +4,76 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.9] — 2026-09-01
+
+The evidence release. PR bodies shrink to final results with the full receipts
+in a per-attempt artifact; UI-touching tasks attach real screenshots and a walk
+video; the second brain manages itself — screened learnings activate on a daily
+cap with an audit trail, one Settings surface, and a kill switch; and the board
+gets faster on large fleets.
+
+### Added
+
+- **Visual proof on UI PRs.** After tests pass on a task that touched `web/` or
+  `desktop/`, the harness runs the browser walk and attaches screenshots (up to
+  six) and a walk video via an evidence side branch that never reaches main or
+  the export (`nh-evidence/<task-id>`, deleted when the task branch is cleaned).
+- **Auto-managed learnings.** Harvested learnings that pass the existing
+  screens (dedupe, PII, provenance, terms) activate automatically — capped per
+  day (`learning.auto_activate_daily_cap`, default 10), audited in
+  `learning_events` (including which trigger tags fired), auto-retired after 90
+  days unused (auto-activated rows only), with Pause/Delete/Restore in the UI
+  and a kill switch (`learning.auto_manage: false`) that restores the confirm
+  queue exactly.
+- **Second brain, one surface.** The pane lives in Settings only, opens with a
+  plain explainer, shows each learning with its origin task and usage count,
+  and keeps the operator's manual rules untouched. The sidebar "!" badge is its
+  own click target that deep-links there and clears only once the pane has
+  actually been seen.
+- **Create-time feasibility.** The pre-flight hint now appears the moment a
+  task is created (a status toast from the create response), not only while the
+  task is still pending.
+- **Board pagination.** `GET /api/tasks` accepts opt-in `?limit`/`?offset`
+  (SQL-side, deterministic ordering); the no-params response is byte-identical
+  to before.
+- **Convergence early-abort.** An attempt that stops making progress (no file
+  edit or real test run within a bounded window) is aborted early with an
+  honest blocker and checkpoint instead of burning to the turn cap
+  (`worker.abort_non_converging`, default on; corpus-anchored thresholds).
+
+### Changed
+
+- **PR bodies carry final results only.** One line per test layer from the
+  final run, a pointer to the full verification log (attempt-scoped artifact,
+  surfaced by `nh logs`), a 6,000-character budget enforced in code, and
+  failure excerpts that show the first failing blocking layer's traceback.
+- **Learning triggers match whole words.** The injection trigger no longer
+  fires on substrings ("fact" inside "artefact"), and every injection audit
+  row records the tags that fired.
+- **Task detail payloads are lean.** The three heavy per-attempt fields
+  (review checklist, verifier results, test results) moved behind a lazy
+  details endpoint with client-side caching keyed on terminal attempt status.
+- **Doc citations tolerate drift.** Line-anchored citations resolve by content
+  within a window, with a mechanical re-anchor helper
+  (`scripts/reanchor_citations.py`).
+
+### Fixed
+
+- **Inspector scroll drift.** The running-task inspector no longer drifts while
+  live events append (observer armed once per drawer, compensation only for
+  growth fully above the viewport, native scroll anchoring disabled on that one
+  container) — pinned by a three-scenario end-to-end test.
+- **Orphaned work that actually landed now reconciles** to a delivered state
+  through a validated transition instead of being marked failed.
+- **Human holds survive blocker updates,** and conflict/quota watchers respect
+  them — a held task stays held until a human resumes it.
+- **Reviewer verdict parsing takes the last well-formed verdict block,** so
+  quoted untrusted content earlier in a transcript cannot preempt the real
+  verdict.
+- **The verifier module's docs match its wiring,** its retry window is pinned
+  by tests, and stale distribution/backend docs were rewritten to the shipped
+  reality.
+
 ## [0.1.8] — 2026-08-30
 
 The pre-flight release. no_human now reads a new task before you start it: when
