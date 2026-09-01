@@ -351,6 +351,48 @@ def user_pause_blocker(
     }
 
 
+#: Sibling fields that travel WITH a durable hold when it is carried forward.
+#: Only keys actually present on the prior blocker are copied — this never
+#: invents a reason/actor `POST /pause`'s hold branch did not record.
+_HOLD_KEYS = ("human_stopped", "hold_reason", "hold_actor", "held_at")
+
+
+def carry_human_hold(
+    prior: dict[str, Any] | None, new: dict[str, Any],
+) -> dict[str, Any]:
+    """Forward a durable HOLD (``human_stopped``, see the module docstring)
+    across a blocker REPLACEMENT.
+
+    Every machine code path that writes a brand-new blocker dict in place of
+    the old one (`Orchestrator._park_quota`'s fresh QUOTA park,
+    `Orchestrator._raise_blocker`'s ``blocker.to_dict()``) silently dropped a
+    hold a human had stamped on the blocker it replaced — a re-park after
+    `POST /pause` held the task looked, to the wake sweep, exactly like a
+    never-held one (SCRUM-22 regression). Call this with the PRIOR blocker
+    (read before the assignment) and the REPLACEMENT dict; it returns the
+    replacement with the hold re-stamped on top when the prior had one.
+
+    Returns ``new`` unchanged when ``prior`` is not a dict or its
+    ``human_stopped`` is not truthy — no hold to carry.
+
+    Deliberate exception: never stamps a hold onto a replacement whose
+    ``category`` is ``BlockerCategory.USER_PAUSED.value``. PAUSE and HOLD are
+    mutually exclusive stop shapes (see the module docstring) and
+    `api.pause_task` already refuses to mix them at the write end; carrying
+    a hold onto a PAUSE here would manufacture the exact shape that refusal
+    exists to prevent. A PAUSE is already a human stop, so nothing is lost.
+    """
+    if not isinstance(prior, dict) or not prior.get("human_stopped"):
+        return new
+    if new.get("category") == BlockerCategory.USER_PAUSED.value:
+        return new
+    carried = dict(new)
+    for key in _HOLD_KEYS:
+        if key in prior:
+            carried[key] = prior[key]
+    return carried
+
+
 def human_event(
     verb: str,
     *,

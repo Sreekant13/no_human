@@ -226,7 +226,12 @@ FROZEN_FILE_LINES = {
     # 20507 -> 20513 (+6): efficiency pair — the batched
     # `record_learning_events` call replacing the per-injection loop at the
     # memory-injection site. Measured on the pair's merge result.
-    "core/orchestrator.py": 20513,
+    # 20513 -> 20523 (+10): human-hold durability fix (SCRUM-22 regression) —
+    # `_raise_blocker` and `_park_quota` now route their blocker-replacement
+    # writes through `carry_human_hold` so a durable human pause survives a
+    # machine blocker rewrite. Re-anchored on this rebased tree (main had
+    # independently grown the file to 20513 lines by the time this landed).
+    "core/orchestrator.py": 20523,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -400,7 +405,11 @@ FROZEN_FILE_LINES = {
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.
-    "blockers/wake.py": 2711,
+    # 2711 -> 2733 (+22): human-hold durability fix (SCRUM-22 regression) —
+    # the `human_stopped` guard hoisted above the `AWAITING_APPROVAL` branch
+    # in `_evaluate` and the new hold check in `_resume` (returns
+    # `"skipped_human_stopped"`). Measured on this change.
+    "blockers/wake.py": 2733,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies

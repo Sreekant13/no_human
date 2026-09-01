@@ -145,7 +145,7 @@ from .bounds import (
     Bounds, ConvergenceTracker, QuotaExhausted, StuckDetector, error_signature,
     quota_reason, quota_signal,
 )
-from ..blockers.taxonomy import carried_checkpoint, resume_checkpoint
+from ..blockers.taxonomy import carried_checkpoint, carry_human_hold, resume_checkpoint
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
 from .infra_breaker import infra_breaker
@@ -9303,8 +9303,11 @@ class Orchestrator:
         except Exception:
             self._advisory("escalation latency unavailable")
 
-        # 4. Persist the structured report and transition.
-        task.blocker = blocker.to_dict()
+        # 4. Persist the structured report and transition. `Blocker.to_dict()`
+        # has no `human_stopped` field, so every off-ramp through here would
+        # otherwise silently drop a durable hold a human stamped on the
+        # blocker being replaced (SCRUM-22 regression) — carry it forward.
+        task.blocker = carry_human_hold(task.blocker, blocker.to_dict())
         await self.store.update_task(task)
         await self.store.set_status(task, route.target_status, validate=False)
 
@@ -9737,7 +9740,14 @@ class Orchestrator:
         # park's semantics. The existing green test for it supplied this
         # blocker in its fixture, which is why the gap survived: the fixture
         # asserted a shape the real park path never wrote.
-        task.blocker = {
+        # `carry_human_hold`: this replaces the WHOLE blocker dict, so a
+        # human hold (`human_stopped`) stamped on the prior blocker — e.g. a
+        # supervisor holding this quota park via `POST /pause` — would
+        # otherwise be silently dropped by the fresh QUOTA dict below and the
+        # next quota wake would resume a task a human had stopped (the
+        # measured SCRUM-22 regression). Read `task.blocker` BEFORE the
+        # assignment overwrites it.
+        task.blocker = carry_human_hold(task.blocker, {
             "category": "QUOTA",
             "wake_condition": "quota_refreshed",
             "raised_at": _now(),
@@ -9757,7 +9767,7 @@ class Orchestrator:
             # task's attempt but is not a billing wall — it arms no pool
             # clock and corroborates no other task's bare-shape death.
             "infra": bool(getattr(exc, "infra", False)),
-        }
+        })
         # Columns only (blocker, wake_check_at): `update_task` would rewrite
         # the whole context blob from this in-memory copy and drop whatever
         # the CLI or the watcher merged meanwhile — and the blocker is now the

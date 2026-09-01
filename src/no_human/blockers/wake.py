@@ -598,6 +598,25 @@ class WakeWatcher:
         # loop (M1). It NEVER times out — a PR may wait for human approval
         # indefinitely.
         #
+        # A human chose "stop — keep the work parked as-is" (SCRUM-22's
+        # terminal park). Review 2026-07-25: without this skip the sweep
+        # undid the stop — max_park re-escalated the task within 48h and any
+        # wake_condition on the blocker resumed it. Human decisions outrank
+        # every automatic branch below; only another human reply changes it.
+        #
+        # LOAD-BEARING ORDERING: this must run BEFORE the AWAITING_APPROVAL
+        # branch just below. That branch is the door the pr_conflict rung
+        # comes through — `_check_open_pr` polls the forge, can shepherd a
+        # conflicting/commented PR, and resumes on its own via `_resume`
+        # (which re-checks `_is_terminal` but NOT the hold). A held task
+        # reaching AWAITING_APPROVAL must never enter that ladder at all: no
+        # forge polls, no `pr_conflict_rounds` bump, no resume. Read off
+        # `current` (the fresh row fetched above), not the possibly-stale
+        # `task` snapshot — same reasoning as the AWAITING_APPROVAL branch's
+        # own comment.
+        if (current.blocker or {}).get("human_stopped"):
+            return None
+
         # `current.status` (the fresh read above), not `task.status`: `task`
         # can be the stale snapshot `tick()` listed under `BLOCKED` before a
         # concurrent restore-approval flipped the live row to
@@ -607,14 +626,6 @@ class WakeWatcher:
         # blocker, the exact 2026-08-11 incident.
         if current.status == TaskStatus.AWAITING_APPROVAL:
             return await self._check_open_pr(task)
-
-        # A human chose "stop — keep the work parked as-is" (SCRUM-22's
-        # terminal park). Review 2026-07-25: without this skip the sweep
-        # undid the stop — max_park re-escalated the task within 48h and any
-        # wake_condition on the blocker resumed it. Human decisions outrank
-        # every automatic branch below; only another human reply changes it.
-        if (task.blocker or {}).get("human_stopped"):
-            return None
 
         blocker = Blocker.from_dict(task.blocker) if task.blocker else None
         raised_at = _parse_iso(blocker.raised_at if blocker else None) \
@@ -740,6 +751,17 @@ class WakeWatcher:
         # a rung did since its own recheck reopens the race this closes.
         if await self._is_terminal(task):
             return "skipped_terminal"
+        # Invariant twin of the terminal guard just above: every present and
+        # future resume path (wake-condition rung, pr_conflict/comment/CI
+        # rungs via `_check_open_pr`, `Scheduler._resume_quota_parks` via
+        # `resume_now`) funnels through this one chokepoint, so this is the
+        # one place a durable human hold can be enforced without trusting
+        # every caller to re-check it. The `_evaluate` early-out above is
+        # only a cheap short-circuit for the common tick path; this is the
+        # backstop. Read off `task.blocker` exactly as `_evaluate` does, for
+        # one spelling of the check.
+        if (task.blocker or {}).get("human_stopped"):
+            return "skipped_human_stopped"
         now = now or datetime.now(timezone.utc)
 
         # Death-blind resume loop guard. Every resume — whichever of the five
