@@ -714,6 +714,33 @@ ui_evidence:
                    # this is the key the egress allowlist charges that channel to.
 ```
 
+The switch above is the install-wide kill switch. The *per-repo* half — telling
+the walk which dev server to boot — lives in `<repo>/.no_human/project.yml`
+(and its mirrored DB row), not `~/.no_human/config.yaml`:
+
+```yaml
+# <repo>/.no_human/project.yml
+ui_evidence:
+  enabled: true
+  start_cmd: npm run dev
+  base_url: http://localhost:5173
+```
+
+Nothing wrote this before no-human-67: a repo could have Playwright installed
+and the kill switch on, and the walk still had no `start_cmd`/`base_url` to
+boot. `nh onboard <repo>` now detects a `dev` script in the repo's own
+`package.json` — only when a known framework (vite, `@sveltejs/kit`, next,
+nuxt, `react-scripts`, astro, `@angular/cli`, `@vue/cli-service`) is also a
+declared dependency, so the port is read off the framework, never guessed —
+and offers a single "Enable visual-proof walks?" (Yes/No, default No) prompt.
+Accepting writes the block above to both `project.yml` and the DB row in one
+step; declining, or a repo with no `dev` script, writes nothing. Once
+`ui_evidence` is configured — by this prompt or by hand — it is never
+suggested again: manual config always wins. `nh doctor` names the same gap
+("visual-proof walks: repo not configured — detected `npm run dev` on :5173,
+enable?") for any known repo that still has no `ui_evidence` configured; it is
+an advisory only and never affects doctor's exit code.
+
 ## Timeouts read straight from your config
 
 Two ceilings are read the same way and default generously so a legitimately

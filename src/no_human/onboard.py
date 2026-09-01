@@ -32,13 +32,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .profile import ProjectProfile
 from .testing import runner
+
+if TYPE_CHECKING:
+    from .core.db import Store
+
+log = logging.getLogger(__name__)
 
 # Commands we prove, in the order we prove them. install runs first so the test
 # command's dependencies exist; test is the trust anchor; lint is best-effort.
@@ -111,6 +117,11 @@ class DerivedCommands:
     ci: dict[str, Any] = field(default_factory=dict)
     human_gated_steps: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)   # all declarations consulted
+    # no-human-67 follow-up: a detected `npm run dev` convention (see
+    # detect_dev_server below), or None when nothing was detected. AgentDeriver
+    # never sets this (leaves the dataclass default) — the agentic path has no
+    # equivalent recon step, by design (out of scope for this ticket).
+    dev_server: dict[str, Any] | None = None
 
     def of_kind(self, kind: str) -> list[CommandCandidate]:
         return [c for c in self.candidates if c.kind == kind]
@@ -156,6 +167,61 @@ def _make_targets(makefile: Path) -> set[str]:
         if m:
             targets.add(m.group(1))
     return targets
+
+
+# Framework -> its documented default dev-server port. Deliberately a closed
+# table: an unknown framework yields NO suggestion rather than a guessed port,
+# because the value ends up in a base_url the harness probes. Detection scope
+# is deliberately rigid (no-human-67 follow-up) — only the `dev` script name
+# plus this table; no `start`/`serve` scripts, no `--port` flag parsing, no
+# non-npm package managers. Widening this is a separate ticket.
+_DEV_SERVER_PORTS = {
+    "vite": 5173,
+    "@sveltejs/kit": 5173,
+    "next": 3000,
+    "nuxt": 3000,
+    "react-scripts": 3000,
+    "astro": 4321,
+    "@angular/cli": 4200,
+    "@vue/cli-service": 8080,
+}
+
+
+def detect_dev_server(repo_path: str | Path, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Detect a `npm run dev` convention from a repo's own package.json.
+
+    Reuses the already-parsed package.json ``data`` when the caller (usually
+    ``_derive_node``) has one, rather than re-reading/re-parsing the file — the
+    extension point the plan calls for, not a new detector. Returns None
+    unless BOTH hold: a ``dev`` script exists, AND a known framework (a key of
+    ``_DEV_SERVER_PORTS``) appears in ``dependencies``/``devDependencies`` —
+    the framework name is what tells us which port its own dev server binds,
+    not a guess.
+    """
+    repo = Path(repo_path).expanduser()
+    if data is None:
+        pkg = repo / "package.json"
+        if not pkg.exists():
+            return None
+        try:
+            data = json.loads(_read_text(pkg) or "{}")
+        except json.JSONDecodeError:
+            return None
+    scripts = data.get("scripts") or {}
+    if "dev" not in scripts:
+        return None
+    deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
+    framework = next((name for name in _DEV_SERVER_PORTS if name in deps), None)
+    if framework is None:
+        return None
+    port = _DEV_SERVER_PORTS[framework]
+    return {
+        "start_cmd": "npm run dev",
+        "base_url": f"http://localhost:{port}",
+        "port": port,
+        "framework": framework,
+        "source": "package.json:scripts.dev",
+    }
 
 
 class DeclarationDeriver:
@@ -206,6 +272,7 @@ class DeclarationDeriver:
         scripts = data.get("scripts") or {}
         d.ecosystem = d.ecosystem or "node"
         d.sources.append("package.json")
+        d.dev_server = detect_dev_server(repo, data)
         if (repo / "package-lock.json").exists():
             install = "npm ci"
         elif (repo / "yarn.lock").exists():
@@ -546,3 +613,134 @@ def confirm_profile(profile: ProjectProfile) -> ProjectProfile:
         )
     profile.confirmed = True
     return profile
+
+
+# --------------------------------------------------------------------------- #
+# UI-evidence provisioning (no-human-67 follow-up)                            #
+# --------------------------------------------------------------------------- #
+#
+# No flow ever configured `ProjectProfile.ui_evidence` — the visual-proof-walks
+# feature (testing/ui_evidence.py, out of scope here) is unreachable for any
+# customer even with Playwright installed, because nothing ever writes
+# start_cmd/base_url for their repo. This section only PROVISIONS that config
+# (a detect -> one-confirm-offer -> dual-write pipeline); the consumer runtime
+# that reads it is untouched.
+
+UI_EVIDENCE_PROMPT = "Enable visual-proof walks?"
+
+
+def ui_evidence_configured(profile: ProjectProfile) -> bool:
+    """True once a repo's ui_evidence is configured — manually or via a prior
+    accept — so a suggestion never re-fires and never overwrites a human's own
+    choice. Checked against the persisted profile, never re-derived."""
+    ui = getattr(profile, "ui_evidence", None) or {}
+    return bool(ui.get("enabled") or ui.get("start_cmd") or ui.get("base_url"))
+
+
+def ui_evidence_suggestion(
+    profile: ProjectProfile,
+    repo_path: str | Path | None = None,
+    dev_server: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """The one suggestion object shared by the CLI offer, `nh doctor`'s
+    advisory, and the wizard's API row — so all three read the exact same gap
+    text and the exact same start_cmd/base_url. Returns None when the repo is
+    already configured (manual config wins — never re-prompt) OR nothing was
+    detected (``detect_dev_server``'s closed table found no known framework).
+
+    ``dev_server`` may be passed directly (the API already has ``derived``
+    from this request); otherwise it is (re-)detected from ``repo_path``, file
+    reads only, no network, no subprocess.
+    """
+    if ui_evidence_configured(profile):
+        return None
+    if dev_server is None:
+        repo = repo_path if repo_path is not None else profile.repo_path
+        dev_server = detect_dev_server(repo)
+    if not dev_server:
+        return None
+    gap = (
+        "visual-proof walks: repo not configured — detected "
+        f"`{dev_server['start_cmd']}` on :{dev_server['port']}, enable?"
+    )
+    return {
+        "start_cmd": dev_server["start_cmd"],
+        "base_url": dev_server["base_url"],
+        "port": dev_server["port"],
+        "framework": dev_server["framework"],
+        "gap": gap,
+    }
+
+
+def apply_ui_evidence_suggestion(profile: ProjectProfile, suggestion: dict[str, Any]) -> ProjectProfile:
+    """Turn an accepted suggestion into the enabled ui_evidence config, in
+    place. ``ready_path``/``ready_timeout_s``/``ui_paths`` keep whatever the
+    dataclass default already put on ``profile.ui_evidence`` — only the three
+    keys the suggestion actually knows about change. Pure: persisting the
+    result (yml + DB) is the caller's job, via ``persist_profile``."""
+    ui = dict(profile.ui_evidence or {})
+    ui["enabled"] = True
+    ui["start_cmd"] = suggestion["start_cmd"]
+    ui["base_url"] = suggestion["base_url"]
+    profile.ui_evidence = ui
+    return profile
+
+
+class ProjectYmlPersistError(RuntimeError):
+    """Raised by `persist_profile` when `project.yml` cannot be written.
+
+    Unlike `onboarding_confirm_repo`'s older pairing (which logs the OSError
+    from `profile.save()` and writes the DB row regardless), this feature's
+    own acceptance criteria promise the two artifacts as a matching pair —
+    "verify both artifacts contain matching config". Writing only the DB row
+    would leave a live, "enabled" row with no on-disk config to match it,
+    while every caller up the chain (CLI, API) reports full success. So on a
+    yml failure the DB write is skipped too, and this is raised instead of
+    swallowed: no caller may report success, and no split-brain state (DB
+    says enabled, project.yml does not) is ever created.
+    """
+
+
+async def persist_profile(store: "Store", profile: ProjectProfile) -> None:
+    """The one dual-write: `<repo>/.no_human/project.yml` AND the DB row, in
+    that order. Raises `ProjectYmlPersistError` — and skips the DB write —
+    if the yml write fails; see that class for why. Callers (CLI, API) must
+    catch it and surface the failure honestly rather than reporting success.
+    """
+    try:
+        profile.save()
+    except OSError as exc:
+        log.warning("could not write project.yml for %s: %s", profile.repo_path, exc)
+        raise ProjectYmlPersistError(
+            f"could not write project.yml for {profile.repo_path}: {exc}"
+        ) from exc
+    await store.upsert_profile(profile)
+
+
+async def offer_ui_evidence(
+    store: "Store",
+    profile: ProjectProfile,
+    suggestion: dict[str, Any],
+    *,
+    ask: Callable[[str], bool],
+) -> bool:
+    """Ask once (via ``ask``, the only interactive part — a plain callable so
+    CLI and API callers can each supply their own prompt/decline mechanics)
+    and, on acceptance, apply + persist the suggestion. Returns whether it was
+    enabled. A decline (``ask`` returns False) writes NOTHING — no yml write,
+    no DB write — a decline must never create config, exactly as a repo with
+    no dev script leaves no trace anywhere.
+
+    On acceptance this propagates ``ProjectYmlPersistError`` from
+    ``persist_profile`` rather than swallowing it — a caller that got back
+    ``True`` here has a real, matching dual-write; a caller that gets the
+    exception must not print/return a success message.
+
+    ``ask`` receives ``UI_EVIDENCE_PROMPT`` — the ONE prompt text ("Enable
+    visual-proof walks?") — not the longer gap description, which the caller
+    prints separately as context before asking."""
+    if not ask(UI_EVIDENCE_PROMPT):
+        return False
+    apply_ui_evidence_suggestion(profile, suggestion)
+    await persist_profile(store, profile)
+    return True

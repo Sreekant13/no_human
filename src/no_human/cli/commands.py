@@ -3028,7 +3028,8 @@ def onboard(repo, confirm, agent):
     repo_path = str(Path(repo).resolve())
     from ..onboard import (
         AgentDeriver, DeclarationDeriver, OnboardEngine, ProfileNotProven,
-        confirm_profile,
+        ProjectYmlPersistError, confirm_profile, offer_ui_evidence,
+        ui_evidence_suggestion,
     )
     from ..profile import ProjectProfile
 
@@ -3112,6 +3113,28 @@ def onboard(repo, confirm, agent):
 
             prof.save()
             await store.upsert_profile(prof)
+
+            # Visual-proof (ui_evidence) provisioning offer (no-human-67
+            # follow-up): a one-action confirm, skipped entirely when
+            # ui_evidence is already manually configured — manual config
+            # always wins over detection, never re-prompt.
+            sug = ui_evidence_suggestion(prof, repo_path)
+            if sug:
+                console.print(f"\n[bold]{sug['gap']}[/]")
+
+                def _ask(prompt: str) -> bool:
+                    try:
+                        return click.confirm(prompt, default=False)
+                    except (click.Abort, EOFError):
+                        return False  # piped/cron stdin => No, never a hang
+
+                try:
+                    if await offer_ui_evidence(store, prof, sug, ask=_ask):
+                        console.print(f"  [green]✓[/] ui_evidence: "
+                                      f"{sug['start_cmd']} → {sug['base_url']}")
+                except ProjectYmlPersistError as exc:
+                    console.print(f"  [red]✗[/] could not enable ui_evidence: {exc}")
+
             if prof.proven.get("test_cmd"):
                 console.print(f"\n[green]test command proven.[/] confirm to make it "
                               f"usable:\n  [bold]nh onboard {repo} --confirm[/]")
@@ -6393,6 +6416,31 @@ def doctor(verbose, verify_auth):
                           f"[{key_colour}]{key_state}[/]  [dim](presence only)[/]")
             console.print(f"                [dim]{d.codex.get('entitlement_note')}[/]")
 
+        # Visual-proof (ui_evidence) provisioning state (no-human-67
+        # follow-up): current state and, side-by-side, the suggested state
+        # when the repo has a detected `npm run dev` convention and isn't
+        # configured yet. Nothing prints when there are no known profiles —
+        # this is read-only and additive, never affects `healthy`.
+        for row in d.ui_evidence:
+            name = Path(row["repo_path"]).name
+            if row["enabled"]:
+                console.print(
+                    f"[bold]visual-proof walks[/] — {name}: [green]enabled[/] "
+                    f"({row['start_cmd']} → {row['base_url']})"
+                )
+            else:
+                sug = row.get("suggestion")
+                if sug:
+                    console.print(
+                        f"[bold]visual-proof walks[/] — {name}: "
+                        f"[yellow]not configured[/]  detected "
+                        f"`{sug['start_cmd']}` on :{sug['port']}, enable?"
+                    )
+                else:
+                    console.print(
+                        f"[bold]visual-proof walks[/] — {name}: "
+                        "[dim]not configured[/]"
+                    )
 
         if verbose:
             console.print("[bold]mechanism liveness[/] (lifetime firings)")

@@ -917,6 +917,7 @@ export function proveRepoSSE({ repo_path, test_cmd, install_cmd, timeout }, onFr
 }
 
 export const confirmRepoProfile = (repo_path) => _post("/api/onboarding/repos/confirm", { repo_path });
+export const setRepoUiEvidence  = (repo_path, enabled) => _post("/api/onboarding/repos/ui-evidence", { repo_path, enabled });
 
 export async function fetchReadiness() {
   const r = await fetch(`${BASE}/api/onboarding/readiness`);

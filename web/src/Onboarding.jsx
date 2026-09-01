@@ -4,7 +4,7 @@ import {
   completeOnboarding, suggestPaths, createProject,
   generateDocs, getDocsJob, detectDocs, fetchIntegrationSetup, saveIntegrationSetup,
   testIntegration,
-  proveRepoSSE, confirmRepoProfile, fetchReadiness,
+  proveRepoSSE, confirmRepoProfile, fetchReadiness, setRepoUiEvidence,
 } from "./api.js";
 import { shouldPoll, nextJobState } from "./wikiJobs.js";
 import { repoBadges, discoveryMessage, ambiguousNames, rowName } from "./discoveredRepos.js";
@@ -107,6 +107,10 @@ export default function Onboarding({ onComplete }) {
   const [manualScan, setManualScan] = useState(false);
   const [selectedRepos, setSelectedRepos] = useState(new Set());
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
+  // no-human-67 follow-up: "Not now" on the visual-proof-walks suggestion is a
+  // local, in-session dismiss only — it makes no API call and writes no
+  // config, so re-opening the wizard (or a re-derive) can offer it again.
+  const [uiEvidenceDismissed, setUiEvidenceDismissed] = useState(() => new Set());
   const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set, primary}]
   const [newProjName, setNewProjName] = useState("");
   // The repos ticked in the ADD-project form for the project being composed now
@@ -493,6 +497,21 @@ export default function Onboarding({ onComplete }) {
     });
   }
 
+  // no-human-67 follow-up: the wizard's one-action confirm for the
+  // ui_evidence suggestion. The server re-derives the suggestion itself and
+  // writes ui_evidence to both project.yml and the DB row — this only merges
+  // the response's fresh ui_evidence block back into local state so the
+  // suggestion disappears once accepted.
+  async function enableUiEvidence(path) {
+    await guard(async () => {
+      const res = await setRepoUiEvidence(path, true);
+      setOnboarded((o) => ({
+        ...o,
+        [path]: { ...(o[path] || {}), ui_evidence: res.ui_evidence },
+      }));
+    });
+  }
+
   // The summary reads readiness from the server, not from local state, so it
   // cannot claim "Ready." on the strength of a click that did not stick.
   useEffect(() => {
@@ -591,18 +610,37 @@ export default function Onboarding({ onComplete }) {
   // render as cards; the card renderer never read onboarded[path]/proveState,
   // so "Profile" changed a card by nothing and Launch pointed at a "Prove test
   // command" button that only existed on the (30-days-untouched) list rows.
-  const profileStatus = (st) => {
+  const profileStatus = (st, path) => {
     if (st === "busy") return (
       <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>
     );
     if (st && st !== "busy") return (
-      <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
-        {st.ecosystem || "unknown"}{st.test_cmd ? ` · ${st.test_cmd}` : ""}
-        {" · "}
-        {st.is_usable ? "proven & confirmed"
-          : st.test_proven ? "proven — confirm to use"
-          : "not proven yet"}
-      </span>
+      <>
+        <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
+          {st.ecosystem || "unknown"}{st.test_cmd ? ` · ${st.test_cmd}` : ""}
+          {" · "}
+          {st.is_usable ? "proven & confirmed"
+            : st.test_proven ? "proven — confirm to use"
+            : "not proven yet"}
+        </span>
+        {/* no-human-67 follow-up: a one-action confirm for enabling
+            visual-proof walks, shown only when the server detected an
+            `npm run dev` convention and ui_evidence isn't already
+            configured — "Not now" is a local dismiss, no API call. */}
+        {st.ui_evidence?.suggestion && !uiEvidenceDismissed.has(path) && (
+          <div className="ob-row ob-ui-evidence-row">
+            <span className="ob-note">Enable visual-proof walks?</span>
+            <button type="button" className="ob-btn-ghost" disabled={busy}
+                    onClick={() => enableUiEvidence(path)}>
+              Enable
+            </button>
+            <button type="button" className="ob-btn-ghost" disabled={busy}
+                    onClick={() => setUiEvidenceDismissed((s) => new Set(s).add(path))}>
+              Not now
+            </button>
+          </div>
+        )}
+      </>
     );
     return null;
   };
@@ -798,7 +836,7 @@ export default function Onboarding({ onComplete }) {
                           {/* B1: once profiled, the card expands to show its
                               profile result and the Prove panel — the same
                               capability the list rows have. */}
-                          {profileStatus(onboarded[r.path])}
+                          {profileStatus(onboarded[r.path], r.path)}
                           {proveBlock(r)}
                         </div>
                       );
@@ -828,7 +866,7 @@ export default function Onboarding({ onComplete }) {
                       {ambiguousRepoNames.has(rowName(r)) && (
                         <span className="ob-repo-path">{r.path}</span>
                       )}
-                      {profileStatus(st)}
+                      {profileStatus(st, r.path)}
                     </label>
                     {proveBlock(r)}
                     </div>

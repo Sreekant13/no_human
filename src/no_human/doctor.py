@@ -421,10 +421,72 @@ class Diagnosis:
     # OPENAI_API_KEY presence). None-shaped ({"selected": False}, []) unless the
     # codex backend is actually in play — see `codex_readiness`.
     codex: dict[str, Any] | None = None
+    # no-human-67 follow-up: one row per known repo profile, from
+    # `ui_evidence_rows` — current ui_evidence state plus a suggestion when the
+    # repo has a detected `npm run dev` convention and isn't configured yet.
+    # Read-only and additive: never affects `healthy` (see `advisories`).
+    ui_evidence: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def healthy(self) -> bool:
         return not self.contradictions and not self.evidence_gaps
+
+
+def ui_evidence_rows(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """no-human-67 follow-up: one row per known repo profile — current
+    ui_evidence state, plus a suggestion when the repo has a detected
+    `npm run dev` convention and isn't configured yet (manual config wins:
+    `ui_evidence_suggestion` itself returns None once a repo is configured).
+
+    Takes the already-fetched ``Store.list_profiles()`` rows (pure, no DB
+    I/O here) so this stays trivially testable and reusable by both `nh
+    doctor` and, later, any other surface that wants the same rows. Repos
+    whose directory no longer exists are skipped — nothing useful to detect
+    or suggest for a repo that isn't on disk anymore."""
+    from .onboard import ui_evidence_suggestion
+    from .profile import ProjectProfile
+
+    rows: list[dict[str, Any]] = []
+    for row in profiles:
+        repo_path = row.get("repo_path") or ""
+        if not repo_path or not Path(repo_path).expanduser().is_dir():
+            continue
+        try:
+            profile = ProjectProfile.from_dict(json.loads(row["data"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+        ui = profile.ui_evidence or {}
+        rows.append({
+            "repo_path": repo_path,
+            "configured": bool(ui.get("enabled") or ui.get("start_cmd") or ui.get("base_url")),
+            "enabled": bool(ui.get("enabled")),
+            "start_cmd": ui.get("start_cmd") or "",
+            "base_url": ui.get("base_url") or "",
+            "suggestion": ui_evidence_suggestion(profile, repo_path),
+        })
+    return rows
+
+
+async def _apply_ui_evidence_advisories(d: "Diagnosis", store: Store) -> None:
+    """Fill `d.ui_evidence` and append one advisory per unconfigured repo with
+    a detected dev-server convention. Same rule as every other optional check
+    in `diagnose`: read-only, additive, never touches `d.healthy` (advisories
+    only, never contradictions/evidence_gaps), and never raises."""
+    try:
+        profiles = await store.list_profiles()
+        d.ui_evidence = ui_evidence_rows(profiles)
+        for row in d.ui_evidence:
+            sug = row.get("suggestion")
+            if sug:
+                d.advisories.append(
+                    "VISUAL-PROOF WALKS NOT CONFIGURED: "
+                    f"{row['repo_path']} — detected `{sug['start_cmd']}` on "
+                    f":{sug['port']}, enable? Run `nh onboard {row['repo_path']}` "
+                    "and answer yes, or set ui_evidence in "
+                    ".no_human/project.yml."
+                )
+    except Exception:  # noqa: BLE001 — a diagnostic must never CRASH `nh doctor`
+        pass
 
 
 async def _kind_stats(store: Store) -> dict[str, tuple[int, float]]:
@@ -862,4 +924,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
                 f"task {task_id[:8]} is 'escalated' with an empty blocker — "
                 "a human was summoned with nothing to decide on."
             )
+
+    # Visual-proof (ui_evidence) provisioning gap (no-human-67 follow-up).
+    await _apply_ui_evidence_advisories(d, store)
     return d

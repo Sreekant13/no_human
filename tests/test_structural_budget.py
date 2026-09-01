@@ -277,7 +277,17 @@ FROZEN_FILE_LINES = {
     # 8204 -> 8214 (+10): D3.1 — `nh serve` threads learning.auto_manage /
     # auto_activate_daily_cap into HarvestJob (kill-switch wiring). Measured
     # on the D3.1 landing result.
-    "cli/commands.py": 8214,
+    # 8214 -> 8258 (+44): no-human-67 follow-up — `nh onboard`'s post-derive
+    # one-confirm offer for `ui_evidence` (detected `npm run dev` convention:
+    # print the gap, `click.confirm` default-No, `offer_ui_evidence` on
+    # accept) and `nh doctor`'s side-by-side current/suggested `ui_evidence`
+    # rendering per known profile. Measured via
+    # `len(Path(...).read_text().splitlines())` on the landing tree.
+    # 8258 -> 8262 (+4): review-round fix — `nh onboard`'s ui_evidence offer
+    # now catches `ProjectYmlPersistError` from `offer_ui_evidence` and prints
+    # a red failure line instead of silently reporting success when
+    # project.yml could not be written. Measured on this branch's tree.
+    "cli/commands.py": 8262,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -333,7 +343,19 @@ FROZEN_FILE_LINES = {
     # 24h" spend (core/metrics.py:window_spend), fixing the board banner
     # sweeping a closed task's LIFETIME cost into the window on a bare
     # `updated_at` touch. Re-anchored on rebase onto the P5 merge result.
-    "api/app.py": 5807,
+    # 5807 -> 5882 (+75): no-human-67 follow-up — `RepoUiEvidenceRequest` +
+    # `POST /api/onboarding/repos/ui-evidence` (the wizard's one-action
+    # confirm; re-derives the suggestion server-side, dual-writes via
+    # `persist_profile`), plus the `ui_evidence` carry-forward fix and
+    # response block in `onboarding_onboard_repo` (a re-derive no longer
+    # silently wipes a previously-accepted ui_evidence). Measured via
+    # `len(Path(...).read_text().splitlines())` on the landing tree.
+    # 5882 -> 5889 (+7): review-round fix — `onboarding_ui_evidence` now
+    # catches `ProjectYmlPersistError` and 500s instead of answering
+    # `{"ok": True, "enabled": True}` when project.yml could not be written
+    # (persist_profile also skips the DB write in that case, so the two
+    # artifacts never disagree). Measured on this branch's tree.
+    "api/app.py": 5889,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
