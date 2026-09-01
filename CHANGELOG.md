@@ -4,6 +4,12 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Development now happens directly in this repository: changes land here as
+  commits and pull requests rather than arriving through a periodic export.
+
 ## [0.1.9] — 2026-09-01
 
 The evidence release. PR bodies shrink to final results with the full receipts
