@@ -142,7 +142,7 @@ from ..vcs.task_pr import resolve_task_pr
 from . import merge_policy
 from . import plan_gate
 from .bounds import (
-    Bounds, QuotaExhausted, StuckDetector, error_signature,
+    Bounds, ConvergenceTracker, QuotaExhausted, StuckDetector, error_signature,
     quota_reason, quota_signal,
 )
 from ..blockers.taxonomy import carried_checkpoint, resume_checkpoint
@@ -432,6 +432,71 @@ def _summarize_tool_sig(tool: str, inp: dict) -> str:
     return str(first)[:80]
 
 
+#: Common test-runner invocations, matched against a Bash tool call's raw
+#: command by `ConvergenceTracker` (P2). This is the closest cheap proxy the
+#: live event stream has for "a test result appeared": `tool_result` events
+#: never carry output text (`claude_backend._exit_status`'s docstring — only
+#: size, and an exit code on failure, by design), so whether the run PASSED
+#: cannot be read from the stream at all. Running one of these commands is
+#: itself evidence the attempt is verifying, not just looking around; it is
+#: not narrowed to project-specific commands because the convergence signal
+#: only needs "some test framework ran", not which one.
+_TEST_RUNNER_RE = re.compile(
+    r"\b(pytest|py\.test|unittest|npm\s+(run\s+)?test|yarn\s+test|"
+    r"pnpm\s+test|node\s+--test|go\s+test|cargo\s+test|mvn\s+test|"
+    r"gradle\s+test|rspec|jest|vitest)\b"
+)
+
+#: Leading tokens that make a shell segment a read-only SEARCH/INSPECTION,
+#: never an execution — a segment starting with one of these never counts as
+#: "a test ran" no matter what runner's name appears later in it. Review fix
+#: (P2 round 2): a corpus replay found `rg pytest` / `grep -rn "node --test"`
+#: — a search FOR the runner's name, not a run of it — as 5.0% of the
+#: original (unfiltered) regex's matches.
+_READ_ONLY_LEADING_TOKENS = frozenset({
+    "grep", "rg", "cat", "ls", "find", "head", "tail", "sed", "awk", "wc",
+})
+#: `git <subcommand>` is read-only for exactly these subcommands. Every other
+#: git subcommand (`checkout`, `stash`, `commit`, ...) is left unclassified —
+#: NOT rejected — because this set exists only to exclude known-safe
+#: inspection, never to positively assert what git DOES execute.
+_GIT_READ_ONLY_SUBCOMMANDS = frozenset({"grep", "log", "show", "diff"})
+
+#: Splits a shell command on its control operators, so a compound command's
+#: EXECUTING segment is still judged on its own merits even when an earlier
+#: segment is a read-only search — `rg pytest && pytest -q` counts (on its
+#: second segment); `rg pytest` alone does not.
+_SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[|;]")
+
+
+def _looks_like_test_run(command: str) -> bool:
+    """True when *command* EXECUTES a recognized test runner (P2).
+
+    Matched per shell segment against `_TEST_RUNNER_RE`, skipping any segment
+    whose leading token is a read-only search/inspection tool
+    (`_READ_ONLY_LEADING_TOKENS`/`_GIT_READ_ONLY_SUBCOMMANDS`) — a grep or a
+    `git log` that merely MENTIONS a runner's name by string match is not
+    evidence the attempt ran anything.
+    """
+    if not command:
+        return False
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        tokens = segment.split()
+        if not tokens:
+            continue
+        lead = tokens[0]
+        if lead in _READ_ONLY_LEADING_TOKENS:
+            continue
+        if lead == "git" and len(tokens) > 1 and tokens[1] in _GIT_READ_ONLY_SUBCOMMANDS:
+            continue
+        if _TEST_RUNNER_RE.search(segment):
+            return True
+    return False
+
+
 # How often the watcher re-reads `tasks.cancel_requested` while a task runs.
 # The agent session is the only thing being interrupted, and it emits events far
 # faster than this, so the operator's `nh task pause` lands within a few seconds.
@@ -499,6 +564,22 @@ class StuckAbort(RuntimeError):
     """
 
 
+class ConvergenceAbort(RuntimeError):
+    """P2: the running attempt crossed `ConvergenceTracker`'s threshold —
+    varied tool calls, but no file edit or test run for a whole window.
+
+    Raised out of the implementer's event sink exactly like `StuckAbort` —
+    same unwinding, same [WIP-PARTIAL] checkpoint, same routing to a FAILED
+    attempt so the bounded loop retries with fresh context — because it is
+    the same class of problem the hard stuck tiers exist to end (an attempt
+    that has stopped making progress), just one those deterministic
+    detectors structurally cannot see: they fire on a REPEATED call, and a
+    non-converging attempt's calls are never repeated. Kill-switched by
+    `worker.abort_non_converging` (default on); off reproduces today's
+    behaviour exactly.
+    """
+
+
 class ReviewedShaMismatch(RuntimeError):
     """Delivery would push an object the review gate never judged.
 
@@ -522,6 +603,20 @@ class BudgetAbort(RuntimeError):
     the task parks behind the same BUDGET_EXHAUSTED blocker the boundary
     check raises — the human decides, the loop never silently continues.
     """
+
+
+def _abort_kind(exc: BaseException) -> str:
+    """"budget" / "stuck" / "non-converging" — the three sink-raised abort
+    kinds, named consistently everywhere `_agent_sink`'s controls are
+    reported (the ``failure_reason`` prefix, the ``agent_error`` event's
+    ``error_class``). `BudgetAbort` is checked first because it is the only
+    one of the three raisable mid-attempt for a reason unrelated to whether
+    the attempt is converging."""
+    if isinstance(exc, BudgetAbort):
+        return "budget"
+    if isinstance(exc, ConvergenceAbort):
+        return "non-converging"
+    return "stuck"
 
 
 class InactivityTimeout(TimeoutError):
@@ -1910,6 +2005,32 @@ class Orchestrator:
             ),
         }
 
+    def _active_convergence(self) -> "ConvergenceTracker | None":
+        """The running attempt's `ConvergenceTracker`, or None if there isn't
+        one scoped to `_active_task_id` right now (review fix, P2 round 2).
+
+        `self._convergence` is a ``(task_id, tracker)`` pair — the SAME
+        scoping shape as `_token_ceiling` — because the worker pool reuses
+        one Orchestrator and `_run_attempt` never clears the attribute on
+        exit: an unscoped tracker set by task A's attempt would otherwise
+        stay armed (and, if task A's attempt ended near its own threshold,
+        already primed to fire within a handful more ticks) for whatever
+        CODER_ROLE session runs next on this instance — most dangerously
+        `_run_code_review`'s read-only diff-fetch fallback, which streams
+        through this exact sink with no `ConvergenceAbort` handler (see the
+        `_server_stopping` comment above naming that same session as one
+        that "sets no `_active_task_id`" and would crash on an unhandled
+        raise). That specific call site ALSO clears `self._convergence`
+        outright before it runs, belt-and-braces: `_active_task_id` is never
+        reassigned for a task that skips `_run_attempt` entirely (code
+        review tasks do), so an id match alone cannot tell that call site's
+        session apart from the very attempt that latched the tracker.
+        """
+        scoped = getattr(self, "_convergence", None)
+        if scoped is not None and scoped[0] == self._active_task_id:
+            return scoped[1]
+        return None
+
     def _agent_sink(self, event: AgentEvent, *, role: str = CODER_ROLE) -> None:
         self._sink(
             {
@@ -1976,6 +2097,23 @@ class Orchestrator:
         # actually bounds those five roles; widening the watch to cover
         # them is a behaviour change, not a comment fix, and is left out here.
         if event.kind == "usage":
+            # P2: convergence check on the SAME "one usage event per turn"
+            # cadence the budget watch below uses — deliberately unconditional
+            # on the token ceiling existing, so a task with no armed ceiling
+            # (or a test that never calls `_begin_attempt_accounting`) still
+            # gets turn-cap convergence coverage.
+            conv = self._active_convergence()
+            if conv is not None:
+                conv.tick()
+                conv_reason = conv.non_converging_reason
+                if conv_reason:
+                    self.emit(
+                        "stuck",
+                        f"non-converging: {conv_reason} — hard threshold "
+                        "crossed; aborting the attempt (work checkpointed, "
+                        "the loop retries with fresh context)",
+                    )
+                    raise ConvergenceAbort(conv_reason)
             ceiling = getattr(self, "_token_ceiling", None)
             usage = getattr(self, "_attempt_usage", None)
             if (ceiling is not None and usage is not None
@@ -2081,18 +2219,47 @@ class Orchestrator:
             # strip, the whole worktree reads as agent-owned and both guards below
             # silently switch off.
             repo_root = getattr(self, "_active_repo_root", "")
-            if path and not is_agent_owned(path, repo_root):
-                if not hasattr(self, "_agent_edited_files"):
-                    self._agent_edited_files: set[str] = set()
-                self._agent_edited_files.add(str(path))
-                # R2.3 Layer 1: per-file edit count.
-                detector = getattr(self, "_stuck", None)
-                if detector is not None and detector.record_edit(str(path)):
-                    self.emit(
-                        "stuck",
-                        f"edit-loop: {path} edited {detector._edit_counts[str(path)]}×; "
-                        "consider a different approach",
-                    )
+            if path:
+                if not is_agent_owned(path, repo_root):
+                    if not hasattr(self, "_agent_edited_files"):
+                        self._agent_edited_files: set[str] = set()
+                    self._agent_edited_files.add(str(path))
+                    # P2: a real file edit is a convergence signal.
+                    conv = self._active_convergence()
+                    if conv is not None:
+                        conv.mark_progress()
+                    # R2.3 Layer 1: per-file edit count.
+                    detector = getattr(self, "_stuck", None)
+                    if detector is not None and detector.record_edit(str(path)):
+                        self.emit(
+                            "stuck",
+                            f"edit-loop: {path} edited {detector._edit_counts[str(path)]}×; "
+                            "consider a different approach",
+                        )
+                else:
+                    # P2 (review fix): a write into the agent's OWN sanctioned
+                    # scratch dir (`.no_human/` &c.) is still real CONVERGENCE
+                    # progress — report-kind tasks (investigation/design_doc)
+                    # draft their deliverable there before a final commit, and
+                    # the corpus that motivated this fix showed exactly that
+                    # shape: no committable edit until the very end, but real,
+                    # periodic scratch writes throughout. It must NOT feed
+                    # `_agent_edited_files` or the edit-loop detector above,
+                    # both of which exist to bound COMMITTABLE churn — an
+                    # uncommittable path can never be the thing either guards.
+                    conv = self._active_convergence()
+                    if conv is not None:
+                        conv.mark_progress()
+        # P2: a test-runner invocation is the other convergence signal — see
+        # `ConvergenceTracker`'s docstring for why "the command ran" is the
+        # honest proxy available here, not "a new result appeared".
+        if event.kind == "tool_use" and event.tool_name in ("Bash", "Terminal"):
+            command = (event.tool_input or {}).get("command") or (
+                event.tool_input or {}).get("cmd") or ""
+            if _looks_like_test_run(command):
+                conv = self._active_convergence()
+                if conv is not None:
+                    conv.mark_progress()
         # Hard tier (ARCH_REVIEW B2 #1): checked AFTER both record paths so an
         # edit-tool event counts toward both detectors before the verdict.
         # Advisory fires above are telemetry; this one has teeth — the raise
@@ -4106,6 +4273,29 @@ class Orchestrator:
             task.id, attempt_seq, mechanical=await self._mechanical_round(task))
         stuck = StuckDetector()
         self._stuck: StuckDetector | None = stuck  # visible to _agent_sink
+        # P2: reset per attempt, same as `_stuck` — a non-converging PREVIOUS
+        # attempt must not carry its turn count into a fresh one. Scoped by
+        # TASK ID, the same shape as `_token_ceiling` (review fix, round 2):
+        # `_active_convergence()` only returns this tracker while
+        # `_active_task_id` still names THIS task, so a stale tracker from an
+        # earlier attempt can never fire inside an unrelated later session —
+        # see that method's docstring for the specific crash this closes.
+        #
+        # `cap=self.bounds.max_turns_per_attempt` clamps `min_turns` to at
+        # most half of THIS task's real per-attempt turn budget — read-mostly
+        # `_REPORT_KINDS` tasks run with an 80-turn cap (vs. the default
+        # 500), and the corpus that motivated this fix showed their live
+        # usage-tick count running to 86-103 under it (subagent turns inflate
+        # the tick count past the SDK's own top-level max_turns). Left
+        # unclamped, the default `min_turns=80` sat almost exactly AT that
+        # cap, so a report attempt that (correctly) writes its deliverable
+        # once near the very end tripped the check before ever getting
+        # credit for it. See `ConvergenceTracker.from_config`.
+        self._convergence: "tuple[str, ConvergenceTracker] | None" = (
+            task.id,
+            ConvergenceTracker.from_config(
+                self.config.get("worker"), cap=self.bounds.max_turns_per_attempt),
+        )
         self._agent_edited_files: set[str] = set()  # reset per attempt
         # `_agent_sink` needs this to tell a worktree's own `.no_human` prefix
         # apart from a `.no_human/` directory *inside* the checkout.
@@ -4803,12 +4993,15 @@ class Orchestrator:
             # `run_task` call, silently undoing the cancel it just honoured.
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail,
                               off_ramp=True)
-        except StuckAbort as exc:
-            # Deterministic runaway (B2 #1): fail the ATTEMPT — checkpoint the
-            # work, record the true spend, and let the bounded loop retry with
-            # fresh context. Never park the task: unlike a pause, nobody asked
-            # for a stop, and the retry machinery (corrective preamble, stuck
-            # hypothesis) exists for exactly this.
+        except (StuckAbort, ConvergenceAbort) as exc:
+            # Deterministic runaway (StuckAbort, B2 #1) or turn-cap
+            # convergence timeout (ConvergenceAbort, P2): both fail the
+            # ATTEMPT — checkpoint the work, record the true spend, and let
+            # the bounded loop retry with fresh context. Never park the task:
+            # unlike a pause, nobody asked for a stop, and the retry
+            # machinery (corrective preamble, stuck hypothesis) exists for
+            # exactly this.
+            kind = _abort_kind(exc)
             wip_sha = ""
             if repo.has_changes():
                 try:
@@ -4819,10 +5012,10 @@ class Orchestrator:
                     self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
                               f"({wip_commit.files_changed} files preserved)")
                 except Exception as commit_exc:  # noqa: BLE001
-                    log.warning("WIP checkpoint on stuck-abort failed: %s", commit_exc)
+                    log.warning("WIP checkpoint on %s-abort failed: %s", kind, commit_exc)
             await self._record_wip_checkpoint(
-                task, wip_sha, repo, stopped_because="stuck-abort")
-            detail = f"stuck-abort: {exc}"
+                task, wip_sha, repo, stopped_because=f"{kind}-abort")
+            detail = f"{kind}-abort: {exc}"
             u = self._attempt_usage
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
@@ -4832,7 +5025,7 @@ class Orchestrator:
                 cache_creation_tokens=u["cache_creation_tokens"],
                 **self._pop_aux_usage(),
             )
-            self.emit("agent_error", detail, error_class="stuck")
+            self.emit("agent_error", detail, error_class=kind)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         except BudgetAbort as exc:
             # Mid-attempt budget cross (B2 #2). Record the attempt's TRUE
@@ -5281,7 +5474,7 @@ class Orchestrator:
                     except CancelRequested as exc:
                         return await self._honor_cancel(
                             task, repo, branch, str(exc), attempt_id=attempt_id)
-                    except (BudgetAbort, StuckAbort) as exc:
+                    except (BudgetAbort, StuckAbort, ConvergenceAbort) as exc:
                         return await self._abort_during_nudge(
                             task, repo, attempt_id, exc, result=result,
                             branch=branch)
@@ -5595,7 +5788,7 @@ class Orchestrator:
             # re-implement from base — the waste this path exists to avoid.
             return await self._honor_cancel(
                 task, repo, branch, str(exc), attempt_id=attempt_id)
-        except (BudgetAbort, StuckAbort) as exc:
+        except (BudgetAbort, StuckAbort, ConvergenceAbort) as exc:
             return await self._abort_during_repro_corrective(
                 task, repo, attempt_id, exc, branch=branch)
         if repro_outcome is not None:
@@ -7806,9 +7999,10 @@ class Orchestrator:
 
     async def _abort_during_nudge(
         self, task: Task, repo: GitRepo, attempt_id: str,
-        exc: "BudgetAbort | StuckAbort", *, result, branch: str | None,
+        exc: "BudgetAbort | StuckAbort | ConvergenceAbort", *, result,
+        branch: str | None,
     ) -> TaskOutcome:
-        """A budget or stuck abort raised out of the reformat nudge.
+        """A budget, stuck, or convergence abort raised out of the reformat nudge.
 
         Same three obligations the coder turn's own handlers carry, in the same
         order and with the same detail strings, because those strings are what
@@ -7833,7 +8027,8 @@ class Orchestrator:
            be an empty commit that makes the next attempt look resumed.
         """
         is_budget = isinstance(exc, BudgetAbort)
-        detail = f"{'budget' if is_budget else 'stuck'}-abort: {exc}"
+        kind = _abort_kind(exc)
+        detail = f"{kind}-abort: {exc}"
         partial = self.__dict__.pop("_nudge_partial_usage", None) or {}
 
         def _billed(field: str) -> int:
@@ -7855,8 +8050,7 @@ class Orchestrator:
             cache_creation_tokens=_billed("cache_creation_tokens"),
             **self._pop_aux_usage(),
         )
-        self.emit("agent_error", detail,
-                  error_class="budget" if is_budget else "stuck")
+        self.emit("agent_error", detail, error_class=kind)
         if is_budget:
             budget_blocker = await self._check_lifetime_budget(task)
             if budget_blocker is not None:
@@ -8063,7 +8257,7 @@ class Orchestrator:
                 ),
                 timeout=timeout_s,
             )
-        except (CancelRequested, BudgetAbort, StuckAbort):
+        except (CancelRequested, BudgetAbort, StuckAbort, ConvergenceAbort):
             # Single-use, popped by `_abort_during_repro_corrective`.
             self._repro_partial_usage = _delta()
             raise
@@ -8177,10 +8371,11 @@ class Orchestrator:
 
     async def _abort_during_repro_corrective(
         self, task: Task, repo: GitRepo, attempt_id: str,
-        exc: "BudgetAbort | StuckAbort", *, branch: str | None,
+        exc: "BudgetAbort | StuckAbort | ConvergenceAbort", *,
+        branch: str | None,
     ) -> TaskOutcome:
-        """A budget or stuck abort raised out of the repro-gate corrective
-        round. Same obligations as `_abort_during_nudge`, in the same order,
+        """A budget, stuck, or convergence abort raised out of the repro-gate
+        corrective round. Same obligations as `_abort_during_nudge`, in the same order,
         adapted for a round that — unlike the nudge — bills additively
         (`Store.add_attempt_usage`) rather than by re-summing an `AgentResult`
         already on the row:
@@ -8202,7 +8397,8 @@ class Orchestrator:
            mid-attempt abort that does not itself commit.
         """
         is_budget = isinstance(exc, BudgetAbort)
-        detail = f"{'budget' if is_budget else 'stuck'}-abort: {exc}"
+        kind = _abort_kind(exc)
+        detail = f"{kind}-abort: {exc}"
         partial = self.__dict__.pop("_repro_partial_usage", None) or {}
         if any(partial.values()):
             await self.store.add_attempt_usage(attempt_id, **partial)
@@ -8210,8 +8406,7 @@ class Orchestrator:
             attempt_id, status="failed", failure_reason=detail,
             **self._pop_aux_usage(),
         )
-        self.emit("agent_error", detail,
-                  error_class="budget" if is_budget else "stuck")
+        self.emit("agent_error", detail, error_class=kind)
         if is_budget:
             budget_blocker = await self._check_lifetime_budget(task)
             if budget_blocker is not None:
@@ -8299,7 +8494,8 @@ class Orchestrator:
 
         TOTAL by construction, because it is called from a ``finally``: an
         exception escaping here would REPLACE an in-flight CancelRequested /
-        BudgetAbort / StuckAbort, turning a routed park into an unhandled crash.
+        BudgetAbort / StuckAbort / ConvergenceAbort, turning a routed park
+        into an unhandled crash.
         A revert that fails therefore degrades to a loud advisory naming what it
         could not restore — the residual risk (a stray file surviving into the
         next attempt) is the defect this method exists to close, so it is
@@ -8488,7 +8684,7 @@ class Orchestrator:
                         "attempt_timeout_s") or 3600),
                     _NUDGE_TIMEOUT_S),
             )
-        except (CancelRequested, BudgetAbort, StuckAbort):
+        except (CancelRequested, BudgetAbort, StuckAbort, ConvergenceAbort):
             # The sink's three controls, RE-RAISED rather than swallowed. Each
             # carries a reason, a routing decision and a spend the ledger has
             # not seen yet — a pause must still park, a lifetime-budget cross
@@ -11662,6 +11858,21 @@ class Orchestrator:
                 self.emit("review_error", f"could not fetch diff for {url}: {exc}")
             if not d:
                 # Fallback: the working agent fetches via its tools (read-only).
+                #
+                # P2 (review fix, round 2): this streams through `_agent_sink`
+                # under the DEFAULT (coder) role but is not an attempt — this
+                # method never calls `_run_attempt`, so `_active_task_id` is
+                # never (re)assigned for a code_review task and stays at
+                # whatever an EARLIER, unrelated task's attempt last set it
+                # to. Belt-and-braces on top of `_active_convergence`'s
+                # task-id scoping (which cannot, by itself, tell this session
+                # apart from that earlier attempt when the id happens to
+                # still match): explicitly disarm the tracker before this
+                # read-only, non-committing session runs, so a stale tracker
+                # that latched near its own threshold can never fire here —
+                # this fallback has no `ConvergenceAbort` handler and would
+                # crash the whole code-review task on an unhandled raise.
+                self._convergence = None
                 self.emit("review_start", f"fetching diff via agent: {url}")
                 result = await self.backend.run(
                     f"Fetch the diff for {url} and output the complete diff. "

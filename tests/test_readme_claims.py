@@ -2243,8 +2243,8 @@ def test_symbol_citation_falls_back_to_regex_when_ast_fails():
 
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
-    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1842` inside
-    `update_attempt` and `orchestrator.py:4067` inside `_run_attempt` — not
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1935` inside
+    `update_attempt` and `orchestrator.py:4559` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
@@ -2253,8 +2253,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
         "the traceback no longer cites db.py:1935 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:4369" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4369 — this test is "
+    assert "orchestrator.py:4559" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:4559 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -2273,13 +2273,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
-    assert 1 <= 4369 <= len(orch_lines), "orchestrator.py is now shorter than line 4369"
-    assert "self.store.update_attempt(" in orch_lines[4368], (
-        f"orchestrator.py:4369 is now {orch_lines[4368]!r}, not the "
+    assert 1 <= 4559 <= len(orch_lines), "orchestrator.py is now shorter than line 4559"
+    assert "self.store.update_attempt(" in orch_lines[4558], (
+        f"orchestrator.py:4559 is now {orch_lines[4558]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (
-        "line 4369 is no longer inside _run_attempt's body"
+        "line 4559 is no longer inside _run_attempt's body"
     )
 
 

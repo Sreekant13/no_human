@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from no_human.core.bounds import (
-    Bounds, QuotaExhausted, StuckDetector, error_signature,
+    Bounds, ConvergenceTracker, QuotaExhausted, StuckDetector, error_signature,
     parse_quota_reset,
 )
 from no_human.core.pricing import weighted_tokens
@@ -489,3 +489,94 @@ def test_quota_exhausted_beyond_six_hours_falls_back_not_days_out(monkeypatch):
     expected = (_FixedNow._fixed
                 + timedelta(seconds=QuotaExhausted.RETRY_AFTER_S)).isoformat()
     assert exc.resets_at == expected
+
+
+# --------------------- ConvergenceTracker (P2) ------------------------- #
+
+
+def test_convergence_from_config_defaults():
+    c = ConvergenceTracker.from_config(None)
+    assert c == ConvergenceTracker()
+    assert c.enabled is True
+    assert c.min_turns == 80
+    assert c.window == 40
+
+
+def test_convergence_from_config_override():
+    c = ConvergenceTracker.from_config({
+        "abort_non_converging": False,
+        "convergence_check_after_turns": 10,
+        "convergence_window_turns": 4,
+    })
+    assert c.enabled is False
+    assert c.min_turns == 10
+    assert c.window == 4
+
+
+def test_convergence_silent_below_min_turns():
+    c = ConvergenceTracker(min_turns=5, window=2)
+    for _ in range(5):
+        c.tick()
+    assert c.non_converging_reason is None
+
+
+def test_convergence_fires_past_min_turns_with_no_progress():
+    c = ConvergenceTracker(min_turns=5, window=2)
+    for _ in range(7):
+        c.tick()
+    reason = c.non_converging_reason
+    assert reason is not None
+    assert "no file edit or test run" in reason
+
+
+def test_convergence_progress_resets_the_window():
+    c = ConvergenceTracker(min_turns=5, window=3)
+    for _ in range(6):
+        c.tick()
+    c.mark_progress()
+    # Two more turns after the reset — still inside the window.
+    c.tick()
+    c.tick()
+    assert c.non_converging_reason is None
+    c.tick()
+    assert c.non_converging_reason is not None
+
+
+def test_convergence_disabled_never_fires():
+    c = ConvergenceTracker(enabled=False, min_turns=1, window=1)
+    for _ in range(50):
+        c.tick()
+    assert c.non_converging_reason is None
+
+
+def test_convergence_from_config_cap_clamps_min_turns():
+    """Round-2 review: `_REPORT_KINDS` tasks run with an 80-turn
+    per-attempt cap; unclamped, the default `min_turns=80` sits almost
+    exactly AT it. `cap` clamps `min_turns` to at most half of it."""
+    c = ConvergenceTracker.from_config({}, cap=80)
+    assert c.min_turns == 40
+    # A normal 500-turn cap must leave the default untouched.
+    assert ConvergenceTracker.from_config({}, cap=500).min_turns == 80
+    # No cap at all (the common orchestrator call before this fix) is a no-op.
+    assert ConvergenceTracker.from_config({}, cap=None).min_turns == 80
+
+
+def test_convergence_from_config_cap_never_raises_an_already_small_override():
+    """An operator override already below half the cap is never RAISED —
+    the clamp is a ceiling, not a floor."""
+    c = ConvergenceTracker.from_config(
+        {"convergence_check_after_turns": 10}, cap=80)
+    assert c.min_turns == 10
+
+
+def test_convergence_from_config_bad_types_fall_back_to_defaults():
+    """A malformed config value (an operator typo) must not raise — this is
+    read EAGERLY at the top of every attempt, so a bare int() crashing here
+    would kill every attempt on the task with an unrelated error, including
+    with the feature turned off."""
+    c = ConvergenceTracker.from_config({
+        "convergence_check_after_turns": "eighty",
+        "convergence_window_turns": None,
+    })
+    assert c.min_turns == 80
+    assert c.window == 40

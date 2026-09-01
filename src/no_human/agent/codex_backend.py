@@ -925,9 +925,10 @@ async def _kill_and_reap(proc: Any) -> tuple[int, bytes]:
     `(with_code, stderr)`; interpreting the code is the caller's job.
     """
     # Kill on EVERY exit path, including the exception `on_event`
-    # raises into `run` (CancelRequested / BudgetAbort / StuckAbort).
-    # Without this a cancelled attempt leaves a live `codex` writing to
-    # the working tree that is about to be diffed and committed.
+    # raises into `run` (CancelRequested / BudgetAbort / StuckAbort /
+    # ConvergenceAbort). Without this a cancelled attempt leaves a live
+    # `codex` writing to the working tree that is about to be diffed and
+    # committed.
     if proc.returncode is None:
         try:
             proc.kill()

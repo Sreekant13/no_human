@@ -77,7 +77,18 @@ FROZEN_FUNCTION_LINES = {
     # 2118 -> 2130 (+12): D1.1 (short PR bodies) fix round, review finding #6 —
     # the shared first-blocking-failure excerpt feeding both stuck detection
     # and failure_reason. Measured on the D1.1 squash-merge result.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2130,
+    # 2130 -> 2137 (+7): P2 (turn-cap convergence early-abort) — the
+    # per-attempt `ConvergenceTracker` reset (alongside `_stuck`'s) and the
+    # `StuckAbort`/`ConvergenceAbort` abort handler merged into one `except`
+    # clause with a one-line `kind = ... if ... else ...` dispatch, replacing
+    # what was a `StuckAbort`-only branch. Measured on this tree with the
+    # scanner below.
+    # 2137 -> 2156 (+19): P2 review-fix round 2 — the per-attempt
+    # `ConvergenceTracker` reset now carries a task-id-scoped tuple (plus its
+    # anchored comment) and passes `cap=self.bounds.max_turns_per_attempt`,
+    # and `_abort_kind(exc)` replaces the inline ternary in the merged
+    # abort handler. Measured on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2156,
     "core/orchestrator.py:Orchestrator._drive": 760,
     # 449 -> 457 (+8): D3.1 (2026-08-31, auto-activation pipeline) adds the
     # one call (plus its explanatory comment) that hands `paused`/
@@ -130,7 +141,9 @@ FROZEN_FUNCTION_LINES = {
 
 # 5 functions with estimated cyclomatic complexity > 60.
 FROZEN_FUNCTION_CC = {
-    "core/orchestrator.py:Orchestrator._run_attempt": 250,
+    # 250 -> 251 (+1): P2's `kind = "stuck" if ... else "non-converging"`
+    # dispatch (an IfExp) in the merged StuckAbort/ConvergenceAbort handler.
+    "core/orchestrator.py:Orchestrator._run_attempt": 251,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -196,7 +209,21 @@ FROZEN_FILE_LINES = {
     # `_LINE_BREAKS` regex embeds literal U+0085/U+2028/U+2029 line-separator
     # characters that `splitlines()` treats as breaks and `wc -l` does not,
     # a 3-line difference between the two counts that predates this PR).
-    "core/orchestrator.py": 20296,
+    # 20296 -> 20388 (+92): P2 (turn-cap convergence early-abort) —
+    # `ConvergenceAbort`, `_abort_kind`, the `_TEST_RUNNER_RE`/
+    # `_looks_like_test_run` helper, the `_agent_sink` tick/mark_progress
+    # wiring, the per-attempt `ConvergenceTracker` reset, and the
+    # `ConvergenceAbort` additions to five existing abort call sites — all
+    # with anchored docstrings/comments explaining why. Measured on this
+    # tree with the scanner below.
+    # 20388 -> 20507 (+119): P2 review-fix round 2 — `_active_convergence`
+    # (the task-id-scoped read helper, with its anchored docstring), the
+    # agent-owned-scratch-write progress branch, the `_run_code_review`
+    # diff-fetch explicit disarm, and the leading-token read-only rejection
+    # in `_looks_like_test_run` (`_READ_ONLY_LEADING_TOKENS`/
+    # `_GIT_READ_ONLY_SUBCOMMANDS`/`_SHELL_SEGMENT_RE`). Measured on this
+    # tree with the scanner below.
+    "core/orchestrator.py": 20507,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -312,7 +339,11 @@ FROZEN_FILE_LINES = {
     # comment to the auto-activation write path specifically (it does not
     # revert the trigger-matching fix or reject-aliases-pause). Re-anchored
     # on merge.
-    "config.py": 3307,
+    # 3307 -> 3328 (+21): P2 (turn-cap convergence early-abort) —
+    # `worker.abort_non_converging`/`convergence_check_after_turns`/
+    # `convergence_window_turns` defaults, with the docstring justifying
+    # them (see `core.bounds.ConvergenceTracker`). Measured on this tree.
+    "config.py": 3328,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

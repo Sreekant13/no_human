@@ -317,6 +317,170 @@ class StuckDetector:
         self._edit_counts.clear()
 
 
+@dataclass
+class ConvergenceTracker:
+    """Turn-cap convergence early-abort (P2).
+
+    `StuckDetector.hard_stuck_reason` above ends a DETERMINISTIC runaway — the
+    same tool call, or the same alternating pair, repeated. It deliberately
+    does not fire on an attempt that keeps VARYING its tool calls — a new file
+    read here, a new grep there, never the same signature twice — while never
+    converging on a fix: every call is "new" by the doom-loop signature, so
+    that counter never crosses its threshold and the attempt is free to spend
+    the whole ``max_turns_per_attempt`` (500) looking around without ever
+    writing or verifying anything. This class ends THAT class instead, so the
+    raw cap (measured against real ~328-turn successful runs, PLAN.md 4.3)
+    never has to be lowered to catch it.
+
+    A "turn" is one assistant message with a usage block — the SAME proxy
+    ``Orchestrator._attempt_usage["assistant_messages"]`` already counts (its
+    own comment: "enough to tell a spinning attempt (hundreds) from an
+    attempt whose context is simply too big (a handful)"). "Progress" is a
+    file-modifying tool call (Write/Edit/MultiEdit/NotebookEdit, agent-owned
+    scratch writes included) or a test-runner Bash invocation — the two
+    signals the live event stream can actually see cheaply. It is
+    deliberately NOT "a new test result" in the literal pass/fail sense:
+    `claude_backend._exit_status` documents, with a measured corpus, that a
+    ``tool_result`` event carries only size and (on a FAILURE only) an exit
+    code — never the command's output text, by design, so a printed
+    credential is never captured. Treating "a test command ran" as progress
+    is the honest signal available at this seam.
+
+    THIS UNDERCOUNTS STALLING, IT DOES NOT ONLY UNDERCOUNT PROGRESS — an
+    earlier version of this docstring claimed the substitute "never
+    overcounts" a truly stuck attempt, and a round-2 review disproved that
+    against a real corpus. Two concrete residual classes evade it entirely:
+    (1) a command that merely MENTIONS a runner's name without executing it
+    (`rg pytest`, `git log --grep pytest`) — filtered at the Bash-command
+    layer by `Orchestrator._looks_like_test_run`'s leading-token check, but
+    that filter is a denylist of known read-only tools, not a proof no
+    executable can print a runner's name without running it; and (2) an
+    attempt that keeps varying its tool calls enough to dodge the doom-loop
+    signature while periodically touching a file or re-running tests WITHOUT
+    making real progress (e.g. re-reading the same content into slightly
+    different windows, or re-running a test suite whose result it discards)
+    — the hard stuck tier only catches that shape at 9 identical consecutive
+    calls or a 12-call A-B-A-B alternation, both far above what this
+    heuristic can distinguish from genuine, varied, converging work. Both are
+    accepted trade-offs of a cheap, mid-attempt, no-tool-result-text signal —
+    named here so a future reader does not re-derive "never overcounts" as
+    fact.
+
+    Two knobs, both under ``worker.*`` (not ``bounds.*`` — this is a
+    kill-switched heuristic sitting BESIDE the hard caps, not one of them):
+
+    * ``min_turns`` (default 80) — below this, no check at all. Early
+      exploration (reading the ticket, the code, the tests) is normal and
+      must never be mistaken for stalling. Clamped to at most half of the
+      running attempt's real per-attempt turn budget when one is known
+      narrower than the default (`from_config`'s ``cap`` argument) — see
+      that method's docstring for the corpus evidence this closes.
+    * ``window`` (default 40) — turns since the last progress signal that
+      constitute stalling, once past ``min_turns``. Half of the DEFAULT
+      ``min_turns``: short enough that a genuinely stuck attempt is caught
+      tens of turns into a 500-turn budget rather than at the very end, long
+      enough that a normal edit/verify/edit cadence never trips it (a coder
+      that reads for a while before its first edit, then edits or tests at
+      least once every 40 turns thereafter, never fires this).
+
+    DEFAULTS' ANCHOR: the round-2 independent review replayed these defaults
+    against ~758k real recorded events (this install's attempt event
+    history) and reported that they correctly aborted the 3 attempts that
+    replay identified as genuine non-converging burners (activity with no
+    committable or test-verifying progress for the rest of their run) and
+    never aborted a converging one — the widest progress gap the reviewer
+    measured inside any converging attempt was 25 turns, comfortably under
+    the 40-turn window. Cited here as the reproducible anchor behind the
+    numbers; re-derive by replaying `_agent_sink`'s tool_use/usage events per
+    attempt against a fresh `ConvergenceTracker()` and diffing the fire/
+    no-fire verdict against that attempt's actual outcome.
+
+    No advisory tier, unlike ``StuckDetector``: past ``min_turns``, ``window``
+    consecutive turns with neither signal IS the rule, with nothing softer
+    beneath it — the false-positive risk that justified a two-tier design for
+    doom-loop (2026-08-16: 19M tokens of correct work killed by an advisory
+    that should have stayed advisory) does not apply here, because file edits
+    and test runs are commonplace enough in real work that the window rarely
+    closes on a converging attempt.
+    """
+
+    enabled: bool = True
+    min_turns: int = 80
+    window: int = 40
+    _turns: int = 0
+    _last_progress_turn: int = 0
+
+    def tick(self) -> None:
+        """Call once per turn (one deduped 'usage' event)."""
+        self._turns += 1
+
+    def mark_progress(self) -> None:
+        """Call on a file-modifying tool_use or a test-runner Bash tool_use."""
+        self._last_progress_turn = self._turns
+
+    @property
+    def non_converging_reason(self) -> str | None:
+        """A reason iff past ``min_turns`` with no progress for ``window``
+        consecutive turns, else None. Always None when ``enabled`` is False —
+        the kill switch is checked here so every caller gets it for free."""
+        if not self.enabled:
+            return None
+        if self._turns <= self.min_turns:
+            return None
+        since = self._turns - self._last_progress_turn
+        if since < self.window:
+            return None
+        return (
+            f"no file edit or test run in {since} turns (turn {self._turns}, "
+            f"threshold {self.min_turns}, window {self.window})"
+        )
+
+    @staticmethod
+    def from_config(
+        worker_cfg: dict | None, *, cap: int | None = None,
+    ) -> "ConvergenceTracker":
+        """Config lives under ``worker.*``: ``abort_non_converging`` (the
+        on/off switch, default True), ``convergence_check_after_turns``
+        (``min_turns``) and ``convergence_window_turns`` (``window``).
+
+        A malformed numeric value (an operator typo, a bad hand-edit of
+        ``config.yaml``) falls back to the default rather than raising —
+        this is read EAGERLY at the top of every attempt, so a bare ``int()``
+        that raised on a typo would kill every attempt on the task with an
+        unrelated crash, including with the feature turned OFF.
+
+        ``cap``, when given, is the running attempt's REAL per-attempt turn
+        budget (``Bounds.max_turns_per_attempt``, after any per-kind
+        override) — ``min_turns`` is clamped to at most half of it. Review
+        fix (round 2): ``_REPORT_KINDS`` tasks (investigation/design_doc) run
+        with an 80-turn cap, and a live corpus showed their usage-tick count
+        running to 86-103 UNDER that nominal 80 (subagent turns inflate the
+        tick count past the SDK's own top-level ``max_turns``). The default
+        ``min_turns=80`` sat almost exactly at that cap, so a report attempt
+        that (correctly) writes its deliverable once near the very end
+        tripped the check before ever getting credit for the write. Left
+        unset (the normal 500-turn case), this is a no-op: ``min(80, 250)``
+        is still 80.
+        """
+        w = worker_cfg or {}
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(w.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        min_turns = _int("convergence_check_after_turns", 80)
+        window = _int("convergence_window_turns", 40)
+        if cap is not None and cap > 0:
+            min_turns = min(min_turns, cap // 2)
+        return ConvergenceTracker(
+            enabled=bool(w.get("abort_non_converging", True)),
+            min_turns=min_turns,
+            window=window,
+        )
+
+
 # The CLI states the reset time in prose: "resets 4:20am (Asia/Jerusalem)" or
 # "resets Jul 24 at 6pm (Europe/London)". Matched loosely (optional ":MM",
 # case-insensitive am/pm) with the IANA zone required in parentheses — a

@@ -19,9 +19,11 @@ either vendor's SDK. Concretely, ``core/orchestrator.py`` depends on:
   * ``on_event`` being invoked SYNCHRONOUSLY between events, and an exception
     raised inside it propagating OUT of ``run``. ``_agent_sink`` raises
     ``CancelRequested`` (``nh task pause``), ``BudgetAbort`` (the mid-attempt
-    spend watch) and ``StuckAbort`` (doom-loop) from inside the callback; that
-    raise is the ONLY way those three controls stop a running attempt. A
-    backend that swallowed callback exceptions would silently disable all three.
+    spend watch), ``StuckAbort`` (doom-loop) and ``ConvergenceAbort`` (P2:
+    turn-cap convergence — varied calls, no progress) from inside the
+    callback; that raise is the ONLY way those four controls stop a running
+    attempt. A backend that swallowed callback exceptions would silently
+    disable all four.
   * event kinds ``thinking`` / ``text`` / ``tool_use`` / ``tool_result`` /
     ``usage`` / ``result`` with the meta keys spelled out in
     :class:`AgentEvent`. ``tool_use`` drives the doom-loop detector, the

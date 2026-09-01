@@ -1333,6 +1333,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # that sanctioned a second backend moved neither. See
         # `agent.backend.CLAUDE_PINNED_ROLES`.
         "backend": "claude",
+        # P2 (turn-cap convergence early-abort): a coder attempt can spend
+        # its whole 500-turn budget (`bounds.max_turns_per_attempt`, left
+        # UNCHANGED by this feature) still "doing things" — varied reads and
+        # greps, never the same tool call twice — without ever converging on
+        # a fix. `StuckDetector`'s doom-loop/edit-loop/ping-pong tiers never
+        # fire on that shape (every call is "new" by their signature), so
+        # nothing used to end it before the raw cap. This is the kill
+        # switch: True (default) aborts the ATTEMPT — checkpointed, the
+        # bounded loop retries with fresh context, exactly like a
+        # `StuckAbort` — once past `convergence_check_after_turns` with no
+        # file edit or test run in the last `convergence_window_turns`
+        # turns. False reproduces today's behaviour exactly: only the raw
+        # cap and the hard stuck tiers can end an attempt.
+        "abort_non_converging": True,
+        # See `core.bounds.ConvergenceTracker` for the defaults' full
+        # justification: 80 clears normal up-front exploration, and 40 (half
+        # of it) is long enough that a real edit/verify cadence never trips
+        # it but short enough to catch a genuine stall tens of turns into
+        # the 500-turn budget rather than at the very end of it.
+        "convergence_check_after_turns": 80,
+        "convergence_window_turns": 40,
     },
     "llm": {
         # Billing mode. "subscription" (the default) bills a Claude
