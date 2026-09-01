@@ -791,6 +791,27 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
             except OSError:
                 pass
 
+    # The documented `.no_human/project.yml` is a DECOY once a confirmed DB
+    # row exists: `Orchestrator._usable_profile` prefers the row, so an edit
+    # to the file has no effect and used to say nothing. Advisory, never a
+    # contradiction — a stale file is a documentation drift, not a state
+    # contradiction, and an advisory must not fail the doctor gate.
+    try:
+        from .profile import ProjectProfile, profile_divergence
+        for row in await store.list_profiles():
+            db_prof = ProjectProfile.from_dict(json.loads(row["data"]))
+            on_disk = ProjectProfile.load(row["repo_path"])
+            keys = profile_divergence(db_prof, on_disk)
+            if keys:
+                d.advisories.append(
+                    f"PROFILE DIVERGENCE: {row['repo_path']}/.no_human/project.yml "
+                    "differs from the confirmed profile on: "
+                    f"{', '.join(keys)} - the confirmed profile wins; "
+                    "re-onboard or use the API to update"
+                )
+    except Exception:  # noqa: BLE001 — a diagnostic must never crash `nh doctor`
+        pass
+
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():

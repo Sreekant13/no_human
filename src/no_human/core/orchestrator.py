@@ -1475,6 +1475,11 @@ class Orchestrator:
         # nothing to see. Checked (and cleared) right alongside that
         # existing check so either signal parks the task the same way.
         self._supervisor_quota_wall: str | None = None
+        # One-shot latch: `.no_human/project.yml` diverging from the confirmed
+        # DB profile is advised ONCE per orchestrator (one task execution),
+        # not once per `_usable_profile` call — it is called 6+ times per
+        # attempt.
+        self._profile_divergence_warned: bool = False
 
     # ----------------------------- events ---------------------------------- #
 
@@ -12839,6 +12844,7 @@ class Orchestrator:
         it); fall back to the repo's ``.no_human/project.yml``."""
         from ..profile import ProjectProfile
         prof = None
+        hit_cand = None
         candidates = [str(repo_path)]
         primary = self._primary_repo_path(repo_path)
         if primary:
@@ -12849,7 +12855,10 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 log.warning("profile lookup failed: %s", exc)
             if prof is not None:
+                hit_cand = cand
                 break
+        if prof is not None:
+            self._warn_profile_divergence(hit_cand, prof)
         if prof is None:
             for cand in candidates:
                 try:
@@ -12863,6 +12872,32 @@ class Orchestrator:
         # The repo's own `.no_human.yml` may fill routing rules the operator's
         # profile leaves empty (never replace them) — see project_config.py.
         return apply_repo_config(prof, self._repo_config(repo_path))
+
+    def _warn_profile_divergence(self, repo_path, db_prof) -> None:
+        """Advise ONCE when the documented `.no_human/project.yml` disagrees
+        with the confirmed DB profile that actually wins. Never syncs and
+        never changes precedence — confirmation is a human gate (`nh onboard`
+        / the API); the file alone cannot confer trust."""
+        if self._profile_divergence_warned:
+            return
+        from ..profile import ProjectProfile, profile_divergence
+        try:
+            on_disk = ProjectProfile.load(repo_path)
+        except Exception:  # noqa: BLE001 — a corrupt yml must never break a task
+            on_disk = None
+        if on_disk is None:
+            return
+        keys = profile_divergence(db_prof, on_disk)
+        if not keys:
+            return
+        self._profile_divergence_warned = True
+        self.emit(
+            "profile_divergence",
+            "project.yml differs from the confirmed profile on: "
+            f"{', '.join(keys)} - the confirmed profile wins; "
+            "re-onboard or use the API to update",
+            keys=keys, repo_path=str(repo_path),
+        )
 
     def _repo_config(self, repo_path) -> dict[str, Any]:
         """The repo's `.no_human.yml`, read ONCE per repo per orchestrator and
