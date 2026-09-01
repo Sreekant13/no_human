@@ -4,6 +4,8 @@
 // muted group — nothing is dismissed, filtered, or dropped (fresh.length +
 // stale.length === items.length, always).
 
+import { timestampMs } from "./parseTimestamp.js";
+
 export const STALE_ANSWER_MS = 24 * 3600 * 1000;
 
 // Prefers a dedicated `escalated_at` (when the schema tracks one); otherwise
@@ -40,7 +42,7 @@ export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS,
   const stale = [];
   for (const item of sorted) {
     const ts = tsOf(item);
-    const ageMs = ts ? nowMs - new Date(ts).getTime() : Infinity;
+    const ageMs = ts ? nowMs - timestampMs(ts) : Infinity;
     // Missing/unparseable timestamp → treated as infinitely old: buried at the
     // bottom of stale, never throws (new Date(NaN) - anything is NaN, and
     // NaN > thresholdMs is false, so an explicit Infinity fallback is required).

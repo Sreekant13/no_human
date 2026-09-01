@@ -15,6 +15,8 @@
  * that is provable without a renderer.
  */
 
+import { timestampMs } from "./parseTimestamp.js";
+
 /** The trackers this product can list, in display order. */
 export const TRACKERS = [
   { name: "jira", label: "Jira" },
@@ -53,8 +55,8 @@ export function mergeTrackerResults(results) {
     else for (const i of r.issues || []) if (i && i.key) issues.push(i);
   }
   issues.sort((a, b) => {
-    const ta = Date.parse(a.updated || "");
-    const tb = Date.parse(b.updated || "");
+    const ta = timestampMs(a.updated || "");
+    const tb = timestampMs(b.updated || "");
     if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
     if (Number.isNaN(ta)) return 1;
     if (Number.isNaN(tb)) return -1;

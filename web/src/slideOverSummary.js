@@ -11,6 +11,7 @@ import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 import { httpPrUrl } from "./prUrl.js";
 import { pluralize } from "./pluralize.js";
+import { timestampMs } from "./parseTimestamp.js";
 
 // The statuses whose gate the operator clears IN the drawer (Reply / Resume / the
 // blocker's options). Single definition — SlideOver's `isParked` and the
@@ -48,11 +49,11 @@ export function isHumanStopped(task) {
 export function questionState(task) {
   if (!task?.blocker?.question) return null;
   if (isTerminalStatus(task.status)) return "terminal";
-  const raisedAt = Date.parse(task.blocker.raised_at);
+  const raisedAt = timestampMs(task.blocker.raised_at);
   const replies = task.context?.human_replies || [];
   const answered = replies.some((r) => {
     if (!String(r?.answer || "").trim()) return false;
-    const at = Date.parse(r?.at);
+    const at = timestampMs(r?.at);
     return !Number.isNaN(at) && !Number.isNaN(raisedAt) && at > raisedAt;
   });
   if (answered) return "answered";
@@ -436,7 +437,7 @@ export { diffStats };
 
 function relativeTimeFrom(iso, nowMs = Date.now()) {
   if (!iso) return null;
-  const then = new Date(iso).getTime();
+  const then = timestampMs(iso);
   if (Number.isNaN(then)) return null;
   const s = Math.max(0, Math.round((nowMs - then) / 1000));
   if (s < 60) return "just now";
@@ -602,11 +603,11 @@ export function taskApprovedAt(task) {
   // and it never clears approved_at server-side. An approval recorded before
   // the latest send-back is SPENT — treating it as live would lock the operator
   // out of approving the PR that replaced the one they rejected.
-  const t = Date.parse(at);
+  const t = timestampMs(at);
   const backs = task?.context?.send_back_feedback;
   if (Number.isFinite(t) && Array.isArray(backs)) {
     for (const b of backs) {
-      const bt = Date.parse(b?.at);
+      const bt = timestampMs(b?.at);
       if (Number.isFinite(bt) && bt > t) return null;
     }
   }

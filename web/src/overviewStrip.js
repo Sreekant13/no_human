@@ -6,13 +6,14 @@
 // this strip now reports ONLY live state: what needs the operator right now,
 // how long the oldest of those has waited, and what is actively running.
 import { isNeedsYou, deriveCounts } from "./boardLanes.js";
+import { timestampMs } from "./parseTimestamp.js";
 
 export function overviewState(tasks, now = Date.now()) {
   const list = Array.isArray(tasks) ? tasks : [];
   const needsYou = list.filter(isNeedsYou);
   const counts = deriveCounts(list);
   const oldestWaitingSec = needsYou.length > 0
-    ? Math.max(...needsYou.map((t) => (now - new Date(t.updated_at || t.created_at || 0).getTime()) / 1000))
+    ? Math.max(...needsYou.map((t) => (now - timestampMs(t.updated_at || t.created_at, 0)) / 1000))
     : null;
   return {
     needsYouCount: needsYou.length,

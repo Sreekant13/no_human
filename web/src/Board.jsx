@@ -13,6 +13,7 @@ import { cardTitle } from "./cardTitle.js";
 import { cardFacts } from "./cardFacts.js";
 import { taskCost } from "./cost.js";
 import { isFirstRun } from "./boardFirstRun.js";
+import { timestampMs } from "./parseTimestamp.js";
 
 // Toast lifetime — long enough to read a refusal sentence, short enough not
 // to pile up. The persistent source of truth is the card banner (dismissed
@@ -315,7 +316,7 @@ const STALE_THRESHOLD_S = 16 * 3600;
 
 function TaskCard({ task, isAwaiting, staleAnswer, onClick, approveError, onDismissApproveError }) {
   const activityTs = task.last_activity || task.updated_at || task.created_at;
-  const ageMs = Date.now() - new Date(activityTs).getTime();
+  const ageMs = Date.now() - timestampMs(activityTs);
   const ageSec = ageMs / 1000;
   const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
@@ -447,7 +448,7 @@ function TaskCard({ task, isAwaiting, staleAnswer, onClick, approveError, onDism
 
 function relativeTime(iso) {
   if (!iso) return "";
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  const diff = (Date.now() - timestampMs(iso)) / 1000;
   if (diff < 60) return "<1m";
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;

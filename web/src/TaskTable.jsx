@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { httpPrUrl } from "./prUrl.js";
 import { failedReasonLine } from "./cardBlockerLine.js";
+import { parseTimestamp } from "./parseTimestamp.js";
 
 // The task table, extracted from Stats.jsx so the outcome screens (5D: Done / Failed) show the
 // SAME table instead of a second one that would drift out of step with it.
@@ -19,9 +20,9 @@ const STATUS_DOT = {
 };
 
 function parseTS(ts) {
-  if (!ts) return null;
-  const d = new Date(ts);
-  return isNaN(d.getTime()) ? null : d;
+  // Delegates to the shared UTC-aware helper (web/src/parseTimestamp.js) —
+  // a naive DB timestamp must parse as UTC, not local.
+  return parseTimestamp(ts);
 }
 
 function fmtDuration(seconds) {

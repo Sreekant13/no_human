@@ -14,6 +14,7 @@
 // the caller's already-fetched `{cost_usd, tokens, ...}` (or null before the
 // first fetch / on an old server).
 import { isNeedsYou, isRealFailure } from "./boardLanes.js";
+import { timestampMs } from "./parseTimestamp.js";
 
 export const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -21,7 +22,7 @@ export function ledgerSummary(tasks, now = Date.now(), windowMs = LEDGER_WINDOW_
   const since = now - windowMs;
   // No upper bound: a timestamp milliseconds ahead (clock skew) still counts.
   const inWindow = (t) =>
-    new Date(t.updated_at || t.created_at || 0).getTime() >= since;
+    timestampMs(t.updated_at || t.created_at, 0) >= since;
   const recent = (tasks || []).filter(inWindow);
   const done = recent.filter((t) => t.status === "done").length;
   const failed = recent.filter(isRealFailure).length;

@@ -8,6 +8,7 @@ import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
 import { pluralize } from "./pluralize.js";
 import { costByProject, totalCost } from "./costGroups.js";
+import { parseTimestamp } from "./parseTimestamp.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -25,9 +26,9 @@ function fmtDuration(seconds) {
 }
 
 function parseTS(ts) {
-  if (!ts) return null;
-  const d = new Date(ts);
-  return isNaN(d.getTime()) ? null : d;
+  // Delegates to the shared UTC-aware helper (web/src/parseTimestamp.js) —
+  // a naive DB timestamp must parse as UTC, not local.
+  return parseTimestamp(ts);
 }
 
 // Compute all stats from the task list
