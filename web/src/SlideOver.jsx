@@ -99,6 +99,93 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const [mergeStep, setMergeStep] = useState(null);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
+  const scrollRef = useRef(null);
+  const primaryStreamRef = useRef(null);
+
+  // G-2: the primary digest (ActivityTab) sits ABOVE the accordion inside the
+  // one shared `.so-scroll` region (styles.css FINDING G) and grows on its own
+  // as live events stream in — a turn counter and a live-status line appear
+  // where there were none a moment ago. Nothing here changes scrollTop, but a
+  // reader who has scrolled PAST the digest into the Details & tools inspector
+  // still gets visually yanked: the document reflows underneath them and the
+  // thing they were reading moves down the screen. A ResizeObserver on the
+  // digest is the only thing that can see this (it fires regardless of WHY the
+  // digest grew — new events, a task refetch, a diff arriving) and compensate
+  // scrollTop by the same delta so the reader's view never moves. Skipped
+  // while ANY part of the digest is still on screen: there the reader is
+  // watching it (or close enough to see something new arrive), so growth
+  // landing in view is the correct, expected behavior — compensating would
+  // scroll PAST content they have not seen yet (review finding #2: a coarse
+  // `scrollTop > 0` check over-compensated in the 0 < scrollTop < digestHeight
+  // band, hiding growth the reader should have seen appear).
+  //
+  // Reads `entries[].contentRect`, never `getBoundingClientRect()`, for the
+  // SIZE delta: the drawer itself mounts with a `transform: scale(0.97 → 1)`
+  // entrance animation (styles.css `.slideover { animation: modal-in … }`),
+  // and getBoundingClientRect() reports that ancestor transform — so a
+  // baseline taken with it mid-animation reads ~3% short of the settled size
+  // and every later delta is skewed by that same amount. contentRect is the
+  // element's own untransformed layout box, immune to an ancestor's scale.
+  // The "is it still visible" check below DOES use getBoundingClientRect —
+  // safely, because it only compares two positions at the same instant under
+  // the same transform, which preserves ordering regardless of scale.
+  //
+  // Keyed on `Boolean(task)`, NOT `task` itself (review finding #1): `task` is
+  // a fresh object on every fetch, and a live task update — delivered over
+  // Board's WS `sync` path, which diffs the task's `updated_at` and bumps
+  // `refreshKey` on a change (Board.jsx:58-66) — makes SlideOver refetch and
+  // hand ActivityTab a NEW `task` object, all while the drawer stays open.
+  // An effect keyed on `[task]` tears down and re-arms the observer on every
+  // one of those refetches, resetting `lastHeight` to
+  // null right as it happens — any digest-height change landing in that same
+  // tick is silently swallowed as "just the new baseline", reintroducing the
+  // drift intermittently in a live session. `Boolean(task)` only flips once,
+  // false→true, on the first successful fetch — the observer then stays
+  // armed, tracking the SAME `lastHeight`, across every later refetch for as
+  // long as this drawer instance is mounted (Board remounts SlideOver wholesale
+  // on a task switch via `key={selectedId}`, which re-runs this from scratch).
+  //
+  // `.so-scroll` also carries `overflow-anchor: none` (styles.css) — measured
+  // directly while building this fix: once the digest is fully scrolled past,
+  // Chromium's OWN native scroll anchoring tries to compensate the same
+  // growth on its own, and with both active `scrollTop` moved by the delta
+  // TWICE (an exact, reproducible overshoot). Disabling the native mechanism
+  // makes this effect the sole authority — deterministic, and not dependent
+  // on a browser's own anchoring heuristics or timing.
+  useEffect(() => {
+    const scrollEl = scrollRef.current;
+    const streamEl = primaryStreamRef.current;
+    // `.so-primary-stream` only mounts once `task` is truthy (it's `{task &&
+    // (<div ref={primaryStreamRef}>…)}` below) — the FIRST render always has
+    // task=null, so an effect keyed on `[]` captures a null ref forever and
+    // this guard silently never re-arms once the digest actually mounts.
+    // Keying on `Boolean(task)` re-runs this exactly once, when the ref goes live.
+    if (!scrollEl || !streamEl || typeof ResizeObserver === "undefined") return undefined;
+    let lastHeight = null;   // established by the observer's own first callback, below
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[entries.length - 1].contentRect.height;
+      if (lastHeight === null) { lastHeight = h; return; }   // baseline only — no prior size to diff against
+      const delta = h - lastHeight;
+      lastHeight = h;
+      if (delta === 0) return;
+      // Fully scrolled past BEFORE this growth, not merely "scrolled some" —
+      // and not "still fully past AFTER growing", which is the wrong question:
+      // by the time this callback runs the DOM already reflects the NEW
+      // (grown) size, so `streamEl`'s current bottom edge already includes
+      // content the reader never had a chance to see. Appending can grow the
+      // digest well past whatever margin the reader had scrolled by (e.g. 40px
+      // past, then it grows 172px) — read post-growth, that tail pokes back
+      // into the viewport and this would wrongly read as "still visible",
+      // refusing to compensate a case it must. Subtracting `delta` back out
+      // recovers the PRE-growth bottom edge — the position the check actually
+      // needs, since the box's top edge does not move as it grows downward.
+      const streamBottom = streamEl.getBoundingClientRect().bottom - delta;
+      const viewTop = scrollEl.getBoundingClientRect().top;
+      if (streamBottom <= viewTop) scrollEl.scrollTop += delta;
+    });
+    ro.observe(streamEl);
+    return () => ro.disconnect();
+  }, [Boolean(task)]);
 
   // Elapsed-time ticker for the "Merging… m:ss" label.
   useEffect(() => {
@@ -482,7 +569,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             together. Without this the inspector (a flex:1 child) collapsed to a
             0px sliver under the tall header + the 46vh-capped stream, so its
             sections were unreachable on any task with a live stream (FINDING G). */}
-        <div className="so-scroll">
+        <div className="so-scroll" ref={scrollRef}>
         {/* Why it failed — the orchestrator's own failure_reason, verbatim. A
             failed task otherwise showed only a Retry button, so a quota stop
             ("...returned an error result: success") was indistinguishable from a
@@ -536,7 +623,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             wall of logs. The raw event stream is demoted to the collapsed
             "Event log" accordion section below, alongside System/Diff/Review. */}
         {task && (
-          <div className="so-primary-stream" data-testid="primary-stream">
+          <div className="so-primary-stream" ref={primaryStreamRef} data-testid="primary-stream">
             <ActivityTab taskId={taskId} task={task} isActive={isLive} diff={diff} />
           </div>
         )}
@@ -2106,6 +2193,24 @@ function ActivityLog({ taskId, task, isActive }) {
     // The section shares one scroll container (.so-scroll) with the rest of the
     // inspector, so an unconditional scroll-to-latest would yank a reader who
     // scrolled up on every streamed event.
+    //
+    // Interaction with G-2's digest-growth compensation (this component's
+    // `scrollRef`/`primaryStreamRef` effect, above): both write `.so-scroll`'s
+    // `scrollTop`, but their arm conditions are near-disjoint by construction.
+    // G-2 only fires once the digest (`.so-primary-stream`, which sits ABOVE
+    // this section in the document) is scrolled ENTIRELY out of view — which
+    // this "near the bottom" check (within 160px of the content's end) implies
+    // in practice, since the digest is nowhere near .so-scroll's bottom on any
+    // task with more than a screenful of content. When both are armed they
+    // agree on direction (both are following new content DOWN the page), so a
+    // same-tick G-2 `scrollTop +=` lands as an instant jump the in-flight
+    // smooth-scroll animation resumes from — it does not fight it, because
+    // `scrollIntoView`'s target is `el`'s position, which is unaffected by an
+    // upstream `scrollTop` write; the animation simply continues toward the
+    // same element from wherever the jump left it. No guard added: an
+    // occasional single extra frame of adjustment here is not the drift class
+    // this fix exists for (a static reading position moving on its own) — it
+    // is the two features cooperating to keep the SAME reader at the bottom.
     const sc = el.closest(".so-scroll");
     if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight > 160) return;
     el.scrollIntoView({ behavior: "smooth" });

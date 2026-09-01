@@ -2658,6 +2658,17 @@ a.so-chip-value:hover { color: var(--accent-300); }
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
+  overflow-anchor: none;
+  /* G-2: the JS fix in SlideOver.jsx (a ResizeObserver on `.so-primary-stream`
+     that compensates scrollTop by the digest's own height delta) is the ONE
+     mechanism that adjusts this scrollTop for digest growth. Chromium's
+     native CSS scroll anchoring (the `overflow-anchor: auto` default) tries
+     to do the SAME job on its own once the digest is scrolled fully out of
+     view, and — measured directly — DOUBLE-compensates when both are active
+     at once (each moves scrollTop by the full delta, landing 2x past the
+     correct position). Turned off here so the JS fix is the sole authority:
+     deterministic, and consistent on browsers (Safari, historically) whose
+     native anchoring support differs or is absent. */
 }
 
 .so-primary-stream {
