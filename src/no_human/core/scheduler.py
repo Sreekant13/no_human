@@ -36,6 +36,7 @@ from ..blockers import human_gate_armed
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
                       pid_alive, process_start_token, worktree_isolation_enabled)
+from ..vcs.pr_watcher import orphan_landed_evidence
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
@@ -43,7 +44,7 @@ from . import plan_gate
 from . import slot_wait
 from .events import EventPersister
 from .infra_breaker import infra_breaker
-from .task import TaskStatus, priority_rank
+from .task import LANDED_RECONCILABLE, TaskStatus, priority_rank
 from .worktree import salvage_dead_worktrees, sweep_stale_worktrees
 
 log = logging.getLogger("no_human.scheduler")
@@ -1028,6 +1029,75 @@ class Scheduler:
                   "dispatching attempt 1", task.id[:8], ctx.get("base_branch"))
         return True
 
+    async def _reconcile_landed_orphan(self, t) -> bool:
+        """True when an about-to-be-requeued orphan's attempt already landed
+        — its PR merged, or its commit is an ancestor of the base branch —
+        in which case it is reconciled straight to DONE instead of being
+        requeued (and eventually failed) on top of work that already shipped.
+
+        Called from `_recover_orphans`, AFTER `_row_is_live` (unchanged: a
+        row something is still actively working must never be touched here)
+        and BEFORE the existing unvalidated-requeue `set_status(IMPLEMENTING,
+        ...)` write — a `True` return means the caller should `continue` its
+        loop instead of requeueing.
+
+        Fails open on every ambiguity, exactly like `_shipped_before_dispatch`
+        beside it: no repo path, no base branch, no PR/commit to check, a git
+        error, or a status outside `LANDED_RECONCILABLE` all fall through to
+        `False` (requeue as normal, today's behaviour, unchanged). The probe
+        itself (`vcs.pr_watcher.orphan_landed_evidence`) is LOCAL-GIT-ONLY —
+        no forge/network call happens on this path, sweep or otherwise.
+        """
+        try:
+            if t.status not in LANDED_RECONCILABLE:
+                return False
+            ctx = t.context or {}
+            base = ctx.get("base_branch")
+            if not base or not t.repo_path:
+                # Cheap pre-filter: never spawn git for a row with no base
+                # branch recorded (same shape as `_shipped_before_dispatch`).
+                return False
+            pr_url = await self.store.latest_attempt_pr_url(t.id)
+            branch_info = await self.store.latest_attempt_branch(t.id)
+            commit_sha = (branch_info or {}).get("commit_sha") or ""
+            if not commit_sha and not pr_url:
+                return False
+            evidence = await orphan_landed_evidence(
+                t.repo_path, base, commit_sha=commit_sha, pr_url=pr_url)
+            if not evidence:
+                return False
+            # Re-check terminality: the probe just ran arbitrary-duration git
+            # subprocesses, during which a human could have cancelled or
+            # completed this row out from under us (mirrors
+            # `_shipped_before_dispatch`'s post-probe re-check).
+            if await self._is_terminal_row(t):
+                return True
+            current = await self.store.get_task(t.id)
+            if current is None:
+                return False
+            reconciled = await self.store.reconcile_landed_orphan(
+                current, evidence=evidence,
+                event={
+                    "source": "orchestrator", "kind": "orphan_reconciled",
+                    "text": (f"reconciled: work landed while orphaned "
+                             f"({evidence['kind']} {evidence['sha'][:8]} "
+                             f"on {base}) — {t.id[:8]} completed instead of "
+                             "requeued"),
+                    "ts": time.time(),
+                },
+            )
+            if reconciled is None:
+                return False
+            self._on_event(
+                "orphan_reconciled",
+                f"{t.id[:8]} was orphaned but had already landed on {base} — "
+                "reconciled to DONE instead of requeued")
+            return True
+        except Exception as exc:  # noqa: BLE001 — the sweep must never block on this
+            log.warning("landed-orphan reconciliation failed for %s: %s",
+                        t.id[:8], exc)
+            return False
+
     async def _read_heartbeat_with_retry(self) -> dict | None:
         """Read the id=1 heartbeat row, retrying a bounded number of times on
         exception before giving up. A read failure is UNKNOWN, not "no row"
@@ -1336,6 +1406,8 @@ class Scheduler:
                 if plan_gate.correcting(t):
                     continue
                 if await self._row_is_live(t):
+                    continue
+                if await self._reconcile_landed_orphan(t):
                     continue
                 if startup:
                     text = (f"found in {status.value} at startup with no "

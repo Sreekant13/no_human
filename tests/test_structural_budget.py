@@ -327,7 +327,43 @@ FROZEN_FILE_LINES = {
     # commit for every injected memory's audit row, matching the idiom of
     # the already-batched `record_memory_uses`/`touch_memories_used`).
     # Measured on this tree with the scanner below.
-    "core/db.py": 4691,
+    # 4691 -> 4784 (+93): orphan landed-reconciliation. `set_status` now
+    # delegates its CAS-write/DONE-event-guard/phase-recording tail to a new
+    # `_write_status` helper (shared, no legality check of its own) so
+    # `Store.reconcile_landed_orphan` can complete an orphaned-but-landed
+    # row through `assert_landed_reconciliation` — its own narrower gate —
+    # without widening the general `ALLOWED_TRANSITIONS` map (that would
+    # also legitimize IMPLEMENTING/TESTING->DONE for `Orchestrator.
+    # _advance_after_review`'s plain `set_status` call, defeating
+    # tests/test_post_review_transition_6408aba0.py). `reconcile_landed_
+    # orphan` itself gained a `@serialized_write` decorator, needed once its
+    # tail call moved from `set_status` (already decorated) to the
+    # undecorated `_write_status`.
+    # 4505 -> 4553 (+48): review finding fix — `reconcile_landed_orphan`'s
+    # DONE write now goes through `set_status` itself (a new optional
+    # `reconciliation_gate` parameter) instead of calling `_write_status`
+    # directly, so the general `ALLOWED_TRANSITIONS` map (`assert_transition`)
+    # is always consulted first, unconditionally, for this write too — the
+    # narrower `assert_landed_reconciliation` gate is now only a fallback
+    # `set_status` consults if the general map refuses, never a replacement
+    # for it. The general map itself is NOT widened (still refuses
+    # IMPLEMENTING/TESTING->DONE), so
+    # `test_recovery_never_launders_an_illegal_jump` and
+    # `tests/test_state_machine.py::
+    # test_landed_reconciliation_edges_are_legal_only_via_the_narrow_gate`
+    # both keep passing unchanged.
+    # 4553 -> 4562 (+9): `_write_status` gained its own `@serialized_write` —
+    # `test_every_committing_store_method_is_serialized` (test_db_concurrency.py)
+    # flags any `Store` coroutine that commits without the decorator, and the
+    # write-path consolidation above left `_write_status` as a plain, un-
+    # decorated `self.db.commit()`-er with exactly one caller left
+    # (`set_status`, already decorated). Adding the decorator here matches the
+    # exact precedent `Store.create_wiki_job`/`update_wiki_job` set for this
+    # same guard, and nests safely into `set_status`'s already-held lock:
+    # `_critical()` is reentrant per (Store, owning asyncio task).
+    # 4562 -> 4841 (+279): re-anchored on rebase onto main (measured directly
+    # on this tree with the scanner below).
+    "core/db.py": 4841,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.
@@ -379,7 +415,14 @@ FROZEN_FILE_LINES = {
     # 2700 -> 2776 (+76): D3.1 — HarvestJob auto-activation branch,
     # RetirementSweepJob 90-day auto-retire branch, and the rewritten
     # operator-directive docstrings. Measured on the D3.1 landing result.
-    "core/scheduler.py": 2776,
+    # 2776 -> 2848 (+72): `_reconcile_landed_orphan` — probes the attempt's
+    # commit/PR against the base branch via `vcs.pr_watcher.
+    # orphan_landed_evidence` (local-git-only, no network) and, on landed
+    # evidence, calls `Store.reconcile_landed_orphan` instead of requeuing;
+    # wired into `_recover_orphans` after the existing `_row_is_live` check.
+    # Re-anchored on rebase onto main (measured directly on this tree with
+    # the scanner below).
+    "core/scheduler.py": 2848,
 }
 
 

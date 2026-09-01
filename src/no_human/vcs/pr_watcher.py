@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 from dataclasses import dataclass, field
@@ -1418,6 +1419,80 @@ async def branch_landed_commit(
             candidate = candidate.strip()
             if candidate and await _contained_at(repo_path, candidate, branch):
                 return candidate
+    return None
+
+
+#: How far back `orphan_landed_evidence`'s squash-subject scan walks a base
+#: tip's first-parent history looking for a `(#N)` PR reference. A module
+#: constant for the same reason as `_LANDING_SCAN_DEPTH`: a user's
+#: `blockers:` config section replaces the defaults map wholesale, so a
+#: config key here could silently resolve to an unset/zero depth.
+_ORPHAN_SUBJECT_SCAN_DEPTH = 500
+
+
+async def orphan_landed_evidence(
+    repo_path: str, base: str, *, commit_sha: str = "", pr_url: str = "",
+    depth: int = _ORPHAN_SUBJECT_SCAN_DEPTH,
+) -> dict | None:
+    """Did an orphaned attempt's recorded work land on *base* — LOCAL GIT
+    ONLY, never the network. The one probe `Scheduler._reconcile_landed_orphan`
+    is allowed to call from the scheduler tick (see that method): unlike
+    `default_pr_state`/`default_pr_merged`, this never shells out to `gh`/
+    `glab`, so a caller on the tick's hot path stays network-free.
+
+    Fail-closed on every ambiguity, the same contract as every other probe in
+    this module: returns ``None``, never a manufactured sha, the moment the
+    evidence is anything less than certain.
+
+    1. PRECONDITIONS: `repo_path`, `base`, and at least one of `commit_sha`/
+       `pr_url` — otherwise ``None``. `base` is never defaulted to
+       ``"main"`` — mirrors `blockers/shipped.py`'s documented refusal to
+       guess a base; a caller with no recorded `base_branch` has nothing
+       honest to check ancestry against.
+    2. ANCESTRY: if `commit_sha` and `commit_is_ancestor(repo_path,
+       commit_sha, base)` — the attempt's own commit is still reachable from
+       a base tip (the branch sha survived, e.g. a fast-forward or a rebase
+       merge) — return ``{"kind": "commit", "sha": commit_sha, "base": base}``.
+    3. SQUASH-SUBJECT: this repo (and GitHub generally) lands PRs as a squash
+       commit that carries none of the branch's own commits, so ancestry
+       above is blind to the common case. If `pr_url` parses (`parse_pr_url`)
+       to a PR number `n`, walk each tip from `_base_tips(repo_path, base)`
+       with `git log --first-parent -n depth --format=%H%x00%s <tip>` and
+       return `{"kind": "pr", "sha": <that commit>, "pr": n, "base": base}`
+       for the first subject matching the ANCHORED pattern `\\(#n\\)(\\s|$)`
+       — the GitHub/`nh` squash-merge subject suffix. Anchoring matters: an
+       unanchored `#12` would match `(#123)` too, misattributing PR 123's
+       landing to PR 12 (or, per the prefix case below, PR 4 to `(#42)`).
+    4. Anything else — a git command failing, no ancestry, no subject match
+       — ``None``.
+
+    Only `_git_rc` (a local `git` subprocess rooted at `repo_path`) is used.
+    `_base_tips` is local-refs-only by construction (see its docstring),
+    which is what keeps this network-free. The forge PR states
+    (`open|closed|merged|draft`, GitLab's `opened|merged|closed|locked`) are
+    deliberately NOT consulted here — that is what `default_pr_state`/
+    `default_pr_merged` are for, and they are not safe to call from a
+    scheduler tick.
+    """
+    if not repo_path or not base or not (commit_sha or pr_url):
+        return None
+    if commit_sha and await commit_is_ancestor(repo_path, commit_sha, base):
+        return {"kind": "commit", "sha": commit_sha, "base": base}
+    parsed = parse_pr_url(pr_url) if pr_url else None
+    if not parsed:
+        return None
+    n = parsed[3]
+    pattern = re.compile(rf"\(#{n}\)(\s|$)")
+    for tip in await _base_tips(repo_path, base):
+        rc, out = await _git_rc(
+            repo_path, "log", "--first-parent", "-n", str(depth),
+            "--format=%H%x00%s", tip)
+        if rc != 0 or not out:
+            continue
+        for line in out.splitlines():
+            sha, _, subject = line.partition("\x00")
+            if sha and pattern.search(subject):
+                return {"kind": "pr", "sha": sha, "pr": n, "base": base}
     return None
 
 

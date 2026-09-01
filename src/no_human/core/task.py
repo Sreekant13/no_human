@@ -152,6 +152,18 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     # happened.
     table[TaskStatus.IMPLEMENTING].add(TaskStatus.TESTING)
 
+    # NOTE: IMPLEMENTING -> DONE and TESTING -> DONE are deliberately NOT
+    # added here. `Store.reconcile_landed_orphan` (core/db.py) completes an
+    # orphaned-but-landed row through its OWN narrower gate
+    # (`assert_landed_reconciliation` / `LANDED_RECONCILABLE` below), not
+    # through this general map — widening this map instead would also make
+    # IMPLEMENTING/TESTING -> DONE legal for `Orchestrator._advance_after_
+    # review`'s plain `set_status(task, target)` call, defeating the guard
+    # `tests/test_post_review_transition_6408aba0.py::
+    # test_recovery_never_launders_an_illegal_jump` exists to enforce: a
+    # post-review target outside the two post-review states must still be
+    # refused. See Scheduler._reconcile_landed_orphan (core/scheduler.py).
+
     # approval gate
     table[TaskStatus.AWAITING_APPROVAL].add(TaskStatus.IMPLEMENTING)  # sent back
     table[TaskStatus.AWAITING_APPROVAL] |= _OFF_RAMPS
@@ -198,6 +210,30 @@ def can_transition(src: TaskStatus, dst: TaskStatus) -> bool:
 def assert_transition(src: TaskStatus, dst: TaskStatus) -> None:
     if not can_transition(src, dst):
         raise IllegalTransition(f"{src.value} -> {dst.value} is not allowed")
+
+
+#: Statuses from which `Store.reconcile_landed_orphan` may complete a row
+#: whose recorded work is provably on the base branch. CONTEXT/PLANNING are
+#: deliberately absent: no attempt of theirs has committed work, so there is
+#: nothing to reconcile — those orphans keep today's requeue exactly.
+LANDED_RECONCILABLE: frozenset[TaskStatus] = frozenset({
+    TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+    TaskStatus.TESTING, TaskStatus.AWAITING_APPROVAL,
+})
+
+
+def assert_landed_reconciliation(src: TaskStatus) -> None:
+    """Raise `IllegalTransition` unless *src* is one of `LANDED_RECONCILABLE`.
+
+    A second, narrower gate than `assert_transition` — REVIEWING -> DONE and
+    AWAITING_APPROVAL -> DONE are already legal main-flow/approval edges, but
+    legal there does not mean "this attempt's work landed while orphaned";
+    this asserts the reconciliation's own precondition, independent of
+    whether the destination edge happens to be allowed for other reasons.
+    """
+    if src not in LANDED_RECONCILABLE:
+        raise IllegalTransition(
+            f"{src.value} -> done is not a landed reconciliation")
 
 
 def _now() -> str:

@@ -4,8 +4,10 @@ import pytest
 
 from no_human.core.task import (
     IllegalTransition,
+    LANDED_RECONCILABLE,
     Task,
     TaskStatus,
+    assert_landed_reconciliation,
     assert_transition,
     can_transition,
 )
@@ -123,12 +125,68 @@ def test_review_pass_from_implementing_has_a_path_forward():
         (S.CONTEXT, S.TESTING),
         (S.IMPLEMENTING, S.AWAITING_APPROVAL),
         (S.IMPLEMENTING, S.DONE),
+        (S.TESTING, S.DONE),
     ],
 )
 def test_the_guard_was_not_weakened(src, dst):
     """The new IMPLEMENTING->TESTING edge is the ONLY edge added; every other
     previously-illegal transition, including ones adjacent to the new edge,
-    must still raise."""
+    must still raise.
+
+    (S.IMPLEMENTING, S.DONE) and (S.TESTING, S.DONE) stay pinned illegal
+    HERE, in the general map, on purpose: orphan-landed-reconciliation
+    (`Store.reconcile_landed_orphan`) completes those two specific edges
+    through its OWN narrower gate, `assert_landed_reconciliation` — see
+    `test_landed_reconciliation_edges_are_legal_only_via_the_narrow_gate`
+    below — precisely so that widening THIS map never happens. Widening it
+    would also legitimize IMPLEMENTING/TESTING->DONE for
+    `Orchestrator._advance_after_review`'s plain `set_status(task, target)`
+    call, defeating
+    `tests/test_post_review_transition_6408aba0.py::
+    test_recovery_never_launders_an_illegal_jump`."""
     assert not can_transition(src, dst)
     with pytest.raises(IllegalTransition):
         assert_transition(src, dst)
+
+
+def test_landed_reconciliation_edges_are_legal_only_via_the_narrow_gate():
+    """Orphan recovery must be able to reconcile a landed-but-orphaned row
+    straight to DONE from either IMPLEMENTING or TESTING — the two points in
+    the flow where `_recover_orphans` finds orphaned rows with a completed
+    attempt (PLAN.md item 2/6: orphan recovery landed-work reconciliation) —
+    but ONLY through `assert_landed_reconciliation`, the dedicated gate
+    `Store.reconcile_landed_orphan` calls, never through the general
+    `ALLOWED_TRANSITIONS` map (`can_transition`/`assert_transition`), which
+    `test_the_guard_was_not_weakened` above pins as still refusing both
+    edges."""
+    assert not can_transition(S.IMPLEMENTING, S.DONE)
+    assert not can_transition(S.TESTING, S.DONE)
+    with pytest.raises(IllegalTransition):
+        assert_transition(S.IMPLEMENTING, S.DONE)
+    with pytest.raises(IllegalTransition):
+        assert_transition(S.TESTING, S.DONE)
+
+    assert S.IMPLEMENTING in LANDED_RECONCILABLE
+    assert S.TESTING in LANDED_RECONCILABLE
+    assert_landed_reconciliation(S.IMPLEMENTING)  # must not raise
+    assert_landed_reconciliation(S.TESTING)  # must not raise
+
+
+def test_landed_reconciliation_guard_still_refuses_failed_and_early_states():
+    """The new edges must not widen into a general DONE bypass: FAILED stays
+    terminal (FAILED->DONE is still illegal), and `assert_landed_reconciliation`
+    — the narrower gate `Store.reconcile_landed_orphan` calls in addition to
+    the transition map — refuses any source status outside
+    LANDED_RECONCILABLE, e.g. CONTEXT."""
+    assert not can_transition(S.FAILED, S.DONE)
+    with pytest.raises(IllegalTransition):
+        assert_transition(S.FAILED, S.DONE)
+
+    assert S.CONTEXT not in LANDED_RECONCILABLE
+    with pytest.raises(IllegalTransition):
+        assert_landed_reconciliation(S.CONTEXT)
+
+    assert S.IMPLEMENTING in LANDED_RECONCILABLE
+    assert S.TESTING in LANDED_RECONCILABLE
+    assert_landed_reconciliation(S.IMPLEMENTING)  # must not raise
+    assert_landed_reconciliation(S.TESTING)  # must not raise

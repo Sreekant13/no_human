@@ -19,7 +19,13 @@ from typing import (
 import aiosqlite
 
 from . import slot_wait
-from .task import Task, TaskStatus, assert_transition
+from .task import (
+    IllegalTransition,
+    Task,
+    TaskStatus,
+    assert_landed_reconciliation,
+    assert_transition,
+)
 
 log = logging.getLogger("no_human.db")
 
@@ -1527,6 +1533,7 @@ class Store:
         validate: bool = True,
         human_override: bool = False,
         event: dict[str, Any] | None = None,
+        reconciliation_gate: Callable[[TaskStatus], None] | None = None,
     ) -> Task | None:
         """Transition a task, enforcing the legal-transition map by default.
 
@@ -1557,14 +1564,77 @@ class Store:
         an emitter failure must fail the completion loudly, the opposite of
         `EventPersister`'s best-effort contract. Non-DONE transitions are
         unaffected: `event` is optional and ignored when absent.
+
+        `reconciliation_gate` is a SECOND, NARROWER legality check consulted
+        ONLY as a fallback: `assert_transition` — the general
+        `ALLOWED_TRANSITIONS` map — still runs first and unconditionally
+        whenever `validate=True`, exactly as before this parameter existed.
+        Only when that raises `IllegalTransition` does a caller-supplied gate
+        get one more chance to accept the SAME (src, dst) pair on its own,
+        narrower terms; if it also raises (or none was given), the original
+        `IllegalTransition` propagates unchanged. This is how
+        `reconcile_landed_orphan` below completes an orphaned-but-landed row
+        (IMPLEMENTING/TESTING -> DONE) through this one validated write path
+        — passing `assert_landed_reconciliation` as the gate — WITHOUT
+        widening the general map itself: the map staying authoritative is
+        exactly what keeps `Orchestrator._advance_after_review`'s plain
+        `set_status(task, target)` call (no `reconciliation_gate` argument,
+        so no fallback is even consulted) refusing IMPLEMENTING/TESTING ->
+        DONE — see
+        `tests/test_post_review_transition_6408aba0.py::
+        test_recovery_never_launders_an_illegal_jump`. It is not a
+        validation bypass in the `validate=False`/`human_override` sense:
+        every write still passes through an explicit, raising check —
+        either the general map alone, or the general map followed by a
+        named narrower one — never neither.
         """
         if validate:
-            assert_transition(task.status, new_status)
-        # Checked AFTER `assert_transition` on purpose: an illegally-shaped
-        # transition (e.g. CONTEXT -> DONE) must still raise `IllegalTransition`
-        # — that is a different, pre-existing invariant, and this guard must
-        # not shadow it. Only once a DONE transition is otherwise legal does
-        # "did you bring an event" apply.
+            try:
+                assert_transition(task.status, new_status)
+            except IllegalTransition:
+                if reconciliation_gate is None:
+                    raise
+                reconciliation_gate(task.status)
+        return await self._write_status(
+            task, new_status, human_override=human_override, event=event)
+
+    @serialized_write
+    async def _write_status(
+        self,
+        task: Task,
+        new_status: TaskStatus,
+        *,
+        human_override: bool = False,
+        event: dict[str, Any] | None = None,
+    ) -> Task | None:
+        """The CAS write + DONE-event guard + phase recording shared by every
+        validated transition. The only caller is `set_status` itself, which
+        has already run its own legality check (the general map, optionally
+        falling back to a caller-supplied `reconciliation_gate`) before
+        reaching here — see `set_status`'s docstring for how
+        `reconcile_landed_orphan` (below) uses that fallback to complete an
+        orphan's IMPLEMENTING/TESTING -> DONE reconciliation without widening
+        the general map (and, with it, `Orchestrator._advance_after_review`'s
+        plain `set_status(task, target)` call, which must keep refusing any
+        post-review target outside the two post-review states — see
+        tests/test_post_review_transition_6408aba0.py). This method itself
+        performs no legality check: it is not a public bypass, only the
+        write tail `set_status` delegates to. Carries its own
+        `@serialized_write` too — not for a legality reason, but because
+        `test_every_committing_store_method_is_serialized` asserts every
+        `self.db.commit()`-ing coroutine on `Store` is decorated, on the
+        `Store.create_wiki_job`/`update_wiki_job` precedent (see
+        `git log -S"async def _write_status"`): its one caller, `set_status`,
+        is already decorated, so this nests into the SAME lock —
+        `_critical()` is reentrant per (Store, owning asyncio task), see its
+        own docstring — never a second, competing acquisition.
+        """
+        # Checked AFTER the caller's own transition check on purpose: an
+        # illegally-shaped transition (e.g. CONTEXT -> DONE) must still raise
+        # `IllegalTransition` from the caller — that is a different,
+        # pre-existing invariant, and this guard must not shadow it. Only
+        # once a DONE transition is otherwise legal does "did you bring an
+        # event" apply.
         if new_status is TaskStatus.DONE and not (
             event and event.get("kind") and event.get("source")
         ):
@@ -1634,6 +1704,86 @@ class Store:
         if not already_there:
             await self._record_phase(task, new_status)
         return task
+
+    @serialized_write
+    async def reconcile_landed_orphan(
+        self,
+        task: Task,
+        *,
+        evidence: dict[str, Any],
+        event: dict[str, Any],
+    ) -> Task | None:
+        """Move an orphaned-but-actually-landed row straight to DONE.
+
+        Orphan recovery (`Scheduler._recover_orphans`) used to requeue/fail a
+        row purely from its status, with no check for whether the attempt's
+        PR merged or its commit already landed on the base branch — a dead
+        or restarted server has no memory of that, but the base branch does.
+        This is the reconciliation write: called ONLY after the caller has
+        independently confirmed landedness via
+        `vcs.pr_watcher.orphan_landed_evidence` (a local-git-only probe; no
+        network call happens here or upstream of here).
+
+        `evidence` must be the dict `orphan_landed_evidence` returned:
+        truthy `sha`, `kind` in `{"commit", "pr"}`, truthy `base`. Anything
+        else is a caller bug, not an ambiguous case — raise `ValueError`
+        rather than silently doing nothing, so a malformed probe result
+        cannot be mistaken for "no evidence, requeue as normal".
+
+        `assert_landed_reconciliation(task.status)` is checked here, FIRST,
+        as a fast pre-flight (`IMPLEMENTING`, `REVIEWING`, `TESTING`,
+        `AWAITING_APPROVAL` only) — raises `IllegalTransition` for anything
+        else, e.g. `CONTEXT`, which has no attempt to have landed in the
+        first place, before either the evidence check or the context write
+        below runs anything.
+
+        The evidence is stamped into the context anchor BEFORE the status
+        write (same pattern as `blockers/shipped.py`'s `landed_sha`
+        bookkeeping) so a restart between the two writes does not lose it:
+        `merge_context` is its own atomic UPDATE and commits independently
+        of the status write below.
+
+        The actual status write below goes through `self.set_status` —
+        the SAME single validated write path every other transition in this
+        Store uses, never `_write_status` directly. `set_status` runs its
+        own `assert_transition` against the general `ALLOWED_TRANSITIONS`
+        map FIRST and unconditionally: `IMPLEMENTING -> DONE` / `TESTING ->
+        DONE` are NOT, and must not become, generally legal edges there, so
+        that check still raises `IllegalTransition` exactly as it does for
+        any other caller. Only because this call also names
+        `reconciliation_gate=assert_landed_reconciliation` does `set_status`
+        get a second, narrower, still-raising-on-failure chance to accept
+        that SAME edge — see `set_status`'s docstring. The pre-flight check
+        above means that fallback never actually has to reject anything
+        here (an illegal source status already raised before this point),
+        but the write itself is validated by the general map first, not by
+        skipping it: widening the general map is still never required, and
+        `Orchestrator._advance_after_review`'s plain
+        `self.store.set_status(task, target)` call (no `reconciliation_gate`
+        keyword, so no fallback) keeps refusing IMPLEMENTING/TESTING -> DONE
+        exactly as before, which is what
+        `tests/test_post_review_transition_6408aba0.py::
+        test_recovery_never_launders_an_illegal_jump` pins. This is still a
+        fully validated write, never a bypass: the call below names only
+        `event=` and `reconciliation_gate=`, leaving every other keyword of
+        `set_status` — including its terminal-row escape hatch — at its
+        safe default, so `set_status` and `_write_status`'s own CAS guard
+        and `SilentCompletion` event check both still apply exactly as they
+        do for any other DONE transition — a concurrent human cancel or a
+        missing `event` still refuses the write.
+        """
+        assert_landed_reconciliation(task.status)
+        sha = evidence.get("sha")
+        kind = evidence.get("kind")
+        base = evidence.get("base")
+        if not sha or kind not in ("commit", "pr") or not base:
+            raise ValueError(
+                f"reconcile_landed_orphan: malformed evidence {evidence!r}")
+        await self.merge_context(task.id, {"landed_sha": sha})
+        return await self.set_status(
+            task, TaskStatus.DONE, event=event,
+            reconciliation_gate=assert_landed_reconciliation,
+        )
 
     @serialized_write
     async def update_task(self, task: Task) -> Task:

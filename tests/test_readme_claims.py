@@ -2444,8 +2444,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
     """
-    assert "db.py:1935" in known_issues_doc, (
-        "the traceback no longer cites db.py:1935 — this test is pointed at "
+    assert "db.py:2085" in known_issues_doc, (
+        "the traceback no longer cites db.py:2085 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4559" in known_issues_doc, (
@@ -2456,13 +2456,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 1935 <= len(db_lines), "db.py is now shorter than line 1935"
-    assert db_lines[1934].strip() == "await self.db.commit()", (
-        f"db.py:1935 is now {db_lines[1934]!r}, not the commit the traceback "
+    assert 1 <= 2085 <= len(db_lines), "db.py is now shorter than line 2085"
+    assert db_lines[2084].strip() == "await self.db.commit()", (
+        f"db.py:2085 is now {db_lines[2084]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (
-        "line 1842 is no longer inside update_attempt's body"
+        "line 2085 is no longer inside update_attempt's body"
     )
 
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
