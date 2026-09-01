@@ -1132,11 +1132,19 @@ def run_command(
 
 
 def _git_show(repo_path: Path, ref: str, path: str) -> str:
+    # No `text=True`: that decodes stdout with the locale codec and RAISES
+    # UnicodeDecodeError on a binary blob (e.g. a `.tgz` fixture under
+    # `tests/`), which propagated out of `tamper_check_between` and killed a
+    # whole run at scoring (first hit 2026-08-09, SWE-bench). Decoding bytes
+    # ourselves with `errors="replace"` never raises; a binary blob decodes to
+    # replacement-char noise that `tamper_guard.is_binary_content` then skips.
     proc = subprocess.run(
         ["git", "show", f"{ref}:{path}"],
-        cwd=repo_path, capture_output=True, text=True,
+        cwd=repo_path, capture_output=True,
     )
-    return proc.stdout if proc.returncode == 0 else ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", errors="replace")
 
 
 def _git_files(repo_path: Path, ref: str) -> list[str]:
@@ -1349,8 +1357,16 @@ def tamper_check_between(
     before, after = {}, {}
     for path in _git_files(repo_path, before_ref):
         if tamper_guard.is_test_file(path):
-            before[path] = _git_show(repo_path, before_ref, path)
+            src = _git_show(repo_path, before_ref, path)
+            if tamper_guard.is_binary_content(src):
+                log.debug("tamper guard: skipping binary test-path file %s", path)
+                continue
+            before[path] = src
     for path in _git_files(repo_path, after_ref):
         if tamper_guard.is_test_file(path):
-            after[path] = _git_show(repo_path, after_ref, path)
+            src = _git_show(repo_path, after_ref, path)
+            if tamper_guard.is_binary_content(src):
+                log.debug("tamper guard: skipping binary test-path file %s", path)
+                continue
+            after[path] = src
     return tamper_guard.check(before, after)
