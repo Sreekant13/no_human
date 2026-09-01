@@ -3903,12 +3903,35 @@ async def remove_skill(skill_id: str, request: Request) -> dict[str, Any]:
 
 @app.get("/api/learnings")
 async def list_learnings(
-    request: Request, active: bool = False,
+    request: Request, active: bool = False, include_paused: bool = False,
+    include_archived: bool = False,
 ) -> list[dict[str, Any]]:
+    """``include_paused``/``include_archived`` (D3.2, 2026-09-01 review
+    deferrals) only affect the ``active=true`` branch — `pending()` takes
+    neither kwarg (it is a plain `list_memories(confirmed=False,
+    source=SOURCE_PROPOSED)` call with no paused/archived handling of its
+    own), so the query string is simply ignored on that branch rather than
+    422ing a caller that always sends both regardless of which view it's
+    requesting. (Both flags CAN apply to a pending row in principle —
+    `pause()`/`delete()` both work "on a row of any status" per their own
+    docstrings — but a pending row that is also paused or archived already
+    falls out of `pending()`'s result today, independent of this change; the
+    Second-brain UI never calls delete/pause against an unconfirmed row in
+    the first place, so this is not a path either flag needs to reach.) The
+    Second-brain UI passes ``include_paused=true`` so a paused row stays
+    visible (with its own `Paused` chip) instead of vanishing the moment
+    Pause is clicked, and ``include_archived=true`` so a just-deleted
+    (archived) row is likewise recoverable from the same list's archived-
+    count footer rather than only "recoverable" in the sense that the byte-
+    for-byte row still exists somewhere no UI shows it — the same rows
+    `Store.list_memories`'s defaults would otherwise hide from every caller,
+    injection included."""
     store = _store(request)
     from ..learning import LearningQueue
     q = LearningQueue(store)
-    rows = await (q.active() if active else q.pending())
+    rows = await (
+        q.active(include_paused=include_paused, include_archived=include_archived)
+        if active else q.pending())
     return await _with_usage_counts(store, rows)
 
 

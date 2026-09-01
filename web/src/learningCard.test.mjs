@@ -8,6 +8,7 @@ import {
   filterLearnings,
   learningEvidence,
   learningOrigin,
+  learningOriginTaskId,
   learningScope,
   memoryUsageSummary,
 } from "./learningCard.js";
@@ -97,6 +98,39 @@ test("origin is null rather than guessed for rows that predate the column", () =
   assert.equal(learningOrigin({ origin: null }), null);
   assert.equal(learningOrigin({}), null);
   assert.equal(learningOrigin(null), null);
+});
+
+// ── origin TASK id, for the Second-brain row's task link ────────────────── //
+
+test("learningOriginTaskId reads evidence.task_id, the parsed OR raw-JSON form", () => {
+  assert.equal(
+    learningOriginTaskId({ evidence: { kind: "task_outcome", task_id: "0123456789ab" } }),
+    "0123456789ab");
+  assert.equal(
+    learningOriginTaskId({ evidence: '{"kind":"task_outcome","task_id":"0123456789ab"}' }),
+    "0123456789ab");
+});
+
+test("learningOriginTaskId falls back to the first of task_ids, then recurrences", () => {
+  assert.equal(
+    learningOriginTaskId({ evidence: { kind: "supervisor_correction", task_ids: ["ta", "tb"] } }),
+    "ta");
+  assert.equal(
+    learningOriginTaskId({ evidence: { kind: "review_finding", recurrences: ["tc", "td"] } }),
+    "tc");
+  // task_id wins over both when present.
+  assert.equal(
+    learningOriginTaskId({ evidence: { task_id: "t0", task_ids: ["ta"], recurrences: ["tc"] } }),
+    "t0");
+});
+
+test("learningOriginTaskId is null, never throws, on a row with no recorded task", () => {
+  assert.equal(learningOriginTaskId(null), null);
+  assert.equal(learningOriginTaskId({}), null);
+  assert.equal(learningOriginTaskId({ evidence: null }), null);
+  assert.equal(learningOriginTaskId({ evidence: "{not json" }), null);
+  assert.equal(learningOriginTaskId({ evidence: "[1,2]" }), null);
+  assert.equal(learningOriginTaskId({ evidence: { kind: "task_outcome" } }), null);
 });
 
 // ── filter ───────────────────────────────────────────────────────────────── //

@@ -100,6 +100,44 @@ async def test_confirm_promotes_to_active(queue):
 
 
 @pytest.mark.asyncio
+async def test_active_excludes_paused_by_default_but_include_paused_surfaces_it(queue):
+    """D3.2 review deferral: `active()` must keep excluding a paused row by
+    default (the injection-visibility contract every existing caller
+    relies on) while giving the Second-brain UI list an explicit way to ask
+    for it back — a paused row stays visible there (`Paused` chip, so
+    Restore is discoverable) even though it stays invisible to
+    injection."""
+    mem_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "x"})
+    assert await queue.confirm(mem_id) is True
+    assert await queue.pause(mem_id) is True
+
+    assert await queue.active() == [], "a paused row must stay out of the default (injectable) view"
+    with_paused = await queue.active(include_paused=True)
+    assert [r["id"] for r in with_paused] == [mem_id]
+    assert with_paused[0]["paused"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_excludes_archived_by_default_but_include_archived_surfaces_it(queue):
+    """D3.2 review-round fix: Delete only archives (`LearningQueue.delete`),
+    never a real DELETE FROM — but a caller with no way to ask for the
+    archived row back makes that recoverability theoretical. Mirrors
+    `include_paused` above."""
+    mem_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "x"})
+    assert await queue.confirm(mem_id) is True
+    assert await queue.delete(mem_id) is True
+
+    assert await queue.active() == [], "an archived row must stay out of the default view"
+    with_archived = await queue.active(include_archived=True)
+    assert [r["id"] for r in with_archived] == [mem_id]
+    assert with_archived[0]["archived"] == 1
+
+
+@pytest.mark.asyncio
 async def test_reject_removes_proposal(queue):
     mem_id = await queue.propose_from_outcome(
         _task(), status=TaskStatus.ESCALATED,

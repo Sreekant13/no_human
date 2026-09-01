@@ -97,6 +97,34 @@ export function learningOrigin(item) {
   return o || null;
 }
 
+// The task a learning was harvested FROM, for the Second-brain row's "origin
+// task" link — distinct from `learningOrigin` above, which names WHICH
+// PRODUCER proposed it (review/history/supervisor), not which task.
+//
+// Reads the same structured `evidence` JSON `learningEvidence` already
+// parses (raw JSON string or pre-parsed object), preferring the row's own
+// `evidence.task_id`, then the first entry of `evidence.task_ids` (the
+// supervisor-correction shape), then the first of `evidence.recurrences`
+// (dedupe's cross-task record — see `Store.record_recurrence`). Returns null
+// — never throws — where the row genuinely records no task, the same
+// honesty stance `learningOrigin` takes for a missing producer.
+export function learningOriginTaskId(item) {
+  if (!item) return null;
+  let ev = item.evidence;
+  if (typeof ev === "string") {
+    try {
+      ev = JSON.parse(ev);
+    } catch {
+      return null;
+    }
+  }
+  if (!ev || typeof ev !== "object" || Array.isArray(ev)) return null;
+  if (ev.task_id) return String(ev.task_id);
+  if (Array.isArray(ev.task_ids) && ev.task_ids.length) return String(ev.task_ids[0]);
+  if (Array.isArray(ev.recurrences) && ev.recurrences.length) return String(ev.recurrences[0]);
+  return null;
+}
+
 // Free-text filter over a learning list. 329 pending rows do not triage one
 // click at a time and they do not triage by scrolling either.
 //

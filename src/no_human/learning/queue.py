@@ -1121,9 +1121,37 @@ class LearningQueue:
         return await self.store.list_memories(
             confirmed=False, source=SOURCE_PROPOSED)
 
-    async def active(self) -> list[dict[str, Any]]:
-        """The confirmed, active rule/skill set later tasks consult."""
-        return await self.store.list_memories(confirmed=True)
+    async def active(
+        self, *, include_paused: bool = False, include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """The confirmed, active rule/skill set later tasks consult.
+
+        ``include_paused`` defaults OFF, matching `Store.list_memories`: a
+        paused row must never reach a prompt via this call — though note
+        that injection itself (`orchestrator.py:_load_active_memories`)
+        reads `Store.list_memories` DIRECTLY, not through this method, so
+        this default protects this method's OTHER two callers instead: `nh
+        learnings`'s count/stale reports (`cli/commands.py`), which must
+        keep excluding a paused row from "active" the same way the prompt
+        does. D3 (2026-09-01 review deferral): the Second-brain UI's list
+        needs the opposite — a paused row must stay VISIBLE in the panel (a
+        `Paused` chip, so Restore is discoverable) even though it is
+        invisible to injection — so the one caller that renders the UI list
+        (`GET /api/learnings?active=true&include_paused=true`) passes
+        ``True`` here explicitly rather than this method silently deciding
+        for it.
+
+        ``include_archived`` (D3.2 fix-review, 2026-09-01): the Second-brain
+        UI's Delete action archives, never really deletes
+        (`LearningQueue.delete`) — a caller that never asks for archived rows
+        back makes that recoverability theoretical. The same UI passes
+        ``True`` here (mirroring the Rules/Skills `MemoryList` panel's own
+        `fetchFn({includeArchived: true})` convention) so the archived rows
+        are on hand for its own archived-count footer to reveal, same as
+        `include_paused` above — nothing else calls this with either flag on."""
+        return await self.store.list_memories(
+            confirmed=True, include_paused=include_paused,
+            include_archived=include_archived)
 
     async def stale(self, *, days: int) -> list[dict[str, Any]]:
         """Confirmed rules not injected into a prompt in *days* — a report, and

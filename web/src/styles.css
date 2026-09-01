@@ -1674,6 +1674,11 @@ a.card-pr-badge:focus-visible,
 .memory-card-remove:focus-visible,
 .project-repo-action:focus-visible,
 .learning-filter:focus-visible,
+/* Second-brain row's origin-task link (D3.2): a <button> styled as an
+   inline link, so it needs the same ring every other custom-styled control
+   in this list gets — the base <a>/<button> UA outline would otherwise be
+   the only thing distinguishing it from the plain-text meta beside it. */
+.second-brain-task-link:focus-visible,
 .card-action:focus-visible {
   outline: 2px solid var(--accent-500);
   outline-offset: 2px;
@@ -5248,6 +5253,103 @@ a.so-chip-value:hover { color: var(--accent-300); }
   font-size: 12px;
   color: var(--text-dim);
   margin: -6px 0 12px;
+}
+
+/* ── Second brain (D3.2) ──────────────────────────────────────────────────
+   Same width cap as every other memory-panel; named separately so a future
+   Second-brain-only layout tweak has its own selector instead of reaching
+   back into the shared .memory-panel rule. */
+.second-brain-panel {
+  max-width: 800px;
+}
+
+/* Auto-managed line: a fact ("here's the cap, here's the retirement rule"),
+   not a warning — so it gets the same tint-card treatment as the explainer
+   above it, not the amber blast-radius vocabulary. */
+.learning-auto-line {
+  font-size: 13px; color: var(--text-muted); line-height: 1.55;
+  margin: -4px 0 14px;
+}
+.second-brain-cap { color: var(--text-hi); font-variant-numeric: tabular-nums; }
+
+.second-brain-list { display: flex; flex-direction: column; gap: 10px; }
+
+.second-brain-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* A tint, not a stripe (craft directive) — the whole card takes on the warn
+   hue at low opacity rather than a coloured border-left. */
+.second-brain-row.paused {
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-card));
+  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
+}
+
+.second-brain-row-text {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.second-brain-row-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.second-brain-task-link {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--cyan);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.second-brain-task-link:hover { color: var(--accent-500); }
+
+.second-brain-origin-unknown {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.second-brain-used {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Same tint formula as .second-brain-row.paused, at chip strength — the
+   "Paused" state's own colour vocabulary, applied consistently rather than
+   inventing a second amber recipe for the same fact. */
+.second-brain-paused-chip {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+}
+
+.second-brain-row-actions {
+  display: flex;
+  gap: 8px;
+}
+.second-brain-row-actions .btn { flex: 0 0 auto; }
+
+/* Review-round fix (#1): the archived-count footer. `.memory-archive-toggle`
+   itself is the Rules/Skills panel's existing rule, reused verbatim — this
+   only adds the vertical rhythm a footer needs that a header-row toggle
+   (its usual home) does not. */
+.second-brain-archived-toggle {
+  margin: 14px 0 10px;
 }
 
 .btn-sm {

@@ -8,6 +8,7 @@ import {
   fetchProfiles, detectRepos, onboardRepo,
   fetchAuthStatus, setAuthToken, setCodexMode, setCodexKey, fetchVersion,
   fetchRetireCandidates, retireLearning, restoreLearning,
+  pauseLearning, deleteLearning, fetchConfig,
   fetchQuarantineCounts, fetchTelemetryConsent, saveTelemetryConsent,
 } from "./api.js";
 import { archiveBadge, archivedCount, visibleMemories } from "./memoryArchive.js";
@@ -21,6 +22,7 @@ import {
   filterLearnings,
   learningEvidence,
   learningOrigin,
+  learningOriginTaskId,
   learningScope,
   memoryUsageSummary,
 } from "./learningCard.js";
@@ -35,7 +37,14 @@ const SECTIONS = [
   { key: "projects",  label: "Projects" },
   { key: "rules",     label: "Rules" },
   { key: "skills",    label: "Skills" },
-  { key: "learnings", label: "Learnings" },
+  // Operator directive (D3, 2026-08-31; hotfix 2026-09-01): the learnings
+  // pane is now "Second brain" everywhere — this is its ONLY surface (the
+  // sidebar row and its own page were removed from App.jsx). Section `key`
+  // stays "learnings" — it is the SettingsOverlay routing key, an internal
+  // identifier the operator never sees, and changing it would break every
+  // `?tab=learnings` deep link (FinishSetupCard, the "!" nudge) for no
+  // visible benefit.
+  { key: "learnings", label: "Second brain" },
   { key: "integrations", label: "Integrations" },
   { key: "models",    label: "Models" },
   { key: "account",   label: "Account" },
@@ -468,7 +477,7 @@ function CodexSection({ codex, onStatus }) {
 // left section list and the section's panel content on the right — not a
 // routed page. Mirrors the SlideOver focus/Escape pattern (SlideOver.jsx),
 // so it behaves like the app's other modal surfaces.
-export default function SettingsOverlay({ onClose, initialTab }) {
+export default function SettingsOverlay({ onClose, initialTab, onOpenTask }) {
   // A Finish-setup deep link (App passes initialTab) opens the overlay on the
   // matching pane. An unknown tab (e.g. "docs"/"history", which have no pane of
   // their own yet) falls back to Projects rather than a blank content area.
@@ -627,7 +636,7 @@ export default function SettingsOverlay({ onClose, initialTab }) {
             {section === "projects"  && <ProjectsPanel />}
             {section === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
             {section === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
-            {section === "learnings" && <LearningsPanel />}
+            {section === "learnings" && <LearningsPanel onOpenTask={onOpenTask} />}
             {section === "integrations" && <IntegrationsPanel />}
             {section === "models"      && <ModelsPanel />}
             {section === "account"     && <AuthPanel />}
@@ -892,9 +901,378 @@ function AddMemoryModal({ kind, onClose, onSaved, addFn }) {
   );
 }
 
-/* ── Learnings queue ─────────────────────────────────────────────────────── */
+/* ── Second brain (D3.2) ─────────────────────────────────────────────────── */
+//
+// One entry point, two renderings. `config learning.auto_manage` (default
+// True) is the kill switch the D3 operator directive requires to exist
+// BEFORE the auto-activation default flips — it governs `HarvestJob`
+// server-side, and this component mirrors it on the UI side: the confirm
+// queue it restores has to actually be reachable, or the switch would
+// silence auto-activation while leaving every proposal it stops auto-
+// activating permanently invisible (queued, unconfirmed, no UI to confirm
+// it from). So the panel branches:
+//   - `auto_manage: true`  (default) → SecondBrainPanel: no pending queue,
+//     no Confirm buttons, no bulk bar — everything auto-activates or
+//     auto-archives, and the human's only actions are Pause/Delete/Restore.
+//   - `auto_manage: false` (kill switch) → LegacyLearningQueuePanel: the
+//     pre-D3 confirm queue, byte-for-byte unchanged, so flipping the switch
+//     back really does "restore the confirm queue" the directive names, not
+//     just the write path behind it.
+export function LearningsPanel({ onOpenTask } = {}) {
+  const [autoManage, setAutoManage] = useState(true);
+  const [dailyCap, setDailyCap] = useState(10);
 
-export function LearningsPanel() {
+  useEffect(() => {
+    let alive = true;
+    fetchConfig()
+      .then((cfg) => {
+        if (!alive) return;
+        const lc = (cfg && cfg.learning) || {};
+        // Mirrors the Python default (`config.py`: `"auto_manage": True`) —
+        // only an explicit `false` restores the legacy queue; a missing key
+        // (older config, or a fetch that raced ahead of a default merge)
+        // must not be misread as the kill switch being armed.
+        setAutoManage(lc.auto_manage !== false);
+        setDailyCap(Number(lc.auto_activate_daily_cap) || 10);
+      })
+      .catch(() => { /* best-effort: keep the auto-managed default */ });
+    return () => { alive = false; };
+  }, []);
+
+  return autoManage
+    ? <SecondBrainPanel dailyCap={dailyCap} onOpenTask={onOpenTask} />
+    : <LegacyLearningQueuePanel />;
+}
+
+// The new, understandable surface (D3 design point 2): the D2 explainer,
+// then "what it learned" — search + plain-language rows — then the
+// Auto-managed line. No pending queue, no Confirm/Reject, no bulk bar: a
+// harvested learning that passes the screens is already active by the time
+// this list would show it (`LearningQueue.auto_activate`), and one that
+// doesn't was already archived, not queued — there is nothing left here for
+// a human to triage. The 90-day retire suggestion (Memory lifecycle C) is
+// likewise gone from THIS panel: for an auto-activated row it is no longer a
+// suggestion, `retire.py:sweep_auto_activated` retires it outright, and an
+// operator-pinned/manually-added row is exempt by construction (never
+// selected by that sweep) — so there is no "retire?" decision left for
+// either kind of row to ask the human about.
+function SecondBrainPanel({ dailyCap, onOpenTask }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [query, setQuery] = useState("");
+  // Review-round fix: EVERY row used to share one `busyId`, so clicking
+  // Pause on row B while row A's own POST was still in flight silently did
+  // nothing — B never went disabled, so the click looked dropped rather
+  // than "wait your turn". Each row now guards only ITSELF; unrelated rows
+  // stay fully clickable, matching what a caller can actually observe (its
+  // OWN button, not some other row's).
+  const [busyIds, setBusyIds] = useState(() => new Set());
+  const [quarantined, setQuarantined] = useState(0);
+  // Review-round fix (#1): Delete only ARCHIVES server-side
+  // (`LearningQueue.delete`) — recoverable in principle — but this panel
+  // used to fetch active+paused only, so a deleted row vanished with no
+  // confirm and no way back except knowing its id. Same shape as the
+  // Rules/Skills `MemoryList` panel just below: fetch archived rows too,
+  // keep them out of the main list, and reveal them from an archived-count
+  // footer reusing that panel's own archiveBadge/archivedCount/
+  // visibleMemories helpers — not a new pattern invented for this one panel.
+  const [showArchived, setShowArchived] = useState(false);
+  // Manual add (operator ask: "they can add stuff there") — operator-pinned,
+  // confirmed on arrival, and NEVER auto-retired (`curator.py`'s pinned-
+  // exempt rule): the one control this panel keeps unconditionally.
+  const [newRule, setNewRule] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    // `includePaused: true` — review deferral (2026-09-01): a paused row
+    // must stay visible here (its own `Paused` chip) so Restore is
+    // discoverable, even though `list_memories`'s default (and every
+    // injection read) still excludes it. `includeArchived: true` — review-
+    // round fix #1, same reasoning, for a Delete-archived row.
+    fetchLearnings({ active: true, includePaused: true, includeArchived: true })
+      .then((rows) => { setItems(rows); setError(null); })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+    // Best-effort, same as the legacy panel: a footer count that fails to
+    // load is silent, not a second error banner over a list that loaded fine.
+    fetchQuarantineCounts()
+      .then((c) => setQuarantined(c.learnings || 0))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function addBrainRule() {
+    const content = newRule.trim();
+    if (!content || adding) return;
+    setAdding(true);
+    setError(null);
+    try {
+      // Title = the first line, capped; the whole text is the rule body. A
+      // hand-written rule is confirmed on arrival, so it lands straight in
+      // the list.
+      const title = content.split("\n")[0].slice(0, 80);
+      await addRule({ title, content });
+      setNewRule("");
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function runAction(id, action) {
+    if (busyIds.has(id)) return;
+    setBusyIds((s) => new Set(s).add(id));
+    try {
+      await action(id);
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusyIds((s) => { const n = new Set(s); n.delete(id); return n; });
+    }
+  }
+
+  const handlePause = (id) => runAction(id, pauseLearning);
+  const handleDelete = (id) => runAction(id, deleteLearning);
+  const handleRestore = (id) => runAction(id, restoreLearning);
+
+  // `liveItems` excludes archived (same predicate `visibleMemories` already
+  // applies for Rules/Skills when its "Show archived" box is unchecked) —
+  // everything the header count, the search filter and the main list work
+  // off of. `archivedItems` is the other side of that same split, reserved
+  // for the footer below; `archivedCount` is the Rules/Skills panel's own
+  // helper, unchanged.
+  const liveItems = visibleMemories(items, { showArchived: false });
+  const archivedTotal = archivedCount(items);
+  const archivedItems = items.filter((it) => it && it.archived);
+  const visible = filterLearnings(liveItems, query);
+
+  return (
+    <div className="memory-panel second-brain-panel">
+      <div className="memory-header">
+        {/* See MemoryList: redundant with the overlay header's own title. */}
+        <h3 className="memory-title">
+          <span className="panel-title-text">Second brain</span>
+          {!loading && <span className="memory-count">{liveItems.length}</span>}
+        </h3>
+      </div>
+      {/* D2 explainer, VERBATIM from the spec — this is the "!" nudge's real
+          destination, not a rewrite of it. */}
+      <p className="learning-explainer">
+        Your second brain. no_human learns from every task — what worked, what
+        broke, your repo's rules — and applies it automatically to the next
+        task. Nothing to approve. Review or pause anything here.
+      </p>
+      <p className="learning-auto-line">
+        Auto-managed — up to{" "}
+        <strong className="second-brain-cap">{dailyCap}</strong> new learnings
+        activate a day; ones it activated on its own retire automatically
+        after 90 days unused. Rules you add yourself are never auto-retired.
+      </p>
+      {/* Manual add (operator ask: "add stuff there"). */}
+      <div className="learning-add">
+        <textarea
+          className="learning-add-input"
+          rows={2}
+          placeholder="Add a rule the AI should always follow — e.g. &quot;Always run the linter before opening a PR.&quot;"
+          value={newRule}
+          onChange={(e) => setNewRule(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addBrainRule(); }}
+        />
+        <button
+          type="button"
+          className="btn btn-approve btn-sm"
+          disabled={!newRule.trim() || adding}
+          onClick={addBrainRule}
+        >
+          {adding ? "Adding…" : "Add rule"}
+        </button>
+      </div>
+      {error && <div className="settings-error">{error}</div>}
+      {!loading && liveItems.length > 0 && (
+        <div className="learning-toolbar">
+          <input
+            type="search"
+            className="learning-filter"
+            placeholder="Filter by title, content, type, origin or project…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Filter what your second brain learned"
+          />
+          <span className="learning-filter-count">
+            {visible.length === liveItems.length
+              ? `${liveItems.length}`
+              : `${visible.length} of ${liveItems.length}`}
+          </span>
+        </div>
+      )}
+      {loading ? (
+        <div className="settings-empty">Loading…</div>
+      ) : liveItems.length === 0 ? (
+        <div className="settings-empty">
+          Nothing learned yet. Your second brain fills in as tasks run —
+          check back after a few have gone through.
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="settings-empty">
+          No learning matches “{query}”.
+        </div>
+      ) : (
+        <div className="memory-list second-brain-list">
+          {visible.map((item) => (
+            <SecondBrainRow
+              key={item.id}
+              item={item}
+              busy={busyIds.has(item.id)}
+              onPause={handlePause}
+              onDelete={handleDelete}
+              onRestore={handleRestore}
+              onOpenTask={onOpenTask}
+            />
+          ))}
+        </div>
+      )}
+      {/* Review-round fix (#1): Delete is one click and (until now) looked
+          irreversible — the row just vanished. Same "Show archived (N)"
+          idiom the Rules/Skills panel already uses (`.memory-archive-toggle`,
+          reused verbatim below), so a deleted learning is exactly as
+          recoverable, in exactly the same place an operator already knows
+          to look for a Rules/Skills undo. */}
+      {!loading && archivedTotal > 0 && (
+        <label className="memory-archive-toggle second-brain-archived-toggle">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={(e) => setShowArchived(e.target.checked)}
+          />
+          {" "}Show archived ({archivedTotal})
+        </label>
+      )}
+      {showArchived && archivedItems.length > 0 && (
+        <div className="memory-list second-brain-list">
+          {archivedItems.map((item) => (
+            <SecondBrainRow
+              key={item.id}
+              item={item}
+              busy={busyIds.has(item.id)}
+              onPause={handlePause}
+              onDelete={handleDelete}
+              onRestore={handleRestore}
+              onOpenTask={onOpenTask}
+            />
+          ))}
+        </div>
+      )}
+      {!loading && quarantineFooterLabel(quarantined) && (
+        <div className="settings-empty">{quarantineFooterLabel(quarantined)}</div>
+      )}
+    </div>
+  );
+}
+
+// One row: plain-language text · origin task link · used N× · Pause/Delete
+// (D3.2 spec, verbatim shape). A paused OR archived row is "inert" — it
+// shows Restore instead of Pause, and never Delete (an archived row has
+// nothing further to delete). Review deferral (2026-09-01): "a paused row
+// must remain VISIBLE ... so restore is discoverable" — extended in the
+// review round to an archived (Delete-archived) row for the same reason.
+function SecondBrainRow({ item, busy, onPause, onDelete, onRestore, onOpenTask }) {
+  const taskId = learningOriginTaskId(item);
+  const useCount = Number(item.use_count || 0);
+  const paused = Boolean(item.paused);
+  const archived = Boolean(item.archived);
+  const inert = paused || archived;
+  // Reuses the Rules/Skills card's own blast-radius-free label — "Archived"
+  // or "Superseded", the latter naming the survivor id — rather than a
+  // second, second-brain-only vocabulary for the identical server state.
+  const badge = archived ? archiveBadge(item) : null;
+  const text = item.content || item.title || "(no text recorded)";
+  const label = (item.title || text).slice(0, 60);
+
+  return (
+    <div className={`memory-card second-brain-row ph-no-capture${inert ? " paused" : ""}`}>
+      <div className="second-brain-row-text">{text}</div>
+      <div className="second-brain-row-meta">
+        {/* Review-round fix (minor): a control with no handler is a DEAD
+            control — underlined, focusable, and inert on click, which reads
+            as broken rather than as "not wired up yet". Render the same
+            fact as plain text instead whenever there is nowhere for the
+            click to go. */}
+        {taskId && onOpenTask ? (
+          <button
+            type="button"
+            className="second-brain-task-link"
+            onClick={() => onOpenTask(taskId)}
+            aria-label={`Open the task this learning came from (${taskId.slice(0, 8)})`}
+          >
+            from task {taskId.slice(0, 8)}
+          </button>
+        ) : taskId ? (
+          <span>from task {taskId.slice(0, 8)}</span>
+        ) : (
+          <span className="second-brain-origin-unknown">origin not recorded</span>
+        )}
+        {/* Review-round fix: `aria-label` on a bare `<span>` is silently
+            IGNORED by assistive tech — a `<span>`'s implicit ARIA role is
+            `generic`, and the spec prohibits naming a generic role, so the
+            label above was never announced despite compiling and looking
+            correct in markup. The fix is the standard split: the glyph
+            stays visible and `aria-hidden` (screen readers must not read
+            "used 3 times" then "used 3×" back to back), and a
+            visually-hidden `.sr-only` sibling carries the one string a
+            screen reader actually announces. */}
+        <span className="second-brain-used" aria-hidden="true">used {useCount}×</span>
+        <span className="sr-only">{`used ${useCount} time${useCount === 1 ? "" : "s"}`}</span>
+        {paused && !archived && <span className="second-brain-paused-chip">Paused</span>}
+        {badge && <span className="second-brain-paused-chip" title={badge.title}>{badge.label}</span>}
+      </div>
+      <div className="second-brain-row-actions">
+        {inert ? (
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={busy}
+            onClick={() => onRestore(item.id)}
+            aria-label={`Restore "${label}"`}
+          >
+            {busy ? "Restoring…" : "Restore"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={busy}
+            onClick={() => onPause(item.id)}
+            aria-label={`Pause "${label}"`}
+          >
+            {busy ? "Pausing…" : "Pause"}
+          </button>
+        )}
+        {!archived && (
+          <button
+            type="button"
+            className="btn btn-cancel btn-sm"
+            disabled={busy}
+            onClick={() => onDelete(item.id)}
+            aria-label={`Delete "${label}"`}
+          >
+            {busy ? "Deleting…" : "Delete"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// The pre-D3 confirm queue, unchanged, restored whenever
+// `learning.auto_manage: false`. See LearningsPanel's own comment above for
+// why this has to keep working rather than merely being kept for history.
+function LegacyLearningQueuePanel() {
   const [pending, setPending] = useState([]);
   const [active, setActive] = useState([]);
   const [view, setView] = useState("pending");

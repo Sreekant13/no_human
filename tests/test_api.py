@@ -3581,6 +3581,91 @@ async def test_restore_also_unpauses(client, store):
     assert mem_id in {row["id"] for row in active}
 
 
+async def test_list_learnings_active_excludes_paused_by_default(client, store):
+    """D3.2 review deferral: `GET /api/learnings?active=true` must keep
+    excluding a paused row by default — the injection-visibility contract
+    (`Store.list_memories`'s default) is not what's changing here."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    await client.post(f"/api/learnings/{mem_id}/pause")
+
+    r = await client.get("/api/learnings?active=true")
+    assert r.status_code == 200
+    assert mem_id not in {row["id"] for row in r.json()}
+
+
+async def test_list_learnings_active_include_paused_surfaces_the_row(client, store):
+    """D3.2 review deferral: a paused row must remain VISIBLE in the
+    Second-brain panel list (with a `Paused` chip, so Restore is
+    discoverable) even though it stays invisible to injection —
+    `?active=true&include_paused=true` is the one caller allowed to ask for
+    that."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    await client.post(f"/api/learnings/{mem_id}/pause")
+
+    r = await client.get("/api/learnings?active=true&include_paused=true")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.json()}
+    assert mem_id in rows
+    assert rows[mem_id]["paused"] == 1
+
+
+async def test_list_learnings_include_paused_is_a_no_op_on_the_pending_branch(client, store):
+    """A PENDING (unconfirmed) proposal is not what `include_paused` is
+    for — `pending()` takes no such parameter, so the query string must be
+    silently ignored on that branch rather than 422ing a caller that always
+    sends both params regardless of which view it's requesting."""
+    from no_human.learning import LearningQueue, TYPE_RULE
+
+    queue = LearningQueue(store)
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="a proposal", content="x", confirmed=False,
+        source="proposed")
+    assert mem_id is not None
+
+    r = await client.get("/api/learnings?active=false&include_paused=true")
+    assert r.status_code == 200
+    assert mem_id in {row["id"] for row in r.json()}
+
+
+async def test_list_learnings_active_excludes_archived_by_default(client, store):
+    """D3.2 review-round fix: `GET /api/learnings?active=true` must keep
+    excluding a Delete-archived row by default — the same exclusion
+    `Store.list_memories`'s default already gives Rules/Skills."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    await client.post(f"/api/learnings/{mem_id}/delete")
+
+    r = await client.get("/api/learnings?active=true")
+    assert r.status_code == 200
+    assert mem_id not in {row["id"] for row in r.json()}
+
+
+async def test_list_learnings_active_include_archived_surfaces_the_deleted_row(client, store):
+    """D3.2 review-round fix: Delete only archives (never a real DELETE
+    FROM), but a UI that can never ask for the archived row back makes that
+    recoverability theoretical. `?active=true&include_archived=true` is the
+    Second-brain panel's own archived-count footer asking for it."""
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="active rule", content="x", confirmed=True)
+    await client.post(f"/api/learnings/{mem_id}/delete")
+
+    r = await client.get("/api/learnings?active=true&include_archived=true")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.json()}
+    assert mem_id in rows
+    assert rows[mem_id]["archived"] == 1
+
+
 @pytest.mark.asyncio
 async def test_pause_on_inflight_task_requests_cancel_and_leaves_status_to_the_worker(
         client, store):

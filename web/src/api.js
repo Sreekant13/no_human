@@ -324,8 +324,19 @@ export async function removeSkill(id) {
   return r.json();
 }
 
-export async function fetchLearnings({ active = false } = {}) {
-  const r = await fetch(`${BASE}/api/learnings?active=${active}`);
+// `includePaused` (D3.2 review deferral): the Second-brain panel's list must
+// keep showing a paused row (its own `Paused` chip, so Restore is
+// discoverable) even though `list_memories`'s default hides it from every
+// OTHER caller, injection included. `includeArchived` (D3.2 review-round
+// fix): the same panel's Delete only archives, never really deletes — a
+// caller that never asks for the archived row back makes that
+// recoverability theoretical, so the panel's own archived-count footer
+// passes this to get it back. Both are only meaningful with `active: true` —
+// see `GET /api/learnings`'s docstring for why either flag is a harmless
+// no-op on the pending branch rather than something this client has to gate
+// on.
+export async function fetchLearnings({ active = false, includePaused = false, includeArchived = false } = {}) {
+  const r = await fetch(`${BASE}/api/learnings?active=${active}&include_paused=${includePaused}&include_archived=${includeArchived}`);
   if (!r.ok) throw new Error(`GET /api/learnings → ${r.status}`);
   return r.json();
 }
@@ -345,6 +356,24 @@ export async function confirmLearning(id) {
 export async function rejectLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/reject`, { method: "POST" });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST reject → ${r.status}`)); }
+  return r.json();
+}
+
+// D3: the Second-brain UI's Pause action — the row stays (recoverable),
+// never injected again. Idempotent on the server (pausing an already-paused
+// row is a no-op 200, not an error).
+export async function pauseLearning(id) {
+  const r = await fetch(`${BASE}/api/learnings/${id}/pause`, { method: "POST" });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST pause → ${r.status}`)); }
+  return r.json();
+}
+
+// D3: the Second-brain UI's Delete action — archives the row, never a real
+// delete (mirrors the curator's never-deletes invariant); recoverable via
+// restoreLearning.
+export async function deleteLearning(id) {
+  const r = await fetch(`${BASE}/api/learnings/${id}/delete`, { method: "POST" });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST delete → ${r.status}`)); }
   return r.json();
 }
 

@@ -1387,7 +1387,24 @@ export default function App() {
           onStopQueue={stopQueue}
         />
       )}
-      {settingsOpen && <SettingsOverlay initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(null); }} />}
+      {settingsOpen && (
+        <SettingsOverlay
+          initialTab={settingsTab}
+          onClose={() => { setSettingsOpen(false); setSettingsTab(null); }}
+          // Second-brain row's "origin task" link: close Settings, land on the
+          // board, and open that task — the same pendingOpenId hand-off the
+          // "needs you" desktop notification already uses (Board is
+          // conditionally mounted, so a direct openTask() call here would be
+          // lost whenever Settings was opened from a page other than the
+          // board).
+          onOpenTask={(id) => {
+            setSettingsOpen(false);
+            setSettingsTab(null);
+            setPage("board");
+            setPendingOpenId(id);
+          }}
+        />
+      )}
       {showShortcuts && <ShortcutsDialog isDesktop={Boolean(window.nhDesktop)} onClose={() => setShowShortcuts(false)} />}
     </div>
   );

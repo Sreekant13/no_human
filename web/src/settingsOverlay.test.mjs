@@ -18,13 +18,16 @@ const stylesCss = readFileSync(here + "styles.css", "utf8");
 
 test("the Config section is gone: no ConfigPanel, no config entry in the section list", () => {
   assert.doesNotMatch(settingsJsx, /ConfigPanel/, "ConfigPanel must be removed");
-  assert.doesNotMatch(settingsJsx, /fetchConfig/, "fetchConfig import/usage must be removed");
-  // The section list (formerly TABS) must not carry a "config" key or "Config" label.
+  // fetchConfig itself came BACK (D3.2, 2026-09-01) for an unrelated reason —
+  // the Second-brain pane reads `config.learning.auto_manage` to decide which
+  // of its two renderings to show — so it is no longer a valid proxy for "the
+  // removed Config panel is gone". What actually matters, still asserted
+  // directly: no ConfigPanel component and no "config" section/label.
   assert.doesNotMatch(settingsJsx, /key:\s*["']config["']/);
   assert.doesNotMatch(settingsJsx, /label:\s*["']Config["']/);
 });
 
-test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Updates", () => {
+test("the section list covers Projects, Rules, Skills, Second brain, Integrations, Account, Updates", () => {
   // The name used to claim "exactly" while only checking presence, so adding a
   // section quietly made the title a lie. Both directions are asserted now:
   // every expected label is there, and the list holds nothing else.
@@ -32,7 +35,10 @@ test("the section list covers Projects, Rules, Skills, Learnings, Integrations, 
   // is on by default and no longer surfaced in the UI, so the pane is gone.
   // "Models" is the model-picker pane (part 3 of 3): one row per role, fed by
   // GET /api/models — see modelsPanelView.test.mjs.
-  const expected = ["Projects", "Rules", "Skills", "Learnings", "Integrations",
+  // "Second brain" (D3.2, 2026-09-01 hotfix): the learnings pane was renamed
+  // and is now the ONLY surface for it — see sidebarNav.test.mjs for the
+  // sidebar-row removal this pairs with.
+  const expected = ["Projects", "Rules", "Skills", "Second brain", "Integrations",
                     "Models", "Account", "Updates"];
   for (const label of expected) {
     assert.match(settingsJsx, new RegExp(`label:\\s*["']${label}["']`), `missing section: ${label}`);

@@ -266,7 +266,15 @@ FROZEN_FILE_LINES = {
     # `.../delete` routes, `restore`'s pause-aware rewrite (undoes archive
     # AND pause in one call), and the `RetirementSweepJob` construction's
     # `auto_manage`/`auto_retire_days` config threading. Re-anchored on merge.
-    "api/app.py": 5714,
+    # 5714 -> 5723 (+9): D3.2 — `GET /api/learnings` grows an `include_paused`
+    # query param (and its docstring) so the Second-brain UI's list can ask
+    # for a paused row back after it stops excluding it by default. Measured
+    # directly against this branch's tree.
+    # 5723 -> 5737 (+14): D3.2 review-round fix #1 — the same route grows an
+    # `include_archived` param (and its docstring) so the Second-brain UI's
+    # archived-count footer can ask a Delete-archived row back too. Measured
+    # directly against this branch's tree.
+    "api/app.py": 5737,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

@@ -180,8 +180,9 @@ if (await settingsNav.count()) {
   await page.waitForTimeout(400);
   // Section list and class verified against src/Settings.jsx SECTIONS + the
   // `.settings-overlay-navitem` nav. NOT `.settings-tab` — that class belongs to the
-  // Learnings sub-tabs — and there is no "Config" section at all. e2e/sweep.mjs asks
-  // for both and swallows the miss in a try/catch.
+  // Second-brain pane's own Pending/Active sub-tabs (rendered only in the D3
+  // kill-switch/`auto_manage: false` view) — and there is no "Config" section
+  // at all. e2e/sweep.mjs asks for both and swallows the miss in a try/catch.
   //
   // 🖐️ CORRECTION. An earlier version of this comment, and the commit message that
   // shipped it, said sweep therefore "saves the default settings screen six times per
@@ -192,7 +193,7 @@ if (await settingsNav.count()) {
   // 2026-07-18 run against an older UI that did have a `.settings-tab` nav and a
   // Config section. Reading stale artifacts as current evidence is the same mistake
   // as trusting a file:line without re-checking it.
-  for (const label of ["Projects", "Rules", "Skills", "Learnings", "Integrations", "Account"]) {
+  for (const label of ["Projects", "Rules", "Skills", "Second brain", "Integrations", "Account"]) {
     const tab = page.locator(`.settings-overlay-navitem:has-text('${label}')`);
     // A tab that cannot be opened is a FAILURE, not a skip. A silent skip is
     // indistinguishable from a pass, and that is the bug class this file exists for.
