@@ -2438,14 +2438,19 @@ def test_every_line_citation_currently_resolves_exactly():
 
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
-    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:1935` inside
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2103` inside
     `update_attempt` and `orchestrator.py:4559` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
+
+    Re-anchored 2026-09-01: P5's `list_tasks(limit=, offset=)` pagination and
+    its review-round-1 `rowid DESC` tie-break together added 18 lines above
+    this call inside db.py (most recently to 2103 on the P5 merge); the citation is re-verified
+    against the code, not carried forward blind.
     """
-    assert "db.py:2085" in known_issues_doc, (
-        "the traceback no longer cites db.py:2085 — this test is pointed at "
+    assert "db.py:2103" in known_issues_doc, (
+        "the traceback no longer cites db.py:2103 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4559" in known_issues_doc, (
@@ -2456,13 +2461,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 2085 <= len(db_lines), "db.py is now shorter than line 2085"
-    assert db_lines[2084].strip() == "await self.db.commit()", (
-        f"db.py:2085 is now {db_lines[2084]!r}, not the commit the traceback "
+    assert 1 <= 2103 <= len(db_lines), "db.py is now shorter than line 2103"
+    assert db_lines[2102].strip() == "await self.db.commit()", (
+        f"db.py:2103 is now {db_lines[2102]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (
-        "line 2085 is no longer inside update_attempt's body"
+        "line 2103 is no longer inside update_attempt's body"
     )
 
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")

@@ -1448,16 +1448,34 @@ class Store:
             return Task.from_row(dict(rows[0]))
         return None
 
-    async def list_tasks(self, status: TaskStatus | None = None) -> list[Task]:
-        if status is not None:
-            rows = await self._fetchall(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC",
-                (status.value,),
-            )
-        else:
-            rows = await self._fetchall(
-                "SELECT * FROM tasks ORDER BY created_at DESC"
-            )
+    async def list_tasks(
+        self,
+        status: TaskStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[Task]:
+        """`limit`/`offset` (P5, fleet finding 6468d631) are pushed down to
+        SQL, not sliced in Python after a full fetch — a page must not still
+        pay the full-table row-hydration cost. `None` (every pre-P5 caller)
+        is exactly the old unbounded query.
+
+        `rowid DESC` is the tie-break (review round 1) — same reasoning as
+        `list_claimable_tasks`'s `rowid ASC`, mirrored for direction:
+        `created_at` is an ISO-8601 string, so rows created in the same tight
+        loop (`/split`'s children) can share one value, and without a
+        tie-break their relative order is not part of the SQL contract —
+        nothing stops it differing between two separate `LIMIT`/`OFFSET`
+        calls (a page boundary landing inside a tie), which would duplicate
+        or drop a row across pages.
+        """
+        params: tuple = (status.value,) if status is not None else ()
+        where = "WHERE status = ? " if status is not None else ""
+        sql = f"SELECT * FROM tasks {where}ORDER BY created_at DESC, rowid DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params = params + (limit, offset or 0)
+        rows = await self._fetchall(sql, params)
         return [Task.from_row(dict(r)) for r in rows]
 
     async def list_claimable_tasks(self, status: TaskStatus) -> list[Task]:

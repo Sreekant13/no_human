@@ -315,7 +315,10 @@ FROZEN_FILE_LINES = {
     # (review_checklist/verifier_results/test_results) `AttemptOut` no longer
     # inlines. Measured directly against this branch's tree
     # (`len(Path(...).read_text().splitlines())`, the scanner's own metric).
-    "api/app.py": 5760,
+    # 5760 -> 5797 (+37): P5 — opt-in ?limit/?offset pagination on GET
+    # /api/tasks (validated Query params + docstring rationale). Measured on
+    # the P5 merge result.
+    "api/app.py": 5797,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -368,7 +371,10 @@ FROZEN_FILE_LINES = {
     # `_critical()` is reentrant per (Store, owning asyncio task).
     # 4562 -> 4841 (+279): re-anchored on rebase onto main (measured directly
     # on this tree with the scanner below).
-    "core/db.py": 4841,
+    # 4841 -> 4859 (+18): P5 — SQL-pushed pagination in Store.list_tasks with
+    # the rowid tie-break + its rationale docstring. Measured on the P5 merge
+    # result.
+    "core/db.py": 4859,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

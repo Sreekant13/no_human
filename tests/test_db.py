@@ -231,6 +231,75 @@ async def test_list_tasks_is_newest_first(store):
     assert pend_ids == [newest.id, middle.id, oldest.id]
 
 
+async def test_list_tasks_limit_offset_pushdown(store):
+    """P5: `?limit/offset` on GET /api/tasks is pushed down to SQL — a page
+    request must not hydrate every row and slice in Python (that would still
+    pay the full 700+-row cost on the production fleet, just later)."""
+    ids = []
+    for i in range(10):
+        t = Task.new(f"t{i}", repo_path="/r")
+        t.created_at = f"2026-08-{i + 1:02d}T08:00:00+00:00"
+        await store.create_task(t)
+        ids.append(t.id)
+    ids.reverse()  # newest first, matching ORDER BY created_at DESC
+
+    page1 = await store.list_tasks(limit=3)
+    assert [t.id for t in page1] == ids[:3]
+
+    page2 = await store.list_tasks(limit=3, offset=3)
+    assert [t.id for t in page2] == ids[3:6]
+
+    # No limit → unchanged full-list behavior (existing callers/tests).
+    full = await store.list_tasks()
+    assert [t.id for t in full] == ids
+
+
+async def test_list_tasks_created_at_tie_spanning_a_page_boundary(store):
+    """Review finding: `ORDER BY created_at DESC` alone has no tie-break, and
+    `list_claimable_tasks` (this file, oldest-first sibling) documents why
+    that's live: `created_at` is an ISO string, and rows created in the same
+    tight loop (e.g. `/split`'s children) can share one value. A tie must
+    still resolve DETERMINISTICALLY and consistently with the DESC ("newest
+    first") convention this query promises — most-recently-created of a tied
+    group first, mirroring the sibling's own `rowid` tie-break — not to
+    whatever order SQLite's query planner happens to produce absent one,
+    which is not part of the SQL contract and cannot be relied on to stay
+    stable across a plan change. Six rows share ONE `created_at`, split
+    across a limit=3 page boundary."""
+    ids = []
+    for i in range(6):
+        t = Task.new(f"tie{i}", repo_path="/r")
+        t.created_at = "2026-08-15T08:00:00+00:00"
+        await store.create_task(t)
+        ids.append(t.id)
+    # DESC + a rowid tie-break must put the LAST-inserted (highest rowid) of
+    # the tied group first, same direction as created_at DESC itself.
+    expected = list(reversed(ids))
+
+    page1 = await store.list_tasks(limit=3, offset=0)
+    page2 = await store.list_tasks(limit=3, offset=3)
+    paged = [t.id for t in page1] + [t.id for t in page2]
+    assert paged == expected, (
+        "a created_at tie spanning the page boundary did not resolve "
+        "deterministically DESC by rowid — list_tasks needs the same "
+        "tie-break as list_claimable_tasks"
+    )
+    assert sorted(paged) == sorted(ids), (
+        "paging across the tie must recover every row exactly once"
+    )
+
+
+async def test_list_tasks_limit_offset_composes_with_status(store):
+    a = Task.new("a", repo_path="/r")
+    b = Task.new("b", repo_path="/r")
+    a.created_at = "2026-08-01T08:00:00+00:00"
+    b.created_at = "2026-08-02T08:00:00+00:00"
+    await store.create_task(a)
+    await store.create_task(b)
+    page = await store.list_tasks(TaskStatus.PENDING, limit=1)
+    assert [t.id for t in page] == [b.id]
+
+
 async def test_list_claimable_tasks_is_oldest_first(store):
     """The scheduler's claim query is the exact reverse of the board's, and
     ties (identical `created_at`) break on ascending rowid — insertion

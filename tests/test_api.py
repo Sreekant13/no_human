@@ -153,6 +153,110 @@ async def test_list_tasks_survives_naive_updated_at(client, store):
     assert corrupt_card["wall_seconds"] >= 0
 
 
+# --------------------------------------------------------------------------- #
+# P5: GET /api/tasks?limit/offset                                             #
+# --------------------------------------------------------------------------- #
+
+async def _seed_n_tasks(store: Store, n: int) -> list[str]:
+    """Newest-first ids to match `_board_tasks`'s ORDER BY created_at DESC."""
+    ids = []
+    for i in range(n):
+        t = Task.new(f"fleet-{i:04d}", repo_path="/tmp/repo")
+        t.acceptance_criteria = ["Should work"]
+        t.created_at = f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00"
+        await store.create_task(t)
+        ids.append(t.id)
+    ids.reverse()
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_no_params_stays_the_full_unpaginated_list(client, store):
+    """Backward compatibility: every existing consumer (web `fetchTasks`, the
+    CLI's `board()`/`ping()`, the desktop shell's `probe()`) calls this with
+    NO query params and must keep getting every row, exactly as before."""
+    ids = await _seed_n_tasks(store, 25)
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    assert [t["id"] for t in r.json()] == ids
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_limit_offset_paginate_newest_first(client, store):
+    ids = await _seed_n_tasks(store, 10)
+    r = await client.get("/api/tasks", params={"limit": 3, "offset": 2})
+    assert r.status_code == 200
+    assert [t["id"] for t in r.json()] == ids[2:5]
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_limit_is_pushed_down_not_sliced_in_python(client, store, monkeypatch):
+    """A page must not still pay to hydrate/serialize the whole table — the
+    handler has to pass limit/offset into the store query, not fetch
+    everything and slice the result."""
+    await _seed_n_tasks(store, 10)
+    calls = []
+    real_list_tasks = store.list_tasks
+
+    async def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return await real_list_tasks(*args, **kwargs)
+
+    monkeypatch.setattr(store, "list_tasks", spy)
+    r = await client.get("/api/tasks", params={"limit": 4})
+    assert r.status_code == 200
+    assert len(r.json()) == 4
+    assert calls and calls[-1].get("limit") == 4
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_rejects_invalid_pagination_params(client, store):
+    await _seed_n_tasks(store, 3)
+    assert (await client.get("/api/tasks", params={"limit": 0})).status_code == 422
+    assert (await client.get("/api/tasks", params={"offset": -1})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_fleet_scale_800_rows_pagination_shrinks_the_payload(client, store):
+    """Fleet finding 6468d631: 700+ rows on the production fleet. Seeds 800
+    (the same order of magnitude) and MEASURES the win: a paginated page must
+    be a small fraction of the full-list response's bytes, and every row
+    must still be reachable through paging (no task silently dropped)."""
+    ids = await _seed_n_tasks(store, 800)
+
+    full = await client.get("/api/tasks")
+    assert full.status_code == 200
+    full_body = full.content
+    assert len(full.json()) == 800
+
+    page = await client.get("/api/tasks", params={"limit": 50})
+    assert page.status_code == 200
+    page_body = page.content
+    assert [t["id"] for t in page.json()] == ids[:50]
+
+    # The measured win: a 50-row page is roughly limit/total of the full
+    # payload's bytes (~6.25% here), never anywhere close to the full size.
+    ratio = len(page_body) / len(full_body)
+    assert ratio < 0.15, (
+        f"800-row baseline {len(full_body)} bytes; 50-row page "
+        f"{len(page_body)} bytes ({ratio:.1%}) — pagination did not shrink "
+        "the payload as expected"
+    )
+
+    # Paging through recovers every row exactly once — deletions/rewrites
+    # aside, a client that pages the FULL range sees the same rows a full
+    # fetch would, in the same order.
+    paged_ids = []
+    offset = 0
+    while offset < 800:
+        r = await client.get("/api/tasks", params={"limit": 100, "offset": offset})
+        batch = r.json()
+        assert len(batch) == min(100, 800 - offset)
+        paged_ids.extend(t["id"] for t in batch)
+        offset += 100
+    assert paged_ids == ids
+
+
 @pytest.mark.asyncio
 async def test_merge_ready_field_reads_the_verdict_for_the_current_head(client, store):
     """`TaskSummaryOut.merge_ready` reads `task.context.merge_policy[<latest

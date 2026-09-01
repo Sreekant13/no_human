@@ -598,8 +598,13 @@ def _max_pr_conflict_rounds() -> int:
         return 3
 
 
-async def _board_tasks(store: Store, scheduler=None) -> list[TaskSummaryOut]:
-    tasks = await store.list_tasks()
+async def _board_tasks(
+    store: Store, scheduler=None, *, limit: int | None = None, offset: int | None = None,
+) -> list[TaskSummaryOut]:
+    """`limit`/`offset` (P5) are threaded through ONLY by the `GET /api/tasks`
+    route — every other caller here (approve/cancel/pause/..., `/ws`) needs
+    the full board and calls this with the defaults, unchanged."""
+    tasks = await store.list_tasks(limit=limit, offset=offset)
     # B2 #16: ONE grouped query instead of an N+1 per board tick per socket.
     by_task = await store.attempts_by_task()
     # SCRUM-15: `scheduler.inflight` returns a fresh set() copy per call — snapshot
@@ -718,14 +723,46 @@ def _record_feature_used(request: Request, name: str) -> None:
 async def list_tasks(
     request: Request,
     merge_ready: bool | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    # No upper cap on `offset` (review round 1): SQLite's `OFFSET` past the
+    # end of the result set just returns zero rows, and its cost is bounded
+    # by the table's own row count either way — no worse than the uncapped,
+    # unpaginated default every caller already gets today. A cap would only
+    # protect against a cost this endpoint already carries.
+    offset: int | None = Query(default=None, ge=0),
 ) -> list[TaskSummaryOut]:
-    tasks = await _board_tasks(_store(request), scheduler=_sched(request))
+    """P5 (fleet finding 6468d631): 700+ rows on the fleet meant every caller
+    here — the board's init/resync fetch, CLI `board()`/`ping()`, the desktop
+    shell's `probe()` — paid to hydrate and serialize the WHOLE table, always.
+
+    `?limit`/`?offset` are additive and OPT-IN: no params (every caller
+    today) is byte-for-byte the old unpaginated, newest-first response. Chosen
+    over an incremental `?updated_since` because the board's own fetch is
+    reconciliation against a WS snapshot that is already full-state — a row
+    that vanished (deleted, cancelled without touching `updated_at`) must
+    disappear from this list the same way it disappears from that snapshot,
+    and `updated_since` can only ever report what CHANGED, never what is
+    simply gone (no tombstone feed exists to cover that). A `limit`/`offset`
+    page carries no such risk: it is always a true slice of the current
+    table, so a future paginated consumer can adopt it safely.
+
+    Only this route's own `_board_tasks` call is paginated — every internal
+    caller (approve/cancel/pause/..., the `/ws` loop) still needs the full
+    board and is untouched.
+    """
+    tasks = await _board_tasks(
+        _store(request), scheduler=_sched(request), limit=limit, offset=offset,
+    )
     if merge_ready:
         # Truthy-only filter (?merge_ready=1): the merge-ready policy is
         # advisory ("this row is not ready" and "this row was never
         # evaluated" both read `merge_ready is not True`), so there is no
         # useful "?merge_ready=0" query to distinguish from the unfiltered
         # list — every other task already IS that.
+        #
+        # Applied AFTER the page is sliced: no live caller combines this with
+        # `limit`/`offset` today (grep — 2026-09-01); a future one that does
+        # can get fewer than `limit` rows back — documented, not solved.
         tasks = [t for t in tasks if t.merge_ready is True]
     return tasks
 
