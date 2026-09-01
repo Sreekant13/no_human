@@ -23,10 +23,48 @@ export async function fetchTasks() {
   return r.json();
 }
 
+/** The three heavy per-attempt blobs (`review_checklist`, `verifier_results`,
+ * `test_results`) for one attempt — served lazily (P1, running-task page
+ * slow-open) rather than inline on `GET /api/tasks/{id}`, because they are
+ * multi-KB JSON per attempt on live tasks and the detail payload was heavy on
+ * every open/poll whether or not the drawer needed them yet. */
+export async function fetchAttemptDetails(taskId, attemptNumber) {
+  const r = await fetch(`${BASE}/api/tasks/${taskId}/attempts/${attemptNumber}/details`);
+  if (!r.ok) {
+    throw new Error(
+      `GET /api/tasks/${taskId}/attempts/${attemptNumber}/details → ${r.status}`);
+  }
+  return r.json();
+}
+
+/** Merge each attempt's lazily-fetched heavy blobs back onto `task.attempts`
+ * in place, so callers see the exact shape the detail payload used to inline
+ * — the drawer's own summary logic (`slideOverSummary.js`, `SlideOver.jsx`)
+ * never has to know the split happened. A single attempt's fetch failing
+ * (404, offline) degrades that ONE attempt to missing fields rather than
+ * failing the whole task fetch — the same "no data" shape those consumers
+ * already handle for an attempt that predates these columns. */
+async function _hydrateAttemptDetails(task) {
+  const attempts = task?.attempts;
+  if (!Array.isArray(attempts) || attempts.length === 0) return task;
+  await Promise.all(attempts.map(async (a) => {
+    try {
+      const details = await fetchAttemptDetails(task.id, a.attempt_number);
+      a.review_checklist = details.review_checklist;
+      a.verifier_results = details.verifier_results;
+      a.test_results = details.test_results;
+    } catch {
+      // Leave this attempt's heavy fields absent — see doc comment above.
+    }
+  }));
+  return task;
+}
+
 export async function fetchTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}`);
   if (!r.ok) throw new Error(`GET /api/tasks/${id} → ${r.status}`);
-  return r.json();
+  const task = await r.json();
+  return _hydrateAttemptDetails(task);
 }
 
 export async function fetchDiff(id) {

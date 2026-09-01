@@ -56,8 +56,8 @@ from ..core.pricing import weighted_tokens
 from ..core.task import Task, TaskStatus, normalise_priority
 from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
-    AttemptOut, BoardPayload, BudgetOut, CancelRequest, CreateProjectRequest, CreateTaskRequest,
-    GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
+    AttemptDetailsOut, AttemptOut, BoardPayload, BudgetOut, CancelRequest, CreateProjectRequest,
+    CreateTaskRequest, GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
     ImportedInfo, LandedOverrideRequest, PhaseOut, ProjectOut, ReplyRequest,
     SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, SplitRequest, TaskOut,
     TaskSummaryOut, TelemetryConsentRequest, TrackerIssueOut, UpdateProjectRequest,
@@ -1259,6 +1259,29 @@ async def get_task(task_id: str, request: Request) -> TaskOut:
     if sched is not None:
         out.claimed = task.id in sched.inflight
     return out
+
+
+@app.get("/api/tasks/{task_id}/attempts/{attempt_number}/details",
+         response_model=AttemptDetailsOut)
+async def get_attempt_details(
+    task_id: str, attempt_number: int, request: Request,
+) -> AttemptDetailsOut:
+    """The three heavy per-attempt blobs (`review_checklist`, `verifier_results`,
+    `test_results`) `GET /api/tasks/{id}` no longer inlines (P1, running-task
+    page slow-open) — multi-KB JSON per attempt, observed on live tasks, that
+    made the detail payload large on every open/poll regardless of whether the
+    drawer needed them yet. `web/src/api.js`'s `fetchTask` calls this once per
+    attempt and merges the result back onto `AttemptOut`, so the drawer's own
+    code never has to know the split happened.
+    """
+    store = _store(request)
+    task = await _require_task(store, task_id)
+    attempts = await store.list_attempts(task.id)
+    for a in attempts:
+        if a.get("attempt_number") == attempt_number:
+            return AttemptDetailsOut.from_row(a)
+    raise HTTPException(
+        404, f"attempt {attempt_number} not found for task {task_id!r}")
 
 
 @app.get("/api/tasks/{task_id}/subtasks", response_model=list[TaskSummaryOut])

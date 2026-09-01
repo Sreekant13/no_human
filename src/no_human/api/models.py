@@ -15,6 +15,23 @@ from ..core.task import Task
 from .title_short import title_short
 
 
+def _json_field(v: Any) -> Any:
+    """Parse a column that may be a JSON string or already-decoded value.
+
+    Shared by every AttemptOut-shaped model so ``review_checklist`` /
+    ``verifier_results`` / ``test_results`` are decoded identically wherever
+    they are surfaced — the full detail payload (`AttemptDetailsOut`, P1)
+    used to have its own inline copy, and a divergence there would decode
+    the same column two different ways depending which endpoint served it.
+    """
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return v
+
+
 class AttemptOut(BaseModel):
     id: str
     attempt_number: int
@@ -22,15 +39,15 @@ class AttemptOut(BaseModel):
     commit_sha: str | None = None
     pr_url: str | None = None
     review_passed: int | None = None
-    review_checklist: dict | None = None
-    # Every deterministic verifier verdict from this attempt's gate round
-    # (review/verifiers.py's VerifierResult.as_dict(), via
-    # Orchestrator._run_review) — a JSON list, or None when no verifiers ran
-    # for this attempt. `list_attempts` is `SELECT *` (db.py), so no route
-    # change was needed to surface the new `attempts.verifier_results`
-    # column; this model is the only place it must be named.
-    verifier_results: list | None = None
-    test_results: dict | None = None
+    # review_checklist / verifier_results / test_results are NOT on this
+    # model (P1, running-task page slow-open): they are multi-KB JSON blobs
+    # per attempt, observed on live tasks, and serializing them into every
+    # `GET /api/tasks/{id}` response is exactly the heavy-payload cost this
+    # endpoint was measured to carry. Fetch them lazily, per attempt, from
+    # `GET /api/tasks/{id}/attempts/{attempt_number}/details`
+    # (`AttemptDetailsOut` below) instead — `web/src/api.js`'s `fetchTask`
+    # is the one call site that does this today, so the drawer never notices
+    # the split.
     ci_pipeline_id: str | None = None
     ci_pipeline_url: str | None = None
     ci_status: str | None = None
@@ -71,14 +88,6 @@ class AttemptOut(BaseModel):
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "AttemptOut":
-        def _json(v: Any) -> Any:
-            if isinstance(v, str):
-                try:
-                    return json.loads(v)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            return v
-
         cost_usd, cost_model = attempt_cost(row)
         return cls(
             id=row.get("id", ""),
@@ -87,9 +96,6 @@ class AttemptOut(BaseModel):
             commit_sha=row.get("commit_sha"),
             pr_url=row.get("pr_url"),
             review_passed=row.get("review_passed"),
-            review_checklist=_json(row.get("review_checklist")),
-            verifier_results=_json(row.get("verifier_results")),
-            test_results=_json(row.get("test_results")),
             ci_pipeline_id=row.get("ci_pipeline_id"),
             ci_pipeline_url=row.get("ci_pipeline_url"),
             ci_status=row.get("ci_status"),
@@ -107,6 +113,32 @@ class AttemptOut(BaseModel):
             status=row.get("status"),
             started_at=row.get("started_at"),
             completed_at=row.get("completed_at"),
+        )
+
+
+class AttemptDetailsOut(BaseModel):
+    """The three heavy per-attempt blobs `AttemptOut` no longer carries
+    (P1, running-task page slow-open) — served on demand from
+    `GET /api/tasks/{task_id}/attempts/{attempt_number}/details` rather than
+    inline on every `GET /api/tasks/{id}`. Same decode as `AttemptOut` used
+    to do inline (`_json_field`), so a client that merges this back onto an
+    `AttemptOut` sees byte-identical shapes to before the split.
+    """
+    attempt_number: int
+    review_checklist: dict | None = None
+    # Every deterministic verifier verdict from this attempt's gate round
+    # (review/verifiers.py's VerifierResult.as_dict(), via
+    # Orchestrator._run_review) — a JSON list, or None when no verifiers ran.
+    verifier_results: list | None = None
+    test_results: dict | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "AttemptDetailsOut":
+        return cls(
+            attempt_number=row.get("attempt_number", 0),
+            review_checklist=_json_field(row.get("review_checklist")),
+            verifier_results=_json_field(row.get("verifier_results")),
+            test_results=_json_field(row.get("test_results")),
         )
 
 

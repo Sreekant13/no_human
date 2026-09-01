@@ -274,7 +274,13 @@ FROZEN_FILE_LINES = {
     # `include_archived` param (and its docstring) so the Second-brain UI's
     # archived-count footer can ask a Delete-archived row back too. Measured
     # directly against this branch's tree.
-    "api/app.py": 5737,
+    # 5737 -> 5760 (+23): P1 (running-task page slow-open) — the new
+    # `GET /api/tasks/{task_id}/attempts/{attempt_number}/details` lazy
+    # endpoint, which serves the three heavy per-attempt blobs
+    # (review_checklist/verifier_results/test_results) `AttemptOut` no longer
+    # inlines. Measured directly against this branch's tree
+    # (`len(Path(...).read_text().splitlines())`, the scanner's own metric).
+    "api/app.py": 5760,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

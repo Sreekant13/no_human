@@ -225,3 +225,89 @@ test("splitTask surfaces the server's 409 reason, not a bare status", async () =
   await assert.rejects(splitTask("t9", [{ title: "A" }, { title: "B" }]),
     /no longer pending/);
 });
+
+
+// P1 (running-task page slow-open): review_checklist/verifier_results/
+// test_results moved off the inline detail payload onto a per-attempt lazy
+// endpoint. `fetchTask` is the one call site (SlideOver.jsx) that has to
+// paper over the split so the drawer's existing summary code — which reads
+// `task.attempts[i].review_checklist` etc. across MULTIPLE attempts, not
+// just the last one — keeps working unchanged.
+import { fetchAttemptDetails, fetchTask } from "./api.js";
+
+/** Route a stubbed fetch by exact URL rather than answering every call the
+ * same way — `fetchTask` now issues N+1 requests (the task, plus one per
+ * attempt), each of which must get its OWN body. */
+function stubFetchByUrl(routes) {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    calls.push(u);
+    const route = routes[u];
+    if (!route) throw new Error(`unstubbed fetch: ${u}`);
+    return {
+      ok: route.status === undefined || (route.status >= 200 && route.status < 300),
+      status: route.status ?? 200,
+      json: async () => route.body,
+    };
+  };
+  return calls;
+}
+
+test("fetchAttemptDetails GETs the per-attempt lazy endpoint", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/t1/attempts/2/details": {
+      body: { attempt_number: 2, review_checklist: { passed: true }, verifier_results: [], test_results: null },
+    },
+  });
+  const out = await fetchAttemptDetails("t1", 2);
+  assert.deepEqual(calls, ["/api/tasks/t1/attempts/2/details"]);
+  assert.equal(out.review_checklist.passed, true);
+});
+
+test("fetchAttemptDetails rejects on a non-2xx", async () => {
+  stubFetchByUrl({ "/api/tasks/t1/attempts/9/details": { status: 404, body: {} } });
+  await assert.rejects(fetchAttemptDetails("t1", 9), /404/);
+});
+
+test("fetchTask hydrates every attempt's heavy fields from the lazy endpoint", async () => {
+  stubFetchByUrl({
+    "/api/tasks/t1": {
+      body: {
+        id: "t1",
+        attempts: [{ id: "a1", attempt_number: 1 }, { id: "a2", attempt_number: 2 }],
+      },
+    },
+    "/api/tasks/t1/attempts/1/details": {
+      body: { attempt_number: 1, review_checklist: { passed: false }, verifier_results: [{ name: "v1" }], test_results: { test_count: 1 } },
+    },
+    "/api/tasks/t1/attempts/2/details": {
+      body: { attempt_number: 2, review_checklist: { passed: true }, verifier_results: [{ name: "v2" }], test_results: { test_count: 2 } },
+    },
+  });
+  const task = await fetchTask("t1");
+  assert.equal(task.attempts[0].review_checklist.passed, false);
+  assert.equal(task.attempts[1].review_checklist.passed, true);
+  assert.deepEqual(task.attempts[0].verifier_results, [{ name: "v1" }]);
+  assert.equal(task.attempts[1].test_results.test_count, 2);
+});
+
+test("fetchTask degrades gracefully when one attempt's details 404 — the task still resolves", async () => {
+  stubFetchByUrl({
+    "/api/tasks/t1": {
+      body: { id: "t1", attempts: [{ id: "a1", attempt_number: 1 }] },
+    },
+    "/api/tasks/t1/attempts/1/details": { status: 404, body: {} },
+  });
+  const task = await fetchTask("t1");
+  assert.equal(task.id, "t1");
+  assert.equal(task.attempts[0].review_checklist, undefined);
+});
+
+test("fetchTask with no attempts makes no lazy-detail calls at all", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/t1": { body: { id: "t1", attempts: [] } },
+  });
+  await fetchTask("t1");
+  assert.deepEqual(calls, ["/api/tasks/t1"]);
+});

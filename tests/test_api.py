@@ -293,6 +293,81 @@ async def test_get_task_prefix_lookup(client, store):
 
 
 # --------------------------------------------------------------------------- #
+# P1: heavy per-attempt blobs move off the inline payload (running-task page  #
+# slow-open) — review_checklist / verifier_results / test_results are multi- #
+# KB JSON per attempt, observed on live tasks, and neither the list nor the   #
+# detail payload should carry them inline any more.                          #
+# --------------------------------------------------------------------------- #
+
+_HEAVY_ATTEMPT_FIELDS = ("review_checklist", "verifier_results", "test_results")
+
+
+async def _seed_task_with_heavy_attempt(store) -> tuple:
+    t = await _seed_task(store)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        aid,
+        review_checklist={"passed": True, "items": [{"passed": True, "label": "x"}]},
+        verifier_results=[{"name": "tests", "passed": True}],
+        test_results={"test_count": 5},
+    )
+    return t, aid
+
+
+@pytest.mark.asyncio
+async def test_list_payload_never_carries_the_heavy_attempt_fields(client, store):
+    await _seed_task_with_heavy_attempt(store)
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    body_text = r.text
+    for field in _HEAVY_ATTEMPT_FIELDS:
+        assert field not in body_text, (
+            f"list payload leaked {field!r} — it must never appear on the "
+            "board's list endpoint")
+
+
+@pytest.mark.asyncio
+async def test_detail_payload_drops_the_heavy_attempt_fields(client, store):
+    t, _aid = await _seed_task_with_heavy_attempt(store)
+    r = await client.get(f"/api/tasks/{t.id}")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["attempts"]) == 1
+    attempt = data["attempts"][0]
+    for field in _HEAVY_ATTEMPT_FIELDS:
+        assert field not in attempt, (
+            f"detail payload still inlines {field!r} — it must be served "
+            "lazily from the per-attempt details endpoint instead")
+    # The summaries the drawer still needs inline stay put.
+    assert attempt["attempt_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_attempt_details_endpoint_returns_the_full_blobs(client, store):
+    t, _aid = await _seed_task_with_heavy_attempt(store)
+    r = await client.get(f"/api/tasks/{t.id}/attempts/1/details")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["review_checklist"] == {
+        "passed": True, "items": [{"passed": True, "label": "x"}]}
+    assert data["verifier_results"] == [{"name": "tests", "passed": True}]
+    assert data["test_results"] == {"test_count": 5}
+
+
+@pytest.mark.asyncio
+async def test_attempt_details_404_for_unknown_attempt_number(client, store):
+    t, _aid = await _seed_task_with_heavy_attempt(store)
+    r = await client.get(f"/api/tasks/{t.id}/attempts/99/details")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_attempt_details_404_for_unknown_task(client):
+    r = await client.get("/api/tasks/does-not-exist/attempts/1/details")
+    assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
 # POST /api/tasks — external_id (SCRUM-32)                                    #
 # --------------------------------------------------------------------------- #
 
