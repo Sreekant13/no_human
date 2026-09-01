@@ -402,7 +402,11 @@ FROZEN_FILE_LINES = {
     # `worker.abort_non_converging`/`convergence_check_after_turns`/
     # `convergence_window_turns` defaults, with the docstring justifying
     # them (see `core.bounds.ConvergenceTracker`). Measured on this tree.
-    "config.py": 3328,
+    # 3328 -> 3340 (+12): the `git.merge_identity_name`/`_email` flat-alias
+    # config keys (second-tier resolution between `approve_identity` and the
+    # repo's own git config, never a fallback to `agent_identity_*`) and
+    # their explanatory comment. Re-anchored on rebase.
+    "config.py": 3340,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

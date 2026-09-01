@@ -141,16 +141,22 @@ def _git_config_value(repo_path: Path | str, key: str) -> str:
 
 def _resolve_approve_identity(git_cfg: dict, repo_path: Path | str) -> tuple[str, str, str]:
     """Return ``(name, email, error)`` for the identity `nh approve`'s squash
-    commit is attributed to. Explicit ``git.approve_identity`` config wins;
-    otherwise falls back to git's own resolved identity for *repo_path*
-    (`git config --get`, which already applies repo-local -> global ->
-    system precedence). NEVER falls back to the agent identity — this
-    function never reads `agent_identity_name`/`agent_identity_email`. If
-    either field is still empty after both sources, returns an explicit
-    error and no identity; the caller must refuse rather than guess."""
+    commit is attributed to. Precedence, highest first: explicit
+    ``git.approve_identity.{name,email}``; then the flat
+    ``git.merge_identity_name``/``git.merge_identity_email`` aliases; then
+    git's own resolved identity for *repo_path* (`git config --get`, which
+    already applies repo-local -> global -> system precedence). NEVER falls
+    back to the agent identity — this function never reads
+    `agent_identity_name`/`agent_identity_email`. If either field is still
+    empty after all three sources, returns an explicit error and no
+    identity; the caller must refuse rather than guess."""
     ident = git_cfg.get("approve_identity") or {}
     name = (ident.get("name") or "").strip()
     email = (ident.get("email") or "").strip()
+    if not name:
+        name = (git_cfg.get("merge_identity_name") or "").strip()
+    if not email:
+        email = (git_cfg.get("merge_identity_email") or "").strip()
     if not name:
         name = _git_config_value(repo_path, "user.name")
     if not email:

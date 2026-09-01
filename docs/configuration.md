@@ -215,6 +215,9 @@ git:
   approve_identity:               # who a human merge is attributed to
     name: ""                      # empty -> resolved from this repo's git
     email: ""                     # config (user.name/user.email)
+  merge_identity_name: ""         # flat aliases for the same merge identity;
+  merge_identity_email: ""        # lower precedence than approve_identity,
+                                   # higher than the repo's own git config
 
 `approve_merge.enabled` is what makes `nh approve` LAND the pull request:
 squash the branch into one commit, push it to the default branch, and close
@@ -236,6 +239,15 @@ would use; it is deliberately never `git.agent_identity_name`/`_email`. Set
 both fields to override per install. If neither the config nor git yields
 both `name` and `email`, `nh approve` refuses with an explicit message
 rather than guessing.
+
+`git.merge_identity_name`/`.email` are flat aliases for the same merge
+identity, for installs where a flat pair of keys is more convenient to
+template or override than the nested `approve_identity` block. Resolution
+order, highest precedence first: `git.approve_identity.{name,email}`, then
+`git.merge_identity_name`/`.email`, then the repo's own resolved
+`user.name`/`user.email`. Like `approve_identity`, these are never a fallback
+to `git.agent_identity_name`/`_email` — an unresolvable identity still
+refuses rather than attributing the merge commit to the agent.
 
 safety:
   max_files_changed: null         # no size cap by default; set an int to escalate
