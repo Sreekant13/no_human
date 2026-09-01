@@ -833,6 +833,86 @@ class GitRepo:
         )
         return proc.returncode == 0
 
+    def _have_remote_commit(self, remote: str, branch: str, remote_sha: str,
+                             timeout: int) -> bool:
+        """Is *remote_sha* available in this local object store?
+
+        Factored out of `remote_branch_relation` (still byte-identical
+        behaviour) and reused by `remote_branches_containing`: both need to
+        prove a remote-advertised sha is actually fetchable, not merely
+        named by `ls-remote`. See that method's docstring for why the
+        fetch-on-miss uses `--refmap=` into a private namespace rather than
+        the tracking ref.
+        """
+        have_obj = subprocess.run(
+            ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
+            cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
+        )
+        if have_obj.returncode == 0:
+            return True
+        private_ref = f"refs/no_human/push-check/{branch}"
+        fetched = subprocess.run(
+            ["git", "fetch", "--refmap=", remote,
+             f"+refs/heads/{branch}:{private_ref}"],
+            cwd=self.path, capture_output=True, text=True, timeout=timeout,
+            **hidden_console_kwargs(),
+        )
+        if fetched.returncode != 0:
+            return False
+        have_obj = subprocess.run(
+            ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
+            cwd=self.path, capture_output=True, text=True,
+            **hidden_console_kwargs(),
+        )
+        return have_obj.returncode == 0
+
+    def remote_branches_containing(self, sha: str, patterns: list[str], *,
+                                    remote: str = "origin",
+                                    timeout: int = 30) -> list[str]:
+        """Which remote branches (matching *patterns*) contain *sha*?
+
+        Proves "the work is on a remote ref" — NOT "the work merged"; a
+        match here is exactly as strong as `remote_branch_relation`'s
+        `up_to_date`, deliberately extended from tip-equality to ancestry
+        (a later commit on the same pushed branch still contains an
+        earlier reviewed sha). Reachable states of `git ls-remote --heads`
+        (the VCS API used here): rc 0 with matching refs, rc 0 with empty
+        stdout (nothing pushed), rc != 0 (auth/unreachable/bad URL), a
+        timeout, or `OSError` (git missing) — every one of those last four
+        returns `[]`, so the caller fails closed and refuses the claim.
+        Read-only and idempotent: it writes no ref of its own; the only
+        write is `_have_remote_commit`'s private, overwritten-in-place
+        `refs/no_human/push-check/<branch>`, never a tracking ref.
+        """
+        try:
+            ls = subprocess.run(
+                ["git", "ls-remote", "--heads", remote, *patterns],
+                cwd=self.path, capture_output=True, text=True, timeout=timeout,
+                **hidden_console_kwargs(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        if ls.returncode != 0 or not ls.stdout.strip():
+            return []
+        matches: list[str] = []
+        for line in ls.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not parts[1].startswith("refs/heads/"):
+                continue
+            remote_sha, ref = parts
+            name = ref.removeprefix("refs/heads/")
+            try:
+                if remote_sha == sha:
+                    matches.append(name)
+                    continue
+                if (self._have_remote_commit(remote, name, remote_sha, timeout)
+                        and self.is_ancestor(sha, remote_sha)):
+                    matches.append(name)
+            except Exception:  # noqa: BLE001 — one bad ref must not sink the rest
+                continue
+        return matches
+
     def remote_branch_relation(self, branch: str, *, remote: str = "origin",
                                 timeout: int = 30) -> str:
         """How local ``branch`` relates to its own tip on ``remote``.
@@ -873,28 +953,8 @@ class GitRepo:
         remote_sha = ls.stdout.split()[0]
         if remote_sha == local:
             return "up_to_date"
-        have_obj = subprocess.run(
-            ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
-            cwd=self.path, capture_output=True, text=True,
-            **hidden_console_kwargs(),
-        )
-        if have_obj.returncode != 0:
-            private_ref = f"refs/no_human/push-check/{branch}"
-            fetched = subprocess.run(
-                ["git", "fetch", "--refmap=", remote,
-                 f"+refs/heads/{branch}:{private_ref}"],
-                cwd=self.path, capture_output=True, text=True, timeout=timeout,
-                **hidden_console_kwargs(),
-            )
-            if fetched.returncode != 0:
-                return "unknown"
-            have_obj = subprocess.run(
-                ["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"],
-                cwd=self.path, capture_output=True, text=True,
-                **hidden_console_kwargs(),
-            )
-            if have_obj.returncode != 0:
-                return "unknown"
+        if not self._have_remote_commit(remote, branch, remote_sha, timeout):
+            return "unknown"
         return "behind" if self.is_ancestor(local, remote_sha) else "diverged"
 
     def diff(self, ref: str = "HEAD~1") -> str:

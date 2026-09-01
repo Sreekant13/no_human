@@ -92,6 +92,165 @@ async def _gate(store, tmp_path, repo_path, *, branch, reviewer=PASS):
     return outcome, task, fake, events
 
 
+async def _gate_with_task(store, tmp_path, repo_path, setup, *, reviewer=PASS):
+    """Like `_gate`, but builds the `Task` first and hands its id to
+    `setup(task_id)` before running the gate, so a caller can push branches
+    named after the task's own id (mirrors orchestrator.py's
+    `branch_prefix + task.id[:8]` attempt-branch scheme, ~4407).
+    `setup(task_id)` must return the branch name to invoke the gate with.
+    """
+    events: list[dict] = []
+    fake = FakeReviewer(reviewer)
+    orch = Orchestrator(store, _config(tmp_path).data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=fake, event_sink=events.append)
+    task = Task.new("existing", repo_path=str(repo_path), kind="feature")
+    task.acceptance_criteria = ["existing"]
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+    branch = setup(task.id)
+    outcome = await orch._gate_already_satisfied(
+        task, GitRepo(repo_path), attempt_id, CLAIM, branch=branch,
+        attempt_n=1, base="main")
+    return outcome, task, fake, events
+
+
+async def test_a_sha_on_the_tasks_own_pushed_branch_is_accepted_off_main(
+    bare_repo, tmp_path, store
+):
+    def setup(task_id):
+        stem = f"no-human/{task_id[:8]}"
+        _git(bare_repo, "checkout", "-b", stem)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        _git(bare_repo, "push", "-u", "origin", stem)
+        claimed = GitRepo(bare_repo).head_sha()
+        attempt_branch = f"{stem}-2"
+        _git(bare_repo, "checkout", "-b", attempt_branch, claimed)
+        return attempt_branch
+
+    outcome, _, reviewer, events = await _gate_with_task(
+        store, tmp_path, bare_repo, setup)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert reviewer.calls
+    assert "pushed branch" in outcome.detail
+    assert "not on origin/main" in outcome.detail
+    evidence = next(event for event in events if event["kind"] == "already_satisfied")
+    assert evidence["subject_on_main"] is False
+
+
+async def test_a_sha_reachable_from_but_not_the_tip_of_the_pushed_branch_is_accepted(
+    bare_repo, tmp_path, store
+):
+    def setup(task_id):
+        stem = f"no-human/{task_id[:8]}"
+        _git(bare_repo, "checkout", "-b", stem)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        _git(bare_repo, "push", "-u", "origin", stem)
+        claimed = GitRepo(bare_repo).head_sha()
+        # The remote branch moves AHEAD of the claimed sha — reachability,
+        # not tip equality, is what should be accepted.
+        (bare_repo / "more.txt").write_text("more\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "more work")
+        _git(bare_repo, "push", "origin", stem)
+        attempt_branch = f"{stem}-2"
+        _git(bare_repo, "checkout", "-b", attempt_branch, claimed)
+        return attempt_branch
+
+    outcome, _, reviewer, events = await _gate_with_task(
+        store, tmp_path, bare_repo, setup)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert reviewer.calls
+    evidence = next(event for event in events if event["kind"] == "already_satisfied")
+    assert evidence["subject_on_main"] is False
+
+
+async def test_a_sha_on_no_remote_ref_is_still_refused(bare_repo, tmp_path, store):
+    def setup(task_id):
+        stem = f"no-human/{task_id[:8]}"
+        attempt_branch = f"{stem}-2"
+        _git(bare_repo, "checkout", "-b", attempt_branch)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        return attempt_branch
+
+    outcome, task, reviewer, _ = await _gate_with_task(store, tmp_path, bare_repo, setup)
+
+    assert outcome.status is TaskStatus.FAILED
+    assert reviewer.calls == []
+    stem = f"no-human/{task.id[:8]}"
+    remote = _git(bare_repo, "ls-remote", "origin", f"refs/heads/{stem}")
+    assert not remote.stdout.strip()
+    remote_attempt = _git(bare_repo, "ls-remote", "origin", f"refs/heads/{stem}-2")
+    assert not remote_attempt.stdout.strip()
+
+
+async def test_a_foreign_pushed_branch_does_not_satisfy_another_tasks_claim(
+    bare_repo, tmp_path, store
+):
+    def setup(task_id):
+        foreign = "no-human/deadbeef"
+        _git(bare_repo, "checkout", "-b", foreign)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        _git(bare_repo, "push", "-u", "origin", foreign)
+        claimed = GitRepo(bare_repo).head_sha()
+        stem = f"no-human/{task_id[:8]}"
+        attempt_branch = f"{stem}-2"
+        _git(bare_repo, "checkout", "-b", attempt_branch, claimed)
+        return attempt_branch
+
+    outcome, _, reviewer, _ = await _gate_with_task(store, tmp_path, bare_repo, setup)
+
+    assert outcome.status is TaskStatus.FAILED
+    assert reviewer.calls == []
+
+
+def test_remote_branches_containing_tip_ancestor_unpushed_and_unreachable(
+    bare_repo,
+):
+    repo = GitRepo(bare_repo)
+    branch = "no-human/rbc"
+    _git(bare_repo, "checkout", "-b", branch)
+    (bare_repo / "work.txt").write_text("work\n")
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "work")
+    _git(bare_repo, "push", "-u", "origin", branch)
+    tip = repo.head_sha()
+
+    # Tip match.
+    assert repo.remote_branches_containing(tip, [branch, f"{branch}-*"]) == [branch]
+
+    # Ancestor match: remote moves ahead of the previously-tipped sha.
+    (bare_repo / "more.txt").write_text("more\n")
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "more")
+    _git(bare_repo, "push", "origin", branch)
+    assert repo.remote_branches_containing(tip, [branch, f"{branch}-*"]) == [branch]
+
+    # Never pushed -> [].
+    other = repo.head_sha()
+    _git(bare_repo, "checkout", "-b", "no-human/unpushed")
+    (bare_repo / "local-only.txt").write_text("local\n")
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "local only")
+    unpushed = repo.head_sha()
+    assert repo.remote_branches_containing(
+        unpushed, ["no-human/unpushed", "no-human/unpushed-*"]) == []
+    assert other  # sanity: distinct from the unpushed commit
+
+    # Unreachable remote -> [].
+    _git(bare_repo, "remote", "set-url", "origin", "/nonexistent/remote.git")
+    assert repo.remote_branches_containing(tip, [branch, f"{branch}-*"]) == []
+
+
 async def test_a_wip_blocked_non_ancestor_unpushed_claim_is_refused(
     bare_repo, tmp_path, store
 ):
@@ -320,3 +479,68 @@ async def test_refusal_and_refutation_share_the_failed_feedback_shape(
     assert failed_context["review_round_seq"] == refused_context["review_round_seq"] == 1
     assert len(failed_context["review_feedback"]) == len(
         refused_context["review_feedback"]) == 1
+# Reviewer-authored coverage for the two UNCOVERED guards in the
+# sibling-branch acceptance path (orchestrator.py:10066-10069).
+# Verified: each goes RED under the matching mutant, GREEN on d6bbd99d.
+# Append to tests/test_already_satisfied_subject_tree.py.
+
+
+async def test_a_nested_ref_that_ls_remote_tail_matches_does_not_satisfy(
+    bare_repo, tmp_path, store
+):
+    """`git ls-remote origin <pattern>` tail-matches, so `evil/no-human/<id8>`
+    IS returned by the sibling ls-remote query — only the `re.fullmatch`
+    filter at orchestrator.py:10068 rejects it. Without this test that filter
+    can be deleted and the whole file still passes (verified by ablation)."""
+    def setup(task_id):
+        stem = f"no-human/{task_id[:8]}"
+        evil = f"evil/{stem}"
+        _git(bare_repo, "checkout", "-b", evil)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        _git(bare_repo, "push", "-u", "origin", evil)
+        claimed = GitRepo(bare_repo).head_sha()
+        attempt = f"{stem}-2"
+        _git(bare_repo, "checkout", "-b", attempt, claimed)
+        return attempt
+
+    outcome, task, reviewer, _ = await _gate_with_task(
+        store, tmp_path, bare_repo, setup)
+
+    # Positive control: the nested ref really is inside the pattern's results,
+    # so the refusal below is the name filter working, not an empty query.
+    stem = f"no-human/{task.id[:8]}"
+    ls = _git(bare_repo, "ls-remote", "--heads", "origin", stem, f"{stem}-*")
+    assert f"refs/heads/evil/{stem}" in ls.stdout, ls.stdout
+    assert outcome.status is TaskStatus.FAILED
+    assert reviewer.calls == []
+
+
+async def test_the_offered_branch_behind_its_own_remote_is_still_refused(
+    bare_repo, tmp_path, store
+):
+    """The `behind` refusal ("commits the reviewer did not judge") survives the
+    new path only because of the `name != branch` self-exclusion at
+    orchestrator.py:10067. Drop that term and the whole file still passes
+    (verified by ablation) while this protection silently disappears."""
+    def setup(task_id):
+        stem = f"no-human/{task_id[:8]}"
+        _git(bare_repo, "checkout", "-b", stem)
+        (bare_repo / "work.txt").write_text("work\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "work")
+        _git(bare_repo, "push", "-u", "origin", stem)
+        judged = GitRepo(bare_repo).head_sha()
+        (bare_repo / "unjudged.txt").write_text("unjudged\n")
+        _git(bare_repo, "add", "-A")
+        _git(bare_repo, "commit", "-m", "unjudged extra")
+        _git(bare_repo, "push", "origin", stem)
+        _git(bare_repo, "checkout", "-B", stem, judged)
+        return stem
+
+    outcome, _, reviewer, _ = await _gate_with_task(
+        store, tmp_path, bare_repo, setup)
+
+    assert outcome.status is TaskStatus.FAILED
+    assert reviewer.calls == []

@@ -9943,7 +9943,10 @@ class Orchestrator:
         tip a delivery offers. Everything else fails closed: a reviewer must
         never verify an unpushable checkpoint and turn it into approval proof.
         """
-        del task  # The policy is solely about the candidate delivery tree.
+        # `task` is needed below to enumerate THIS task's own pushed agent
+        # branches (attempt 2+ pushes to a distinct branch — see
+        # branch_prefix usage at ~4407 — so the offered branch alone can
+        # undercount what this task has actually shipped to the remote).
         try:
             head = repo.head_sha().strip()
         except Exception as exc:  # noqa: BLE001 — unreadable means unshippable
@@ -10045,6 +10048,27 @@ class Orchestrator:
                 False, ship_ref
         if relation == "up_to_date":
             label = f"{head[:12]} (pushed branch {branch}, not on {ship_ref})"
+            return True, head, label, "", False, ship_ref
+        # `branch` itself isn't up to date — but constraint #2 forbids the
+        # agent merging to `ship_ref`, so attempt 2+ pushes to a DIFFERENT,
+        # attempt-suffixed branch of this same task (~4407) while `branch`
+        # here still names an earlier/unpushed one. Before refusing, check
+        # whether one of THIS task's other pushed branches already contains
+        # `head` — sibling branches only, never any remote ref, so a
+        # foreign task's branch can't satisfy this claim.
+        prefix_cfg = (self.config.get("git") or {}).get("branch_prefix") or "no-human/"
+        stem = f"{prefix_cfg}{task.id[:8]}"
+        try:
+            sibling_names = await asyncio.to_thread(
+                repo.remote_branches_containing, head, [stem, f"{stem}-*"])
+        except Exception:  # noqa: BLE001 — sibling check is best-effort proof only
+            sibling_names = []
+        sibling_names = [
+            name for name in sibling_names
+            if name != branch and re.fullmatch(rf"{re.escape(stem)}(-\d+)?", name)
+        ]
+        if sibling_names:
+            label = f"{head[:12]} (pushed branch {sibling_names[0]}, not on {ship_ref})"
             return True, head, label, "", False, ship_ref
         relation_reason = {
             "behind": "the remote branch contains commits the reviewer did not judge",
