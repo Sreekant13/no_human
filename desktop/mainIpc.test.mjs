@@ -37,7 +37,7 @@ let probes = 0;
 // the one they run against.
 let knownRepos = "[]";
 const server = http.createServer((q, s) => {
-  if (q.url === "/api/tasks") probes += 1;   // one per navigation run
+  if (q.url.split("?")[0] === "/api/tasks") probes += 1;   // one per navigation run
   if (q.url === "/api/repos") { s.end(knownRepos); return; }
   s.end("[]");
 });

@@ -37,21 +37,45 @@ export function configuredPort(
 export const DEFAULT_ORIGIN = `http://127.0.0.1:${configuredPort()}`;
 
 /**
- * Probe the nh server. Resolves "up" | "down".
- * Uses /api/tasks (cheap, always registered) rather than the SPA catch-all,
- * which would 200 even for a half-up static server.
+ * Single probe attempt. Resolves "up" (2xx), "down" (a real non-2xx HTTP
+ * response — server state, not transient, so callers must not retry it), or
+ * "unreachable" (abort/timeout, ECONNREFUSED, DNS failure, socket reset —
+ * transient, safe to retry).
  */
-export async function probe(origin = DEFAULT_ORIGIN, timeoutMs = 1500) {
+async function probeOnce(origin, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${origin}/api/tasks`, { signal: ctrl.signal });
+    const res = await fetch(`${origin}/api/tasks?limit=1`, { signal: ctrl.signal });
     return res.ok ? "up" : "down";
   } catch {
-    return "down";
+    return "unreachable";
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Probe the nh server. Resolves "up" | "down". Never throws.
+ * Uses /api/tasks?limit=1 (P5 opt-in pagination, landed 0.1.9 in
+ * src/no_human/api/app.py — `limit: int | None = Query(default=None, ge=1,
+ * le=1000)`) rather than the full task list, which on a large fleet can be
+ * >1MB just to answer "is a server up". Backward-compatible with an 0.1.8
+ * server: unknown query params are ignored there and the full list still
+ * comes back as a valid 200.
+ * Retries once after retryDelayMs on a transient ("unreachable") failure —
+ * a single 1500ms timeout during a DB write burst previously read as "down"
+ * mid-launch and sent the shell down the spawn path, producing the
+ * pid-lock/"another instance is already running" error screen against a
+ * perfectly healthy server. A real non-2xx HTTP response is not retried:
+ * it reflects server state, not a transient timing issue.
+ */
+export async function probe(origin = DEFAULT_ORIGIN, timeoutMs = 1500, retryDelayMs = 300) {
+  const first = await probeOnce(origin, timeoutMs);
+  if (first !== "unreachable") return first;
+  await new Promise((r) => setTimeout(r, retryDelayMs));
+  const second = await probeOnce(origin, timeoutMs);
+  return second === "up" ? "up" : "down";
 }
 
 /**

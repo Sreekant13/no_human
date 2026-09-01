@@ -34,7 +34,7 @@ function bootstrapEnv() {
 process.title = ${JSON.stringify(MARK)};
 const http = require("node:http");
 http.createServer((q, s) => {
-  if (q.url === "/api/tasks") { s.end("[]"); return; }
+  if (q.url.split("?")[0] === "/api/tasks") { s.end("[]"); return; }
   s.setHeader("content-type", "text/html"); s.end("<h1>BOARD</h1>");
 }).listen(${PORT}, "127.0.0.1");
 setInterval(() => {}, 1000);
