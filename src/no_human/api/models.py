@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, model_validator
 
+from ..blockers.taxonomy import Blocker
 from ..core.cost import attempt_cost, attempts_cost
 from ..core.db import USAGE_ROLES, usage_columns_for
 from ..core.metrics import cache_read_share
@@ -645,9 +646,17 @@ class TaskSummaryOut(BaseModel):
         escalation_attempts = None
         escalation_tokens = None
         if task.blocker and isinstance(task.blocker, dict):
-            blocker_q = task.blocker.get("question")
-            blocker_cat = task.blocker.get("category")
-            blocker_wake = task.blocker.get("wake_condition")
+            # Legacy rows persisted before the blocker-prose normalisation
+            # (2026-09-01, e18192e04) can still hold LIST-shaped question/
+            # category/wake_condition on disk — a raw `.get()` lift feeds a
+            # list straight into these `str | None` fields below and
+            # ValidationErrors the whole board list endpoint. Route through
+            # `Blocker.from_dict`, the same coercion every new blocker gets,
+            # so a legacy row renders instead of detonating the page.
+            _blocker = Blocker.from_dict(task.blocker)
+            blocker_q = _blocker.question
+            blocker_cat = _blocker.category.value
+            blocker_wake = _blocker.wake_condition
             blocker_stopped = bool(task.blocker.get("human_stopped"))
             _lat = task.blocker.get("escalation_latency") or {}
             escalation_attempts = _lat.get("attempts_before_escalation")
