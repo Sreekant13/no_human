@@ -4192,6 +4192,41 @@ class Store:
         await self.db.commit()
         return event_id
 
+    @serialized_write
+    async def record_learning_events(
+        self, rows: list[tuple[str, str, dict[str, Any] | None]],
+    ) -> list[str]:
+        """Batched form of `record_learning_event`: ONE `executemany` and ONE
+        commit for every `(memory_id, event, detail)` triple in *rows*,
+        instead of one write + commit per row.
+
+        Same reasoning, same call site, as `record_memory_uses` and
+        `touch_memories_used`: `Orchestrator._load_active_memories`'s
+        injection loop wrote one `inject` audit row per selected memory via
+        `record_learning_event` — a per-row serialized write + commit on the
+        per-attempt hot path — while its two ledger-writing siblings right
+        beside it were already batched. Per-row content (each memory's
+        `trigger_reason` detail) is unchanged; only the write shape is.
+
+        Returns the new event ids, in the same order as *rows*. Empty input
+        is a no-op — mirrors `record_memory_uses`'s empty-list behaviour.
+        """
+        if not rows:
+            return []
+        now = _now()
+        ids = [uuid.uuid4().hex for _ in rows]
+        await self.db.executemany(
+            "INSERT INTO learning_events (id, memory_id, event, detail, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                (event_id, memory_id, event,
+                 json.dumps(detail) if detail is not None else None, now)
+                for event_id, (memory_id, event, detail) in zip(ids, rows)
+            ],
+        )
+        await self.db.commit()
+        return ids
+
     async def list_learning_events(
         self, *, memory_id: str | None = None, limit: int = 200,
     ) -> list[dict[str, Any]]:

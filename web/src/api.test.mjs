@@ -233,7 +233,10 @@ test("splitTask surfaces the server's 409 reason, not a bare status", async () =
 // paper over the split so the drawer's existing summary code — which reads
 // `task.attempts[i].review_checklist` etc. across MULTIPLE attempts, not
 // just the last one — keeps working unchanged.
-import { fetchAttemptDetails, fetchTask } from "./api.js";
+import {
+  fetchAttemptDetails, fetchTask,
+  _attemptDetailsCacheSizeForTests, _clearAttemptDetailsCacheForTests,
+} from "./api.js";
 
 /** Route a stubbed fetch by exact URL rather than answering every call the
  * same way — `fetchTask` now issues N+1 requests (the task, plus one per
@@ -310,4 +313,170 @@ test("fetchTask with no attempts makes no lazy-detail calls at all", async () =>
   });
   await fetchTask("t1");
   assert.deepEqual(calls, ["/api/tasks/t1"]);
+});
+
+// ── Fix A: the attempt-details fan-out cache ─────────────────────────────────
+// A SlideOver poll calls fetchTask repeatedly for the same task; before this,
+// EVERY poll re-fetched EVERY attempt's heavy blobs even though a TERMINAL
+// attempt's review_checklist/verifier_results/test_results never change
+// again. Cache eligibility is `attempt.status` in ("failed", "succeeded") —
+// NOT `completed_at` presence: only the successful-delivery paths stamp
+// `completed_at`, while a failed attempt (the ordinary, far more common
+// shape) leaves it null. `completed_at` still rides in the cache key as an
+// extra invalidation signal when a resumed attempt (same number) reaches a
+// new terminal state.
+
+test.beforeEach(() => { _clearAttemptDetailsCacheForTests(); });
+
+test("a succeeded attempt's details are fetched once across two fetchTask calls", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/cache-done": {
+      body: {
+        id: "cache-done",
+        attempts: [{ id: "a1", attempt_number: 1, status: "succeeded", completed_at: "2026-08-01T00:00:00Z" }],
+      },
+    },
+    "/api/tasks/cache-done/attempts/1/details": {
+      body: { attempt_number: 1, review_checklist: { passed: true }, verifier_results: [], test_results: null },
+    },
+  });
+  await fetchTask("cache-done");
+  const second = await fetchTask("cache-done");
+  const detailHits = calls.filter((u) => u === "/api/tasks/cache-done/attempts/1/details");
+  assert.equal(detailHits.length, 1, "the second call must reuse the cached blobs");
+  assert.equal(second.attempts[0].review_checklist.passed, true,
+    "the cached blobs must still be merged onto the SECOND call's task");
+});
+
+test("a FAILED attempt with completed_at NULL is still cached — status, not completed_at, gates eligibility", async () => {
+  // This is the real, ordinary shape: `update_attempt(..., status="failed")`
+  // never stamps `completed_at` (only the success-delivery paths in the
+  // orchestrator's finalizer do). A cache gated on completed_at presence
+  // would refetch every failed attempt forever — this pins that it does not.
+  const calls = stubFetchByUrl({
+    "/api/tasks/cache-failed": {
+      body: {
+        id: "cache-failed",
+        attempts: [{ id: "a1", attempt_number: 1, status: "failed", completed_at: null }],
+      },
+    },
+    "/api/tasks/cache-failed/attempts/1/details": {
+      body: { attempt_number: 1, review_checklist: { passed: false }, verifier_results: [], test_results: null },
+    },
+  });
+  await fetchTask("cache-failed");
+  await fetchTask("cache-failed");
+  const detailHits = calls.filter((u) => u === "/api/tasks/cache-failed/attempts/1/details");
+  assert.equal(detailHits.length, 1,
+    "a failed attempt's blobs are frozen just like a succeeded one's — the second call must reuse the cache");
+});
+
+test("an INTERRUPTED attempt is never cached — it can resume and its blobs can change again", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/cache-interrupted": {
+      body: {
+        id: "cache-interrupted",
+        attempts: [{ id: "a1", attempt_number: 1, status: "interrupted", completed_at: null }],
+      },
+    },
+    "/api/tasks/cache-interrupted/attempts/1/details": {
+      body: { attempt_number: 1, review_checklist: null, verifier_results: [], test_results: null },
+    },
+  });
+  await fetchTask("cache-interrupted");
+  await fetchTask("cache-interrupted");
+  const detailHits = calls.filter((u) => u === "/api/tasks/cache-interrupted/attempts/1/details");
+  assert.equal(detailHits.length, 2,
+    "interrupted looks terminal but is resumable — a resume can write NEW blobs onto the same row");
+});
+
+test("a RUNNING attempt (in-progress status, completed_at null) is refetched on every fetchTask call", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/cache-inflight": {
+      body: {
+        id: "cache-inflight",
+        attempts: [{ id: "a1", attempt_number: 1, status: "in_progress", completed_at: null }],
+      },
+    },
+    "/api/tasks/cache-inflight/attempts/1/details": {
+      body: { attempt_number: 1, review_checklist: null, verifier_results: [{ name: "v1" }], test_results: null },
+    },
+  });
+  await fetchTask("cache-inflight");
+  await fetchTask("cache-inflight");
+  const detailHits = calls.filter((u) => u === "/api/tasks/cache-inflight/attempts/1/details");
+  assert.equal(detailHits.length, 2, "a still-running attempt's blobs genuinely change and must never be cached");
+});
+
+test("a changed completed_at (a resumed attempt reaching a new terminal state) busts the cached entry", async () => {
+  const detailHits = [];
+  let taskCalls = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u === "/api/tasks/cache-bust") {
+      taskCalls += 1;
+      const completed_at = taskCalls === 1 ? "2026-08-01T00:00:00Z" : "2026-08-02T00:00:00Z";
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          id: "cache-bust",
+          attempts: [{ id: "a1", attempt_number: 1, status: "succeeded", completed_at }],
+        }),
+      };
+    }
+    if (u === "/api/tasks/cache-bust/attempts/1/details") {
+      detailHits.push(u);
+      return {
+        ok: true, status: 200,
+        json: async () => ({ attempt_number: 1, review_checklist: { round: detailHits.length }, verifier_results: [], test_results: null }),
+      };
+    }
+    throw new Error(`unstubbed fetch: ${u}`);
+  };
+  const first = await fetchTask("cache-bust");
+  const secondFetch = await fetchTask("cache-bust");
+  assert.equal(detailHits.length, 2,
+    "a different completed_at is a different attempt outcome and must not reuse the old blobs");
+  assert.equal(first.attempts[0].review_checklist.round, 1);
+  assert.equal(secondFetch.attempts[0].review_checklist.round, 2);
+});
+
+test("a failed details fetch for a terminal attempt degrades to absent fields and is never cached", async () => {
+  const calls = stubFetchByUrl({
+    "/api/tasks/cache-fetch-fail": {
+      body: {
+        id: "cache-fetch-fail",
+        attempts: [{ id: "a1", attempt_number: 1, status: "succeeded", completed_at: "2026-08-01T00:00:00Z" }],
+      },
+    },
+    "/api/tasks/cache-fetch-fail/attempts/1/details": { status: 404, body: {} },
+  });
+  const task = await fetchTask("cache-fetch-fail");
+  assert.equal(task.id, "cache-fetch-fail");
+  assert.equal(task.attempts[0].review_checklist, undefined);
+  assert.equal(task.attempts[0].verifier_results, undefined);
+  assert.equal(task.attempts[0].test_results, undefined);
+  const detailHits = calls.filter((u) => u === "/api/tasks/cache-fetch-fail/attempts/1/details");
+  assert.equal(detailHits.length, 1);
+});
+
+test("the attempt-details cache is bounded — inserting more than the cap evicts the oldest", async () => {
+  assert.equal(_attemptDetailsCacheSizeForTests(), 0);
+  const CAP_PROBE = 60; // > the documented 50-entry cap
+  for (let i = 0; i < CAP_PROBE; i++) {
+    const taskId = `cache-bound-${i}`;
+    stubFetchByUrl({
+      [`/api/tasks/${taskId}`]: {
+        body: { id: taskId, attempts: [{ id: "a1", attempt_number: 1, status: "succeeded", completed_at: "2026-08-01T00:00:00Z" }] },
+      },
+      [`/api/tasks/${taskId}/attempts/1/details`]: {
+        body: { attempt_number: 1, review_checklist: { passed: true }, verifier_results: [], test_results: null },
+      },
+    });
+    await fetchTask(taskId);
+    assert.ok(_attemptDetailsCacheSizeForTests() <= 50,
+      `cache grew past the cap after inserting entry ${i}`);
+  }
+  assert.equal(_attemptDetailsCacheSizeForTests(), 50,
+    "a long board session must not grow the cache unbounded");
 });

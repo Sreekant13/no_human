@@ -223,7 +223,10 @@ FROZEN_FILE_LINES = {
     # in `_looks_like_test_run` (`_READ_ONLY_LEADING_TOKENS`/
     # `_GIT_READ_ONLY_SUBCOMMANDS`/`_SHELL_SEGMENT_RE`). Measured on this
     # tree with the scanner below.
-    "core/orchestrator.py": 20507,
+    # 20507 -> 20513 (+6): efficiency pair — the batched
+    # `record_learning_events` call replacing the per-injection loop at the
+    # memory-injection site. Measured on the pair's merge result.
+    "core/orchestrator.py": 20513,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -319,7 +322,12 @@ FROZEN_FILE_LINES = {
     # `count_auto_activated_since`, `set_paused`, `record_learning_event`,
     # `list_learning_events`, `archive_stale_auto_activated`). Re-anchored
     # on merge.
-    "core/db.py": 4656,
+    # 4656 -> 4691 (+35): efficiency fix — `record_learning_events`, the
+    # batched sibling of `record_learning_event` (one `executemany` + one
+    # commit for every injected memory's audit row, matching the idiom of
+    # the already-batched `record_memory_uses`/`touch_memories_used`).
+    # Measured on this tree with the scanner below.
+    "core/db.py": 4691,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

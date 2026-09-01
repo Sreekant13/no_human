@@ -720,3 +720,157 @@ async def test_auto_retire_sweep_does_not_abort_on_a_mid_loop_audit_failure(
         assert row["archived"] == 1
     assert calls["n"] == 3, (
         "the loop must have attempted every id, not stopped at the failure")
+
+
+# --------------------------------------------------------------------------- #
+# efficiency minor (D3.1's deferred item): the injection loop's audit trail   #
+# is batched — ONE `record_learning_events` executemany+commit for every     #
+# injected memory, not one `record_learning_event` write+commit PER memory,  #
+# mirroring the already-batched `record_memory_uses`/`touch_memories_used`   #
+# right beside it in `_load_active_memories`.                                #
+# --------------------------------------------------------------------------- #
+
+async def test_record_learning_events_batch_writes_all_rows_in_one_call(
+        store, monkeypatch):
+    """`Store.record_learning_events` — the batched sibling of
+    `record_learning_event` — writes N rows via a SINGLE `executemany` +
+    SINGLE `commit`, not N round trips."""
+    mem_ids = [
+        await store.add_memory(mem_type=TYPE_RULE, title=f"r{i}", content="x",
+                                confirmed=True)
+        for i in range(4)
+    ]
+    executemany_calls = {"n": 0}
+    real_executemany = store.db.executemany
+
+    async def _counting_executemany(*a, **k):
+        executemany_calls["n"] += 1
+        return await real_executemany(*a, **k)
+
+    monkeypatch.setattr(store.db, "executemany", _counting_executemany)
+
+    rows = [(mid, "inject", {"tags": ["t"]}) for mid in mem_ids]
+    ids = await store.record_learning_events(rows)
+
+    assert len(ids) == 4
+    assert len(set(ids)) == 4, "each row gets its own event id"
+    assert executemany_calls["n"] == 1, (
+        "N injected memories must produce N audit rows via ONE write call")
+
+    for mid in mem_ids:
+        events = await store.list_learning_events(memory_id=mid)
+        assert len(events) == 1
+        assert events[0]["event"] == "inject"
+
+    assert await store.record_learning_events([]) == [], (
+        "empty input is a no-op, mirroring record_memory_uses")
+
+
+async def test_record_learning_events_batch_row_shape_matches_the_per_row_form(
+        store):
+    """The batched write's row content must be identical in SHAPE to what
+    `record_learning_event` (the per-row form) would have written — only the
+    write mechanism changed, not what's recorded."""
+    import json
+
+    mem_a = await store.add_memory(mem_type=TYPE_RULE, title="a", content="x",
+                                    confirmed=True)
+    mem_b = await store.add_memory(mem_type=TYPE_RULE, title="b", content="x",
+                                    confirmed=True)
+
+    detail_a = {"task_id": "task-1", "attempt_id": "att-1", "tags": ["kafka"]}
+    detail_b = {"task_id": "task-1", "attempt_id": "att-1", "unconditional": True}
+
+    # Per-row form, for the baseline.
+    await store.record_learning_event(mem_a, "inject", detail=detail_a)
+    # Batched form, for the same shape of input.
+    await store.record_learning_events([(mem_b, "inject", detail_b)])
+
+    events_a = await store.list_learning_events(memory_id=mem_a)
+    events_b = await store.list_learning_events(memory_id=mem_b)
+    assert len(events_a) == 1 and len(events_b) == 1
+    row_a, row_b = events_a[0], events_b[0]
+
+    # Same columns populated, same event name, same JSON-serialized detail
+    # shape (only the memory_id and detail payload differ between the two).
+    assert set(row_a.keys()) == set(row_b.keys())
+    assert row_a["event"] == row_b["event"] == "inject"
+    assert row_a["memory_id"] == mem_a
+    assert row_b["memory_id"] == mem_b
+    assert json.loads(row_a["detail"]) == detail_a
+    assert json.loads(row_b["detail"]) == detail_b
+    assert row_a["id"] != row_b["id"]
+    assert row_a["created_at"] and row_b["created_at"]
+
+
+async def test_load_active_memories_uses_the_batched_write_at_the_injection_site(
+        store, monkeypatch):
+    """`_load_active_memories`'s injection loop calls the BATCHED form, not
+    the per-row one, for its `learning_events` audit rows — this is the
+    actual call-site change, not just a new store method sitting unused."""
+    mem_ids = [
+        await store.add_memory(
+            mem_type=TYPE_RULE, title=f"always-on {i}", content="x",
+            confirmed=True)  # untagged -> unconditional, always injects
+        for i in range(3)
+    ]
+    task = Task.new("Fix the Kafka topic creation", repo_path="")
+
+    per_row_calls = {"n": 0}
+    batch_calls = {"n": 0, "rows": None}
+    real_batch = store.record_learning_events
+
+    async def _count_per_row(*a, **k):
+        per_row_calls["n"] += 1
+
+    async def _count_batch(rows):
+        batch_calls["n"] += 1
+        batch_calls["rows"] = rows
+        return await real_batch(rows)
+
+    monkeypatch.setattr(store, "record_learning_event", _count_per_row)
+    monkeypatch.setattr(store, "record_learning_events", _count_batch)
+
+    await _bare_orchestrator(store)._load_active_memories(task)
+
+    assert batch_calls["n"] == 1, (
+        "the injection loop must call the batched form exactly once, "
+        "regardless of how many memories were injected")
+    assert per_row_calls["n"] == 0, (
+        "the per-row form must not be called at all from this call site"
+    )
+    assert len(batch_calls["rows"]) == 3
+
+    for mem_id in mem_ids:
+        events = await store.list_learning_events(memory_id=mem_id)
+        inject_events = [e for e in events if e["event"] == "inject"]
+        assert len(inject_events) == 1
+
+
+async def test_injection_proceeds_when_the_batched_audit_write_fails(
+        store, monkeypatch):
+    """Best-effort guard, batched form: a raising `record_learning_events`
+    must not stop the attempt — `_load_active_memories` must return
+    normally, and the OTHER ledger writes (`touch_memories_used`,
+    `record_memory_uses`) beside it must still have landed."""
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="always-on rule", content="x",
+        confirmed=True)
+    task = Task.new("Fix the Kafka topic creation", repo_path="")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "record_learning_events", _boom)
+
+    # Must not raise.
+    await _bare_orchestrator(store)._load_active_memories(task)
+
+    # The sibling ledger writes are unaffected by the audit-write failure.
+    mem = await store.find_memory(mem_id)
+    assert mem["use_count"] == 1
+    assert mem["last_used_at"]
+    # And no learning_events row exists for this memory — the failure was
+    # real, not silently swallowed into a fake success.
+    events = await store.list_learning_events(memory_id=mem_id)
+    assert events == []

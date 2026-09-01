@@ -37,22 +37,114 @@ export async function fetchAttemptDetails(taskId, attemptNumber) {
   return r.json();
 }
 
+// The P1 split moved the three heavy blobs off the inline task payload so an
+// open/poll would not carry them when the drawer wasn't showing them — but
+// `_hydrateAttemptDetails` below still re-fetched EVERY attempt's blobs on
+// EVERY `fetchTask` call, so a SlideOver poll kept making 1+N requests for
+// the same total payload the split was supposed to shrink.
+//
+// A TERMINAL attempt's blobs never change again (the review/verifier/test
+// rows are written once, at that attempt's terminal transition, and never
+// revised in place) so its detail response is safe to cache once and reuse.
+// "Terminal" here is `attempt.status` in ("failed", "succeeded") — NOT
+// `attempt.completed_at`: only the successful-delivery paths in the
+// orchestrator's finalizer ever stamp `completed_at` (a handful of call
+// sites), while the far more common failure paths (dozens of call sites)
+// mark `status: "failed"` and leave `completed_at` null. Gating on
+// `completed_at` alone would leave the ORDINARY non-final shape — a failed
+// attempt — refetched on every poll forever, unrealizing the win this cache
+// exists for.
+//
+// `status: "interrupted"` (a crashed worker's row, or a server-stop mid-run)
+// is deliberately EXCLUDED even though it looks terminal: an interrupted
+// attempt can still be resumed, and a resume can go on to write NEW
+// review/verifier/test blobs onto that same attempt row — caching it would
+// risk serving a stale pre-resume snapshot forever. A still-running attempt
+// (the default in-progress status, not yet "failed"/"succeeded") is never
+// cacheable either, for the same reason: its blobs genuinely change between
+// polls.
+//
+// `completed_at` still rides along in the cache KEY (not the eligibility
+// gate) as an extra invalidation signal when present: on a terminal row that
+// does carry one, a later value (a resumed attempt reaching a new terminal
+// state) produces a new key and busts the old one, rather than serving a
+// previous run's blobs under the same key forever.
+//
+// Bounded FIFO/LRU at `_ATTEMPT_DETAILS_CACHE_CAP` entries: a long board
+// session opening many tasks' drawers must not grow this without limit. A
+// cache hit is moved to the end (most-recently-used) so eviction drops the
+// entry nobody has touched in the longest time, not just the oldest write.
+const _ATTEMPT_DETAILS_CACHE_CAP = 50;
+const _attemptDetailsCache = new Map();
+
+// Terminal `attempt.status` values whose heavy blobs are frozen and
+// therefore safe to cache — see the block comment above for why
+// "interrupted" and the in-flight default are excluded.
+const _CACHEABLE_ATTEMPT_STATUSES = new Set(["failed", "succeeded"]);
+
+function _attemptCacheKey(taskId, attempt) {
+  return `${taskId}:${attempt.attempt_number}:${attempt.completed_at ?? ""}`;
+}
+
+function _rememberAttemptDetails(key, blobs) {
+  _attemptDetailsCache.set(key, blobs);
+  while (_attemptDetailsCache.size > _ATTEMPT_DETAILS_CACHE_CAP) {
+    // Map iteration order is insertion order — the first key is the
+    // least-recently-used one (see the `delete`+`set` re-insert on a hit
+    // below).
+    const oldest = _attemptDetailsCache.keys().next().value;
+    _attemptDetailsCache.delete(oldest);
+  }
+}
+
+// Test seam only — production code never inspects cache size or clears it;
+// the cap above is what keeps a live session bounded.
+export function _attemptDetailsCacheSizeForTests() {
+  return _attemptDetailsCache.size;
+}
+export function _clearAttemptDetailsCacheForTests() {
+  _attemptDetailsCache.clear();
+}
+
 /** Merge each attempt's lazily-fetched heavy blobs back onto `task.attempts`
  * in place, so callers see the exact shape the detail payload used to inline
  * — the drawer's own summary logic (`slideOverSummary.js`, `SlideOver.jsx`)
  * never has to know the split happened. A single attempt's fetch failing
  * (404, offline) degrades that ONE attempt to missing fields rather than
  * failing the whole task fetch — the same "no data" shape those consumers
- * already handle for an attempt that predates these columns. */
+ * already handle for an attempt that predates these columns. A terminal
+ * ("failed"/"succeeded") attempt with a cached entry skips the network call
+ * entirely — see the cache doc comment above `_attemptDetailsCache`. */
 async function _hydrateAttemptDetails(task) {
   const attempts = task?.attempts;
   if (!Array.isArray(attempts) || attempts.length === 0) return task;
   await Promise.all(attempts.map(async (a) => {
+    const cacheable = _CACHEABLE_ATTEMPT_STATUSES.has(a?.status);
+    const key = cacheable ? _attemptCacheKey(task.id, a) : null;
+    if (key && _attemptDetailsCache.has(key)) {
+      const cached = _attemptDetailsCache.get(key);
+      // Re-insert so this key becomes the most-recently-used for eviction.
+      _attemptDetailsCache.delete(key);
+      _attemptDetailsCache.set(key, cached);
+      a.review_checklist = cached.review_checklist;
+      a.verifier_results = cached.verifier_results;
+      a.test_results = cached.test_results;
+      return;
+    }
     try {
       const details = await fetchAttemptDetails(task.id, a.attempt_number);
-      a.review_checklist = details.review_checklist;
-      a.verifier_results = details.verifier_results;
-      a.test_results = details.test_results;
+      const blobs = {
+        review_checklist: details.review_checklist,
+        verifier_results: details.verifier_results,
+        test_results: details.test_results,
+      };
+      a.review_checklist = blobs.review_checklist;
+      a.verifier_results = blobs.verifier_results;
+      a.test_results = blobs.test_results;
+      // Only a SUCCESSFUL fetch for a TERMINAL attempt is cached — a failed
+      // fetch (404, offline) must not be remembered as "these fields are
+      // absent forever" for what may be a transient blip.
+      if (key) _rememberAttemptDetails(key, blobs);
     } catch {
       // Leave this attempt's heavy fields absent — see doc comment above.
     }
