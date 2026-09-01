@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import sys
 import warnings
 from collections import namedtuple
 from pathlib import Path
@@ -1992,6 +1993,77 @@ def _citation_source_lines(resolve_path: str, spec: str) -> list[str]:
     return lines[start - 1:end]
 
 
+#: How far a line citation may drift before it must be re-anchored. ±5 lines
+#: absorbs the ordinary edit above a citation (an added import, a docstring
+#: line, a small helper) that shifts everything below it in a hot file like
+#: orchestrator.py or db.py — measured: those shifts turned this suite red for
+#: unrelated in-flight tasks, and whole commits (886a575e2) exist only to
+#: re-anchor. It stays far smaller than a real relocation: a moved or
+#: reworded block leaves the token outside the window and still goes RED, and
+#: the token itself must still match EXACTLY as a substring — the window
+#: widens WHERE we look, never WHAT counts as a match.
+_CITATION_DRIFT_WINDOW = 5
+
+
+def _locate_line_citation(
+    resolve_path: str, spec: str, token: str
+) -> tuple[str, int | None, str]:
+    """Where *token* actually lives relative to a legacy `path:line[-line]`
+    citation, tolerating small drift.
+
+    Returns ``(status, found_line, detail)``:
+
+    - ``"unresolved"`` — *resolve_path* does not resolve to exactly one file.
+      *found_line* is None; *detail* is empty. Callers must preserve today's
+      assertion text for this case — it is what `_ABSENT_OK` skips on.
+    - ``"exact"`` — *token* is on the cited line(s), unchanged. *found_line*
+      is the cited start line.
+    - ``"drifted"`` — *token* is not on the cited line(s) but IS within
+      `_CITATION_DRIFT_WINDOW` lines of them. *found_line* is the 1-based
+      line the match now starts on (the occurrence nearest the citation, so
+      a token that also appears far away does not win); *detail* is empty.
+    - ``"missing"`` — *token* is nowhere in the window. *found_line* is the
+      nearest occurrence anywhere else in the file (or None if it appears
+      nowhere at all); *detail* names that candidate, or says the content is
+      gone, for the diagnostic message.
+    """
+    hits = _resolve_source(resolve_path)
+    if len(hits) != 1:
+        return "unresolved", None, ""
+
+    lines = hits[0].read_text(encoding="utf-8").splitlines()
+    if "-" in spec:
+        start_s, end_s = spec.split("-", 1)
+    else:
+        start_s = end_s = spec
+    start, end = int(start_s), int(end_s)
+    span = max(end - start + 1, 1)
+
+    cited = lines[max(start - 1, 0):end] if start >= 1 else []
+    if start >= 1 and end <= len(lines) and token in "\n".join(cited):
+        return "exact", start, ""
+
+    lo = max(0, start - 1 - _CITATION_DRIFT_WINDOW)
+    hi = min(len(lines), end + _CITATION_DRIFT_WINDOW)
+    window_starts = sorted(
+        range(lo, max(hi - span + 1, lo)),
+        key=lambda i: abs(i - (start - 1)),
+    )
+    for i in window_starts:
+        candidate = "\n".join(lines[i:i + span])
+        if token in candidate:
+            return "drifted", i + 1, ""
+
+    # Missing: search the whole file for a diagnostic, but never treat a
+    # distant match as found — that would be exactly the widened match rule
+    # this helper must not implement.
+    for i in range(0, max(len(lines) - span + 1, 0)):
+        candidate = "\n".join(lines[i:i + span])
+        if token in candidate:
+            return "missing", i + 1, f"nearest candidate is line {i + 1}"
+    return "missing", None, f"not found anywhere in {hits[0]}"
+
+
 def _check_citation(
     doc: str,
     raw: str,
@@ -2018,19 +2090,38 @@ def _check_citation(
     """
     tail = raw.split(":", 1)[1]
     if _LEGACY_LINE_SPEC_RE.match(tail):
+        status, found_line, detail = _locate_line_citation(resolve_path, tail, token)
+        if status == "unresolved":
+            assert False, (
+                f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
+                f"does not resolve to a real line range — the code moved or the "
+                f"citation was never re-derived"
+            )
+        if status == "exact":
+            return
+        if status == "drifted":
+            warnings.warn(
+                f"{doc} cites `{raw}` for {token!r}, which has drifted from "
+                f"line {tail} to line {found_line} in {resolve_path} — still "
+                f"passing on a ±{_CITATION_DRIFT_WINDOW}-line tolerance; run "
+                f"`uv run python scripts/reanchor_citations.py --apply` to "
+                f"re-anchor it",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        # status == "missing"
         lines = _citation_source_lines(resolve_path, tail)
-        assert lines, (
-            f"{doc} cites `{raw}` (resolved against {resolve_path!r}) but that "
-            f"does not resolve to a real line range — the code moved or the "
-            f"citation was never re-derived"
-        )
-        haystack = "\n".join(lines)
-        assert token in haystack, (
+        haystack = "\n".join(lines) if lines else "(citation is out of range)"
+        assert False, (
             f"{doc} cites `{raw}` for {token!r}, but the line(s) now read:\n"
             f"  {haystack!r}\n"
-            f"re-derive the citation from the current tree"
+            f"and {token!r} was not found within "
+            f"±{_CITATION_DRIFT_WINDOW} lines of the citation either — "
+            f"{detail}; re-derive the citation from the current tree, or run "
+            f"`uv run python scripts/reanchor_citations.py --apply` if the "
+            f"nearest candidate above is the right target"
         )
-        return
 
     # Symbol citation: strip the optional advisory `:line[-line]` suffix —
     # it is never consulted for pass/fail, only parsed so the format allows it.
@@ -2237,6 +2328,110 @@ def test_symbol_citation_falls_back_to_regex_when_ast_fails():
             "still here",
             source_text=source_text,
         )
+
+
+def test_line_citation_tolerates_small_drift(tmp_path, monkeypatch):
+    """The defect this guard exists for: an unrelated edit prepends a few
+    lines above a citation's target in a hot file, and the cited line number
+    rots — but the CONTENT is still right there, a few lines down.
+
+    `_check_citation` must still pass (with a UserWarning naming the drift,
+    not silently), and `_locate_line_citation` must report exactly where the
+    content moved to.
+    """
+    original = "\n".join(f"line {i}" for i in range(1, 11)) + "\n"
+    target = tmp_path / "widget.py"
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_resolve_source", lambda path: [target])
+
+    status, found_line, _detail = _locate_line_citation("widget.py", "5", "line 5")
+    assert status == "exact" and found_line == 5
+
+    # Prepend 3 lines — everything below shifts down by 3, exactly the shape
+    # of the drift this window absorbs.
+    target.write_text("pad 1\npad 2\npad 3\n" + original, encoding="utf-8")
+
+    status, found_line, _detail = _locate_line_citation("widget.py", "5", "line 5")
+    assert status == "drifted", f"expected drifted, got {status!r}"
+    assert found_line == 8, f"expected the content at its new line 8, got {found_line}"
+
+    with pytest.warns(UserWarning, match="drifted"):
+        _check_citation("security.md", "widget.py:5", "widget.py", "line 5")
+
+
+def test_line_citation_fails_when_content_is_gone(tmp_path, monkeypatch):
+    """A citation must still go RED when its content is genuinely gone —
+    deleted, reworded, or moved far enough that drift tolerance is not the
+    honest answer. Both cases must name a nearest-candidate diagnostic
+    (never silently guess, never pass).
+    """
+    original = "\n".join(f"line {i}" for i in range(1, 11)) + "\n"
+    target = tmp_path / "widget.py"
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_resolve_source", lambda path: [target])
+
+    # Case 1: the token is deleted/reworded entirely — no candidate anywhere.
+    target.write_text(
+        "\n".join(f"line {i}" for i in range(1, 5))
+        + "\nsomething else entirely\n"
+        + "\n".join(f"line {i}" for i in range(6, 11))
+        + "\n",
+        encoding="utf-8",
+    )
+    status, found_line, detail = _locate_line_citation("widget.py", "5", "line 5")
+    assert status == "missing"
+    assert found_line is None
+    assert "not found anywhere" in detail
+    with pytest.raises(AssertionError, match="not found anywhere"):
+        _check_citation("security.md", "widget.py:5", "widget.py", "line 5")
+
+    # Case 2: the token moved 20 lines away — well outside the ±5 window —
+    # still fails, but the diagnostic names where it actually is.
+    padded = "\n".join(f"pad {i}" for i in range(1, 21)) + "\n" + original
+    target.write_text(padded, encoding="utf-8")
+    status, found_line, detail = _locate_line_citation("widget.py", "5", "line 5")
+    assert status == "missing"
+    assert found_line == 25, f"expected the real (out-of-window) line, got {found_line}"
+    assert "nearest candidate is line 25" in detail
+    with pytest.raises(AssertionError, match="nearest candidate is line 25"):
+        _check_citation("security.md", "widget.py:5", "widget.py", "line 5")
+
+
+def test_drift_window_is_not_a_blanket_pass():
+    """The window is a small, deliberate tolerance, not a fuzzy-match
+    escape hatch — this pins both the bound itself and the fact that content
+    genuinely outside it is `"missing"`, not `"drifted"`.
+    """
+    assert _CITATION_DRIFT_WINDOW <= 10, (
+        "the drift window grew past a small tolerance for ordinary edits — "
+        "that starts to hide real relocations instead of catching them"
+    )
+
+
+def test_every_line_citation_currently_resolves_exactly():
+    """The shipped docs are exactly anchored today, not merely within drift
+    tolerance — this is what gives `scripts/reanchor_citations.py --check`
+    something to enforce, and proves the new tolerance did not quietly
+    downgrade every legacy citation to "drifted".
+    """
+    checked = 0
+    for doc, raw, resolve_path, token in CITATION_TABLE:
+        tail = raw.split(":", 1)[1]
+        if not _LEGACY_LINE_SPEC_RE.match(tail):
+            continue  # symbol citation — not part of this guard
+        if (doc, raw) in _ABSENT_OK and not _resolve_source(resolve_path):
+            continue  # export-absent row; covered by its own non-vacuity test
+        status, found_line, detail = _locate_line_citation(resolve_path, tail, token)
+        assert status == "exact", (
+            f"{doc} citation `{raw}` is {status!r} (found_line={found_line}, "
+            f"{detail}), not exactly anchored — the shipped docs should not "
+            f"be relying on drift tolerance"
+        )
+        checked += 1
+    assert checked >= 15, (
+        f"only {checked} legacy line citations were exercised — the ~22-row "
+        f"legacy-form slice of CITATION_TABLE should cover most of them"
+    )
 
 
 # --- KNOWN_ISSUES.md's traceback citations (not backtick-wrapped) ------------

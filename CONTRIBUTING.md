@@ -316,6 +316,38 @@ npm run e2e       # the live-flows suite needs a server on :8420
 - Credentials are never read from or written to anywhere in the repo. They live
   in `~/.no_human/.env` at `chmod 600`.
 
+### Citing code from docs
+
+`docs/security.md`, `docs/eval.md` and `docs/KNOWN_ISSUES.md` cite real code so
+`tests/test_readme_claims.py` can prove the claim still matches the code. Two
+forms:
+
+- **Symbol form** — `` `orchestrator.py::resume_task` `` — resolves by name via
+  the AST (falling back to a regex if the file fails to parse). Drift-immune:
+  it does not care what line the function is on. Prefer this form for hot
+  files (`orchestrator.py`, `db.py`) that churn often.
+- **Line form** — `` `db.py:120-134` `` — resolves by line range, but
+  tolerates up to 5 lines of drift either side: an ordinary edit above the
+  citation (an added import, a docstring line) shifts everything below it
+  without the citation's content actually moving, and pinning to the exact
+  line turned the suite red for unrelated in-flight work. The tolerance is a
+  *hint*, not a licence — the cited text must still match exactly as a
+  substring, and content that has been deleted, reworded, or moved further
+  than 5 lines still fails, with a diagnostic naming the nearest candidate
+  line.
+
+A citation that drifts within the window still passes (with a `UserWarning`)
+but should be re-anchored, not left to rely on the tolerance forever:
+
+```
+uv run python scripts/reanchor_citations.py --check   # is anything drifted?
+uv run python scripts/reanchor_citations.py --apply   # rewrite doc + table
+```
+
+`--apply` rewrites both the doc's citation and its matching row in
+`CITATION_TABLE` together, or writes neither — it never guesses which
+occurrence to rewrite when a citation's raw text appears more than once.
+
 ## Proposing a change
 
 1. Open an issue describing the problem. For a bug, include the repro.
