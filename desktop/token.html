@@ -156,6 +156,15 @@
       </div>
     </fieldset>
 
+    <!-- "Use my existing Claude Code sign-in": deliberately NOT static markup.
+         uiPages.test.mjs pins the page's exact tab order via
+         document.querySelectorAll("input,button"), which does not care about
+         the `hidden` attribute — a statically-hidden button here would still
+         show up in that list on every load, including pageProbe.cjs's, which
+         has no nhSetup bridge and would never detect anything. Building the
+         row in script, ONLY when nh:claude-signin-status reports detected,
+         keeps the no-signal DOM byte-for-byte identical to today (AC5) and
+         the tab order untouched. See the script block below (renderExistingSignin). -->
     <ol id="steps">
       <li>In a terminal, run <code>claude setup-token</code></li>
       <li>Sign in when the browser opens</li>
@@ -272,6 +281,74 @@
   renderRequirements();       // "Checking…" rows, Save disabled, before the first probe lands
   checkRequirements();
 
+  // "Use my existing Claude Code sign-in": a read-only status probe, safe to
+  // call on load — it never runs `setup-token` and never writes anything. The
+  // row itself is built ONLY when detected (see the note above #steps) so the
+  // undetected DOM — and its tab order — are byte-for-byte unchanged.
+  let existingSignin = null, useExisting = null, existingNote = null;
+
+  function renderExistingSignin() {
+    if (existingSignin) return;   // idempotent: never double-insert
+    existingSignin = document.createElement("div");
+    existingSignin.id = "existing-signin";
+    useExisting = document.createElement("button");
+    useExisting.type = "button";
+    useExisting.id = "use-existing";
+    useExisting.textContent = "Use my existing Claude Code sign-in";
+    existingNote = document.createElement("p");
+    existingNote.className = "hint";
+    existingNote.id = "existing-note";
+    existingNote.textContent = "Detected a Claude Code sign-in on this computer.";
+    existingSignin.append(useExisting, existingNote);
+    $("steps").before(existingSignin);
+    // Match #steps' own subscription-only visibility rule (set once here;
+    // renderMode() keeps it in sync on later mode changes).
+    existingSignin.style.display = mode() === "api_key" ? "none" : "";
+    useExisting.addEventListener("click", onUseExistingClick);
+  }
+
+  async function onUseExistingClick() {
+    if (!window.nhSetup) {
+      setMsg("Desktop bridge unavailable — reopen no_human.", "error");
+      return;
+    }
+    useExisting.disabled = true;
+    setMsg("Getting a token from Claude Code…", "ok");
+    let res;
+    try {
+      res = await window.nhSetup.importClaudeSignIn();
+    } catch (err) {
+      res = { ok: false, error: String((err && err.message) || err) };
+    }
+    if (res && res.ok) {
+      setMsg("Connected. Opening no_human…", "ok");
+      return; // main process swaps this window to the board, same as manual save
+    }
+    if (res && res.interactive) {
+      // Fall back to the manual paste path: keep the steps list visible, point
+      // at the one remaining step, re-enable the button, and focus the field.
+      existingNote.textContent =
+        "Couldn't finish that automatically — run the step below, then paste the token.";
+      useExisting.disabled = false;
+      input.focus();
+      setMsg("", null);
+      return;
+    }
+    setMsg((res && res.error) || "Could not get a token from Claude Code.", "error");
+    useExisting.disabled = false;
+  }
+
+  (async () => {
+    try {
+      const s = window.nhSetup?.claudeSignInStatus
+        ? await window.nhSetup.claudeSignInStatus()
+        : null;
+      if (s?.detected) renderExistingSignin();
+    } catch {
+      /* no bridge / probe failure: leave the row absent, exactly like today */
+    }
+  })();
+
   function setMsg(text, kind) {
     msg.textContent = text;
     if (kind) msg.dataset.kind = kind; else delete msg.dataset.kind;
@@ -302,8 +379,10 @@
     $("hint").textContent = copy.hint;
     $("cred-label").textContent = m === "api_key" ? "Anthropic API key" : "Subscription token";
     input.placeholder = m === "api_key" ? "sk-ant-api…" : "sk-ant-oat…";
-    // The 3 setup-token steps only apply to the subscription flow.
+    // The 3 setup-token steps — and the "use existing sign-in" shortcut, which
+    // only ever produces a subscription token — only apply to that flow.
     $("steps").style.display = m === "api_key" ? "none" : "";
+    if (existingSignin) existingSignin.style.display = m === "api_key" ? "none" : "";
     setMsg("", null);   // a validation message for the OTHER mode would mislead
   }
   for (const r of document.querySelectorAll('input[name="mode"]')) {

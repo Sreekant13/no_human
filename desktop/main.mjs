@@ -8,7 +8,9 @@
 
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, nativeTheme, shell, Tray } from "electron";
 import { hasCredential, setAuthMode, validateOpenAiKey, writeCredential, writeOpenAiKey } from "./tokenStore.mjs";
-import { isSetupUrl } from "./setupGate.mjs";
+import {
+  isSetupUrl, claudeCredentialPaths, detectSignIn, classifySetupTokenOutput, redact,
+} from "./setupGate.mjs";
 import { restartFailedMessage } from "./setupUi.mjs";
 import {
   saveAction, stateOnProbeUp,
@@ -24,17 +26,21 @@ import { updateMessage } from "./updatePolicy.mjs";
 import { readUpdateState, writeUpdateState } from "./updateState.mjs";
 import { normalizeTheme, readTheme, themeColors, writeTheme } from "./themeState.mjs";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_ORIGIN,
+  claudeAuthStatus,
   ensureServer,
   forceStopServer,
   isAppOrigin,
+  macClaudeKeychainExists,
   probe,
   resolveClaudeCli,
   resolveNodeBin,
+  runClaudeSetupToken,
   stopServer,
 } from "./server.mjs";
 
@@ -683,6 +689,46 @@ function fromSetupScreen(event) {
   return isSetupUrl(event.senderFrame?.url ?? "", SETUP_FILE);
 }
 
+// Shared "a credential just changed" tail for nh:save-token AND
+// nh:claude-import-token below: decide whether the already-running server
+// needs a restart (it read its token once at bootstrap, so writing a new one
+// is otherwise inert until it restarts), restart it if so, then navigate back
+// to the board. ONE function so the two entry points — manual paste and the
+// "use my existing sign-in" import — can never diverge on this logic.
+// ownsAnything covers a boot still in flight: saveAction on lifecycle.state
+// alone saw "nothing running" mid-boot and returned "proceed", so the user
+// was told "Connected" over a server started with the old token. ONE
+// predicate drives both the branch and the message below — deriving them
+// from different sources is what produced the last two blockers, in mirror
+// image.
+async function finishSave() {
+  const alive = lifecycle.ownsAnyAlive();
+  const action = saveAction(lifecycle.state, (await probe(ORIGIN)) === "up", alive);
+  if (action === "needs-restart") {
+    return { ok: false, needsRestart: true, error:
+      "Saved. The no_human server was already running and still holds the old " +
+      "token — restart it (quit `nh start` and run it again) to use the new one." };
+  }
+  if (action === "restart" && !(await restartOwnServer())) {
+    // Same `alive` that chose the branch — see ownsAnyAlive().
+    return { ok: false, error: restartFailedMessage(ORIGIN, alive) };
+  }
+  try {
+    if (win && !win.isDestroyed()) await loadBoardOrError(win);
+  } catch (err) {
+    // Never leave the setup screen wedged on "Saving…": report and let the
+    // user retry rather than stranding a disabled button.
+    return { ok: false, error: `Saved, but the board did not open: ${err.message}` };
+  }
+  // The nav ran, but "ran" is not "started". Reporting ok here painted
+  // "Connected. Opening no_human…" over an error page.
+  if (lifecycle.state?.status === "failed") {
+    return { ok: false, error:
+      `Saved, but the server did not start (${lifecycle.state.reason}).` };
+  }
+  return { ok: true };
+}
+
 // token.html -> main. Returns {ok} or {error}; the value is never echoed back
 // and never logged. `mode` is the credential type the operator selected —
 // anything but the explicit "api_key" opt-in is treated as the default, so a
@@ -712,39 +758,52 @@ ipcMain.handle("nh:save-token", async (event, value, mode, openaiKey) => {
   } catch (err) {
     return { ok: false, error: err.message };
   }
-  // A running server read its token ONCE at bootstrap, so writing a new one is
-  // inert until that process restarts. Silently returning to the board would
-  // report success while every task keeps failing on the old credential.
-  // ownsAnything covers a boot still in flight: saveAction on lifecycle.state alone
-  // saw "nothing running" mid-boot and returned "proceed", so the user was told
-  // "Connected" over a server started with the old token.
-  // ONE predicate drives both the branch and the message. Deriving them from
-  // different sources is what produced the last two blockers, in mirror image.
-  const alive = lifecycle.ownsAnyAlive();
-  const action = saveAction(lifecycle.state, (await probe(ORIGIN)) === "up", alive);
-  if (action === "needs-restart") {
-    return { ok: false, needsRestart: true, error:
-      "Saved. The no_human server was already running and still holds the old " +
-      "token — restart it (quit `nh start` and run it again) to use the new one." };
-  }
-  if (action === "restart" && !(await restartOwnServer())) {
-    // Same `alive` that chose the branch — see ownsAnyAlive().
-    return { ok: false, error: restartFailedMessage(ORIGIN, alive) };
+  return finishSave();
+});
+
+// token.html -> main. AC1 (existing-credential detection): does this machine
+// already have a Claude Code sign-in? Read-only/idempotent — this handler
+// never writes anything and never runs `claude setup-token`; it only decides
+// whether the "Use my existing Claude Code sign-in" button should render.
+// Same sender gate as every other setup-only channel; fails closed (button
+// stays hidden) on any refusal or error, which is exactly today's screen.
+ipcMain.handle("nh:claude-signin-status", async (event) => {
+  if (!fromSetupScreen(event)) return { detected: false };
+  const cliPath = await resolveClaudeCli();
+  const authStatusCode = cliPath ? await claudeAuthStatus(cliPath) : null;
+  // macOS has no credential FILE to check (see setupGate.mjs's
+  // claudeCredentialPaths note) — its store is the login Keychain, checked
+  // via macClaudeKeychainExists instead of fs.existsSync.
+  const storeExists = process.platform === "darwin"
+    ? await macClaudeKeychainExists()
+    : claudeCredentialPaths(process.platform, process.env, os.homedir())
+      .some((p) => fs.existsSync(p));
+  return detectSignIn({ cliPath, authStatusCode, storeExists });
+});
+
+// token.html -> main. AC2/AC3: runs `claude setup-token` on an explicit user
+// click ONLY — never on screen load, since it may mint a new token on the
+// vendor side. Non-interactive success persists exactly like a manual paste
+// (same writeCredential/setAuthMode, same finishSave tail); anything else
+// reports {interactive:true} so the renderer falls back to the paste field.
+// The token value itself never crosses back to the renderer, and no
+// console.* call anywhere in this handler touches either captured stream —
+// on failure the caller only ever sees a fixed or redacted message.
+ipcMain.handle("nh:claude-import-token", async (event) => {
+  if (!fromSetupScreen(event)) return { ok: false, error: "not permitted" };
+  const cliPath = await resolveClaudeCli();
+  if (!cliPath) return { ok: false, interactive: true };
+  const r = classifySetupTokenOutput(await runClaudeSetupToken(cliPath));
+  if (r.kind !== "token") {
+    return { ok: false, interactive: r.kind === "interactive", error: r.message };
   }
   try {
-    if (win && !win.isDestroyed()) await loadBoardOrError(win);
+    writeCredential(r.token, "subscription");
+    setAuthMode("subscription");
   } catch (err) {
-    // Never leave the setup screen wedged on "Saving…": report and let the
-    // user retry rather than stranding a disabled button.
-    return { ok: false, error: `Saved, but the board did not open: ${err.message}` };
+    return { ok: false, error: redact(err.message, r.token) };
   }
-  // The nav ran, but "ran" is not "started". Reporting ok here painted
-  // "Connected. Opening no_human…" over an error page.
-  if (lifecycle.state?.status === "failed") {
-    return { ok: false, error:
-      `Saved, but the server did not start (${lifecycle.state.reason}).` };
-  }
-  return { ok: true };
+  return finishSave();
 });
 
 // token.html -> main. First-run requirements check: the Agent SDK shells out

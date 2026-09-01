@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { MAC_KEYCHAIN_SERVICE } from "./setupGate.mjs";
 
 export const DEFAULT_PORT = 8420;
 
@@ -250,6 +251,89 @@ export async function resolveClaudeCli(env = process.env, execFileFn = execFile,
 export async function resolveNodeBin(env = process.env, execFileFn = execFile,
                                      exists = fs.existsSync) {
   return resolveOnPath("node", ["node.exe"], env, execFileFn, exists);
+}
+
+/**
+ * Probe whether `claude` reports an active sign-in. Read-only/idempotent —
+ * never mutates any state. Returns the numeric exit code, or `null` when the
+ * command could not be run at all (spawn failure or timeout) — callers must
+ * treat `null` the same as "unknown", not as "signed out". Injectable
+ * `execFileFn` so tests never need a real `claude` binary. Never throws,
+ * never logs stdout/stderr (nothing about a sign-in's status is a secret,
+ * but the discipline is kept uniform with runClaudeSetupToken below).
+ */
+export async function claudeAuthStatus(cliPath, execFileFn = execFile) {
+  return new Promise((resolve) => {
+    try {
+      execFileFn(cliPath, ["auth", "status"],
+                 { timeout: 20000, windowsHide: true },
+                 (err) => resolve(err ? (typeof err.code === "number" ? err.code : null) : 0));
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Run `claude setup-token` and hand back its raw exit code and captured
+ * streams for setupGate's classifySetupTokenOutput to interpret — this
+ * function does no interpretation itself and never logs either stream (the
+ * whole point of the split is that a secret can pass through here without
+ * ever reaching console/log output). `stdin: "ignore"` so a CLI that wants
+ * an interactive prompt fails fast/exits rather than hanging the handler;
+ * the 20s timeout is the same backstop, surfaced as the `{code:null,
+ * stdout:"", stderr:"timeout"}` shape on a kill so the caller can tell a
+ * timeout apart from a clean empty run.
+ */
+export async function runClaudeSetupToken(cliPath, execFileFn = execFile) {
+  return new Promise((resolve) => {
+    try {
+      execFileFn(cliPath, ["setup-token"],
+                 { timeout: 20000, windowsHide: true, stdin: "ignore" },
+                 (err, stdout, stderr) => {
+        if (err && err.killed) {
+          resolve({ code: null, stdout: "", stderr: "timeout" });
+          return;
+        }
+        const code = err ? (typeof err.code === "number" ? err.code : null) : 0;
+        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+      });
+    } catch {
+      resolve({ code: null, stdout: "", stderr: "timeout" });
+    }
+  });
+}
+
+/**
+ * macOS only: does the login Keychain hold a Claude Code sign-in item?
+ * `claude auth status` (above) is the primary signal; this is the fallback
+ * for "the binary exists but isn't the one that's signed in" / "auth
+ * status itself is unavailable" cases. Confirmed empirically (2026-09
+ * against a real signed-in `claude` 2.1.252 install) that macOS Claude
+ * Code CLI credentials live here, NOT in a `~/.claude/.credentials.json`
+ * file (that only exists on linux) — see setupGate.mjs's
+ * claudeCredentialPaths for the full note.
+ *
+ * `security find-generic-password -s "<service>"` WITHOUT `-w` never prints
+ * the secret — only item metadata (service/account/dates) goes to stdout,
+ * which this function doesn't even read — so this keeps the same
+ * existence-check-only discipline as the fs-path checks on other
+ * platforms. Off-platform, or on any spawn/exec error, fails closed to
+ * false. Injectable execFileFn/platform so tests never touch a real
+ * Keychain unless they explicitly fake `security` on PATH.
+ */
+export async function macClaudeKeychainExists(execFileFn = execFile,
+                                              platform = process.platform) {
+  if (platform !== "darwin") return false;
+  return new Promise((resolve) => {
+    try {
+      execFileFn("security", ["find-generic-password", "-s", MAC_KEYCHAIN_SERVICE],
+                 { timeout: 5000, windowsHide: true },
+                 (err) => resolve(!err));
+    } catch {
+      resolve(false);
+    }
+  });
 }
 
 /**
