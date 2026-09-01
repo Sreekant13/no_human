@@ -13,6 +13,36 @@ import { fileURLToPath } from "node:url";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const src = readFileSync(here + "Integrations.jsx", "utf8");
 
+// Regression guard for the Launch-summary mislabeling bug (2026-09-01): that
+// bug was NOT here — this panel already rendered every integration
+// GET /api/integrations returns, unfiltered. But the Onboarding fix narrows
+// the LAUNCH step's summary row to a 5-integration subset, so this panel
+// pins the other half of the claim: Settings → Integrations still shows all
+// nine, unfiltered, so no one "fixes" the mislabel by narrowing this panel to
+// match.
+test("Settings -> Integrations renders every integration the server returns, unfiltered", () => {
+  assert.match(src, /\{items\.map\(\(it\)\s*=>/,
+    "the panel must render one card per fetched integration");
+  assert.doesNotMatch(src, /items\.filter\(/,
+    "the card list must not be narrowed by a client-side filter");
+  const chipSrc = readFileSync(here + "integrationChip.js", "utf8");
+  const nameLabelMatch = chipSrc.match(/export const NAME_LABEL = \{([\s\S]*?)\n\};/);
+  assert.ok(nameLabelMatch, "could not find NAME_LABEL in integrationChip.js");
+  const nameLabelBody = nameLabelMatch[1].replace(/\/\/.*$/gm, ""); // strip line comments
+  const jsNames = new Set([...nameLabelBody.matchAll(/\b([a-z]+):\s*"/g)].map((m) => m[1]));
+  const orderMatch = pySrcForOrder().match(/_ORDER = \[([\s\S]*?)\]/);
+  assert.ok(orderMatch, "could not find _ORDER in integrations/__init__.py");
+  const pyNames = new Set([...orderMatch[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1]));
+  assert.equal(pyNames.size, 9, `_ORDER should list all nine integrations, found ${pyNames.size}`);
+  assert.deepEqual([...jsNames].sort(), [...pyNames].sort(),
+    "NAME_LABEL must cover exactly the nine integrations _ORDER discovers, " +
+    "so the panel never silently drops one");
+});
+
+function pySrcForOrder() {
+  return readFileSync(here + "../../src/no_human/integrations/__init__.py", "utf8");
+}
+
 test("the Configure form is generated from the integration's fields spec", () => {
   assert.match(src, /it\.fields\s*\|\|\s*\[\]/, "must read fields off the card, defaulting to []");
   assert.match(src, /fields\.map\(\(f\)\s*=>/, "must render one row per field in the spec");

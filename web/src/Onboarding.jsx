@@ -1114,9 +1114,20 @@ export default function Onboarding({ onComplete }) {
                     {/* Counted from the SERVER's refreshed specs, so this line
                         agrees with what is actually in config.yaml — "on" is the
                         switch, "ready" additionally has its credential and its
-                        settings. Never claims more than the config supports. */}
+                        settings. Never claims more than the config supports.
+                        `integrations` here is GET /api/integrations/setup,
+                        which is deliberately scoped to the config-block
+                        integrations (jira/linear/monday/slack/teams — the
+                        issue_tracker + notifications kinds from
+                        integrationChip.js's KIND_LABEL). github/gitlab/
+                        jenkins/circleci (vcs + ci kinds) are configured
+                        per-repo under `ci.*`, not here, and render in Settings
+                        → Integrations instead — see Integrations.jsx. The
+                        label below says "Tracker & notification", not
+                        "Integrations", so this row never reads as the
+                        product's full integration count. */}
                     <li>
-                      <span>Integrations on</span>
+                      <span>Tracker &amp; notification integrations on</span>
                       <b>{integrations === null
                         ? "—"
                         : `${setupSummary(integrations).on} of ${setupSummary(integrations).total}` +
