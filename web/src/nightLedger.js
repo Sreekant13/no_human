@@ -21,8 +21,14 @@ export const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
 export function ledgerSummary(tasks, now = Date.now(), windowMs = LEDGER_WINDOW_MS, spend = null) {
   const since = now - windowMs;
   // No upper bound: a timestamp milliseconds ahead (clock skew) still counts.
-  const inWindow = (t) =>
-    timestampMs(t.updated_at || t.created_at, 0) >= since;
+  // Compares through timestampMs, not `new Date(...)` directly: `updated_at`/
+  // `created_at` mix naive-space 'YYYY-MM-DD HH:MM:SS' (implicitly UTC) and
+  // iso-offset strings from the DB, and `new Date()` parses a naive-space
+  // string in the LOCAL timezone rather than UTC, mis-placing a task inside
+  // or outside the window depending on the host machine's TZ. A missing/
+  // unparseable timestamp resolves to NaN, and `NaN >= since` is false, so it
+  // is excluded exactly as the old `|| 0` fallback excluded it.
+  const inWindow = (t) => timestampMs(t.updated_at || t.created_at) >= since;
   const recent = (tasks || []).filter(inWindow);
   const done = recent.filter((t) => t.status === "done").length;
   const failed = recent.filter(isRealFailure).length;

@@ -57,3 +57,30 @@ export function timestampMs(value, fallback = NaN) {
   const d = parseTimestamp(value);
   return d ? d.getTime() : fallback;
 }
+
+
+/**
+ * Descending (newest-first) comparator over two epoch-ms values — pass
+ * `timestampMs(x)`, not a raw field. `NaN`/non-finite values are treated as
+ * `-Infinity` (oldest), so they always sort last; a genuine tie (including
+ * NaN vs NaN) returns 0, matching `Array#sort`'s stable-tie contract.
+ */
+export function compareDesc(msA, msB) {
+  const a = Number.isFinite(msA) ? msA : -Infinity;
+  const b = Number.isFinite(msB) ? msB : -Infinity;
+  if (a === b) return 0;
+  return a > b ? -1 : 1;
+}
+
+/**
+ * Ascending (oldest-first) comparator — see {@link compareDesc}. `NaN`/
+ * non-finite values still sort as the oldest instant, so they come first.
+ *
+ * Implemented as `compareDesc` with swapped arguments rather than
+ * `-compareDesc(msA, msB)`: negating a `0` tie produces `-0`, which fails a
+ * strict-equality assertion (`Object.is(-0, 0)` is `false`) even though it
+ * sorts identically to `0`.
+ */
+export function compareAsc(msA, msB) {
+  return compareDesc(msB, msA);
+}

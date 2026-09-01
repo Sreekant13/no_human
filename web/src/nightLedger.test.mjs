@@ -88,3 +88,17 @@ test("window is configurable", () => {
   assert.equal(s.done, 1);
   assert.equal(LEDGER_WINDOW_MS, 24 * 3600_000);
 });
+
+// Mixed-format regression: `updated_at`/`created_at` mix naive-space
+// 'YYYY-MM-DD HH:MM:SS' (implicitly UTC) and iso-offset strings from the same
+// DB column. `new Date("2026-07-17 04:00:00")` parses in the HOST's local
+// timezone rather than UTC, so on a host west of UTC this naive-space row
+// (2h before NOW) could get pushed outside the 24h window entirely. Routed
+// through timestampMs, the naive-space string is always parsed as UTC, so it
+// counts regardless of the machine's TZ.
+test("a naive-space updated_at inside the window is counted regardless of TZ parsing", () => {
+  const s = ledgerSummary([
+    { status: "done", updated_at: "2026-07-17 04:00:00" }, // NOW is 2026-07-17T06:00:00Z
+  ], NOW);
+  assert.equal(s.done, 1);
+});

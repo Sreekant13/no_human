@@ -4,7 +4,7 @@
 // muted group — nothing is dismissed, filtered, or dropped (fresh.length +
 // stale.length === items.length, always).
 
-import { timestampMs } from "./parseTimestamp.js";
+import { timestampMs, compareDesc } from "./parseTimestamp.js";
 
 export const STALE_ANSWER_MS = 24 * 3600 * 1000;
 
@@ -27,12 +27,16 @@ export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS,
   if (!Array.isArray(items) || items.length === 0) {
     return { fresh: [], stale: [] };
   }
-  // Copy-then-sort: never mutate the caller's array. Descending by ts, id
-  // tiebreak for determinism when timestamps collide (or are both missing).
+  // Copy-then-sort: never mutate the caller's array. Descending by ts (compared
+  // through timestampMs — epoch ms, not the raw string: the DB stores both
+  // naive-space 'YYYY-MM-DD HH:MM:SS' and iso-offset '...+00:00' timestamps in
+  // the same column, and ' ' < 'T' lexically, so a raw `<`/`>` always ranked a
+  // naive-space row as older than an iso-offset row from the same date
+  // regardless of age), id tiebreak for determinism when timestamps collide
+  // (or are both missing).
   const sorted = [...items].sort((a, b) => {
-    const ta = tsOf(a) || "";
-    const tb = tsOf(b) || "";
-    if (ta !== tb) return ta < tb ? 1 : -1;
+    const cmp = compareDesc(timestampMs(tsOf(a)), timestampMs(tsOf(b)));
+    if (cmp !== 0) return cmp;
     const ida = String(a?.id ?? "");
     const idb = String(b?.id ?? "");
     return ida < idb ? -1 : ida > idb ? 1 : 0;
@@ -44,8 +48,9 @@ export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS,
     const ts = tsOf(item);
     const ageMs = ts ? nowMs - timestampMs(ts) : Infinity;
     // Missing/unparseable timestamp → treated as infinitely old: buried at the
-    // bottom of stale, never throws (new Date(NaN) - anything is NaN, and
-    // NaN > thresholdMs is false, so an explicit Infinity fallback is required).
+    // bottom of stale, never throws (timestampMs(NaN-producing input) - anything
+    // is NaN, and NaN > thresholdMs is false, so an explicit Infinity fallback
+    // is required).
     const isStale = Number.isNaN(ageMs) ? true : ageMs > thresholdMs;
     (isStale ? stale : fresh).push(item);
   }

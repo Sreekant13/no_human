@@ -61,3 +61,17 @@ test("an all-cancelled group still shows its newest cancel", () => {
   assert.equal(rows[0].task.id, "c2");
   assert.equal(rows[0].collapsedCount, 1);
 });
+
+// Mixed-format regression: the DB stores both naive-space 'YYYY-MM-DD HH:MM:SS'
+// and iso-offset '...+00:00' created_at values in the same column, and
+// ' ' < 'T' lexically — a raw string `>` always ranked a naive-space row as
+// older than an iso-offset row from the same date, regardless of actual age.
+test("a genuinely newer naive-space row still outranks an older iso-offset one", () => {
+  const rows = groupFailedByTitle([
+    { id: "iso-old", title: "Mixed", status: "failed", created_at: "2026-01-01T10:00:00+00:00" },
+    { id: "naive-new", title: "Mixed", status: "failed", created_at: "2026-01-01 11:00:00" },
+  ]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].task.id, "naive-new", "the genuinely newer naive-space row must head the group");
+  assert.deepEqual(rows[0].olderIds, ["iso-old"]);
+});

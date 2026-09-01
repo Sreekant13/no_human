@@ -124,3 +124,17 @@ test("failed lane: grouping + prioritising surfaces the real failure (the live s
   assert.ok(ids.includes("real_fail"), `the real failure must be visible, got ${ids.join(",")}`);
   assert.equal(ids[0], "real_fail", "and it must lead the lane, ahead of newer cancels");
 });
+
+// Mixed-format regression: the DB stores both naive-space 'YYYY-MM-DD HH:MM:SS'
+// and iso-offset '...+00:00' timestamps in the same column, and ' ' < 'T'
+// lexically — a raw string comparison always ranked a naive-space row as
+// older than an iso-offset row from the same date, regardless of actual age.
+test("a genuinely newer naive-space timestamp outranks an older iso-offset one", () => {
+  const items = [
+    t("iso-old", "2026-01-01T10:00:00+00:00"),
+    t("naive-new", "2026-01-01 11:00:00"),
+  ];
+  const { visible, hiddenCount } = topByRecency(items, 2);
+  assert.deepEqual(visible.map((x) => x.id), ["naive-new", "iso-old"]);
+  assert.equal(hiddenCount, 0);
+});

@@ -13,7 +13,7 @@ import { cardTitle } from "./cardTitle.js";
 import { cardFacts } from "./cardFacts.js";
 import { taskCost } from "./cost.js";
 import { isFirstRun } from "./boardFirstRun.js";
-import { timestampMs } from "./parseTimestamp.js";
+import { timestampMs, compareAsc } from "./parseTimestamp.js";
 
 // Toast lifetime — long enough to read a refusal sentence, short enough not
 // to pile up. The persistent source of truth is the card banner (dismissed
@@ -134,7 +134,12 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled, task
           refreshKey={refreshKey}
           reviewQueue={tasks
             .filter((t) => t.status === "awaiting_approval")
-            .sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""))
+            // Ascending (oldest first) through timestampMs, not a raw string
+            // compare: `created_at` mixes naive-space and iso-offset formats
+            // from the DB, and ' ' < 'T' lexically, so localeCompare always
+            // ranked a naive-space row as older than an iso-offset row from
+            // the same date regardless of actual age.
+            .sort((a, b) => compareAsc(timestampMs(a.created_at), timestampMs(b.created_at)))
             .map((t) => t.id)}
           onJump={(id) => {
             prevUpdatedAtRef.current = null;
@@ -316,7 +321,7 @@ const STALE_THRESHOLD_S = 16 * 3600;
 
 function TaskCard({ task, isAwaiting, staleAnswer, onClick, approveError, onDismissApproveError }) {
   const activityTs = task.last_activity || task.updated_at || task.created_at;
-  const ageMs = Date.now() - timestampMs(activityTs);
+  const ageMs = Date.now() - timestampMs(activityTs, 0);
   const ageSec = ageMs / 1000;
   const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
@@ -448,7 +453,7 @@ function TaskCard({ task, isAwaiting, staleAnswer, onClick, approveError, onDism
 
 function relativeTime(iso) {
   if (!iso) return "";
-  const diff = (Date.now() - timestampMs(iso)) / 1000;
+  const diff = (Date.now() - timestampMs(iso, 0)) / 1000;
   if (diff < 60) return "<1m";
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
