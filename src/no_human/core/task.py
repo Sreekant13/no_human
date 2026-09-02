@@ -164,6 +164,17 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     # post-review target outside the two post-review states must still be
     # refused. See Scheduler._reconcile_landed_orphan (core/scheduler.py).
 
+    # NOTE: FAILED -> DONE is likewise deliberately NOT added here.
+    # `Store.reconcile_landed_terminal` (core/db.py) completes a TERMINAL
+    # failed/cancelled row whose recorded work is provably on the base
+    # branch through its OWN narrower gate
+    # (`assert_terminal_landed_reconciliation` /
+    # `TERMINAL_LANDED_RECONCILABLE` below) — widening this map instead
+    # would make FAILED -> DONE legal for every plain `set_status(task,
+    # DONE)` call, which is exactly the "resurrect a row without reachable
+    # evidence" failure mode this feature must not introduce. See
+    # `Scheduler._reconcile_landed_terminal` (core/scheduler.py).
+
     # approval gate
     table[TaskStatus.AWAITING_APPROVAL].add(TaskStatus.IMPLEMENTING)  # sent back
     table[TaskStatus.AWAITING_APPROVAL] |= _OFF_RAMPS
@@ -234,6 +245,34 @@ def assert_landed_reconciliation(src: TaskStatus) -> None:
     if src not in LANDED_RECONCILABLE:
         raise IllegalTransition(
             f"{src.value} -> done is not a landed reconciliation")
+
+
+#: Statuses from which `Store.reconcile_landed_terminal` may complete a row
+#: whose recorded work is provably on the base branch, despite the row
+#: already being TERMINAL. This is a separate, narrower set from
+#: `LANDED_RECONCILABLE` above — it does not add `FAILED` to that one, and
+#: it does not add `FAILED -> DONE` to `ALLOWED_TRANSITIONS` either; both
+#: stay exactly as they are, so a plain `set_status(task, DONE)` call keeps
+#: refusing this edge. The only failed/cancelled shape recognised here is
+#: `FAILED` itself — there is no separate `CANCELLED` status (see
+#: `core/scheduler.py`; "cancelled" is `FAILED` + `context["cancel_reason"]`).
+TERMINAL_LANDED_RECONCILABLE: frozenset[TaskStatus] = frozenset({
+    TaskStatus.FAILED,
+})
+
+
+def assert_terminal_landed_reconciliation(src: TaskStatus) -> None:
+    """Raise `IllegalTransition` unless *src* is `FAILED`.
+
+    The terminal-row twin of `assert_landed_reconciliation`: a task that
+    already went failed (with or without a `cancel_reason`), but whose
+    recorded work is verifiably reachable from the default branch, is
+    reconciled to DONE ONLY through this gate — never by widening
+    `ALLOWED_TRANSITIONS` or `LANDED_RECONCILABLE`.
+    """
+    if src not in TERMINAL_LANDED_RECONCILABLE:
+        raise IllegalTransition(
+            f"{src.value} -> done is not a terminal landed reconciliation")
 
 
 def _now() -> str:

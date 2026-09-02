@@ -453,7 +453,14 @@ FROZEN_FILE_LINES = {
     # 4841 -> 4859 (+18): P5 — SQL-pushed pagination in Store.list_tasks with
     # the rowid tie-break + its rationale docstring. Measured on the P5 merge
     # result.
-    "core/db.py": 4859,
+    # 4859 -> 4945 (+86): terminal-landed-reconciliation (narrowed refile of
+    # the shipped-metrics-blindness ticket) — the `terminal_reconcile` CAS
+    # mode threaded through `set_status`/`_write_status`, plus
+    # `Store.reconcile_landed_terminal` and
+    # `Store.landed_reconcilable_terminal_tasks`, the TERMINAL-row twin of
+    # `Store.reconcile_landed_orphan` above. Measured on this tree with the
+    # scanner below.
+    "core/db.py": 4945,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.
@@ -520,7 +527,17 @@ FROZEN_FILE_LINES = {
     # wired into `_recover_orphans` after the existing `_row_is_live` check.
     # Re-anchored on rebase onto main (measured directly on this tree with
     # the scanner below).
-    "core/scheduler.py": 2848,
+    # 2848 -> 2973 (+125): terminal-landed-reconciliation (narrowed refile of
+    # the shipped-metrics-blindness ticket) — the TERMINAL-row twin of the
+    # orphan sweep above: `_terminal_landed_evidence`,
+    # `_reconcile_one_landed_terminal`, and `_reconcile_landed_terminal`
+    # (probes a FAILED/cancelled row's `cancel_reason`/attempt commit/PR
+    # against the base branch, reusing `orphan_landed_evidence` verbatim, and
+    # calls `Store.reconcile_landed_terminal` on landed evidence instead of
+    # leaving the row failed forever); wired into `_run`'s startup sequence
+    # next to `_reconcile_terminal_task_attempts`. Measured on this tree with
+    # the scanner below.
+    "core/scheduler.py": 2973,
 }
 
 
