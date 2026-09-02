@@ -285,7 +285,11 @@ FROZEN_FILE_LINES = {
     # `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus threading
     # `repo`/`base`/`mechanical` through `_summary_section` and `_pr_body`.
     # Measured on this tree with the scanner below.
-    "core/orchestrator.py": 20899,
+    # 20899 -> 20949 (+50): the ui_evidence dev-server boot wiring in
+    # _maybe_capture_ui_evidence/_deliver_ui_evidence (the harness now boots
+    # the repo's configured start_cmd and disclosed which server it walked).
+    # Measured on the merge result with the scanner below, never summed.
+    "core/orchestrator.py": 20949,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

@@ -842,6 +842,14 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
     },
 
     "testing/ui_evidence.py": {
+        "exec:<dynamic>": Allowed(
+            "the repo's OWN dev server — `dev_server` spawns the profile's "
+            "`ui_evidence.start_cmd` in the attempt's worktree so the walk "
+            "has something to walk, and kills the process group afterwards",
+            _CFG + "ui_evidence.enabled — and, past that, only when the "
+            "repo's own profile sets a `start_cmd` (absent from "
+            "DEFAULT_CONFIG: it is a per-repo profile field, empty by "
+            "default) and the manifest base_url is loopback"),
         "http:urllib.request": Allowed(
             "the attempt's OWN dev server — one GET of base_url as a readiness "
             "probe before the browser walk (`_reachable`)",

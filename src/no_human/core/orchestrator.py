@@ -20193,8 +20193,24 @@ SIX of them read a checkpoint and TWO do not — but do
                 "the coder wrote no `.no_human/ui_evidence.json` walk manifest")
 
         out_dir = ui_evidence.default_out_dir(task.id)
+        # Boot the repo's configured dev server (`ui_conf["start_cmd"]`) when
+        # nothing already answers at the MANIFEST's `base_url` — never the
+        # profile's — and tear it down before this method returns, so the
+        # server is guaranteed dead before the PR body is produced. A bad/
+        # unreadable manifest reads the same as "unconfigured": `run` below
+        # still reports its own `not_run` for that; this just skips the boot.
         try:
-            result = await ui_evidence.run(Path(repo.path), out_dir)
+            manifest_base_url = ui_evidence.read_manifest(Path(repo.path)).base_url
+        except Exception:  # noqa: BLE001 — bad manifest: skip the boot, `run` reports it
+            manifest_base_url = ""
+        srv: "ui_evidence.DevServerOutcome | None" = None
+        cm = (
+            ui_evidence.dev_server(Path(repo.path), ui_conf or {}, manifest_base_url, out_dir)
+            if manifest_base_url else contextlib.nullcontext(None)
+        )
+        try:
+            async with cm as srv:
+                result = await ui_evidence.run(Path(repo.path), out_dir)
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
             # promise; it fails the same way every other evidence gather here
@@ -20207,6 +20223,11 @@ SIX of them read a checkpoint and TWO do not — but do
             shutil.rmtree(out_dir, ignore_errors=True)
             return self._ui_evidence_skipped(f"the walk errored ({type(exc).__name__})")
 
+        if srv is not None and (srv.detail or srv.mode == "boot-failed"):
+            # Advisory only — `srv.detail` (log tail) never reaches the PR
+            # body, only `nh logs` via `self._advisory`.
+            self._advisory(f"ui evidence dev server ({srv.mode}): {srv.detail}")
+
         if not result.shots:
             # `not_run` (no reachable dev server, bad manifest) or a `failed`
             # walk that broke before its first shot — nothing to embed. This
@@ -20217,26 +20238,40 @@ SIX of them read a checkpoint and TWO do not — but do
             # `result.reason` (falling back to `result.verdict`) is
             # driver/coder-supplied text: newline-stripped, backticks
             # stripped, and truncated so it cannot forge Markdown or break
-            # out of this section.
+            # out of this section. A `boot-failed` dev server names the URL
+            # it never answered at instead — more useful than the walk's own
+            # generic "not reachable" reason, and still sanitized the same way.
             shutil.rmtree(out_dir, ignore_errors=True)
-            reason = (result.reason or result.verdict or "unknown").strip()
-            reason = reason.replace("\n", " ").replace("`", "'")
+            if srv is not None and srv.mode == "boot-failed":
+                reason = (f"the dev server did not answer at {srv.base_url} "
+                          f"within {srv.ready_timeout_s}s ({srv.mode})")
+            else:
+                reason = (result.reason or result.verdict or "unknown")
+            reason = reason.strip().replace("\n", " ").replace("`", "'")
             if len(reason) > 120:
                 reason = reason[:117] + "..."
             return self._ui_evidence_skipped(f"the walk captured no shots ({reason})")
 
         try:
-            return self._deliver_ui_evidence(repo, task.id, out_dir, result)
+            return self._deliver_ui_evidence(repo, task.id, out_dir, result, server=srv)
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
 
     def _deliver_ui_evidence(
         self, repo: "GitRepo", task_id: str, out_dir: Path,
         result: "ui_evidence.UiEvidenceResult",
+        *, server: "ui_evidence.DevServerOutcome | None" = None,
     ) -> str:
         """Commit the captured shots + video to a SIDE branch
         (`nh-evidence/<task_id>`), push it, and return the rendered media
         section — "" on any delivery failure.
+
+        `server` (keyword-only, default `None` so every pre-existing 4-arg
+        call site keeps working byte-for-byte) is the `dev_server` outcome
+        for this walk, if any: when its mode is `booted` or `pre-existing`
+        one extra disclosure sentence is appended naming which case
+        occurred — `unconfigured`/`boot-failed`/`None` add nothing, so the
+        body stays byte-identical to before this parameter existed.
 
         NOT a commit on the task branch itself. D1.2's own decision-gate
         test (`tests/test_approve_merge.py::
@@ -20344,6 +20379,21 @@ SIX of them read a checkpoint and TWO do not — but do
             "branch — proof of what the page rendered at each step, "
             "nothing more.\n",
         ]
+        if server is not None and server.mode == "booted":
+            cmd = (server.start_cmd or "").strip().replace("\n", " ").replace("`", "'")
+            if len(cmd) > 120:
+                cmd = cmd[:117] + "..."
+            lines.append(
+                f"Dev server booted by the harness for this walk (`{cmd}`), "
+                "stopped afterwards.\n")
+        elif server is not None and server.mode == "pre-existing":
+            url = (server.base_url or "").strip().replace("\n", " ").replace("`", "'")
+            if len(url) > 120:
+                url = url[:117] + "..."
+            lines.append(
+                f"Dev server was already running at {url} before "
+                "the walk; the harness did not start it and did not verify "
+                "which checkout it serves.\n")
         shown = delivered_names[: self._UI_EVIDENCE_MAX_EMBEDDED_SHOTS]
         for shot in shown:
             lines.append(f"![{shot['name']}]({_raw_url(shot['path'])})")

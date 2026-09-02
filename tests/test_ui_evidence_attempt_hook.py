@@ -17,6 +17,7 @@ local bare repo underneath it.
 """
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 from pathlib import Path
@@ -30,6 +31,7 @@ from no_human.core.db import Store
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
+from no_human.profile import ProjectProfile
 from no_human.testing import ui_evidence
 from no_human.vcs import PrResult
 from no_human.vcs.git import GitRepo
@@ -120,6 +122,87 @@ def _fake_ui_evidence_run(calls, shots=("loaded", "final"), video="walk.webm"):
         )
 
     return fake_run
+
+
+def _fake_ui_evidence_run_empty(calls, reason="no shots"):
+    """Mirrors `test_ui_evidence_missing_playwright_pr_line.py`'s helper of
+    the same name: a walk that ran (or was attempted) but captured nothing,
+    the shape `_maybe_capture_ui_evidence` needs to reach its dev-server-
+    aware skip-reason branch."""
+    async def fake_run(repo_path, out_dir, **kwargs):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        calls.append({"repo_path": Path(repo_path), "out_dir": out_dir})
+        return ui_evidence.UiEvidenceResult(
+            verdict="not_run", shots=[], video=None,
+            steps_run=0, steps_total=2, reason=reason,
+        )
+
+    return fake_run
+
+
+class _FakeDevServerProc:
+    """Stand-in for a `subprocess.Popen` handle: never exits on its own."""
+
+    def __init__(self, pid=9999):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return None
+
+
+def _spawn_recorder(calls, proc_obj):
+    def _spawn(argv, **kwargs):
+        calls.append({"argv": argv, "kwargs": kwargs})
+        return proc_obj
+
+    return _spawn
+
+
+def _kill_recorder(calls):
+    def _kill(proc):
+        calls.append(proc)
+
+    return _kill
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+class _StepClock:
+    """Deterministic monotonic clock: pops one value per call, repeating the
+    last value forever once the scripted list is exhausted — same shape as
+    `tests/test_ui_evidence.py`'s `FakeClock`, kept local to this file since
+    the two suites intentionally do not share test fixtures."""
+
+    def __init__(self, values):
+        self._values = list(values)
+        self._last = 0.0
+
+    def __call__(self):
+        if self._values:
+            self._last = self._values.pop(0)
+        return self._last
+
+
+def _wire_fake_dev_server(monkeypatch, *, spawn, reachable, kill=None, clock=None):
+    """Patch `orch_mod.ui_evidence.dev_server` to the REAL function with only
+    its spawn/reachable/kill/clock seams overridden — `_maybe_capture_ui_
+    evidence` still calls `ui_evidence.dev_server(repo_path, ui_conf,
+    base_url, out_dir)` exactly as in production and still branches on the
+    `DevServerOutcome` it gets back; only the OS subprocess and the network
+    probe underneath it are faked, so the wiring itself is never bypassed."""
+    real_dev_server = ui_evidence.dev_server
+    fake = functools.partial(
+        real_dev_server, spawn=spawn, reachable=reachable,
+        kill=kill or _kill_recorder([]), clock=clock or (lambda: 0.0),
+        sleep=_no_sleep,
+    )
+    monkeypatch.setattr(orch_mod.ui_evidence, "dev_server", fake)
 
 
 async def test_ui_touching_diff_invokes_the_walk_and_embeds_the_pr_media(
@@ -318,3 +401,314 @@ async def test_ui_touching_diff_with_no_manifest_written_skips_the_walk(
     assert "## UI evidence" in opens[-1]["body"], opens[-1]["body"]
     assert "no `.no_human/ui_evidence.json` walk manifest" in opens[-1]["body"], \
         opens[-1]["body"]
+
+
+def _profile_with_ui_evidence(repo_path, *, start_cmd, base_url,
+                              ready_path="/", ready_timeout_s=30):
+    prof = ProjectProfile(repo_path=str(repo_path))
+    prof.ui_evidence = {
+        **prof.ui_evidence,
+        "enabled": True,
+        "start_cmd": start_cmd,
+        "base_url": base_url,
+        "ready_path": ready_path,
+        "ready_timeout_s": ready_timeout_s,
+    }
+    return prof
+
+
+async def test_booted_dev_server_is_disclosed_in_the_pr_body_and_stopped(
+        repo_env, tmp_path, store, monkeypatch):
+    """D2 (2026-09-02): when nothing already answers at the manifest's
+    `base_url` and the profile has a `start_cmd` configured, the harness
+    boots it through `ui_evidence.dev_server` — never bypassed here, only
+    its spawn/reachable/kill seams are faked — and the PR body discloses
+    that it booted and stopped the server itself."""
+    base_url = "http://127.0.0.1:5199"
+    start_cmd = "python -m http.server 5199"
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"z\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+    fake_proc = _FakeDevServerProc()
+
+    def reachable(url):
+        # Never already up; ready the instant the readiness probe fires
+        # (base_url + ready_path) so the loop exits on its first check.
+        return url == base_url + "/"
+
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_recorder(spawn_calls, fake_proc),
+        reachable=reachable,
+        kill=_kill_recorder(kill_calls),
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url=base_url)
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, boot the dev server", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(calls) == 1, f"expected exactly one ui_evidence.run() call, got {calls}"
+    assert len(spawn_calls) == 1, spawn_calls
+    assert spawn_calls[0]["argv"] == ["python", "-m", "http.server", "5199"]
+    assert len(kill_calls) == 1, "the harness must stop the server it booted"
+
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    assert (
+        f"Dev server booted by the harness for this walk (`{start_cmd}`), "
+        "stopped afterwards." in body
+    ), body
+    assert "already running" not in body, body
+
+
+async def test_pre_existing_dev_server_is_disclosed(
+        repo_env, tmp_path, store, monkeypatch):
+    """When something already answers at the manifest's `base_url`, the
+    harness must never spawn or kill anything — it only discloses that it
+    walked against a pre-existing, unverified server."""
+    base_url = "http://127.0.0.1:5299"
+    start_cmd = "python -m http.server 5299"
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"w\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_recorder(spawn_calls, _FakeDevServerProc()),
+        reachable=lambda url: True,  # already up, at every URL asked about
+        kill=_kill_recorder(kill_calls),
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url=base_url)
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, server already running", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(calls) == 1, f"expected exactly one ui_evidence.run() call, got {calls}"
+    assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
+    assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
+
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    assert (
+        f"Dev server was already running at {base_url} before the walk; "
+        "the harness did not start it and did not verify which checkout "
+        "it serves." in body
+    ), body
+    assert "booted by the harness" not in body, body
+
+
+async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
+        repo_env, tmp_path, store, monkeypatch):
+    """`base_url` is the CODER-written manifest's, not the (trusted) profile's
+    — `_base_url_problem` only checks scheme + loopback hostname, so a value
+    carrying a backtick or an embedded newline in its path still passes
+    validation (`urlsplit` ignores those characters for `.hostname`, but the
+    raw string keeps them). The pre-existing disclosure line must sanitize it
+    exactly like the sibling `booted` branch sanitizes `start_cmd`: strip
+    newlines, replace backticks, and cap the length — never inject the raw
+    manifest string into the PR body."""
+    raw_base_url = "http://127.0.0.1:5299/evil`)\ninjected"
+    start_cmd = "python -m http.server 5299"
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"w\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": raw_base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_recorder(spawn_calls, _FakeDevServerProc()),
+        reachable=lambda url: True,  # already up, at every URL asked about
+        kill=_kill_recorder(kill_calls),
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url="http://127.0.0.1:5299")
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, server already running, hostile base_url",
+                 repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
+    assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
+
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    assert "\ninjected" not in body, body
+    assert "`)\ninjected" not in body, body
+    assert "evil`)" not in body, body
+    assert (
+        "Dev server was already running at "
+        "http://127.0.0.1:5299/evil') injected before the walk; "
+        "the harness did not start it and did not verify which checkout "
+        "it serves." in body
+    ), body
+
+
+async def test_boot_failed_skip_line_names_the_url_not_the_log(
+        repo_env, tmp_path, store, monkeypatch):
+    """A dev server that never answers before `ready_timeout_s` elapses is a
+    boot failure: the walk still runs (and captures nothing useful), and the
+    skip line the PR body shows must name the URL/timeout/mode — never the
+    dev-server log content or any filesystem path."""
+    base_url = "http://127.0.0.1:5399"
+    start_cmd = "python -m http.server 5399"
+    ready_timeout_s = 5
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"q\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+    # started=0.0, then the loop's first condition check reads 999.0 —
+    # `999.0 - 0.0 < 5` is False, so the poll loop never runs at all and the
+    # `else:` (timeout-exhausted) branch fires immediately: deterministic,
+    # no real waiting.
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_recorder(spawn_calls, _FakeDevServerProc()),
+        reachable=lambda url: False,  # never already up, never answers
+        kill=_kill_recorder(kill_calls),
+        clock=_StepClock([0.0, 999.0]),
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        orch_mod.ui_evidence, "run",
+        _fake_ui_evidence_run_empty(calls, reason="page never loaded"))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url=base_url,
+                                     ready_timeout_s=ready_timeout_s)
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, dev server never answers", repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(calls) == 1, f"the walk still runs even on a boot failure: {calls}"
+    assert len(spawn_calls) == 1, spawn_calls
+    assert len(kill_calls) == 1, "a still-running process must be killed on teardown"
+
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    assert (
+        f"the dev server did not answer at {base_url} within "
+        f"{ready_timeout_s}s (boot-failed)" in body
+    ), body
+    # Never the dev-server log, never a filesystem path.
+    assert "dev-server.log" not in body, body
+    assert str(tmp_path) not in body, body
+    assert "page never loaded" not in body, body

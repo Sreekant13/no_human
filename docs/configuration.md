@@ -726,6 +726,21 @@ ui_evidence:
   base_url: http://localhost:5173
 ```
 
+`start_cmd` is no longer just documentation: at attempt time, once tests pass
+and a coder-written walk manifest is present, the harness itself boots
+`start_cmd` in the attempt's worktree — but only if nothing already answers
+at the *manifest's* `base_url` (loopback hosts only: `127.0.0.1`, `localhost`
+or `::1` — never a remote host). It polls `base_url` + `ready_path` until
+something answers or `ready_timeout_s` elapses (clamped to `[1, 300]`
+regardless of the configured value), then runs the walk, then stops the
+process it started — whether the walk finished cleanly or raised. If a
+server was already answering at that URL, the harness never starts or stops
+anything; it just walks against whatever is already running. Either way the
+PR body says which happened: "Dev server booted by the harness for this
+walk (`{start_cmd}`), stopped afterwards." or "Dev server was already
+running at {base_url} before the walk; the harness did not start it and did
+not verify which checkout it serves."
+
 Nothing wrote this before no-human-67: a repo could have Playwright installed
 and the kill switch on, and the walk still had no `start_cmd`/`base_url` to
 boot. `nh onboard <repo>` now detects a `dev` script in the repo's own
