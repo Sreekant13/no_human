@@ -725,10 +725,13 @@ async def default_ci_log_excerpt(link: str) -> str:
     # httpx applies RFC 3986 dot-segment removal AFTER this compare, so
     # `/ctrl/../other` would pass a raw prefix test and be sent to `/other`;
     # a percent-encoded `%2e%2e` or `..%2f` is the same segment once the
-    # server decodes it. A Jenkins build URL never contains a dot segment or
-    # an encoded separator: refuse any, rather than normalise and trust the
-    # normaliser.
-    if any(seg in (".", "..") or "/" in seg or "\\" in seg
+    # server decodes it, and `..;x` is the same segment once a servlet
+    # container strips the path parameter. A Jenkins build URL never contains
+    # a dot segment or an encoded separator: refuse any, rather than normalise
+    # and trust the normaliser. (A single-encoded `%2F` inside a segment is
+    # refused too — Jenkins double-encodes those itself, so the common
+    # multibranch URL still passes.)
+    if any(seg.split(";", 1)[0] in (".", "..") or "/" in seg or "\\" in seg
            for seg in map(unquote, lk.path.split("/"))):
         log.debug("CI log excerpt skipped: %r contains a dot segment or an encoded separator", link)
         return ""

@@ -65,6 +65,12 @@ _NOT_SECRET_EXACT = frozenset({
 })
 # AWS_ENDPOINT_URL and its per-service spellings (AWS_ENDPOINT_URL_S3, ...).
 _NOT_SECRET_PREFIXES = ("AWS_ENDPOINT_URL",)
+# HTTP(S)_PROXY / ALL_PROXY / NO_PROXY: the child IS the process that reaches
+# its model, and on a corporate network it does so through this URL — which
+# carries a password. Kept even so, same category as the child's own billing
+# credential; an EMPTY HTTPS_PROXY means "connect directly", which the network
+# then blocks, so blanking it would cut every session off silently.
+_NOT_SECRET_SUFFIXES = ("_PROXY",)
 
 #: Secret-shaped name prefixes the CLAUDE child keeps with their real value.
 #: ANTHROPIC_*/CLAUDE_* are the model auth + config for the very CLI being
@@ -77,10 +83,17 @@ CLAUDE_CHILD_KEEP: tuple[str, ...] = ("ANTHROPIC_", "CLAUDE_", "NO_HUMAN_AGENT_S
 CODEX_CHILD_KEEP: tuple[str, ...] = ("OPENAI_", "NO_HUMAN_AGENT_SESSION")
 
 
+def _is_operational(upper: str) -> bool:
+    """A name the rules would catch that carries no credential the child may
+    lose, or a credential the child cannot function without (a proxy)."""
+    return (upper in _NOT_SECRET_EXACT or upper.startswith(_NOT_SECRET_PREFIXES)
+            or upper.endswith(_NOT_SECRET_SUFFIXES))
+
+
 def is_secret_env_name(name: str) -> bool:
     """Whether an env-var NAME looks like it carries a credential."""
     upper = name.upper()
-    if upper in _NOT_SECRET_EXACT or upper.startswith(_NOT_SECRET_PREFIXES):
+    if _is_operational(upper):
         return False
     if any(marker in upper for marker in _SECRET_NAME_MARKERS):
         return True
@@ -104,9 +117,11 @@ def is_foreign_secret(name: str, keep: Iterable[str], value: str = "") -> bool:
     on the child's keep-list (prefixes, matched case-insensitively like the
     shape test, so `anthropic_api_key` and `ANTHROPIC_API_KEY` are judged the
     same)."""
+    upper = name.upper()
+    if _is_operational(upper):
+        return False
     if not (is_secret_env_name(name) or _value_embeds_credential(value)):
         return False
-    upper = name.upper()
     return not any(upper.startswith(prefix.upper()) for prefix in keep)
 
 

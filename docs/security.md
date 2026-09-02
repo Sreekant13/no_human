@@ -441,8 +441,11 @@ variable whose value is a URL with a password in it
 `AWS_*`/`GCP_*`/`AZURE_*` namespaces except `AWS_REGION`, `AWS_DEFAULT_REGION`,
 `AWS_PAGER`, `AWS_CA_BUNDLE` and `AWS_ENDPOINT_URL*`; `TOKENIZERS_PARALLELISM`
 is exempt from the `*TOKEN*` rule. Kept: the credential that pays for that
-child (`ANTHROPIC_*`/`CLAUDE_*` for Claude, `OPENAI_*` for Codex) and the
-agent-session mark. A prompt injection in the child cannot read
+child (`ANTHROPIC_*`/`CLAUDE_*` for Claude, `OPENAI_*` for Codex), the
+agent-session mark, and every `*_PROXY` variable even when its URL carries a
+password — the child is the process that reaches its model, and on a network
+that requires an authenticated proxy an empty `HTTPS_PROXY` would mean
+"connect directly" and cut every session off. A prompt injection in the child cannot read
 `GITHUB_TOKEN`, a cloud key or an integration token out of `env`. It is a
 name-shape rule plus one value rule, so a bare credential under an unusual
 name survives, and the Claude child sees the removed names as empty strings

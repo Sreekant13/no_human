@@ -1186,3 +1186,19 @@ async def test_ci_log_excerpt_refuses_dot_segments_in_the_link(monkeypatch):
     # positive control: a dot INSIDE a segment is an ordinary name
     rec = _patch_ci_log(monkeypatch, controller=ctrl)
     assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com/ctrl/job/x.y/42")
+
+
+async def test_ci_log_excerpt_refuses_path_parameter_dot_segments(monkeypatch):
+    """`..;x` is a dot segment once a servlet container strips the path
+    parameter; the guard refuses it without relying on server ordering."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/ctrl/..;/evil/job/1",
+                 "https://build.example.com/ctrl/%2e%2e;x/evil/job/1",
+                 "https://build.example.com/ctrl/.;/job/1"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)  # a `;` inside an ordinary name is fine
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com/ctrl/job/a;b/42")

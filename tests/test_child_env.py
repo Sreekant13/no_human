@@ -136,3 +136,21 @@ def test_localstack_endpoint_family_and_key_suffix_edges():
     # and docs/security.md says so
     for name in ("SORT_KEY", "PARTITION_KEY", "LICENSE_KEY", "SSH_PUBLIC_KEY"):
         assert is_secret_env_name(name), name
+
+
+def test_an_authenticated_proxy_survives_into_both_children():
+    """The child IS the process that reaches the model, and on a corporate
+    network it does so through HTTPS_PROXY — a URL that carries a password.
+    Stripping it would silently cut every coder/reviewer/planner session off
+    from its model (an empty HTTPS_PROXY means "connect directly"). Same
+    category as the child's own billing credential: kept, and documented."""
+    proxy = {"HTTPS_PROXY": "http://corpuser:corppw@proxy.corp:8080",
+             "http_proxy": "http://corpuser:corppw@proxy.corp:8080",
+             "ALL_PROXY": "socks5://u:p@proxy.corp:1080", "NO_PROXY": "localhost",
+             "PATH": "/bin", "GITHUB_TOKEN": "ghp_x"}
+    assert scrub_foreign_secrets_into({}, proxy) == ["GITHUB_TOKEN"]
+    env = dict(proxy)
+    assert drop_foreign_secrets(env) == ["GITHUB_TOKEN"]
+    assert env["HTTPS_PROXY"] == proxy["HTTPS_PROXY"] and env["http_proxy"] == proxy["http_proxy"]
+    # positive control: the same credentialed URL under a non-proxy name goes
+    assert drop_foreign_secrets({"UPSTREAM_URL": "http://corpuser:corppw@proxy.corp:8080"}) == ["UPSTREAM_URL"]
