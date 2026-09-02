@@ -66,6 +66,28 @@ def _load_check_release_manifest():
 _crm = _load_check_release_manifest()
 parse_manifest = _crm.parse_manifest
 MANIFEST_NAME = _crm.MANIFEST_NAME
+CLASSIFICATION_NAME = _crm.CLASSIFICATION_NAME
+
+APPROVE_CMD_PREFIX = "uv run python scripts/export_guard.py approve"
+WRITE_CMD = "python scripts/check_release_manifest.py --write"
+
+
+def remedy_command(root: Path, paths: str) -> str:
+    """The re-pin command that actually exists in THIS tree.
+
+    `export_guard.py` and `EXPORT_CLASSIFICATION.txt` are classified `drop` and
+    do not ship, so on the public tree the only sanctioned re-pin is `--write`
+    — which `check_release_manifest.py` sanctions precisely when no
+    classification sits beside the tree. Where the classification IS present,
+    `--write` refuses (it would forge approvals) and `approve` is the one
+    write path. This file ships to both trees, so the branch stays forever.
+    """
+    try:
+        present = (root / CLASSIFICATION_NAME).exists()
+    except OSError:
+        present = True  # unreadable root is only plausible in the private
+        # tree; a harmless extra command beats pointing at --write there.
+    return f"{APPROVE_CMD_PREFIX} {paths}" if present else WRITE_CMD
 
 
 def repo_root() -> Path:
@@ -147,13 +169,13 @@ def main(argv: list[str] | None = None) -> int:
     print("  FIX: re-pin each file and stage the manifest in the SAME commit:",
           file=sys.stderr)
     paths = " ".join(rel for rel, _, _ in offenders)
-    print(f"    uv run python scripts/export_guard.py approve {paths}",
-          file=sys.stderr)
+    print(f"    {remedy_command(root, paths)}", file=sys.stderr)
     print(f"    git add {MANIFEST_NAME}", file=sys.stderr)
     print("", file=sys.stderr)
-    print("  `approve` writes the new pin into the working tree only — the "
-          "`git add` above", file=sys.stderr)
-    print("  is what puts it in THIS commit. Then commit again.", file=sys.stderr)
+    print("  The re-pin command above writes the new pin into the WORKING TREE "
+          "only — the `git add`", file=sys.stderr)
+    print("  above is what puts it in THIS commit. Then commit again.",
+          file=sys.stderr)
     return 1
 
 

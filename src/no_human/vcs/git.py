@@ -816,6 +816,61 @@ class GitRepo:
                 deletions = int(part.split()[0])
         return {"files_changed": files, "insertions": insertions, "deletions": deletions}
 
+    def commit_subjects(self, base: str, *, limit: int = 200) -> list[str]:
+        """Subjects this branch adds on top of *base*, first-parent, OLDEST FIRST.
+
+        Two-dot (``base..HEAD``) — what the branch *adds* — the same asymmetry
+        `commits_ahead` uses, and deliberately not the three-dot range
+        `head_commit`/`_diffstat` use for the diff. Empty on any failure: a
+        summary aid never raises.
+        """
+        try:
+            ref = (self.resolve_commitish(base) if base else None) or base
+            if not ref:
+                return []
+            out = self._run(
+                "log", "--first-parent", "--reverse", "--format=%s",
+                f"{ref}..HEAD", "-n", str(limit), check=False,
+            )
+            return [ln.strip() for ln in out.splitlines() if ln.strip()]
+        except Exception:
+            return []
+
+    def numstat(self, base: str) -> list[tuple[str, int, int]]:
+        """(path, insertions, deletions) for ``<base>...HEAD``.
+
+        The SAME three-dot range `head_commit`/`_diffstat` use, so the two can
+        never disagree. ``--no-renames`` keeps every entry a plain
+        repo-relative path (the ``dir/{a => b}.py`` form is not a path). A
+        binary sentinel (``-\t-\tpath``) becomes ``0/0`` but the file is still
+        listed. A git-quoted non-ASCII path has only its surrounding quotes
+        stripped, never unescaped. Malformed lines are skipped. Empty on any
+        failure: a summary aid never raises.
+        """
+        try:
+            ref = (self.resolve_commitish(base) if base else None) or base
+            if not ref:
+                return []
+            out = self._run(
+                "diff", "--numstat", "--no-renames", f"{ref}...HEAD", check=False,
+            )
+            result: list[tuple[str, int, int]] = []
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 3:
+                    continue
+                ins_s, del_s, path = parts
+                ins = int(ins_s) if ins_s.isdigit() else 0
+                dels = int(del_s) if del_s.isdigit() else 0
+                path = path.strip()
+                if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+                    path = path[1:-1]
+                if path:
+                    result.append((path, ins, dels))
+            return result
+        except Exception:
+            return []
+
     def is_ancestor(self, sha: str, descendant: str) -> bool:
         """True when *sha* is reachable from *descendant* (it is its own).
 

@@ -31,6 +31,10 @@ INSTALL_SRC = REPO / "scripts" / "hooks" / "install.sh"
 
 MANIFEST = "RELEASE_MANIFEST.txt"
 HEADER = "# RELEASE_MANIFEST.txt\n"
+CLASSIFICATION = "EXPORT_CLASSIFICATION.txt"
+
+WRITE_CMD = "python scripts/check_release_manifest.py --write"
+APPROVE_CMD = "export_guard.py approve"
 
 
 def _git(cwd, *args, check=True):
@@ -47,6 +51,21 @@ def _sha(data: bytes) -> str:
 def _write_manifest(root: Path, pins: dict[str, str]) -> None:
     body = "".join(f"{d}  {p}\n" for p, d in sorted(pins.items()))
     (root / MANIFEST).write_text(HEADER + body, encoding="utf-8")
+
+
+def _classify(root: Path) -> None:
+    """Add `EXPORT_CLASSIFICATION.txt` at the repo root, committed on its own —
+    `remedy_command` only checks existence, but a separate commit keeps the
+    offending edit's staged-paths string exactly `shipped.txt`, matching the
+    without-classification branch's assertions byte-for-byte apart from the
+    remedy line."""
+    (root / CLASSIFICATION).write_text(
+        "ship  1  shipped.txt\n"
+        "ship  1  RELEASE_MANIFEST.txt\n"
+        f"drop  1  {CLASSIFICATION}\n",
+        encoding="utf-8")
+    _git(root, "add", CLASSIFICATION)
+    _git(root, "commit", "-qm", "add classification")
 
 
 @pytest.fixture
@@ -78,13 +97,31 @@ def _run_gate(root: Path):
 # The gate script itself (index-driven), independent of hook installation.
 # --------------------------------------------------------------------------
 
-def test_changed_pin_not_repinned_is_blocked(repo):
+def test_changed_pin_not_repinned_is_blocked_without_classification(repo):
+    """No `EXPORT_CLASSIFICATION.txt` beside the tree: `export_guard.py` and the
+    classification are `drop`-classified and do not ship, so the only remedy
+    that exists in a tree shaped like this one is `--write`."""
     (repo / "shipped.txt").write_bytes(b"shipped v2\n")
     _git(repo, "add", "shipped.txt")          # file staged, manifest NOT re-pinned
     proc = _run_gate(repo)
     assert proc.returncode == 1, proc.stderr
     assert "shipped.txt" in proc.stderr
-    assert "export_guard.py approve" in proc.stderr
+    assert WRITE_CMD in proc.stderr
+    assert APPROVE_CMD not in proc.stderr
+
+
+def test_changed_pin_not_repinned_is_blocked_with_classification(repo):
+    """`EXPORT_CLASSIFICATION.txt` present: this is the private tree shape, where
+    `--write` would refuse (it never forges an approval) and `approve` is the
+    one write path, so the remedy must name it instead."""
+    _classify(repo)
+    (repo / "shipped.txt").write_bytes(b"shipped v2\n")
+    _git(repo, "add", "shipped.txt")          # file staged, manifest NOT re-pinned
+    proc = _run_gate(repo)
+    assert proc.returncode == 1, proc.stderr
+    assert "shipped.txt" in proc.stderr
+    assert "uv run python scripts/export_guard.py approve shipped.txt" in proc.stderr
+    assert WRITE_CMD not in proc.stderr
 
 
 def test_changed_pin_repinned_in_same_commit_passes(repo):
