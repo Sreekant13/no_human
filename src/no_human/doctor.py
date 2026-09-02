@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -421,36 +422,118 @@ WALKS_UNAVAILABLE_LINE = (
     f"({WALKS_DOWNLOAD_SIZE} to install playwright + chromium)"
 )
 
+WALKS_CHROMIUM_MISSING_LINE = (
+    "visual-proof walks: package installed, chromium missing - "
+    "run nh doctor --fix-walks"
+)
 
-def visual_walks_row(*, available: bool | None = None) -> dict[str, Any]:
-    """Presence-only summary of whether visual-proof (Playwright) walks can
-    run in this environment: ``{"available": bool, "line": str}``.
+WALKS_NOT_VERIFIED_LINE = (
+    "visual-proof walks: playwright installed, chromium not verified "
+    "(could not resolve the browser cache directory)"
+)
 
-    Read-only and idempotent — spawns no process, touches no filesystem
-    beyond a Python import — but not a pure package-purity check: the
-    underlying probe (:func:`testing.ui_evidence.playwright_available`)
-    checks ONLY that the ``playwright`` package imports, not that the
-    chromium binary it would launch is present on disk. That narrower
-    contract is deliberate: the previous binary check started
-    ``playwright.sync_api.sync_playwright()``, which raises inside a
-    running ``asyncio`` loop, so it silently returned "unavailable" for
-    every real caller (both ``nh doctor``'s async ``_go`` and the
-    orchestrator's ``_maybe_capture_ui_evidence`` run under a loop). That
-    is also why this now agrees with ``nh doctor --fix-walks`` by
-    construction — same probe, same import-only check, context-independent.
-    A package-present/binary-missing install therefore now reads
-    "available" here; if a walk then finds no browser binary, that gap
-    surfaces as a disclosed skip in the PR body (the orchestrator's
-    no-shots path), not as this diagnostic. Wrapped in ``except Exception``
-    so a broken/partial playwright install reads as unavailable rather than
+
+def _playwright_registry_dir() -> Path | None:
+    """Where playwright's browser registry directory *would* live on this
+    OS, derived purely from documented cache-directory conventions — never
+    by importing ``playwright`` or starting any process. Mirrors playwright's
+    own resolution order without depending on its internals, so a partial or
+    absent install still resolves a path.
+
+    Returns ``None`` when the location cannot be determined by pure path
+    logic (unsupported platform, missing required env var, unresolvable
+    home directory, or ``PLAYWRIGHT_BROWSERS_PATH=0`` — which means browsers
+    live inside the package tree, not at a fixed convention path) — never a
+    guess.
+    """
+    try:
+        override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        if override:
+            if override == "0":
+                return None
+            return Path(override)
+        if sys.platform == "darwin":
+            return Path.home() / "Library/Caches/ms-playwright"
+        if sys.platform.startswith("linux"):
+            xdg_cache = os.environ.get("XDG_CACHE_HOME")
+            base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+            return base / "ms-playwright"
+        if sys.platform == "win32":
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if not local_appdata:
+                return None
+            return Path(local_appdata) / "ms-playwright"
+        return None
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        return None
+
+
+def _resolve_playwright_chromium_status() -> str:
+    """Filesystem-only check of whether a chromium browser is present in
+    playwright's registry directory. Starts no process, spawns no driver,
+    never imports ``playwright`` — pure path existence/listing logic. The
+    single monkeypatch seam tests use to fake the three (+fallback) states.
+
+    Returns ``"present"`` (registry dir exists with a ``chromium*`` entry),
+    ``"missing"`` (registry dir absent, or present with no ``chromium*``
+    entry), or ``"not-verified"`` (the registry path could not be
+    determined, or listing it raised — permission error or otherwise;
+    honest non-answer rather than a guess).
+    """
+    try:
+        registry_dir = _playwright_registry_dir()
+        if registry_dir is None:
+            return "not-verified"
+        if not registry_dir.is_dir():
+            return "missing"
+        for entry in registry_dir.iterdir():
+            if entry.name.startswith("chromium"):
+                return "present"
+        return "missing"
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        return "not-verified"
+
+
+def visual_walks_row(
+    *, available: bool | None = None, chromium: str | None = None
+) -> dict[str, Any]:
+    """Two-layer summary of whether visual-proof (Playwright) walks can run
+    in this environment: ``{"available": bool, "chromium": str | None,
+    "line": str}``.
+
+    ``available`` is the *import* layer, unchanged from before this
+    function grew a chromium layer — it means only that the underlying
+    probe (:func:`testing.ui_evidence.playwright_available`) can import the
+    ``playwright`` package, not that the chromium binary it would launch is
+    present on disk. That narrower contract is deliberate: the previous
+    binary check started ``playwright.sync_api.sync_playwright()``, which
+    raises inside a running ``asyncio`` loop, so it silently returned
+    "unavailable" for every real caller (both ``nh doctor``'s async ``_go``
+    and the orchestrator's ``_maybe_capture_ui_evidence`` run under a
+    loop). ``row["available"]`` keeps that exact meaning so
+    ``nh doctor --fix-walks``'s "already available" branch keeps behaving
+    exactly as it does today.
+
+    ``chromium`` is the new, separate layer: whether a chromium browser
+    build is present in playwright's registry directory, checked with pure
+    filesystem path logic (:func:`_resolve_playwright_chromium_status`) —
+    no process, no driver, no ``import playwright``. It is only probed when
+    the package layer is available; when the package itself is missing,
+    chromium is reported as ``None`` (not probed — there is nothing to
+    launch it with). If the registry location can't be determined or
+    listing it fails, it honestly reports ``"not-verified"`` rather than
+    guessing.
+
+    Both probes are wrapped in ``except Exception`` so a broken/partial
+    playwright install reads as unavailable/not-verified rather than
     crashing the command that prints it. This is deliberately
     advisory-shaped: the caller decides whether to surface the unavailable
     line at all, and it is never appended to a :class:`Diagnosis`'s
     ``contradictions``/``evidence_gaps`` — an optional feature being off
     must never fail ``d.healthy`` or the exit code.
 
-    ``available`` is an injectable override for tests; the normal call site
-    passes nothing and lets this probe live.
+    ``available``/``chromium`` are injectable overrides for tests; the
+    normal call site passes neither and lets both probes live.
     """
     if available is None:
         try:
@@ -459,9 +542,25 @@ def visual_walks_row(*, available: bool | None = None) -> dict[str, Any]:
             available = playwright_available()
         except Exception:  # noqa: BLE001 — a diagnostic must never raise
             available = False
+    if available and chromium is None:
+        try:
+            chromium = _resolve_playwright_chromium_status()
+        except Exception:  # noqa: BLE001 — a diagnostic must never raise
+            chromium = "not-verified"
+    elif not available:
+        chromium = None
+    if not available:
+        line = WALKS_UNAVAILABLE_LINE
+    elif chromium == "present":
+        line = WALKS_AVAILABLE_LINE
+    elif chromium == "missing":
+        line = WALKS_CHROMIUM_MISSING_LINE
+    else:
+        line = WALKS_NOT_VERIFIED_LINE
     return {
         "available": available,
-        "line": WALKS_AVAILABLE_LINE if available else WALKS_UNAVAILABLE_LINE,
+        "chromium": chromium,
+        "line": line,
     }
 
 

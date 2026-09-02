@@ -68,7 +68,7 @@ def _doctor(monkeypatch, tmp_path, *args, live=None, config=None):
 
 def test_visual_walks_row_unavailable_line_is_exact():
     row = visual_walks_row(available=False)
-    assert row == {"available": False, "line": WALKS_UNAVAILABLE_LINE}
+    assert row == {"available": False, "chromium": None, "line": WALKS_UNAVAILABLE_LINE}
     assert WALKS_UNAVAILABLE_LINE == (
         "visual-proof walks: unavailable - playwright not installed "
         "(~120MB to install playwright + chromium)")
@@ -76,8 +76,8 @@ def test_visual_walks_row_unavailable_line_is_exact():
 
 
 def test_visual_walks_row_available_line():
-    row = visual_walks_row(available=True)
-    assert row == {"available": True, "line": WALKS_AVAILABLE_LINE}
+    row = visual_walks_row(available=True, chromium="present")
+    assert row == {"available": True, "chromium": "present", "line": WALKS_AVAILABLE_LINE}
 
 
 def test_visual_walks_row_never_raises_when_the_probe_itself_is_broken(monkeypatch):
@@ -112,6 +112,7 @@ def test_fix_walks_gate_and_doctor_row_use_the_same_probe(monkeypatch, tmp_path)
     import no_human.testing.ui_evidence as ui_evidence_mod
 
     monkeypatch.setattr(ui_evidence_mod, "_import_playwright", lambda: object())
+    monkeypatch.setattr(doctor_mod, "_resolve_playwright_chromium_status", lambda: "present")
 
     def _forbidden(**kw):
         raise AssertionError("install_walks must not run when already available")

@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from no_human import doctor as doctor_mod
+from no_human.cli import commands as cmd_mod
 from no_human.testing import ui_evidence
 
 # Parent package first: `find_spec("playwright.async_api")` RAISES
@@ -92,8 +93,12 @@ def test_import_seam_is_loop_safe():
 
 def test_no_sync_playwright_reference_survives():
     """No `sync_playwright()` call may remain on any path reachable from a
-    running event loop. This test has NO skipif — it reads source, not
-    behavior, so it must run even when playwright itself is absent.
+    running event loop — now checked across every module that touches the
+    walks-availability probe: `ui_evidence.py` (the probe itself),
+    `doctor.py` (the two-layer row and the filesystem-only chromium
+    resolver added on top of it) and `cli/commands.py` (the CLI printer).
+    This test has NO skipif — it reads source, not behavior, so it must run
+    even when playwright itself is absent.
 
     AST-based, not a raw substring scan: `playwright_available`'s own
     docstring names `playwright.sync_api.sync_playwright()` in prose, to
@@ -104,45 +109,70 @@ def test_no_sync_playwright_reference_survives():
     not commentary.
 
     An absence claim needs a positive control: also assert `async_api` IS
-    still referenced in actual code, so this can't be vacuously passing
-    against a module that was gutted or renamed out from under it.
+    still referenced in actual code (scoped to `ui_evidence.py`, the only
+    module that legitimately imports it), so this can't be vacuously
+    passing against a module that was gutted or renamed out from under it.
+    `doctor.py`/`commands.py` must not import ANY `playwright.*` module at
+    all — the chromium layer added there is pure path logic, not a
+    playwright-package consumer.
     """
     import ast
 
-    src = Path(ui_evidence.__file__).read_text()
-    tree = ast.parse(src)
+    modules = {
+        "ui_evidence": Path(ui_evidence.__file__),
+        "doctor": Path(doctor_mod.__file__),
+        "commands": Path(cmd_mod.__file__),
+    }
 
     # NOTE: plain substring matching is wrong here — "async_api" ENDS with
     # "sync_api" (a-'sync_api'), so a naive `"sync_api" in module` check
     # would flag the very import this test must treat as the positive
     # control. Match dotted module paths by exact component instead.
     offenders = []
+    playwright_imports = []
     saw_async_api_import = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or ""):
-            parts = node.module.split(".")
-            if "sync_api" in parts:
-                offenders.append(f"import from {node.module!r}")
-            if "async_api" in parts:
-                saw_async_api_import = True
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                parts = alias.name.split(".")
+    for name, path in modules.items():
+        src = path.read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or ""):
+                parts = node.module.split(".")
                 if "sync_api" in parts:
-                    offenders.append(f"import {alias.name!r}")
+                    offenders.append(f"{name}: import from {node.module!r}")
                 if "async_api" in parts:
-                    saw_async_api_import = True
-        elif isinstance(node, ast.Name) and node.id == "sync_playwright":
-            offenders.append(f"Name(sync_playwright) at line {node.lineno}")
-        elif isinstance(node, ast.Attribute) and node.attr == "sync_playwright":
-            offenders.append(f"Attribute(.sync_playwright) at line {node.lineno}")
+                    if name == "ui_evidence":
+                        saw_async_api_import = True
+                    else:
+                        offenders.append(f"{name}: import from {node.module!r}")
+                if parts[0] == "playwright" and name in ("doctor", "commands"):
+                    playwright_imports.append(f"{name}: import from {node.module!r}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    parts = alias.name.split(".")
+                    if "sync_api" in parts:
+                        offenders.append(f"{name}: import {alias.name!r}")
+                    if "async_api" in parts:
+                        if name == "ui_evidence":
+                            saw_async_api_import = True
+                        else:
+                            offenders.append(f"{name}: import {alias.name!r}")
+                    if parts[0] == "playwright" and name in ("doctor", "commands"):
+                        playwright_imports.append(f"{name}: import {alias.name!r}")
+            elif isinstance(node, ast.Name) and node.id == "sync_playwright":
+                offenders.append(f"{name}: Name(sync_playwright) at line {node.lineno}")
+            elif isinstance(node, ast.Attribute) and node.attr == "sync_playwright":
+                offenders.append(f"{name}: Attribute(.sync_playwright) at line {node.lineno}")
 
     assert offenders == [], (
         "sync_playwright() raises inside a running asyncio loop; no live "
-        f"reference to it may survive in this module's code: {offenders}")
+        f"reference to it may survive in any touched module's code: {offenders}")
     assert saw_async_api_import, (
         "positive control: the loop-safe async_api import must still be "
-        "present in actual code — otherwise the assertions above are vacuous")
+        "present in ui_evidence.py's code — otherwise the assertions above "
+        "are vacuous")
+    assert playwright_imports == [], (
+        "doctor.py/commands.py must never import any playwright.* module — "
+        f"the chromium layer is pure path logic: {playwright_imports}")
 
 
 @_skip_if_absent

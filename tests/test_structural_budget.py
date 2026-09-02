@@ -323,7 +323,11 @@ FROZEN_FILE_LINES = {
     # _print_visual_walks so the merged doctor() stays under the 300-line
     # function budget). Measured on the merge result with the scanner
     # below, never summed.
-    "cli/commands.py": 8352,
+    # 8352 -> 8356 (+4): `_print_visual_walks` now derives `walks_colour`
+    # from the (package, chromium) pair instead of the package layer alone
+    # — a package-present/chromium-missing install must not render green —
+    # plus one extra docstring sentence naming the new third row state.
+    "cli/commands.py": 8356,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`

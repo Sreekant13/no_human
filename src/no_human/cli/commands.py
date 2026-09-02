@@ -6269,11 +6269,15 @@ def _print_visual_walks(console, d) -> None:
     prints when there are no known profiles — read-only and additive. A
     repo can be "enabled" here while the dependency row says unavailable:
     the two rows name different layers (config present vs playwright
-    installed), and the dependency row already carries its remedy."""
+    installed), and the dependency row already carries its remedy. The
+    dependency row also carries a third, chromium-only state (package
+    imports but no browser binary was found) — its own line already names
+    `--fix-walks`, so the hint below stays gated on the package layer only."""
     from ..doctor import visual_walks_row
 
     wrow = visual_walks_row()
-    walks_colour = "green" if wrow["available"] else "yellow"
+    walks_ok = wrow["available"] and wrow.get("chromium") == "present"
+    walks_colour = "green" if walks_ok else "yellow"
     walks_hint = "" if wrow["available"] else "  [dim](nh doctor --fix-walks to enable)[/]"
     console.print(f"[{walks_colour}]{wrow['line']}[/]{walks_hint}")
 
