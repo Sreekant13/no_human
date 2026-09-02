@@ -1135,3 +1135,33 @@ async def test_ci_log_excerpt_verifies_against_system_store_without_a_bundle(mon
     rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example", ca_bundle="")
     await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
     assert rec["verify"] is True  # never verify=False
+
+
+async def test_ci_log_excerpt_scopes_to_the_controller_path_and_port(monkeypatch):
+    """`jenkins_controller` is a URL with a controller path; the same host on
+    another path or port is NOT the controller and gets no request."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/other/job/x/42",
+                 "https://build.example.com/ctrl2/job/x/42",
+                 "https://build.example.com:8443/ctrl/job/x/42",
+                 "https://build.example.com/job/x/42"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com:443/ctrl/job/x/42/")
+    assert rec["url"] == "https://build.example.com:443/ctrl/job/x/42/consoleText"
+
+
+async def test_ci_log_excerpt_warns_when_the_controller_is_not_an_https_url(monkeypatch, caplog):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    for ctrl in ("http://build.example.com/ctrl", "build.example.com"):
+        caplog.clear()
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+            assert await default_ci_log_excerpt("https://build.example.com/ctrl/job/x/42") == ""
+        assert rec["constructed"] is False
+        assert "not an https URL" in caplog.text and ctrl in caplog.text, ctrl

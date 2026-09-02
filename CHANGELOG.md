@@ -11,8 +11,11 @@ All notable changes to no_human. The format follows
   request whose `Host` is not loopback is refused (400, DNS-rebinding defence),
   a cross-origin browser write to any state-changing route is refused (403),
   the CORS grant is exact-host loopback only, and the `/ws` handshake applies
-  the same `Host`/`Origin` gate. Previously only 11 of 50 mutating routes had
-  an origin check and CORS allowed every origin.
+  the same `Host`/`Origin` gate. Allowed hosts are loopback plus the
+  configured `server.host`, which the `nh` CLI addresses the board by. At
+  v0.1.9 only 11 of the 50 mutating routes had an origin check and CORS
+  allowed every origin. The boundary is one middleware dispatch, on the order
+  of 100 µs per request.
 - `land_task` refuses in-process when the calling process carries the
   agent-session mark, so a marked agent cannot land a PR by driving the
   landing module directly.
@@ -33,10 +36,13 @@ All notable changes to no_human. The format follows
 - Development now happens directly in this repository: changes land here as
   commits and pull requests rather than arriving through a periodic export.
 - A board bound to a non-loopback interface (`nh start --host 0.0.0.0`) answers
-  `400 bad_host` to a browser that addresses it by a LAN name or IP; use an SSH
+  `400 bad_host` to a browser that addresses it by a LAN name or IP other than
+  the configured `server.host`; set `server.host` to that name, or use an SSH
   tunnel or loopback port-forward.
 - The CI-log excerpt logs a warning when SSO credentials are set but
-  `ci_gate.jenkins_controller` is empty, instead of silently returning nothing.
+  `ci_gate.jenkins_controller` is empty or not an https URL, instead of
+  silently returning nothing; the fetch is scoped to the controller's host,
+  port and path, not its host alone.
 
 ## [0.1.9] — 2026-09-01
 

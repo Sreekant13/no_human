@@ -810,8 +810,8 @@ async def test_put_setup_accepts_a_registered_default_repo(client, store):
 @pytest.mark.asyncio
 async def test_test_endpoint_refuses_a_cross_origin_call(client):
     # CSRF: POST /test loads .env secrets, fires authenticated OUTBOUND calls
-    # with the operator's tokens, and writes config.yaml on a pass. The app runs
-    # allow_origins=["*"] unauthenticated, so — like every sibling write route —
+    # with the operator's tokens, and writes config.yaml on a pass. The app is
+    # unauthenticated, so — like every sibling write route —
     # it must refuse a cross-origin caller, or a page the operator merely visits
     # could drive a probe with their token and read back the VCS user/project.
     r = await client.post("/api/integrations/github/test",

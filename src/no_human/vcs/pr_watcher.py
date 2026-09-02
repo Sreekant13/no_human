@@ -687,9 +687,10 @@ async def default_ci_log_excerpt(link: str) -> str:
     reaches for Basic. `link` arrives from forge-supplied PR check data (a
     check's `targetUrl`/`detailsUrl` points wherever the forge says), so both
     the credentials AND the request are scoped to the configured Jenkins
-    controller (`ci_gate.jenkins_controller`): a host that is not that
-    controller gets no request at all — `/consoleText` is a Jenkins endpoint,
-    and firing at an arbitrary host would leak credentials or make a request on
+    controller (`ci_gate.jenkins_controller`, an https URL, compared as a
+    scheme+host+port+path prefix): a link outside that controller gets no
+    request at all — `/consoleText` is a Jenkins endpoint, and firing at an
+    arbitrary host, port or path would leak credentials or make a request on
     the forge's behalf. TLS is always verified — against
     `ci_gate.jenkins_ca_bundle` (a PEM path) when set, else the system trust
     store. Best-effort by design: "" simply means the feedback carries only the
@@ -697,24 +698,32 @@ async def default_ci_log_excerpt(link: str) -> str:
     """
     if "/display/redirect" in link:
         link = link.split("/display/redirect")[0]
-    if not link.startswith("https://"):
-        return ""
     from urllib.parse import urlparse
 
     from ..config import load_config, load_env_var
 
-    ci_gate = load_config().data.get("ci_gate") or {}
-    controller_host = (urlparse(ci_gate.get("jenkins_controller") or "").hostname or "").lower()
-    link_host = (urlparse(link).hostname or "").lower()
-    # Credentials and the fetch go ONLY to the configured Jenkins controller.
-    if not controller_host:
+    # load_config reads YAML from disk: off the event loop, like the other
+    # blocking work in this process (api/app.py uses asyncio.to_thread too).
+    ci_gate = (await asyncio.to_thread(load_config)).data.get("ci_gate") or {}
+    controller = urlparse((ci_gate.get("jenkins_controller") or "").strip())
+    # Credentials and the fetch go ONLY to the configured Jenkins controller,
+    # compared as an https scheme+host+port+path prefix. The diagnostics fire
+    # only when SSO credentials exist: without them there is no excerpt to lose.
+    if controller.scheme != "https" or not controller.hostname:
         if load_env_var("SSO_USERNAME"):
             log.warning(
-                "SSO credentials are set but ci_gate.jenkins_controller is empty; "
-                "the CI log excerpt is disabled until it names the Jenkins host")
+                "SSO credentials are set but ci_gate.jenkins_controller is %s; the CI log "
+                "excerpt is disabled until it is the controller's https URL",
+                "empty" if not controller.geturl() else f"not an https URL ({controller.geturl()!r})")
         return ""
-    if link_host != controller_host:
-        log.debug("CI log excerpt skipped: %s is not the configured Jenkins controller", link_host)
+    prefix = (f"https://{controller.hostname.lower()}:{controller.port or 443}"
+              f"{controller.path.rstrip('/')}/")
+    lk = urlparse(link)
+    if lk.scheme != "https" or not lk.hostname:
+        log.debug("CI log excerpt skipped: %r is not an https link", link)
+        return ""
+    if not f"https://{lk.hostname.lower()}:{lk.port or 443}{lk.path}".startswith(prefix):
+        log.debug("CI log excerpt skipped: %s is outside the configured Jenkins controller", link)
         return ""
     # The credentials live in ~/.no_human/.env; the server process does not
     # export them, so reading os.environ alone would always come up empty.

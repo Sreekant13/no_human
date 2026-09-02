@@ -36,13 +36,29 @@ from collections.abc import Iterable, Mapping, MutableMapping
 _SECRET_NAME_MARKERS = (
     "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY",
     "ACCESS_KEY", "PRIVATE_KEY", "CREDENTIAL", "AUTH_TOKEN", "SESSION_KEY",
+    "SIGNING_KEY", "ENCRYPTION_KEY", "WEBHOOK",
 )
-# Credential-bearing names the markers do not catch by shape.
-_SECRET_NAME_EXACT = ("SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS")
-# Cloud-provider namespaces: the whole prefix goes, non-secret members included
-# (AWS_REGION, AWS_PROFILE), because a profile name IS the pointer to a
-# credential file the child could then read.
+# A `*_KEY` suffix is a credential far more often than not (STRIPE_KEY,
+# COOKIE_KEY, SECRET_KEY); the false positive (a key ID such as GPG_KEY) is
+# harmless to lose.
+_SECRET_NAME_SUFFIXES = ("_KEY",)
+# Credential-bearing names the markers do not catch by shape: connection URLs
+# that embed a password, and pointers to credential files.
+_SECRET_NAME_EXACT = (
+    "SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS", "DATABASE_URL",
+    "REDIS_URL", "MONGODB_URI", "SENTRY_DSN", "NETRC", "PGPASSFILE",
+    "KUBECONFIG", "DOCKER_AUTH_CONFIG",
+)
+# Cloud-provider namespaces: the whole prefix goes, because a profile name
+# (AWS_PROFILE) IS the pointer to a credential file the child could then read.
 _SECRET_NAME_PREFIXES = ("AWS_", "GCP_", "AZURE_")
+# Names the rules above would catch that carry no credential and that a task's
+# own test suite commonly needs: a region, a pager setting, a CA bundle path,
+# a LocalStack endpoint, a tokenizer thread flag.
+_NOT_SECRET_EXACT = frozenset({
+    "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PAGER", "AWS_CA_BUNDLE",
+    "AWS_ENDPOINT_URL", "TOKENIZERS_PARALLELISM",
+})
 
 #: Secret-shaped name prefixes the CLAUDE child keeps with their real value.
 #: ANTHROPIC_*/CLAUDE_* are the model auth + config for the very CLI being
@@ -58,9 +74,11 @@ CODEX_CHILD_KEEP: tuple[str, ...] = ("OPENAI_", "NO_HUMAN_AGENT_SESSION")
 def is_secret_env_name(name: str) -> bool:
     """Whether an env-var NAME looks like it carries a credential."""
     upper = name.upper()
+    if upper in _NOT_SECRET_EXACT:
+        return False
     if any(marker in upper for marker in _SECRET_NAME_MARKERS):
         return True
-    if upper in _SECRET_NAME_EXACT:
+    if upper in _SECRET_NAME_EXACT or upper.endswith(_SECRET_NAME_SUFFIXES):
         return True
     return any(upper.startswith(prefix) for prefix in _SECRET_NAME_PREFIXES)
 

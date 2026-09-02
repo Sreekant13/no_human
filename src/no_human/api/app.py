@@ -46,8 +46,8 @@ from pydantic import BaseModel
 from .. import __version__
 from ..agent.session_mark import AGENT_SESSION_HEADER, request_is_marked
 from .local_boundary import (
-    LOOPBACK_ORIGIN_REGEX, install_local_boundary, require_local_origin,
-    ws_handshake_is_local,
+    LOOPBACK_ORIGIN_REGEX, allowed_hosts, install_local_boundary,
+    require_local_origin, ws_handshake_is_local,
 )
 from ..blockers import process_actor
 from ..config import _atomic_write_text, load_config
@@ -484,8 +484,8 @@ async def _refuse_marked_gate_acts(request, call_next):
 
 
 # The loopback boundary, outermost so it runs before every middleware above:
-# every request must address 127.0.0.1/localhost/[::1] and a cross-origin
-# browser write is refused (api/local_boundary.py).
+# every request must address 127.0.0.1/localhost/[::1] or the configured
+# server.host, and a cross-origin browser write is refused (api/local_boundary.py).
 install_local_boundary(app)
 
 
@@ -4333,8 +4333,8 @@ async def test_integration_endpoint(name: str, request: Request) -> dict[str, An
 
     # This route is NOT a no-op read: it loads .env secrets, fires authenticated
     # OUTBOUND calls with the operator's stored tokens, and (on a pass) writes
-    # config.yaml via mark_verified. The app runs allow_origins=["*"]
-    # unauthenticated, so — exactly like /setup and /config — it MUST refuse a
+    # config.yaml via mark_verified. The app is unauthenticated (the loopback
+    # boundary is the only guard), so — exactly like /setup and /config — it MUST refuse a
     # cross-origin caller, or a page the operator merely visits could drive a
     # probe with their token and read back the VCS username/project in `detail`.
     require_local_origin(request, writing=True)
@@ -4386,8 +4386,8 @@ async def save_integration_config_endpoint(
     from ..integrations import KIND_BY_NAME, integration_fields, save_integration_config
 
     # This route writes ~/.no_human/.env — the SAME credential store the auth
-    # endpoint guards. Without this, `allow_origins=["*"]` lets any page the
-    # operator visits while `nh serve` is up preflight successfully and then
+    # endpoint guards. Without this (before the loopback boundary), any page the
+    # operator visited while `nh serve` was up could preflight successfully and then
     # PUT a planted secret into it; that drive-by was demonstrated end to end.
     require_local_origin(request, writing=True)
     if name not in KIND_BY_NAME:
@@ -5749,7 +5749,7 @@ def _task_fingerprint(tlist) -> dict:
 
 @app.websocket("/ws")
 async def ws_board(ws: WebSocket) -> None:
-    if not ws_handshake_is_local(ws.headers):  # a handshake bypasses CORS + middlewares
+    if not ws_handshake_is_local(ws.headers, allowed_hosts(ws.app)):  # bypasses CORS + middlewares
         await ws.close(code=1008)  # policy violation
         return
     await _mgr.connect(ws)

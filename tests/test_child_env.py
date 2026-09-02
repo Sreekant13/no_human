@@ -98,3 +98,19 @@ def test_positive_control_a_secret_free_env_is_left_alone():
     assert scrub_foreign_secrets_into({}, env) == []
     assert drop_foreign_secrets(env) == []
     assert env == {"PATH": "/bin"}
+
+
+def test_connection_urls_credential_files_and_key_suffixes_are_secrets():
+    for name in ("DATABASE_URL", "REDIS_URL", "MONGODB_URI", "SENTRY_DSN", "NETRC",
+                 "PGPASSFILE", "KUBECONFIG", "DOCKER_AUTH_CONFIG", "STRIPE_KEY",
+                 "SIGNING_KEY", "ENCRYPTION_KEY", "COOKIE_KEY", "SLACK_WEBHOOK_URL",
+                 "NPM_TOKEN", "CARGO_REGISTRY_TOKEN", "MAVEN_PASSWORD"):
+        assert is_secret_env_name(name), name
+
+
+def test_operational_names_a_task_suite_needs_are_not_secrets():
+    for name in ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PAGER", "AWS_CA_BUNDLE",
+                 "AWS_ENDPOINT_URL", "TOKENIZERS_PARALLELISM", "PATH", "HOME",
+                 "GIT_TERMINAL_PROMPT", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+        assert not is_secret_env_name(name), name
+    assert is_secret_env_name("AWS_PROFILE")  # the pointer to a credential file stays scrubbed

@@ -6,25 +6,30 @@ the board is up can reach it from the browser. The same-user trust boundary
 docs/security.md draws ("an attacker with shell as the nh user" is out of
 scope) is enforced here as four checks, in one place:
 
-* :func:`require_local_host` (middleware) — every request must carry a loopback
-  ``Host``, else 400. This is the DNS-rebinding defence: a rebound request is
-  same-origin to the browser and sends no ``Origin`` at all, so ``Host`` is the
-  only field that still names the attacker's domain. It also means a board
-  bound to a non-loopback interface (``nh start --host 0.0.0.0``) refuses
-  requests addressed by a LAN name or IP — by design, documented in
-  docs/security.md.
-* :func:`refuse_cross_origin_writes` (middleware) — a state-changing request
-  whose ``Origin`` is present and not loopback is refused (403). A browser
-  always sends ``Origin`` on a cross-site write; an absent ``Origin`` is a
-  non-browser local client (the ``nh`` CLI, the MCP bridge) and is allowed.
-  Only the mutating verbs are checked, so the CORS preflight and every read
-  pass through.
+* ``Host`` must name an allowed host, else 400. This is the DNS-rebinding
+  defence: a rebound request is same-origin to the browser and sends no
+  ``Origin`` at all, so ``Host`` is the only field that still names the
+  attacker's domain. Allowed = loopback, plus the host the server was
+  configured to bind (``server.host``): the ``nh`` CLI and ``nh start`` address
+  the board by that configured value (``cli/shell.py:base_url_from_config``),
+  and a rebinding page cannot make its own domain equal it.
+* A state-changing request whose ``Origin`` is present and not allowed is
+  refused (403). A browser always sends ``Origin`` on a cross-site write; an
+  absent ``Origin`` is a non-browser local client (the ``nh`` CLI, the MCP
+  bridge) and is allowed. Only the mutating verbs are checked, so the CORS
+  preflight and every read pass through.
 * :data:`LOOPBACK_ORIGIN_REGEX` — the CORS grant, exact-host loopback on any
   port, so a cross-origin page cannot read responses. Exact, not
   ``startswith``: ``http://localhost.evil.com`` is a domain an attacker
-  registers (that bug shipped once, see :func:`require_local_origin`).
+  registers (that bug shipped once, see :func:`require_local_origin`). The
+  board page itself is same-origin and needs no CORS grant, so a configured
+  non-loopback ``server.host`` is deliberately NOT in the grant.
 * :func:`ws_handshake_is_local` — the same ``Host``/``Origin`` gate for the
   WebSocket handshake, which bypasses CORS and the HTTP middlewares.
+
+The two HTTP checks run in ONE middleware dispatch (:func:`local_boundary`):
+each ``BaseHTTPMiddleware`` layer costs on the order of 100 µs per request on
+a board the UI polls, and both checks are header predicates.
 
 :func:`require_local_origin` is the older per-route check the credential
 routes call explicitly; it additionally refuses a WRITE with no ``Origin`` at
@@ -32,7 +37,7 @@ all, which the global middleware deliberately does not (the CLI has none).
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
@@ -43,48 +48,62 @@ LOOPBACK_ORIGIN_REGEX = r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$"
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
-def host_is_local(host_header: str | None) -> bool:
-    """Whether a ``Host`` header value names a loopback host (any port)."""
-    return (urlsplit("//" + (host_header or "")).hostname or "") in LOCAL_HOSTS
+def _hostname(authority_or_url: str) -> str:
+    """The lower-cased hostname of a ``Host`` value or a URL, or ``""``.
+
+    Userinfo is refused outright: a browser never sends it in either header,
+    so ``evil.com@127.0.0.1`` is a hand-built request, and parsing it would
+    let ``urlsplit`` report the part after the ``@`` as the host."""
+    if "@" in authority_or_url:
+        return ""
+    value = authority_or_url if "//" in authority_or_url else "//" + authority_or_url
+    try:
+        return (urlsplit(value).hostname or "").lower()
+    except ValueError:  # e.g. an unbracketed IPv6 literal with a port
+        return ""
 
 
-def origin_is_local(origin: str | None) -> bool:
-    """Whether an ``Origin`` header value is an http(s) loopback origin. An
-    absent origin is NOT local — callers decide what absence means."""
+def allowed_hosts(app) -> frozenset[str]:
+    """Loopback plus the configured bind host (``server.host``), if any."""
+    cfg = getattr(getattr(app, "state", None), "config", None)
+    data = getattr(cfg, "data", cfg)
+    server = data.get("server") if isinstance(data, dict) else None
+    host = (server or {}).get("host") if isinstance(server, dict) else None
+    if isinstance(host, str) and host.strip():
+        return LOCAL_HOSTS | {host.strip().strip("[]").lower()}
+    return LOCAL_HOSTS
+
+
+def host_is_local(host_header: str | None, allowed: Iterable[str] = LOCAL_HOSTS) -> bool:
+    """Whether a ``Host`` header value names an allowed host (any port)."""
+    return _hostname(host_header or "") in allowed
+
+
+def origin_is_local(origin: str | None, allowed: Iterable[str] = LOCAL_HOSTS) -> bool:
+    """Whether an ``Origin`` header value is an http(s) origin on an allowed
+    host. An absent origin is NOT local — callers decide what absence means."""
     if origin is None:
         return False
     parts = urlsplit(origin)
-    return parts.scheme in ("http", "https") and (parts.hostname or "") in LOCAL_HOSTS
+    return parts.scheme in ("http", "https") and _hostname(origin) in allowed
 
 
-def ws_handshake_is_local(headers: Mapping[str, str]) -> bool:
-    """The WebSocket handshake gate: loopback ``Host``, and ``Origin`` either
-    absent (a non-browser client) or loopback."""
+def ws_handshake_is_local(headers: Mapping[str, str],
+                          allowed: Iterable[str] = LOCAL_HOSTS) -> bool:
+    """The WebSocket handshake gate: allowed ``Host``, and ``Origin`` either
+    absent (a non-browser client) or allowed."""
     origin = headers.get("origin")
-    return host_is_local(headers.get("host")) and (origin is None or origin_is_local(origin))
+    return host_is_local(headers.get("host"), allowed) and (
+        origin is None or origin_is_local(origin, allowed))
 
 
-async def require_local_host(request: Request, call_next):
-    """Refuse a request whose ``Host`` header is not loopback (400)."""
-    if not host_is_local(request.headers.get("host")):
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "bad_host",
-                "reason": (
-                    "requests must address the board on a loopback host "
-                    "(see docs/security.md)."
-                ),
-            },
-        )
-    return await call_next(request)
-
-
-async def refuse_cross_origin_writes(request: Request, call_next):
-    """Refuse a cross-origin browser write to any state-changing route (403)."""
+async def local_boundary(request: Request, call_next):
+    """One dispatch, two refusals: a cross-origin browser write (403), then a
+    request whose ``Host`` is not an allowed host (400)."""
+    allowed = allowed_hosts(request.app)
     if request.method.upper() in _WRITE_METHODS:
         origin = request.headers.get("origin")
-        if origin is not None and not origin_is_local(origin):
+        if origin is not None and not origin_is_local(origin, allowed):
             return JSONResponse(
                 status_code=403,
                 content={
@@ -95,15 +114,24 @@ async def refuse_cross_origin_writes(request: Request, call_next):
                     ),
                 },
             )
+    if not host_is_local(request.headers.get("host"), allowed):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "bad_host",
+                "reason": (
+                    "requests must address the board on a loopback host or "
+                    "its configured server.host (see docs/security.md)."
+                ),
+            },
+        )
     return await call_next(request)
 
 
 def install_local_boundary(app) -> None:
-    """Register the two boundary middlewares. Each ``app.middleware`` call
-    wraps OUTSIDE the ones before it, so the origin check runs first, then the
-    host check, then whatever the app registered earlier."""
-    app.middleware("http")(require_local_host)
-    app.middleware("http")(refuse_cross_origin_writes)
+    """Register the boundary as the outermost HTTP middleware (each
+    ``app.middleware`` call wraps OUTSIDE the ones before it)."""
+    app.middleware("http")(local_boundary)
 
 
 def require_local_origin(request: Request, *, writing: bool = False) -> None:
@@ -111,8 +139,8 @@ def require_local_origin(request: Request, *, writing: bool = False) -> None:
 
     The server is unauthenticated, so without this ANY page the operator
     visits while `nh serve` is up could PUT the token endpoint and replace the
-    token that pays for the subscription. The global middlewares above now
-    cover every write; this per-route check remains for the credential routes
+    token that pays for the subscription. The global middleware above now
+    covers every write; this per-route check remains for the credential routes
     because it is stricter on one point:
 
     On a WRITE, a missing ``Origin`` is refused too. A browser always sends it
@@ -131,5 +159,5 @@ def require_local_origin(request: Request, *, writing: bool = False) -> None:
             raise HTTPException(
                 403, "this endpoint requires a same-origin browser request")
         return
-    if not origin_is_local(origin):
+    if not origin_is_local(origin, allowed_hosts(request.app)):
         raise HTTPException(403, "cross-origin requests are not allowed here")

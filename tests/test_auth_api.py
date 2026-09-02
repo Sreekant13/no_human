@@ -345,8 +345,8 @@ async def test_an_implausibly_long_token_is_refused(client, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_cross_origin_write_is_refused(client, tmp_path):
-    """The server is unauthenticated and sets allow_origins=["*"], so any page
-    the operator visits could otherwise PUT the credential store."""
+    """The server is unauthenticated, so any page the operator visits could
+    otherwise PUT the credential store."""
     r = await client.put("/api/auth/token",
                          json={"profile": "personal", "token": TOKEN},
                          headers={"Origin": "https://evil.example"})
@@ -484,8 +484,8 @@ def test_repeated_writes_do_not_accumulate_blank_lines(tmp_path):
 async def test_the_integrations_route_writes_env_and_must_guard_its_origin(
         client, tmp_path):
     """`PUT /api/integrations/{name}/config` writes the SAME ~/.no_human/.env
-    the auth route guards. It had no origin check, and with
-    `allow_origins=["*"]` the preflight succeeds for any site — so a page the
+    the auth route guards. It had no origin check, and with the CORS grant
+    open to every origin at the time the preflight succeeded for any site — so a page the
     operator merely visits while `nh serve` is up could plant a credential.
     Demonstrated end to end before this guard existed: 200, value on disk.
     """
