@@ -391,7 +391,13 @@ FROZEN_FILE_LINES = {
     # `{"ok": True, "enabled": True}` when project.yml could not be written
     # (persist_profile also skips the DB write in that case, so the two
     # artifacts never disagree). Measured on this branch's tree.
-    "api/app.py": 5889,
+    # 5889 -> 5904 (+15): rebased in — show_config grows
+    # `coder_backend_effective` / `coder_backend_default`
+    # (resolve_backend_name(cfg.data) vs DEFAULT_CONFIG["worker"]["backend"])
+    # so the composer's coder-backend disclosure caption can gate on the
+    # EFFECTIVE backend, not just the picker. Measured directly against the
+    # rebased tree (`wc -l src/no_human/api/app.py`).
+    "api/app.py": 5904,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

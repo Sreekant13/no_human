@@ -4212,20 +4212,35 @@ async def show_config(request: Request) -> dict[str, Any]:
       its own — a duplicated rule here is exactly what could disagree with
       the CLI/API's own refusal. The task composer greys out an option (and
       shows this ``reason``) using this field instead.
+    * ``coder_backend_effective`` — ``agent.backend.resolve_backend_name``
+      applied to THIS config: what the coder will actually run on right now,
+      whether that came from an explicit ``worker.backend`` or the function's
+      own ``"claude"`` fallback. The composer must never re-derive this
+      precedence itself (a second copy in JS could silently diverge from the
+      one function `make_backend` actually calls).
+    * ``coder_backend_default`` — the pristine default
+      (``DEFAULT_CONFIG["worker"]["backend"]``) ``coder_backend_effective`` is
+      compared against, so the composer can tell "this install configured
+      something non-default" from "nothing was edited" without naming a
+      backend of its own. Precedent: ``core/backend_settings.py`` already
+      ships ``"default": "claude"`` on ``/api/coder-backend`` the same way.
 
-    All three are computed fresh on every call (not config data), so they
+    All five are computed fresh on every call (not config data), so they
     can never be "scrubbed" or otherwise altered by ``_scrub_secrets``.
     """
     cfg = request.app.state.config
     data = copy.deepcopy(cfg.data)
     scrubbed = _scrub_secrets(data)
-    from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS
+    from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS, resolve_backend_name
+    from ..config import DEFAULT_CONFIG
     from ..core.backend_settings import describe_backend
     scrubbed["coder_backends"] = list(SUPPORTED_BACKENDS)
     scrubbed["claude_pinned_roles"] = list(CLAUDE_PINNED_ROLES)
     scrubbed["coder_backend_availability"] = [
         describe_backend(name, cfg.data) for name in SUPPORTED_BACKENDS
     ]
+    scrubbed["coder_backend_effective"] = resolve_backend_name(cfg.data)
+    scrubbed["coder_backend_default"] = DEFAULT_CONFIG["worker"]["backend"]
     return scrubbed
 
 

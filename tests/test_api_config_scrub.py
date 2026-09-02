@@ -138,6 +138,36 @@ async def test_show_config_exposes_coder_backend_availability_shape(client):
 
 
 @pytest.mark.asyncio
+async def test_show_config_exposes_the_effective_and_default_coder_backends(client):
+    """The composer must gate its disclosure caption on the EFFECTIVE coder
+    backend (worker.backend, resolved), not just the picker — otherwise an
+    install with `worker.backend: codex` configured and the picker left on
+    default shows no disclosure at all. Pin both fields against their real
+    sources of truth, never a literal, and prove `coder_backend_default`
+    stays pristine (the DEFAULT_CONFIG value) even when the running config's
+    effective backend has moved off it."""
+    from no_human.agent.backend import resolve_backend_name
+    from no_human.config import DEFAULT_CONFIG
+
+    default_backend = DEFAULT_CONFIG["worker"]["backend"]
+
+    r = await client.get("/api/config")
+    data = r.json()
+    assert data["coder_backend_effective"] == resolve_backend_name(app.state.config.data)
+    assert data["coder_backend_effective"] == default_backend
+    assert data["coder_backend_default"] == default_backend
+
+    app.state.config.data.setdefault("worker", {})["backend"] = "codex"
+    r2 = await client.get("/api/config")
+    data2 = r2.json()
+    assert data2["coder_backend_effective"] == "codex"
+    assert data2["coder_backend_effective"] == resolve_backend_name(app.state.config.data)
+    # the DEFAULT must not move just because this install configured something.
+    assert data2["coder_backend_default"] == default_backend
+    assert data2["coder_backend_default"] != data2["coder_backend_effective"]
+
+
+@pytest.mark.asyncio
 async def test_show_config_reports_local_unavailable_without_local_base_url(client):
     """Acceptance criterion: 'with llm.local_base_url unset, selecting
     local is refused with the reason the existing config check gives.' This
