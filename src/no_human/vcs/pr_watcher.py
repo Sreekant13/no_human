@@ -698,7 +698,7 @@ async def default_ci_log_excerpt(link: str) -> str:
     """
     if "/display/redirect" in link:
         link = link.split("/display/redirect")[0]
-    from urllib.parse import urlparse
+    from urllib.parse import unquote, urlparse
 
     from ..config import load_config, load_env_var
 
@@ -721,6 +721,16 @@ async def default_ci_log_excerpt(link: str) -> str:
     lk = urlparse(link)
     if lk.scheme != "https" or not lk.hostname:
         log.debug("CI log excerpt skipped: %r is not an https link", link)
+        return ""
+    # httpx applies RFC 3986 dot-segment removal AFTER this compare, so
+    # `/ctrl/../other` would pass a raw prefix test and be sent to `/other`;
+    # a percent-encoded `%2e%2e` or `..%2f` is the same segment once the
+    # server decodes it. A Jenkins build URL never contains a dot segment or
+    # an encoded separator: refuse any, rather than normalise and trust the
+    # normaliser.
+    if any(seg in (".", "..") or "/" in seg or "\\" in seg
+           for seg in map(unquote, lk.path.split("/"))):
+        log.debug("CI log excerpt skipped: %r contains a dot segment or an encoded separator", link)
         return ""
     if not f"https://{lk.hostname.lower()}:{lk.port or 443}{lk.path}".startswith(prefix):
         log.debug("CI log excerpt skipped: %s is outside the configured Jenkins controller", link)

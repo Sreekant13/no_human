@@ -114,3 +114,25 @@ def test_operational_names_a_task_suite_needs_are_not_secrets():
                  "GIT_TERMINAL_PROMPT", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
         assert not is_secret_env_name(name), name
     assert is_secret_env_name("AWS_PROFILE")  # the pointer to a credential file stays scrubbed
+
+
+def test_a_connection_url_with_a_password_is_a_secret_under_any_name():
+    # the class, not the six named instances
+    for name in ("POSTGRES_URL", "MYSQL_URL", "AMQP_URL", "CELERY_BROKER_URL", "DATABASE_URI"):
+        assert is_foreign_secret(name, CLAUDE_CHILD_KEEP, "postgres://app:s3cret@db.internal:5432/x"), name
+    # no password in the userinfo, or no userinfo at all: an ordinary URL
+    for value in ("https://api.example.com/v1", "postgres://db.internal/x", "postgres://app@db/x", ""):
+        assert not is_foreign_secret("SERVICE_URL", CLAUDE_CHILD_KEEP, value), value
+    env = {"CELERY_BROKER_URL": "amqp://guest:guest@rabbit/", "API_URL": "https://x", "PATH": "/bin"}
+    assert drop_foreign_secrets(env) == ["CELERY_BROKER_URL"]
+    assert scrub_foreign_secrets_into({}, {"POSTGRES_URL": "postgres://a:b@h/d"}) == ["POSTGRES_URL"]
+
+
+def test_localstack_endpoint_family_and_key_suffix_edges():
+    for name in ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL_DYNAMODB"):
+        assert not is_secret_env_name(name), name
+    assert is_secret_env_name("DOCKER_CONFIG")
+    # the `_KEY` suffix rule is deliberately broad: these non-secrets go too,
+    # and docs/security.md says so
+    for name in ("SORT_KEY", "PARTITION_KEY", "LICENSE_KEY", "SSH_PUBLIC_KEY"):
+        assert is_secret_env_name(name), name

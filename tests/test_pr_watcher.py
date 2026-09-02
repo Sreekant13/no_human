@@ -1165,3 +1165,24 @@ async def test_ci_log_excerpt_warns_when_the_controller_is_not_an_https_url(monk
             assert await default_ci_log_excerpt("https://build.example.com/ctrl/job/x/42") == ""
         assert rec["constructed"] is False
         assert "not an https URL" in caplog.text and ctrl in caplog.text, ctrl
+
+
+async def test_ci_log_excerpt_refuses_dot_segments_in_the_link(monkeypatch):
+    """httpx applies RFC 3986 dot-segment removal AFTER our prefix compare, so
+    `/ctrl/../other` would pass a raw startswith and be sent to `/other`: a
+    link containing any `.`/`..` segment, encoded or not, gets no request."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/ctrl/../secrets/job/1",
+                 "https://build.example.com/ctrl/a/../../other/job/1",
+                 "https://build.example.com/ctrl/%2e%2e/evil/job/1",
+                 "https://build.example.com/ctrl/%2E%2E/evil/job/1",
+                 "https://build.example.com/ctrl/./job/1",
+                 "https://build.example.com/ctrl/..%2fevil/job/1"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    # positive control: a dot INSIDE a segment is an ordinary name
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com/ctrl/job/x.y/42")

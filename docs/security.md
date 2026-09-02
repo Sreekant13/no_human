@@ -431,24 +431,30 @@ gets no request at all.
 The coder subprocess (both backends) does **not** inherit the launcher's
 environment credentials. `agent/child_env.py` removes every environment
 variable whose NAME is credential-shaped — `*TOKEN*`, `*SECRET*`, `*PASSWORD*`,
-`*API_KEY*`, `*CREDENTIAL*`, `*WEBHOOK*`, any `*_KEY`, connection URLs that
-embed a password (`DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `SENTRY_DSN`),
-credential-file pointers (`SSH_AUTH_SOCK`, `GOOGLE_APPLICATION_CREDENTIALS`,
-`NETRC`, `PGPASSFILE`, `KUBECONFIG`, `DOCKER_AUTH_CONFIG`) and the whole
+`*API_KEY*`, `*CREDENTIAL*`, `*WEBHOOK*`, any `*_KEY` (deliberately broad:
+`SORT_KEY`, `PARTITION_KEY`, `LICENSE_KEY` go too), credential-file pointers
+(`SSH_AUTH_SOCK`, `GOOGLE_APPLICATION_CREDENTIALS`, `NETRC`, `PGPASSFILE`,
+`KUBECONFIG`, `DOCKER_CONFIG`, `DOCKER_AUTH_CONFIG`), the named connection
+URLs (`DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `SENTRY_DSN`) plus **any**
+variable whose value is a URL with a password in it
+(`postgres://app:s3cret@host/db`, whatever its name), and the whole
 `AWS_*`/`GCP_*`/`AZURE_*` namespaces except `AWS_REGION`, `AWS_DEFAULT_REGION`,
-`AWS_PAGER`, `AWS_CA_BUNDLE` and `AWS_ENDPOINT_URL` — keeping only the
-credential that pays for that child (`ANTHROPIC_*`/`CLAUDE_*` for Claude,
-`OPENAI_*` for Codex) and the agent-session mark. A prompt injection in the
-child cannot read `GITHUB_TOKEN`, a cloud key or an integration token out of
-`env`. It is a name-shape rule, so a credential under an unusual name survives,
-and the Claude child sees the removed names as empty strings (the SDK merges
-over the parent environment) while the Codex child does not see them at all.
-The runtime's own `git push`/PR-open run in the parent and are unaffected.
+`AWS_PAGER`, `AWS_CA_BUNDLE` and `AWS_ENDPOINT_URL*`; `TOKENIZERS_PARALLELISM`
+is exempt from the `*TOKEN*` rule. Kept: the credential that pays for that
+child (`ANTHROPIC_*`/`CLAUDE_*` for Claude, `OPENAI_*` for Codex) and the
+agent-session mark. A prompt injection in the child cannot read
+`GITHUB_TOKEN`, a cloud key or an integration token out of `env`. It is a
+name-shape rule plus one value rule, so a bare credential under an unusual
+name survives, and the Claude child sees the removed names as empty strings
+(the SDK merges over the parent environment) while the Codex child does not
+see them at all. The runtime's own `git push`/PR-open run in the parent and
+are unaffected.
 
 What this does **not** do: the child keeps `HOME` and the filesystem, so a
 keyring login, `~/.aws/credentials` or `~/.config/gh/hosts.yml` remain
 reachable — `gh` and `git` in the child still authenticate as the operator
-through them. Denying the filesystem is the host's job (§7 above). Inside the
+through them. `forbidden_paths` (§3) refuses the paths it lists; everything
+else on disk is the host's to deny (a container, a separate user). Inside the
 child, an ssh-agent-only key is unusable, `AWS_PROFILE` is gone, and a private
 registry token (`NPM_TOKEN`, `CARGO_REGISTRY_TOKEN`, ...) a task's own test
 suite needs must come from the machine, not from the launcher's shell.

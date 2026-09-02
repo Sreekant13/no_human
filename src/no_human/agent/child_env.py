@@ -29,6 +29,7 @@ docs/security.md.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable, Mapping, MutableMapping
 
 # Env-var NAME shapes that mark a value as a credential, matched
@@ -42,12 +43,15 @@ _SECRET_NAME_MARKERS = (
 # COOKIE_KEY, SECRET_KEY); the false positive (a key ID such as GPG_KEY) is
 # harmless to lose.
 _SECRET_NAME_SUFFIXES = ("_KEY",)
-# Credential-bearing names the markers do not catch by shape: connection URLs
-# that embed a password, and pointers to credential files.
+# Credential-bearing names the markers do not catch by shape: pointers to
+# credential files, and the connection-URL names whose VALUE is the credential
+# (`scheme://user:password@host`). The named ones are caught by name so they
+# go even when the value is a placeholder; the rest of that class is caught by
+# value in `_value_embeds_credential`.
 _SECRET_NAME_EXACT = (
     "SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS", "DATABASE_URL",
     "REDIS_URL", "MONGODB_URI", "SENTRY_DSN", "NETRC", "PGPASSFILE",
-    "KUBECONFIG", "DOCKER_AUTH_CONFIG",
+    "KUBECONFIG", "DOCKER_AUTH_CONFIG", "DOCKER_CONFIG",
 )
 # Cloud-provider namespaces: the whole prefix goes, because a profile name
 # (AWS_PROFILE) IS the pointer to a credential file the child could then read.
@@ -57,8 +61,10 @@ _SECRET_NAME_PREFIXES = ("AWS_", "GCP_", "AZURE_")
 # a LocalStack endpoint, a tokenizer thread flag.
 _NOT_SECRET_EXACT = frozenset({
     "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PAGER", "AWS_CA_BUNDLE",
-    "AWS_ENDPOINT_URL", "TOKENIZERS_PARALLELISM",
+    "TOKENIZERS_PARALLELISM",
 })
+# AWS_ENDPOINT_URL and its per-service spellings (AWS_ENDPOINT_URL_S3, ...).
+_NOT_SECRET_PREFIXES = ("AWS_ENDPOINT_URL",)
 
 #: Secret-shaped name prefixes the CLAUDE child keeps with their real value.
 #: ANTHROPIC_*/CLAUDE_* are the model auth + config for the very CLI being
@@ -74,7 +80,7 @@ CODEX_CHILD_KEEP: tuple[str, ...] = ("OPENAI_", "NO_HUMAN_AGENT_SESSION")
 def is_secret_env_name(name: str) -> bool:
     """Whether an env-var NAME looks like it carries a credential."""
     upper = name.upper()
-    if upper in _NOT_SECRET_EXACT:
+    if upper in _NOT_SECRET_EXACT or upper.startswith(_NOT_SECRET_PREFIXES):
         return False
     if any(marker in upper for marker in _SECRET_NAME_MARKERS):
         return True
@@ -83,11 +89,22 @@ def is_secret_env_name(name: str) -> bool:
     return any(upper.startswith(prefix) for prefix in _SECRET_NAME_PREFIXES)
 
 
-def is_foreign_secret(name: str, keep: Iterable[str]) -> bool:
-    """Secret-shaped AND not on the child's keep-list (prefixes, matched
-    case-insensitively like the shape test, so `anthropic_api_key` and
-    `ANTHROPIC_API_KEY` are judged the same)."""
-    if not is_secret_env_name(name):
+_URL_WITH_PASSWORD = re.compile(r"^[a-z][a-z0-9+.-]*://[^/?#@]*:[^/?#@]+@", re.I)
+
+
+def _value_embeds_credential(value: str) -> bool:
+    """A connection URL whose userinfo carries a password
+    (`postgres://app:s3cret@db/x`), under whatever name it was exported —
+    POSTGRES_URL, DATABASE_URI, CELERY_BROKER_URL, AMQP_URL, ..."""
+    return bool(value) and "://" in value and _URL_WITH_PASSWORD.match(value.strip()) is not None
+
+
+def is_foreign_secret(name: str, keep: Iterable[str], value: str = "") -> bool:
+    """Secret — by name shape, or by a value that embeds a password — AND not
+    on the child's keep-list (prefixes, matched case-insensitively like the
+    shape test, so `anthropic_api_key` and `ANTHROPIC_API_KEY` are judged the
+    same)."""
+    if not (is_secret_env_name(name) or _value_embeds_credential(value)):
         return False
     upper = name.upper()
     return not any(upper.startswith(prefix.upper()) for prefix in keep)
@@ -107,8 +124,8 @@ def scrub_foreign_secrets_into(
     source = os.environ if source_env is None else source_env
     keep = tuple(keep)
     blanked: list[str] = []
-    for name in source:
-        if name in env or not is_foreign_secret(name, keep):
+    for name, value in source.items():
+        if name in env or not is_foreign_secret(name, keep, value):
             continue
         env[name] = ""
         blanked.append(name)
@@ -123,7 +140,7 @@ def drop_foreign_secrets(
     """Delete every foreign secret from the FULL env mapping ``env`` in place.
     Returns the names dropped (for tests/diagnostics)."""
     keep = tuple(keep)
-    dropped = [name for name in env if is_foreign_secret(name, keep)]
+    dropped = [name for name, value in env.items() if is_foreign_secret(name, keep, value)]
     for name in dropped:
         del env[name]
     return dropped

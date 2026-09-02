@@ -209,13 +209,17 @@ async def wide_client(tmp_path):
     `server.host` allow. The nh CLI then addresses it by that host."""
     store = await Store(tmp_path / "w.db").connect()
     app.state.store = store
+    previous = getattr(app.state, "config", None)
     cfg = load_config(tmp_path / "config.yaml")
     cfg.data["server"]["host"] = "board.local"
     app.state.config = cfg
-    async with AsyncClient(transport=ASGITransport(app=app),
-                           base_url="http://board.local") as c:
-        yield c
-    await store.close()
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://board.local") as c:
+            yield c
+    finally:
+        app.state.config = previous  # the module-level app is shared
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -254,6 +258,7 @@ async def test_wildcard_bind_accepts_its_literal_host(tmp_path):
     # Host 0.0.0.0:8420 literally, so that literal must pass
     store = await Store(tmp_path / "z.db").connect()
     app.state.store = store
+    previous = getattr(app.state, "config", None)
     cfg = load_config(tmp_path / "config.yaml")
     cfg.data["server"]["host"] = "0.0.0.0"
     app.state.config = cfg
@@ -263,6 +268,7 @@ async def test_wildcard_bind_accepts_its_literal_host(tmp_path):
             assert (await c.get("/api/tasks")).status_code == 200
             assert (await c.get("/api/tasks", headers={"Host": "attacker.example"})).status_code == 400
     finally:
+        app.state.config = previous
         await store.close()
 
 
