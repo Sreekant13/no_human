@@ -168,6 +168,43 @@ def test_claude_backend_mark_never_leaks_into_this_process_env(tmp_path, monkeyp
     assert NO_HUMAN_AGENT_SESSION not in os.environ
 
 
+@pytest.mark.real_backend
+def test_claude_backend_options_deny_the_coder_ambient_secrets(tmp_path, monkeypatch):
+    """The coder subprocess inherits the launcher's whole environment
+    (`{**os.environ, **options.env}`); `_options` must blank every secret-
+    shaped variable that is not Anthropic/Claude auth so a prompt injection
+    in the child cannot read it. Non-secret operational vars inherit untouched;
+    the model-auth var and the session mark keep their real values."""
+    import os
+
+    from no_human.agent.claude_backend import ClaudeBackend
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws_secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("MY_CUSTOM_TOKEN", "vendor_secret")  # unknown provider, caught by shape
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "real-oauth")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    opts = ClaudeBackend(model="claude-opus-5")._options(tmp_path, 40)
+    # options.env overrides the inherited value to empty for every secret.
+    for secret in ("GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "MY_CUSTOM_TOKEN"):
+        assert opts.env[secret] == "", secret
+    # Allowed vars and non-secret operational vars are not overridden — they
+    # inherit their real value into the child.
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in opts.env
+    assert "PATH" not in opts.env
+    assert "HOME" not in opts.env
+    # The effective child environment: secrets gone, everything needed intact.
+    child = {**os.environ, **opts.env}
+    assert child["GITHUB_TOKEN"] == ""
+    assert child["SSH_AUTH_SOCK"] == ""
+    assert child["CLAUDE_CODE_OAUTH_TOKEN"] == "real-oauth"
+    assert child["PATH"] == "/usr/bin:/bin"
+    assert opts.env["NO_HUMAN_AGENT_SESSION"] == "1"
+
+
 def test_codex_backend_api_key_child_env_carries_the_mark(monkeypatch):
     """No `codex_login_status` stub: this mirrors the existing, unstubbed
     `test_the_claude_credential_is_not_exported_into_the_codex_subprocess`
@@ -271,6 +308,50 @@ def test_approve_unmarked_control_reaches_business_logic(tmp_path):
         result = CliRunner().invoke(cmd_mod.approve, [tid])
     assert result.exit_code == 0
     assert "approved" in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# C2. The landing module itself                                              #
+#                                                                             #
+# `approve_merge.land_task` is the one place the product performs a real      #
+# merge, so the mark check lives at the act, not only in the CLI wrapper and  #
+# HTTP middleware that call in — a marked session that drives the module in-  #
+# process is refused before any state mutates.                                #
+# --------------------------------------------------------------------------- #
+
+def test_land_task_refuses_a_marked_caller(monkeypatch):
+    from no_human.vcs import approve_merge
+
+    monkeypatch.setenv(NO_HUMAN_AGENT_SESSION, "1")
+    monkeypatch.setenv(NO_HUMAN_AGENT_SESSION_KIND, "claude")
+    # A resolvable repo/branch is never reached: the mark check is the first
+    # statement, before any git or config work. GitRepo would raise on this
+    # path if it were reached, so ok=False with the refusal text proves the
+    # refusal — not an incidental failure — is what returned.
+    result = approve_merge.land_task(
+        repo_path="/nonexistent/repo", branch="feature", pr_url="https://example/pr/1",
+        task_id="t1", task_title="t", review_evidence="e", config={},
+    )
+    assert result.ok is False
+    assert result.step == "preconditions"
+    assert "refused" in result.stderr.lower()
+    assert "claude" in result.stderr
+
+
+def test_land_task_unmarked_passes_the_mark_check(monkeypatch):
+    """Control: with no mark, land_task proceeds past the mark check into its
+    ordinary preconditions — here `pr_url=""` returns the skipped no-PR result
+    (ok=True), which is only reachable AFTER the mark gate."""
+    from no_human.vcs import approve_merge
+
+    monkeypatch.delenv(NO_HUMAN_AGENT_SESSION, raising=False)
+    monkeypatch.delenv(NO_HUMAN_AGENT_SESSION_KIND, raising=False)
+    result = approve_merge.land_task(
+        repo_path="/tmp/x", branch="feature", pr_url="",
+        task_id="t1", task_title="t", review_evidence="e", config={},
+    )
+    assert result.ok is True
+    assert result.skipped is True
 
 
 # --------------------------------------------------------------------------- #

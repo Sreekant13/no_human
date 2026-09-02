@@ -72,6 +72,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..agent.session_mark import current_mark
 from .git import GitError, GitRepo, ProtectedBranch
 from .pr_watcher import parse_pr_url
 
@@ -614,6 +615,24 @@ def land_task(
     step X" to a human watching a slow land run) — never raises out of this
     function (see :func:`_step`).
     """
+    # The act-level half of the human gate (session_mark.py): this is the one
+    # sanctioned place the product performs a real merge, so the mark check
+    # lives HERE, at the act, not only in the CLI wrapper and HTTP middleware
+    # that call in. A process descended from a coding backend carries the mark
+    # (stamped by `claude_backend._options` / `codex_backend._child_env`); if it
+    # drives this module in-process it is refused before any state mutates.
+    # Operator/server callers are unmarked and pass. Never raises, per this
+    # function's contract — a set mark returns a failed LandResult.
+    mark = current_mark()
+    if mark is not None:
+        return LandResult(
+            ok=False, step="preconditions", branch=branch, pr_url=pr_url,
+            stderr=(
+                "refused: this process is a marked agent session "
+                f"(kind={mark!r}); merging a PR is operator-only "
+                "(see docs/security.md)."
+            ),
+        )
     _step(on_step, "preconditions")
     approve_cfg = config.get("approve_merge") or {}
     if not approve_cfg.get("enabled", True):

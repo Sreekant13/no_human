@@ -329,6 +329,11 @@ ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
                                   # = escalate code PRs honestly instead
   enrich_job_url: https://build.example.com/<controller>/job/<folder>/.../<image-build-job>
   jenkins_controller: https://build.example.com/<controller>
+  jenkins_ca_bundle: /etc/ssl/internal-ca.pem   # PEM the CI-log fetch verifies the
+                                  # Jenkins TLS chain against; empty = system trust
+                                  # store. The console-log fetch sends its SSO
+                                  # credentials only to jenkins_controller and never
+                                  # disables verification.
   registry_prefix: registry.example.com/<org>/<image-path>
 ```
 

@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     query,
 )
 
+from ..config import scrub_foreign_secrets_into
 from . import guard
 from .backend import AgentEvent, AgentResult, BackendCapabilities
 from .session_mark import mark_env
@@ -687,6 +688,15 @@ class ClaudeBackend:
         # into the SDK's `env` (additive over the subprocess environment,
         # per the comment above) — never into this process's `os.environ`.
         env.update(mark_env("claude"))
+        # Deny the coder subprocess the launcher's ambient secrets. The SDK
+        # inherits the whole parent environment into the child (`{**os.environ,
+        # **env}`), so blanking every secret-shaped variable that is not
+        # Anthropic/Claude auth (or the session mark) OVERRIDES that inheritance:
+        # a prompt injection in the child cannot read GITHUB_TOKEN, cloud keys,
+        # an ssh-agent socket, or any other credential out of its environment.
+        # Git authenticates through the gh credential helper + GIT_ASKPASS, not
+        # these vars, so the coder's own work is unaffected.
+        scrub_foreign_secrets_into(env)
         # `env` is now never empty (the mark alone guarantees that), but the
         # explicit check is kept rather than assigning unconditionally so a
         # future edit that makes the mark optional does not silently start

@@ -1023,3 +1023,104 @@ async def test_default_ci_annotations_hits_the_check_runs_rest_path_with_hostnam
     assert check_runs_call[-1] == "repos/dev/x/commits/deadbeef/check-runs"
     annotations_call = next(c for c in api_calls if c[-1].endswith("/annotations"))
     assert annotations_call[-1] == "repos/dev/x/check-runs/999/annotations"
+
+
+# --------------------------------------------------------------------------- #
+# CI log excerpt: SSO credentials and the fetch are scoped to the configured   #
+# Jenkins controller over verified TLS                                         #
+#                                                                              #
+# `link` is forge-supplied PR check data (a check's targetUrl points wherever  #
+# the forge says), so `default_ci_log_excerpt` sends the SSO Basic-auth        #
+# credentials — and makes any request at all — ONLY to the configured Jenkins  #
+# controller, over TLS it always verifies (a CA bundle when set, else the      #
+# system store), and only over https.                                          #
+# --------------------------------------------------------------------------- #
+
+class _FakeCfg:
+    def __init__(self, controller="", ca_bundle=""):
+        self.data = {"ci_gate": {
+            "jenkins_controller": controller, "jenkins_ca_bundle": ca_bundle}}
+
+
+def _patch_ci_log(monkeypatch, *, controller="", ca_bundle="",
+                  sso=("u", "p"), body="ERROR: boom\nmore\n"):
+    """Wire `default_ci_log_excerpt`'s config + env + httpx seams and record
+    whether an AsyncClient was constructed and with what verify/auth."""
+    import httpx
+
+    from no_human import config
+
+    rec: dict = {"constructed": False}
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: _FakeCfg(controller, ca_bundle))
+    monkeypatch.setattr(
+        config, "load_env_var",
+        lambda name, *a, **k: {"SSO_USERNAME": sso[0], "SSO_PASSWORD": sso[1]}.get(name)
+        if sso else None,
+    )
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            rec["constructed"] = True
+            rec["verify"] = kwargs.get("verify")
+            rec["auth"] = kwargs.get("auth")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            rec["url"] = url
+            return httpx.Response(200, text=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    return rec
+
+
+async def test_ci_log_excerpt_sends_nothing_to_a_foreign_host(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example")
+    out = await default_ci_log_excerpt("https://evil.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False  # no request, so no Authorization header
+
+
+async def test_ci_log_excerpt_refuses_cleartext_http(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example")
+    out = await default_ci_log_excerpt("http://jenkins.internal.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False
+
+
+async def test_ci_log_excerpt_returns_empty_when_no_controller_configured(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="")
+    out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False
+
+
+async def test_ci_log_excerpt_fetches_matching_host_with_auth_and_ca_bundle(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(
+        monkeypatch, controller="https://jenkins.internal.example",
+        ca_bundle="/etc/ssl/internal-ca.pem")
+    out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42/")
+    assert "ERROR: boom" in out
+    assert rec["auth"] == ("u", "p")
+    assert rec["verify"] == "/etc/ssl/internal-ca.pem"
+    assert rec["url"] == "https://jenkins.internal.example/job/x/42/consoleText"
+
+
+async def test_ci_log_excerpt_verifies_against_system_store_without_a_bundle(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example", ca_bundle="")
+    await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
+    assert rec["verify"] is True  # never verify=False

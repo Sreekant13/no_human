@@ -684,26 +684,44 @@ async def default_ci_log_excerpt(link: str) -> str:
     `<build>/consoleText` answers HTTP Basic with the credentials from
     ~/.no_human/.env even where the browser URL redirects to SSO — the API path
     and the human path authenticate differently, which is the whole reason this
-    reaches for Basic. Where the TLS chain is an internal CA, verification is
-    disabled for that host: the excerpt feeds a prompt, it is not an integrity
-    boundary. Best-effort by
-    design: "" simply means the feedback carries only the check name + link.
+    reaches for Basic. `link` arrives from forge-supplied PR check data (a
+    check's `targetUrl`/`detailsUrl` points wherever the forge says), so both
+    the credentials AND the request are scoped to the configured Jenkins
+    controller (`ci_gate.jenkins_controller`): a host that is not that
+    controller gets no request at all — `/consoleText` is a Jenkins endpoint,
+    and firing at an arbitrary host would leak credentials or make a request on
+    the forge's behalf. TLS is always verified — against
+    `ci_gate.jenkins_ca_bundle` (a PEM path) when set, else the system trust
+    store. Best-effort by design: "" simply means the feedback carries only the
+    check name + link.
     """
     if "/display/redirect" in link:
         link = link.split("/display/redirect")[0]
-    if not link.startswith("http"):
+    if not link.startswith("https://"):
+        return ""
+    from urllib.parse import urlparse
+
+    from ..config import load_config, load_env_var
+
+    ci_gate = load_config().data.get("ci_gate") or {}
+    controller_host = (urlparse(ci_gate.get("jenkins_controller") or "").hostname or "").lower()
+    link_host = (urlparse(link).hostname or "").lower()
+    # Credentials and the fetch go ONLY to the configured Jenkins controller.
+    if not controller_host or link_host != controller_host:
         return ""
     # The credentials live in ~/.no_human/.env; the server process does not
     # export them, so reading os.environ alone would always come up empty.
-    from ..config import load_env_var
-
     user = load_env_var("SSO_USERNAME")
     password = load_env_var("SSO_PASSWORD")
     if not (user and password):
         return ""
+    # An internal Jenkins CA is a trust anchor to supply, never a reason to stop
+    # verifying: a PEM path verifies against that CA, its absence against the
+    # system store.
+    verify = (ci_gate.get("jenkins_ca_bundle") or "").strip() or True
     import httpx
     try:
-        async with httpx.AsyncClient(verify=False, timeout=25, auth=(user, password)) as client:
+        async with httpx.AsyncClient(verify=verify, timeout=25, auth=(user, password)) as client:
             resp = await client.get(link.rstrip("/") + "/consoleText")
             if resp.status_code != 200:
                 return ""
