@@ -2438,7 +2438,7 @@ def test_every_line_citation_currently_resolves_exactly():
 
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
-    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2103` inside
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2188` inside
     `update_attempt` and `orchestrator.py:4571` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
@@ -2454,13 +2454,18 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     added lines above this call inside orchestrator.py, moving it from 4559
     to 4566; re-verified against the code, not carried forward blind.
 
+    Re-anchored again 2026-09-02 (second): `reconcile_landed_terminal`
+    (the terminal failed/cancelled landed-evidence pass) added 85 lines above
+    `update_attempt`'s commit in db.py, moving the citation from 2103 to
+    2188; re-verified against the code, not carried forward blind.
+
     Re-anchored again 2026-09-02: the profile-divergence advisory's
     `_profile_divergence_warned` latch, added in `Orchestrator.__init__`,
     pushed every later line in the file down by 5, moving this citation from
     4566 to 4571; re-verified against the code, not carried forward blind.
     """
-    assert "db.py:2103" in known_issues_doc, (
-        "the traceback no longer cites db.py:2103 — this test is pointed at "
+    assert "db.py:2188" in known_issues_doc, (
+        "the traceback no longer cites db.py:2188 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4571" in known_issues_doc, (
@@ -2471,9 +2476,9 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 2103 <= len(db_lines), "db.py is now shorter than line 2103"
-    assert db_lines[2102].strip() == "await self.db.commit()", (
-        f"db.py:2103 is now {db_lines[2102]!r}, not the commit the traceback "
+    assert 1 <= 2188 <= len(db_lines), "db.py is now shorter than line 2103"
+    assert db_lines[2187].strip() == "await self.db.commit()", (
+        f"db.py:2188 is now {db_lines[2187]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (
