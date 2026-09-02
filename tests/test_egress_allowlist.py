@@ -864,6 +864,20 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "login and stores the session cookie (:70-80)",
             _CFG + "ci.enabled"),
     },
+    # The channel is `<dynamic>` because `doctor.walks_install_plan()` builds
+    # argv at runtime (`uv sync --group e2e ...` or `pip install
+    # playwright>=1.50`, then `playwright install chromium`) — PyPI, to
+    # provision the optional visual-proof-walks dependency. Only reachable
+    # from `nh doctor --fix-walks`, and only after that command's own
+    # "Install now? [y/n]" consent prompt states the ~120MB size; `--dry-run`
+    # prints the plan and returns before `install_walks` ever calls `runner`.
+    "walks_provision.py": {
+        "exec:<dynamic>": Allowed(
+            "PyPI — installs the playwright package and downloads the "
+            "chromium browser binary",
+            "user-invoked: `nh doctor --fix-walks` only, after its consent "
+            "prompt"),
+    },
     "integrations/slack/worker.py": {
         "sdk:slack_sdk": Allowed(
             "Slack — a WebClient for the Web API plus a SocketModeClient, "

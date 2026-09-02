@@ -191,8 +191,15 @@ def test_module_imports_without_playwright():
             f"playwright imported at module scope: {ast.dump(node)}"
         )
     assert "_e2e_board_e2e_import_check" not in sys.modules
+    # The runtime claim is that LOADING this module pulls in no playwright —
+    # not that the whole test process never touched it: another test in the
+    # same xdist worker may import playwright for real (the probe-parity
+    # suite does, by design), which is outside this module's control. The
+    # AST walk above already pins the module-scope invariant regardless.
+    playwright_preloaded = "playwright" in sys.modules
     module = _load_module("_e2e_board_e2e_import_check", BOARD_E2E_PATH)
-    assert "playwright" not in sys.modules
+    if not playwright_preloaded:
+        assert "playwright" not in sys.modules
     assert callable(module.run)
 
 

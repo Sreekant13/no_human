@@ -238,11 +238,39 @@ FROZEN_FILE_LINES = {
     # writes through `carry_human_hold` so a durable human pause survives a
     # machine blocker rewrite. Re-anchored on this rebased tree (main had
     # independently grown the file to 20513 lines by the time this landed).
-    # 20577 -> 20612 (+35): profile-divergence advisory — the
-    # `_profile_divergence_warned` one-shot latch in `__init__` and the new
-    # `_warn_profile_divergence` helper called from `_usable_profile`.
-    # Measured on this tree with the scanner below.
-    "core/orchestrator.py": 20612,
+    # 20577 -> 20592 (+15 net on this rebased tree, per the scanner's own
+    # `len(Path(...).read_text().splitlines())` metric): `_maybe_capture_ui_
+    # evidence` now emits the honesty-floor skip line (with remedy) instead
+    # of `""` when the UI-evidence gate qualifies but playwright is
+    # unavailable. Re-anchored on this rebase (main had independently grown
+    # the file to 20577 lines by the time this landed).
+    # 20592 -> 20625 (+33 per the scanner's own
+    # `len(Path(...).read_text().splitlines())` metric, which counts 3
+    # pre-existing Unicode line-separator characters — U+0085/U+2028/U+2029 —
+    # that `wc -l` does not; the file grew +30 by `wc -l`): the honesty-floor
+    # disclosure policy is now self-consistent — the three previously-silent
+    # `return ""` exits (no manifest written, `ui_evidence.run` raising, and
+    # a walk that ran but captured zero shots) now go through the same
+    # `_ui_evidence_skipped` builder as the missing-playwright case, each
+    # naming what was lost (sanitized: exception class only, reason
+    # newline/backtick-stripped and truncated to ~120 chars — the PR body is
+    # a public/untrusted-readable surface). Only the gate-says-no exit
+    # (`ui_evidence_should_run` is False) stays silent, since there is
+    # nothing to disclose. Measured on this landing.
+    # 20625 -> 20636 (+11 per the scanner's own metric): the honesty-floor
+    # comment above `_UI_EVIDENCE_SKIPPED_SECTION` and the
+    # `_maybe_capture_ui_evidence` docstring no longer claim "every exit
+    # discloses" — both now state the actual boundary: disclosure covers
+    # every gated-but-no-shots outcome, but `_deliver_ui_evidence`'s own
+    # pre-existing "" (shots captured, then delivery fails — push rejected,
+    # non-GitHub remote, a `current_branch`/commit error) is unchanged and
+    # out of scope here. Comments only, no behaviour change.
+    # 20612+20636 -> 20673: merge of two independent landings — main's
+    # profile-divergence advisory (+35: `_profile_divergence_warned` latch +
+    # `_warn_profile_divergence` from `_usable_profile`) and this branch's
+    # disclosure work above, plus the review-round comment completion (+2).
+    # Measured on the merge result with the scanner below, never summed.
+    "core/orchestrator.py": 20673,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -277,17 +305,25 @@ FROZEN_FILE_LINES = {
     # 8204 -> 8214 (+10): D3.1 — `nh serve` threads learning.auto_manage /
     # auto_activate_daily_cap into HarvestJob (kill-switch wiring). Measured
     # on the D3.1 landing result.
-    # 8214 -> 8258 (+44): no-human-67 follow-up — `nh onboard`'s post-derive
-    # one-confirm offer for `ui_evidence` (detected `npm run dev` convention:
-    # print the gap, `click.confirm` default-No, `offer_ui_evidence` on
-    # accept) and `nh doctor`'s side-by-side current/suggested `ui_evidence`
-    # rendering per known profile. Measured via
-    # `len(Path(...).read_text().splitlines())` on the landing tree.
-    # 8258 -> 8262 (+4): review-round fix — `nh onboard`'s ui_evidence offer
-    # now catches `ProjectYmlPersistError` from `offer_ui_evidence` and prints
-    # a red failure line instead of silently reporting success when
-    # project.yml could not be written. Measured on this branch's tree.
-    "cli/commands.py": 8262,
+    # 8214 -> 8285 (+71): `nh doctor` gains the visual-proof-walks row and
+    # `--fix-walks`/`--dry-run` consent-first provisioning flow. Measured on
+    # this landing.
+    # 8285 -> 8297 (+12): `visual_walks_row()`'s docstring no longer claims
+    # "Pure and read-only" (it now names the loop-safe `playwright.async_api`
+    # -import probe it actually calls), and the `--fix-walks` "already
+    # available" branch's chromium remedy text grew a one-line clarification
+    # so it agrees, by construction, with `nh doctor`'s plain row. Measured
+    # on this landing.
+    # 8262+8297 -> 8350: merge of two independent landings — main's
+    # no-human-67 follow-up (`nh onboard` one-confirm ui_evidence offer +
+    # per-repo doctor rendering, incl. the ProjectYmlPersistError review fix)
+    # and this branch's `--fix-walks` flow above, plus the two-layer
+    # reconciliation comment in `doctor` (dependency row first, per-repo
+    # config rows after; the whole block then extracted to
+    # _print_visual_walks so the merged doctor() stays under the 300-line
+    # function budget). Measured on the merge result with the scanner
+    # below, never summed.
+    "cli/commands.py": 8352,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`

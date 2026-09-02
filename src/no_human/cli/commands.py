@@ -6256,6 +6256,49 @@ def _release_pid_lock() -> None:
         pass
 
 
+def _print_visual_walks(console, d) -> None:
+    """Visual-proof walks, two layers printed as one block. First the
+    DEPENDENCY layer: advisory-shaped like the codex row in `doctor` —
+    `visual_walks_row` never touches `d`, so an optional feature being off
+    can never flip `d.healthy` or the exit code. Printed unconditionally so
+    a plain `nh doctor` is the one place that tells a customer install "the
+    PR screenshots you were expecting can't run here, and how to fix that."
+    Then the per-repo CONFIGURATION layer (no-human-67 follow-up): current
+    state and, side-by-side, the suggested state when the repo has a
+    detected `npm run dev` convention and isn't configured yet. Nothing
+    prints when there are no known profiles — read-only and additive. A
+    repo can be "enabled" here while the dependency row says unavailable:
+    the two rows name different layers (config present vs playwright
+    installed), and the dependency row already carries its remedy."""
+    from ..doctor import visual_walks_row
+
+    wrow = visual_walks_row()
+    walks_colour = "green" if wrow["available"] else "yellow"
+    walks_hint = "" if wrow["available"] else "  [dim](nh doctor --fix-walks to enable)[/]"
+    console.print(f"[{walks_colour}]{wrow['line']}[/]{walks_hint}")
+
+    for row in d.ui_evidence:
+        name = Path(row["repo_path"]).name
+        if row["enabled"]:
+            console.print(
+                f"[bold]visual-proof walks[/] — {name}: [green]enabled[/] "
+                f"({row['start_cmd']} → {row['base_url']})"
+            )
+        else:
+            sug = row.get("suggestion")
+            if sug:
+                console.print(
+                    f"[bold]visual-proof walks[/] — {name}: "
+                    f"[yellow]not configured[/]  detected "
+                    f"`{sug['start_cmd']}` on :{sug['port']}, enable?"
+                )
+            else:
+                console.print(
+                    f"[bold]visual-proof walks[/] — {name}: "
+                    "[dim]not configured[/]"
+                )
+
+
 @cli.command("doctor")
 @click.option("-v", "--verbose", is_flag=True,
               help="Show the per-mechanism lifetime-firings table.")
@@ -6263,7 +6306,15 @@ def _release_pid_lock() -> None:
               help="Also make ONE cheap live call to prove the credential is "
                    "accepted, not merely present. Costs a few tokens, so it is "
                    "off by default.")
-def doctor(verbose, verify_auth):
+@click.option("--fix-walks", is_flag=True,
+              help="Install playwright + chromium (~120MB) so visual-proof "
+                   "walks can run. Always asks for consent before "
+                   "downloading anything; combine with --dry-run to see "
+                   "the plan without installing.")
+@click.option("--dry-run", is_flag=True,
+              help="With --fix-walks: print the install plan, install "
+                   "nothing, never prompt.")
+def doctor(verbose, verify_auth, fix_walks, dry_run):
     """Liveness check: which guarded mechanisms have actually ever fired.
 
     The system's worst bugs were silences, not crashes — TESTING dead for its
@@ -6283,7 +6334,70 @@ def doctor(verbose, verify_auth):
     from ..config import DEFAULT_AUTH_PROFILE
     from ..doctor import diagnose
 
+    if dry_run and not fix_walks:
+        raise click.UsageError(
+            "--dry-run only makes sense together with --fix-walks.")
+
     config, _ = _bootstrap(require_auth=False)
+
+    if fix_walks:
+        # Consent-first provisioning: this branch never runs the (unrelated)
+        # mechanism diagnosis below — it only decides whether playwright +
+        # chromium get installed, and stops BEFORE any download without an
+        # explicit "y". `--dry-run` never even reaches the prompt.
+        from ..doctor import (
+            WALKS_DOWNLOAD_SIZE,
+            visual_walks_row,
+            walks_install_plan,
+            walks_plan_description,
+        )
+
+        row = visual_walks_row()
+        if row["available"]:
+            console.print(
+                "[bold green]visual-proof walks[/] — already available, "
+                "nothing to install.")
+            # `visual_walks_row` only checks that playwright IMPORTS, not
+            # that the chromium binary is present — that binary check used
+            # to start `sync_playwright()`, which raises inside a running
+            # asyncio loop and made every real caller see "unavailable".
+            # So a package-present/binary-missing install now reads
+            # "already available" here with nothing left to fix; name the
+            # residual remedy so that gap doesn't become a silent dead end.
+            chromium_remedy = " ".join(walks_install_plan()[-1])
+            console.print(
+                "[dim]If a walk still produces no screenshots, the browser "
+                f"binary may be missing — re-run: `{chromium_remedy}`[/]")
+            return
+
+        console.print(f"[yellow]{row['line']}[/]")
+        if dry_run:
+            console.print("plan (nothing will be installed):")
+            console.print(walks_plan_description())
+            return
+
+        if not click.confirm(
+                "Visual-proof walks require playwright and chromium "
+                f"({WALKS_DOWNLOAD_SIZE}). Install now? [y/n]",
+                default=False, show_default=False, prompt_suffix=""):
+            console.print("aborted — nothing installed.")
+            return
+
+        from ..walks_provision import install_walks
+
+        ok, messages = install_walks()
+        for m in messages:
+            colour = "green" if m.startswith("OK") else "red"
+            console.print(f"  [{colour}]{m}[/]")
+        if ok:
+            console.print("[bold green]visual-proof walks installed[/]")
+        else:
+            console.print(
+                "[bold red]install failed[/] — partial state may remain "
+                "(no automatic rollback); re-run `nh doctor --fix-walks` "
+                "to retry, it is safe to run again.")
+            sys.exit(1)
+        return
 
     from ..agent.backend_check import check_backend
 
@@ -6416,31 +6530,7 @@ def doctor(verbose, verify_auth):
                           f"[{key_colour}]{key_state}[/]  [dim](presence only)[/]")
             console.print(f"                [dim]{d.codex.get('entitlement_note')}[/]")
 
-        # Visual-proof (ui_evidence) provisioning state (no-human-67
-        # follow-up): current state and, side-by-side, the suggested state
-        # when the repo has a detected `npm run dev` convention and isn't
-        # configured yet. Nothing prints when there are no known profiles —
-        # this is read-only and additive, never affects `healthy`.
-        for row in d.ui_evidence:
-            name = Path(row["repo_path"]).name
-            if row["enabled"]:
-                console.print(
-                    f"[bold]visual-proof walks[/] — {name}: [green]enabled[/] "
-                    f"({row['start_cmd']} → {row['base_url']})"
-                )
-            else:
-                sug = row.get("suggestion")
-                if sug:
-                    console.print(
-                        f"[bold]visual-proof walks[/] — {name}: "
-                        f"[yellow]not configured[/]  detected "
-                        f"`{sug['start_cmd']}` on :{sug['port']}, enable?"
-                    )
-                else:
-                    console.print(
-                        f"[bold]visual-proof walks[/] — {name}: "
-                        "[dim]not configured[/]"
-                    )
+        _print_visual_walks(console, d)
 
         if verbose:
             console.print("[bold]mechanism liveness[/] (lifetime firings)")

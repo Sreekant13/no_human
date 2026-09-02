@@ -409,6 +409,105 @@ def codex_row(config: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+#: Shown before any install runs and echoed back in the unavailable row, so
+#: the human sees the cost of consenting before they type "y" and again in
+#: `nh doctor`'s plain listing.
+WALKS_DOWNLOAD_SIZE = "~120MB"
+
+WALKS_AVAILABLE_LINE = "visual-proof walks: available"
+
+WALKS_UNAVAILABLE_LINE = (
+    f"visual-proof walks: unavailable - playwright not installed "
+    f"({WALKS_DOWNLOAD_SIZE} to install playwright + chromium)"
+)
+
+
+def visual_walks_row(*, available: bool | None = None) -> dict[str, Any]:
+    """Presence-only summary of whether visual-proof (Playwright) walks can
+    run in this environment: ``{"available": bool, "line": str}``.
+
+    Read-only and idempotent — spawns no process, touches no filesystem
+    beyond a Python import — but not a pure package-purity check: the
+    underlying probe (:func:`testing.ui_evidence.playwright_available`)
+    checks ONLY that the ``playwright`` package imports, not that the
+    chromium binary it would launch is present on disk. That narrower
+    contract is deliberate: the previous binary check started
+    ``playwright.sync_api.sync_playwright()``, which raises inside a
+    running ``asyncio`` loop, so it silently returned "unavailable" for
+    every real caller (both ``nh doctor``'s async ``_go`` and the
+    orchestrator's ``_maybe_capture_ui_evidence`` run under a loop). That
+    is also why this now agrees with ``nh doctor --fix-walks`` by
+    construction — same probe, same import-only check, context-independent.
+    A package-present/binary-missing install therefore now reads
+    "available" here; if a walk then finds no browser binary, that gap
+    surfaces as a disclosed skip in the PR body (the orchestrator's
+    no-shots path), not as this diagnostic. Wrapped in ``except Exception``
+    so a broken/partial playwright install reads as unavailable rather than
+    crashing the command that prints it. This is deliberately
+    advisory-shaped: the caller decides whether to surface the unavailable
+    line at all, and it is never appended to a :class:`Diagnosis`'s
+    ``contradictions``/``evidence_gaps`` — an optional feature being off
+    must never fail ``d.healthy`` or the exit code.
+
+    ``available`` is an injectable override for tests; the normal call site
+    passes nothing and lets this probe live.
+    """
+    if available is None:
+        try:
+            from .testing.ui_evidence import playwright_available
+
+            available = playwright_available()
+        except Exception:  # noqa: BLE001 — a diagnostic must never raise
+            available = False
+    return {
+        "available": available,
+        "line": WALKS_AVAILABLE_LINE if available else WALKS_UNAVAILABLE_LINE,
+    }
+
+
+def walks_install_plan() -> list[list[str]]:
+    """The ordered argv list :func:`walks_provision.install_walks` runs to
+    make visual-proof walks available, in order. Never executes anything —
+    this is the plan an install prints for consent (dry-run) and the plan
+    it follows once consent is given.
+
+    Package-manager choice is a human-gated decision the ticket left to a
+    minimal defensible default rather than resolving outright: uv-first —
+    ``uv sync --group e2e`` — when ``uv`` is on PATH *and* this process is
+    running from a resolvable project checkout (:func:`_running_checkout`,
+    the same resolver :func:`editable_install_problem` uses); pip otherwise
+    (``python -m pip install "playwright>=1.50"``). ``playwright install
+    chromium`` always runs last, even when the ``playwright`` package
+    already imports — an interrupted/corrupted browser download otherwise
+    reads as "installed" because the *package* is present while the
+    *binary* is not.
+
+    Scope: this only provisions a CLI install running from a resolvable
+    project checkout with ``uv`` on PATH, or one with a working
+    ``python -m pip``. A ``uvx``-ephemeral run (often no ``pip``) and the
+    desktop/DMG distribution have no provisioning path today — neither is
+    wired to this plan or to ``nh doctor --fix-walks``.
+    """
+    import shutil
+
+    steps: list[list[str]] = []
+    checkout = _running_checkout()
+    if shutil.which("uv") and checkout is not None:
+        steps.append(["uv", "sync", "--group", "e2e", "--project", str(checkout)])
+    else:
+        steps.append([sys.executable, "-m", "pip", "install", "playwright>=1.50"])
+    steps.append([sys.executable, "-m", "playwright", "install", "chromium"])
+    return steps
+
+
+def walks_plan_description() -> str:
+    """Human-readable rendering of :func:`walks_install_plan`, one line per
+    step — what ``nh doctor --fix-walks --dry-run`` prints instead of
+    running anything.
+    """
+    return "\n".join(f"  $ {' '.join(step)}" for step in walks_install_plan())
+
+
 @dataclass
 class Diagnosis:
     mechanisms: list[dict[str, Any]] = field(default_factory=list)

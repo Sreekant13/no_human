@@ -371,15 +371,52 @@ def read_manifest(repo_path: Path) -> Manifest:
 def _import_playwright():
     """The `async_playwright` factory, or None if playwright is not installed.
 
-    The ONLY reference to `playwright` anywhere in this module — never
-    imported at module scope, so importing `ui_evidence` never requires it.
-    Tests monkeypatch this symbol directly.
+    The only reference to `playwright.async_api` in this module — never
+    imported at module scope, so importing `ui_evidence` never requires
+    it. Loop-safe: importing a module touches no event loop, so this
+    returns the same value whether called from a plain sync context or
+    from inside a running `asyncio` loop. Tests monkeypatch this symbol
+    directly.
     """
     try:
         from playwright.async_api import async_playwright
-    except ImportError:
+    except Exception:
+        # Broader than ImportError: a corrupted/partial install can raise
+        # other errors at import time (e.g. a broken native extension);
+        # any of those means "not usable" here, not a crash.
         return None
     return async_playwright
+
+
+MISSING_PLAYWRIGHT_REASON = "playwright not installed (uv sync --group e2e)"
+
+
+def playwright_available() -> bool:
+    """True when the `playwright` package imports in this environment.
+    Pure/read-only; never raises.
+
+    Loop-safe by construction: the only work is `_import_playwright`,
+    which touches `playwright.async_api` and starts no driver, so this
+    returns the SAME value whether called synchronously (`nh doctor
+    --fix-walks`) or from inside a running `asyncio` loop (`nh doctor`'s
+    async `_go`, `_maybe_capture_ui_evidence`) — pinned by
+    `tests/test_ui_evidence_playwright_probe_parity.py::test_probe_agrees_between_sync_and_async_contexts`.
+
+    This module previously also resolved the chromium binary's path via
+    `playwright.sync_api.sync_playwright()`. That facade raises whenever
+    it is started inside a running event loop, and both production call
+    sites (`_maybe_capture_ui_evidence`, `nh doctor`'s `_go`) run under
+    one — so the binary check made this function return False for every
+    provisioned user, unconditionally. It has been removed; this now
+    checks package presence only.
+
+    Narrowed contract: a package-present/binary-missing partial install
+    now reads **available**. The walk then runs, `_open`'s browser launch
+    fails, `result.shots` stays empty, and `_maybe_capture_ui_evidence`
+    discloses that (`"the walk captured no shots"`) rather than rendering
+    `""` — see `orchestrator.py`'s `_ui_evidence_skipped` paths.
+    """
+    return _import_playwright() is not None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -560,7 +597,7 @@ async def _run_body(
         return
 
     if launch is None and _import_playwright() is None:
-        result.reason = "playwright not installed (uv sync --group e2e)"
+        result.reason = MISSING_PLAYWRIGHT_REASON
         return
 
     try:

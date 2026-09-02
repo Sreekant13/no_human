@@ -19858,6 +19858,37 @@ SIX of them read a checkpoint and TWO do not — but do
     #: at a glance, not scrolled through like the branch it links to.
     _UI_EVIDENCE_MAX_EMBEDDED_SHOTS = 6
 
+    #: The honesty floor: when the diff qualifies for a visual-proof walk
+    #: (`ui_evidence_should_run` says yes) but playwright isn't installed in
+    #: this environment, the PR body must say so instead of silently
+    #: rendering "" — a customer install (pip/uvx, no `--group e2e`) must
+    #: never look identical to "nothing to show here". See
+    #: `_ui_evidence_skipped` immediately below: the SAME policy covers
+    #: every other way a gated walk can end up with NO SHOTS CAPTURED (no
+    #: manifest, the walk raising, zero shots) — once the gate says yes,
+    #: every exit up through "were any shots captured?" discloses. That
+    #: boundary is deliberate: shots that WERE captured but then failed to
+    #: DELIVER (e.g. push rejected, non-GitHub remote, `current_branch`
+    #: erroring, or every captured file missing from disk at commit time —
+    #: `_deliver_ui_evidence`'s `if not committed_paths` exit) are that
+    #: method's own pre-existing "", a delivery failure rather than a walk
+    #: that produced nothing, and unchanged here.
+    _UI_EVIDENCE_SKIPPED_SECTION = (
+        "## UI evidence\n"
+        "Visual proof skipped: playwright not installed - run "
+        "`nh doctor --fix-walks` to enable\n\n"
+    )
+
+    @classmethod
+    def _ui_evidence_skipped(cls, reason: str) -> str:
+        """Render the same `## UI evidence` shape as `_UI_EVIDENCE_SKIPPED_SECTION`
+        for every OTHER gated-but-empty walk outcome (no manifest, the walk
+        raising, zero shots) — one honest line naming what was lost, never
+        `""`. `reason` is caller-sanitized (exception class name only, or a
+        truncated/newline-stripped driver string) before it reaches here;
+        this function does not sanitize."""
+        return f"## UI evidence\nVisual proof skipped: {reason}\n\n"
+
     #: `owner/repo` from a github.com remote, https or ssh form, optional
     #: `.git` suffix and trailing slash. GitHub Enterprise hosts (`git.
     #: github_hosts`) are recognized as GitHub for PR purposes elsewhere in
@@ -19883,8 +19914,20 @@ SIX of them read a checkpoint and TWO do not — but do
     ) -> str:
         """D1.2: after tests pass, run the coder-authored browser walk
         (`testing/ui_evidence.py`) for real and return a rendered PR-body
-        media section — "" for every case where there is nothing to show
-        (non-UI change, no manifest, unreachable dev server, no shots).
+        media section. Honesty floor UP THROUGH deciding whether any shots
+        exist to deliver: `""` ONLY when the diff never qualified for a walk
+        (`ui_evidence_should_run` says no — nothing was skipped, there was
+        nothing to do). Every other empty outcome before that decision —
+        playwright missing, no manifest, the walk raising, unreachable dev
+        server, zero shots — discloses via `_ui_evidence_skipped`/
+        `_UI_EVIDENCE_SKIPPED_SECTION` instead of silently rendering `""`.
+        Past that point this method just forwards `_deliver_ui_evidence`'s
+        return value verbatim: if shots WERE captured but delivery then
+        fails (e.g. push rejected, non-GitHub remote, a `current_branch`/
+        commit error, or none of the captured files still on disk at commit
+        time), that method's own pre-existing "" comes back unchanged — a
+        delivery failure after real proof was produced, not a walk that
+        had nothing to show.
 
         Gating is `config.ui_evidence_should_run`: the diff vs *base* (best-
         effort; an unreadable diff reads as "no UI paths touched", the same
@@ -19909,13 +19952,19 @@ SIX of them read a checkpoint and TWO do not — but do
         if not ui_evidence_should_run(self.config, changed_paths, extra_globs=extra_globs):
             return ""
 
+        if not ui_evidence.playwright_available():
+            self._advisory("ui evidence skipped: playwright not installed")
+            return self._UI_EVIDENCE_SKIPPED_SECTION
+
         manifest_path = Path(repo.path) / ui_evidence.MANIFEST
         if not manifest_path.is_file():
             # The coder never wrote a walk — `ui_evidence.run` would say so
             # too (verdict "not_run", reason "no manifest"), but skipping
             # the temp dir + subprocess dance entirely here is cheaper and
-            # every bit as honest: nothing ran, nothing to report.
-            return ""
+            # every bit as honest: nothing ran, so disclose that instead of
+            # rendering "" (honesty floor, `_ui_evidence_skipped` above).
+            return self._ui_evidence_skipped(
+                "the coder wrote no `.no_human/ui_evidence.json` walk manifest")
 
         out_dir = ui_evidence.default_out_dir(task.id)
         try:
@@ -19923,20 +19972,32 @@ SIX of them read a checkpoint and TWO do not — but do
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
             # promise; it fails the same way every other evidence gather here
-            # does — advisory, never a reason the PR doesn't ship.
+            # does — advisory, never a reason the PR doesn't ship. Disclose
+            # the exception CLASS ONLY: `str(exc)` can carry an absolute
+            # repo path or a multi-line traceback, and a PR body is a
+            # publish surface. The full text still reaches `nh logs` via
+            # `self._advisory` above.
             self._advisory(f"ui evidence run raised: {exc}")
             shutil.rmtree(out_dir, ignore_errors=True)
-            return ""
+            return self._ui_evidence_skipped(f"the walk errored ({type(exc).__name__})")
 
         if not result.shots:
             # `not_run` (no reachable dev server, bad manifest) or a `failed`
-            # walk that broke before its first shot — nothing to embed.
-            # `result.reason` already reaches `nh logs`/the walk's own
-            # `result.json`; repeating it in the PR body is not this
-            # section's job (mirrors `_verification_section` staying silent
-            # rather than growing a NOT-RUN row for every possible gate).
+            # walk that broke before its first shot — nothing to embed. This
+            # is also where a package-present/binary-missing playwright
+            # install now surfaces (`playwright_available()` no longer
+            # checks the chromium binary — see `ui_evidence.py`), so this
+            # path carries real diagnostic weight, not just a corner case.
+            # `result.reason` (falling back to `result.verdict`) is
+            # driver/coder-supplied text: newline-stripped, backticks
+            # stripped, and truncated so it cannot forge Markdown or break
+            # out of this section.
             shutil.rmtree(out_dir, ignore_errors=True)
-            return ""
+            reason = (result.reason or result.verdict or "unknown").strip()
+            reason = reason.replace("\n", " ").replace("`", "'")
+            if len(reason) > 120:
+                reason = reason[:117] + "..."
+            return self._ui_evidence_skipped(f"the walk captured no shots ({reason})")
 
         try:
             return self._deliver_ui_evidence(repo, task.id, out_dir, result)
