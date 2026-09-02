@@ -43,8 +43,8 @@ from claude_agent_sdk import (
     query,
 )
 
-from ..config import scrub_foreign_secrets_into
 from . import guard
+from .child_env import scrub_foreign_secrets_into
 from .backend import AgentEvent, AgentResult, BackendCapabilities
 from .session_mark import mark_env
 from .supervisor import SupervisorHook

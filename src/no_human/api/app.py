@@ -28,7 +28,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # import-cycle-free: the eval package is loaded lazily below
     from ..eval.northstar_card import NorthStarCard
@@ -46,6 +45,10 @@ from pydantic import BaseModel
 
 from .. import __version__
 from ..agent.session_mark import AGENT_SESSION_HEADER, request_is_marked
+from .local_boundary import (
+    LOOPBACK_ORIGIN_REGEX, install_local_boundary, require_local_origin,
+    ws_handshake_is_local,
+)
 from ..blockers import process_actor
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
@@ -359,13 +362,7 @@ app = FastAPI(title="no_human board", version=__version__, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    # Loopback origins only, any port: a page on another origin the operator
-    # visits cannot read this API's responses (task list, transcripts, PR
-    # URLs). Cross-origin writes are refused by `_refuse_cross_origin_writes`;
-    # the `Host` header is checked by `_require_local_host`. The exact-host
-    # regex avoids the `startswith` look-alike (`http://localhost.evil.com`)
-    # that `_require_local_origin` documents.
-    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$",
+    allow_origin_regex=LOOPBACK_ORIGIN_REGEX,  # loopback only: api/local_boundary.py
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -486,68 +483,10 @@ async def _refuse_marked_gate_acts(request, call_next):
     return await call_next(request)
 
 
-@app.middleware("http")
-async def _require_local_host(request, call_next):
-    """Refuse a request whose `Host` header is not loopback (400).
-
-    The board answers on 127.0.0.1 / localhost, so a legitimate request names
-    one of those. A DNS-rebinding page reaches the server with its own domain
-    in `Host` — the browser resolved the attacker's name to a loopback address
-    — and is refused before it routes. This is the case `Origin` cannot cover:
-    a rebound request is same-origin to the browser and carries no `Origin` at
-    all, so the `Host` header is the only field that still names the attacker.
-    """
-    hostname = urlsplit("//" + request.headers.get("host", "")).hostname or ""
-    if hostname not in _LOCAL_HOSTS:
-        from fastapi.responses import JSONResponse
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "bad_host",
-                "reason": (
-                    "requests must address the board on a loopback host "
-                    "(see docs/security.md)."
-                ),
-            },
-        )
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def _refuse_cross_origin_writes(request, call_next):
-    """Refuse a cross-origin browser write to any state-changing route.
-
-    A browser always sends `Origin` on a cross-site write, so a present
-    `Origin` whose host is not loopback names a page the operator is visiting:
-    refuse it (403). An absent `Origin` is a non-browser local client — the
-    `nh` CLI and the MCP bridge send none — and is allowed; a same-user local
-    process is inside the trust boundary docs/security.md draws ("an attacker
-    with shell as the nh user" is out of scope). Only the mutating verbs are
-    checked, so the CORS preflight and every read pass through. The host is
-    matched exactly against `_LOCAL_HOSTS`, the check `_require_local_origin`
-    applies per credential route, here covering the whole state-changing
-    surface in one place.
-    """
-    if request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
-        origin = request.headers.get("origin")
-        if origin is not None:
-            parts = urlsplit(origin)
-            if (parts.scheme not in ("http", "https")
-                    or (parts.hostname or "") not in _LOCAL_HOSTS):
-                from fastapi.responses import JSONResponse
-
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "cross_origin_refused",
-                        "reason": (
-                            "cross-origin writes are not allowed to the local "
-                            "board API (see docs/security.md)."
-                        ),
-                    },
-                )
-    return await call_next(request)
+# The loopback boundary, outermost so it runs before every middleware above:
+# every request must address 127.0.0.1/localhost/[::1] and a cross-origin
+# browser write is refused (api/local_boundary.py).
+install_local_boundary(app)
 
 
 # --------------------------------------------------------------------------- #
@@ -2659,7 +2598,7 @@ async def scaffold_repo(body: ScaffoldRepoRequest, request: Request) -> dict[str
     # posture as the credential routes (a step beyond the read-mostly project
     # siblings): a cross-origin or origin-less browser write is refused, or a
     # drive-by page could litter $HOME with directories while `nh serve` is up.
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     store = _store(request)
     config = request.app.state.config
 
@@ -2778,37 +2717,6 @@ async def scaffold_repo(body: ScaffoldRepoRequest, request: Request) -> dict[str
                      f"(nothing was created)")
         raise
     return {"repo_path": str(target), "project_id": proj.id}
-
-
-_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
-
-def _require_local_origin(request: Request, *, writing: bool = False) -> None:
-    """Refuse a cross-origin call to the credential routes.
-
-    The app sets ``allow_origins=["*"]`` and the server is unauthenticated, so
-    without this ANY page the operator visits while `nh serve` is up can PUT
-    this endpoint and replace the token that pays for the subscription.
-
-    The host is compared EXACTLY, after parsing. A ``startswith`` prefix test
-    looks equivalent and is not: ``http://localhost.evil.com`` starts with
-    ``http://localhost``, and that is a domain an attacker registers. That
-    exact bug shipped here and was caught with a working drive-by.
-
-    On a WRITE, a missing ``Origin`` is refused too. A browser always sends it
-    on a cross-site request, so the legitimate Settings UI is unaffected, and
-    it is the one case where a local malicious process or a rebinding proxy
-    would otherwise face no check at all.
-    """
-    origin = request.headers.get("origin")
-    if origin is None:
-        if writing:
-            raise HTTPException(
-                403, "this endpoint requires a same-origin browser request")
-        return
-    parts = urlsplit(origin)
-    if parts.scheme not in ("http", "https") or (parts.hostname or "") not in _LOCAL_HOSTS:
-        raise HTTPException(403, "cross-origin requests are not allowed here")
 
 
 def _auth_status_payload(request: Request) -> dict[str, Any]:
@@ -2980,7 +2888,7 @@ def _backend_cli_present() -> bool:
 
 @app.get("/api/auth/status")
 async def api_auth_status(request: Request) -> dict[str, Any]:
-    _require_local_origin(request)
+    require_local_origin(request)
     # Offloaded because the codex block can shell out to `codex login status`
     # (up to a 10s timeout) in subscription mode — the same reason /api/models
     # runs its payload in a thread. In the default api_key mode this is a pure
@@ -3010,7 +2918,7 @@ async def api_set_auth_token(request: Request) -> dict[str, Any]:
         set_profile_token,
     )
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — never surface the raw body
@@ -3062,7 +2970,7 @@ async def api_set_codex_mode(request: Request) -> dict[str, Any]:
         set_codex_auth_mode,
     )
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -3094,7 +3002,7 @@ async def api_set_codex_key(request: Request) -> dict[str, Any]:
     """
     from ..config import AuthError, set_codex_api_key
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — never surface the raw body
@@ -4395,7 +4303,7 @@ async def save_integration_setup(
     every other config write."""
     from ..integrations import RepoNotRegistered, apply_setup
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     repos = await _registered_repo_paths(request)
     try:
         spec = await asyncio.to_thread(apply_setup, name, dict(body.values), repos)
@@ -4429,7 +4337,7 @@ async def test_integration_endpoint(name: str, request: Request) -> dict[str, An
     # unauthenticated, so — exactly like /setup and /config — it MUST refuse a
     # cross-origin caller, or a page the operator merely visits could drive a
     # probe with their token and read back the VCS username/project in `detail`.
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
 
     # Load this integration's secret(s) from ~/.no_human/.env into the process
     # env BEFORE the health check. Without this the button could only
@@ -4481,7 +4389,7 @@ async def save_integration_config_endpoint(
     # endpoint guards. Without this, `allow_origins=["*"]` lets any page the
     # operator visits while `nh serve` is up preflight successfully and then
     # PUT a planted secret into it; that drive-by was demonstrated end to end.
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     if name not in KIND_BY_NAME:
         raise HTTPException(status_code=404, detail=f"unknown integration: {name!r}")
     try:
@@ -4523,7 +4431,7 @@ async def save_telemetry_consent(
 
     from ..integrations import _write_config_values
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     from ..config import CONFIG_PATH, load_config
 
     updates: dict[str, Any] = {"telemetry.enabled": bool(body.enabled)}
@@ -4557,7 +4465,7 @@ async def api_get_models(request: Request) -> dict[str, Any]:
     from ..config import CONFIG_PATH
     from ..core import model_settings
 
-    _require_local_origin(request)
+    require_local_origin(request)
     cfg = getattr(request.app.state, "config", None)
     data = getattr(cfg, "data", None) or {}
     return await asyncio.to_thread(model_settings.models_payload, data, CONFIG_PATH)
@@ -4585,7 +4493,7 @@ async def api_set_config_models(request: Request) -> dict[str, Any]:
     from ..config import CONFIG_PATH, AuthError
     from ..core import model_settings
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — never surface the raw body
@@ -4634,7 +4542,7 @@ async def api_get_coder_backend(request: Request) -> dict[str, Any]:
     from ..config import CONFIG_PATH
     from ..core import backend_settings
 
-    _require_local_origin(request)
+    require_local_origin(request)
     cfg = getattr(request.app.state, "config", None)
     data = getattr(cfg, "data", None) or {}
     return await asyncio.to_thread(backend_settings.backend_payload, data, CONFIG_PATH)
@@ -4662,7 +4570,7 @@ async def api_set_coder_backend(request: Request) -> dict[str, Any]:
     from ..config import CONFIG_PATH, AuthError
     from ..core import backend_settings
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — never surface the raw body
@@ -4731,7 +4639,7 @@ async def api_get_config_workers(request: Request) -> dict[str, Any]:
     pool, and whether a restart is pending. See :func:`_workers_payload`."""
     from ..config import CONFIG_PATH, load_config
 
-    _require_local_origin(request)
+    require_local_origin(request)
     cfg = getattr(request.app.state, "config", None)
     running_data = getattr(cfg, "data", None) or {}
     file_cfg = await asyncio.to_thread(load_config, CONFIG_PATH)
@@ -4751,7 +4659,7 @@ async def api_set_config_workers(request: Request) -> dict[str, Any]:
     """
     from ..config import CONFIG_PATH, AuthError, load_config, set_concurrency
 
-    _require_local_origin(request, writing=True)
+    require_local_origin(request, writing=True)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — never surface the raw body
@@ -5841,15 +5749,7 @@ def _task_fingerprint(tlist) -> dict:
 
 @app.websocket("/ws")
 async def ws_board(ws: WebSocket) -> None:
-    # A handshake bypasses CORS and the HTTP middlewares, so the loopback
-    # `Host` and `Origin` checks are repeated here: a cross-origin or
-    # rebinding page can open `/ws` from the browser and would otherwise
-    # stream every task (titles, PR URLs, statuses). Reject before accepting.
-    _host = urlsplit("//" + ws.headers.get("host", "")).hostname or ""
-    _origin = ws.headers.get("origin")
-    _origin_host = urlsplit(_origin).hostname if _origin else None
-    if _host not in _LOCAL_HOSTS or (_origin is not None
-                                     and _origin_host not in _LOCAL_HOSTS):
+    if not ws_handshake_is_local(ws.headers):  # a handshake bypasses CORS + middlewares
         await ws.close(code=1008)  # policy violation
         return
     await _mgr.connect(ws)

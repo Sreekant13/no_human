@@ -136,6 +136,7 @@ from .backend import (
     BackendUnavailable,
     DEFAULT_CODEX_MODEL,
 )
+from .child_env import drop_foreign_secrets
 from .session_mark import mark_env
 
 #: Declared once, read by ``nh doctor``, the seam's tests, and anything that
@@ -1119,6 +1120,12 @@ class CodexBackend:
         for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
                     "ANTHROPIC_AUTH_TOKEN"):
             env.pop(var, None)
+        # This is a FULL environment (a copy of os.environ), so the launcher's
+        # ambient secrets (GITHUB_TOKEN, cloud keys, an ssh-agent socket, every
+        # integration token `load_env_var` exported) are DELETED rather than
+        # overridden — same policy as the Claude child (agent/child_env.py);
+        # only the OpenAI credential this mode bills on survives.
+        drop_foreign_secrets(env)
         # The agent-session mark (session_mark.py): stamped last, after the
         # credential scrub, so it always survives it — the gate-ending act
         # sites refuse a caller descended from this subprocess regardless of

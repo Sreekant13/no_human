@@ -393,71 +393,6 @@ def scrub_metered_auth(
     return report
 
 
-# Env-var NAME shapes that mark a value as a credential. A coding-backend child
-# process (agent/claude_backend.py) inherits the launcher's whole environment;
-# `scrub_foreign_secrets_into` blanks every secret-shaped variable that is not
-# on the child-env allow-list so a prompt injection in that child cannot read
-# the operator's ambient credentials (GITHUB_TOKEN, cloud keys, an ssh-agent
-# socket) out of its environment. Matched case-insensitively as substrings.
-_SECRET_NAME_MARKERS = (
-    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY",
-    "ACCESS_KEY", "PRIVATE_KEY", "CREDENTIAL", "AUTH_TOKEN", "SESSION_KEY",
-)
-# Credential-bearing names the markers above do not catch by shape.
-_SECRET_NAME_EXACT = ("SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS")
-_SECRET_NAME_PREFIXES = ("AWS_", "GCP_", "AZURE_")
-
-# Secret-shaped names the coder subprocess legitimately needs, kept with their
-# real inherited value. ANTHROPIC_*/CLAUDE_* are the model auth + config for the
-# very CLI being launched, and are already reduced to the sanctioned billing
-# path by `scrub_metered_auth` at startup (subscription mode scrubs
-# ANTHROPIC_API_KEY; BYO api_key mode keeps it), so whatever survives to the
-# child is intended. NO_HUMAN_AGENT_SESSION* is the agent-session mark.
-_CHILD_ENV_ALLOW_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "NO_HUMAN_AGENT_SESSION")
-_CHILD_ENV_ALLOW_EXACT = ("GIT_ASKPASS",)
-
-
-def _is_secret_env_name(name: str) -> bool:
-    """Whether an env-var NAME looks like it carries a credential."""
-    upper = name.upper()
-    if any(marker in upper for marker in _SECRET_NAME_MARKERS):
-        return True
-    if upper in _SECRET_NAME_EXACT:
-        return True
-    return any(upper.startswith(prefix) for prefix in _SECRET_NAME_PREFIXES)
-
-
-def _is_child_env_allowed(name: str) -> bool:
-    """Whether a secret-shaped name is one the coder subprocess may keep."""
-    return name in _CHILD_ENV_ALLOW_EXACT or any(
-        name.startswith(prefix) for prefix in _CHILD_ENV_ALLOW_PREFIXES
-    )
-
-
-def scrub_foreign_secrets_into(
-    env: dict[str, str],
-    source_env: dict[str, str] | os._Environ | None = None,
-) -> list[str]:
-    """Blank every secret-shaped variable in ``source_env`` (the process env by
-    default) that is not on the child-env allow-list, writing ``""`` into
-    ``env`` so the child sees an empty value in place of the credential.
-
-    ``env`` is a coding-backend's additive ``ClaudeAgentOptions.env``: the SDK
-    builds the child environment as ``{**os.environ, **env}``, so an inherited
-    secret is neutralised by OVERRIDING its name to empty here, not by removing
-    it. Non-secret operational variables (PATH, HOME, …) are left to inherit
-    untouched. Keys already present in ``env`` are deliberate additions and are
-    left as-is. Returns the names blanked (for tests/diagnostics)."""
-    source = os.environ if source_env is None else source_env
-    blanked: list[str] = []
-    for name in source:
-        if name in env or _is_child_env_allowed(name) or not _is_secret_env_name(name):
-            continue
-        env[name] = ""
-        blanked.append(name)
-    return blanked
-
-
 def _read_env_file(env_path: Path | None = None) -> dict[str, str]:
     """Parse ``~/.no_human/.env`` into ``{key: value}``, dropping blanks.
 
@@ -2144,8 +2079,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # is readable by whoever installs it. An operator using this gate fills
         # these in via ~/.no_human/config.yaml on their own machine.
         "enabled": False,
-        # GitLab numeric project id of the pipeline project to trigger.
-        "project_id": None,
+        "project_id": None,  # GitLab numeric project id of the pipeline project to trigger
         "hostname": "",
         "ref": "main",
         # Repos governed by this gate, matched against the PR's repo name.
@@ -2177,11 +2111,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pr_build": True,
         "enrich_job_url": "",
         "jenkins_controller": "",
-        # CA bundle (PEM path) the CI-log fetch (`pr_watcher.default_ci_log_excerpt`)
-        # verifies the Jenkins TLS chain against. Empty means verify against the
-        # system trust store. This is the trust anchor for an internal Jenkins CA;
-        # the fetch never disables verification.
-        "jenkins_ca_bundle": "",
+        "jenkins_ca_bundle": "",  # PEM the CI-log fetch verifies against; "" = system store
         "registry_prefix": "",
     },
     "hooks": {

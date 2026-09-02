@@ -462,6 +462,13 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "already opened",
             "loopback: BASE_URL is 127.0.0.1:8420; the bridge dials nothing else"),
     },
+    "api/local_boundary.py": {
+        "sock:fastapi": Allowed(
+            "nobody — the Request/HTTPException/JSONResponse types the loopback "
+            "boundary is written against; the module opens no socket, it refuses "
+            "requests whose Host/Origin is not 127.0.0.1, localhost or ::1",
+            "loopback: the boundary itself — every non-loopback Host is a 400"),
+    },
     "api/app.py": {
         "sock:fastapi": Allowed(
             "nobody — FastAPI/Starlette ACCEPT connections, they do not make "
@@ -2033,7 +2040,10 @@ def test_loopback_entries_really_bind_loopback() -> None:
     # split out of cli/commands.py — a move of an existing channel, not a new
     # destination. The runner's BROWSER is deliberately NOT loopback: a page it
     # loads can fetch from anywhere, so that channel is config-gated instead.
-    assert checked == 12, f"expected 12 loopback channels, found {checked}"
+    # + `api/local_boundary.py`, the Host/Origin boundary split out of
+    # api/app.py — the check that DEFINES loopback for the board, not a new
+    # destination.
+    assert checked == 13, f"expected 13 loopback channels, found {checked}"
 
 
 def test_no_unused_local_classifications() -> None:
