@@ -65,9 +65,11 @@ credential to run the product end to end. See
 
 [`RELEASE_MANIFEST.txt`](RELEASE_MANIFEST.txt) pins every shipped file's content
 with a SHA-256. When you change a pinned file you must re-pin it in the *same*
-commit (`uv run python scripts/export_guard.py approve <path>` then
-`git add RELEASE_MANIFEST.txt`). Forgetting the re-pin is a split commit that
-CI's inventory job only catches at push, after `main` has gone red.
+commit: run `python scripts/check_release_manifest.py --write`, then
+`git add RELEASE_MANIFEST.txt`. (In a tree that carries an export gate the
+script refuses and prints the approval command to use instead.) Forgetting the
+re-pin is a split commit that CI's inventory job only catches at push, after
+`main` has gone red.
 
 An opt-in git hook catches it at commit time instead. It is committed but does
 nothing until you enable it for your clone:
