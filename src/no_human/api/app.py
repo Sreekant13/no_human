@@ -359,7 +359,13 @@ app = FastAPI(title="no_human board", version=__version__, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Loopback origins only, any port: a page on another origin the operator
+    # visits cannot read this API's responses (task list, transcripts, PR
+    # URLs). Cross-origin writes are refused by `_refuse_cross_origin_writes`;
+    # the `Host` header is checked by `_require_local_host`. The exact-host
+    # regex avoids the `startswith` look-alike (`http://localhost.evil.com`)
+    # that `_require_local_origin` documents.
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -477,6 +483,70 @@ async def _refuse_marked_gate_acts(request, call_next):
                     ),
                 },
             )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _require_local_host(request, call_next):
+    """Refuse a request whose `Host` header is not loopback (400).
+
+    The board answers on 127.0.0.1 / localhost, so a legitimate request names
+    one of those. A DNS-rebinding page reaches the server with its own domain
+    in `Host` — the browser resolved the attacker's name to a loopback address
+    — and is refused before it routes. This is the case `Origin` cannot cover:
+    a rebound request is same-origin to the browser and carries no `Origin` at
+    all, so the `Host` header is the only field that still names the attacker.
+    """
+    hostname = urlsplit("//" + request.headers.get("host", "")).hostname or ""
+    if hostname not in _LOCAL_HOSTS:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "bad_host",
+                "reason": (
+                    "requests must address the board on a loopback host "
+                    "(see docs/security.md)."
+                ),
+            },
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _refuse_cross_origin_writes(request, call_next):
+    """Refuse a cross-origin browser write to any state-changing route.
+
+    A browser always sends `Origin` on a cross-site write, so a present
+    `Origin` whose host is not loopback names a page the operator is visiting:
+    refuse it (403). An absent `Origin` is a non-browser local client — the
+    `nh` CLI and the MCP bridge send none — and is allowed; a same-user local
+    process is inside the trust boundary docs/security.md draws ("an attacker
+    with shell as the nh user" is out of scope). Only the mutating verbs are
+    checked, so the CORS preflight and every read pass through. The host is
+    matched exactly against `_LOCAL_HOSTS`, the check `_require_local_origin`
+    applies per credential route, here covering the whole state-changing
+    surface in one place.
+    """
+    if request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("origin")
+        if origin is not None:
+            parts = urlsplit(origin)
+            if (parts.scheme not in ("http", "https")
+                    or (parts.hostname or "") not in _LOCAL_HOSTS):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "cross_origin_refused",
+                        "reason": (
+                            "cross-origin writes are not allowed to the local "
+                            "board API (see docs/security.md)."
+                        ),
+                    },
+                )
     return await call_next(request)
 
 
@@ -5664,6 +5734,17 @@ def _task_fingerprint(tlist) -> dict:
 
 @app.websocket("/ws")
 async def ws_board(ws: WebSocket) -> None:
+    # A handshake bypasses CORS and the HTTP middlewares, so the loopback
+    # `Host` and `Origin` checks are repeated here: a cross-origin or
+    # rebinding page can open `/ws` from the browser and would otherwise
+    # stream every task (titles, PR URLs, statuses). Reject before accepting.
+    _host = urlsplit("//" + ws.headers.get("host", "")).hostname or ""
+    _origin = ws.headers.get("origin")
+    _origin_host = urlsplit(_origin).hostname if _origin else None
+    if _host not in _LOCAL_HOSTS or (_origin is not None
+                                     and _origin_host not in _LOCAL_HOSTS):
+        await ws.close(code=1008)  # policy violation
+        return
     await _mgr.connect(ws)
     store: Store = ws.app.state.store
     sched = getattr(ws.app.state, "scheduler", None)

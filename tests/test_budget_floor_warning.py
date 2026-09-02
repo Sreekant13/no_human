@@ -327,7 +327,7 @@ async def test_send_back_and_reply_apis_return_budget_warning(tmp_path):
         app.state.store = store
         app.state.config = load_config(tmp_path / "config.yaml")
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             r_low = await client.post(
                 f"/api/tasks/{low.id}/send-back",
                 json={"message": "needs another pass"})

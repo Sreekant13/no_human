@@ -849,7 +849,7 @@ async def test_every_fault_drops_healthy_whatever_the_reason_says(store,
                      "probe_failing"):
             app.state.scheduler = _rig(store, **{flag: True})
             async with AsyncClient(transport=ASGITransport(app=app),
-                                   base_url="http://test") as c:
+                                   base_url="http://localhost") as c:
                 body = (await c.get("/api/worker/status")).json()
             assert body["healthy"] is False, f"{flag} still reported healthy"
     finally:
@@ -887,7 +887,7 @@ async def test_worker_status_endpoint_distinguishes_idle_from_wedged(store,
     transport = ASGITransport(app=app)
     try:
         async with AsyncClient(transport=transport,
-                               base_url="http://test") as c:
+                               base_url="http://localhost") as c:
             idle = (await c.get("/api/worker/status")).json()
             assert idle["inflight"] == 0
             assert idle["idle_reason"] == "queue_empty"
@@ -931,7 +931,7 @@ async def test_worker_status_flags_a_stalled_loop_and_a_failing_probe(store,
     app.state.watcher_error = None
     try:
         async with AsyncClient(transport=ASGITransport(app=app),
-                               base_url="http://test") as c:
+                               base_url="http://localhost") as c:
             healthy = (await c.get("/api/worker/status")).json()
             assert healthy["healthy"] is True          # known negative
 
@@ -1183,7 +1183,7 @@ async def test_a_dead_worker_loop_is_reported_not_silently_dropped(
     try:
         app.state.worker_error = None
         async with AsyncClient(transport=ASGITransport(app=app),
-                               base_url="http://test") as c:
+                               base_url="http://localhost") as c:
             alive = (await c.get("/api/worker/status")).json()
             assert alive["healthy"] is True          # known negative
             assert alive["worker_error"] is None
@@ -1238,7 +1238,7 @@ async def test_a_scheduler_that_cannot_describe_itself_is_not_healthy(store,
     app.state.worker_error = None
     try:
         async with AsyncClient(transport=ASGITransport(app=app),
-                               base_url="http://test") as c:
+                               base_url="http://localhost") as c:
             body = (await c.get("/api/worker/status")).json()
         assert body["healthy"] is False
         assert "health_error" in body
@@ -1262,7 +1262,7 @@ async def test_worker_status_flags_a_wedged_crash_handler(store, tmp_path):
     app.state.watcher_error = None
     try:
         async with AsyncClient(transport=ASGITransport(app=app),
-                               base_url="http://test") as c:
+                               base_url="http://localhost") as c:
             body = (await c.get("/api/worker/status")).json()
         assert body["healthy"] is False
         assert body["consecutive_status_write_failures"] == 3

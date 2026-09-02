@@ -37,7 +37,7 @@ async def client(store, tmp_path, monkeypatch):
     )
     monkeypatch.setattr(nh_config, "CONFIG_PATH", tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 

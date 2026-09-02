@@ -83,7 +83,7 @@ async def test_metrics_endpoint_carries_by_playbook(store, tmp_path):
     app.state.store = store
     app.state.config = load_config(tmp_path / "c.yaml")
     async with AsyncClient(transport=ASGITransport(app=app),
-                           base_url="http://t") as c:
+                           base_url="http://localhost") as c:
         body = (await c.get("/api/metrics")).json()
     assert any(r["playbook"] == "pb-x" for r in body["by_playbook"])
 

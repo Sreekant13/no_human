@@ -291,7 +291,7 @@ async def client(store, tmp_path):
     app.state.store = store
     app.state.config = load_config(tmp_path / "config.yaml")
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 

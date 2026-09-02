@@ -88,7 +88,7 @@ async def client(store, tmp_path):
     app.state.store = store
     app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 
@@ -112,7 +112,7 @@ async def test_unconfigured_returns_503_with_clear_detail(store, tmp_path):
     app.state.store = store
     app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.get("/api/integrations/linear/issues")
     assert r.status_code == 503
     assert "not configured" in r.json()["detail"].lower()

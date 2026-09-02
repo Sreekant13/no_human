@@ -46,7 +46,7 @@ async def client(tmp_path, monkeypatch):
     transport = ASGITransport(app=app)
     # A real browser always sends Origin on these calls; the write route now
     # requires it, so the fixture mirrors the legitimate UI.
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
     await store.close()
@@ -387,7 +387,7 @@ async def test_a_write_with_no_origin_is_refused(tmp_path, monkeypatch):
     import no_human.config as _cfg
     assert str(_cfg.ENV_PATH).startswith(str(tmp_path))
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.put("/api/auth/token",
                         json={"profile": "personal", "token": TOKEN})
     await store.close()

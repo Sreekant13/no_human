@@ -490,7 +490,7 @@ async def client(store):
     app.state.store = store
     app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
 

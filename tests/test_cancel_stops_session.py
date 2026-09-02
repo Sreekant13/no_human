@@ -222,7 +222,7 @@ async def api_client(api_store, tmp_path):
     fastapi_app.state.store = api_store
     fastapi_app.state.config = load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=fastapi_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
     if hasattr(fastapi_app.state, "scheduler"):
         del fastapi_app.state.scheduler

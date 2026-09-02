@@ -26,7 +26,7 @@ async def store(tmp_path):
 async def client(store):
     app.state.store = store
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 

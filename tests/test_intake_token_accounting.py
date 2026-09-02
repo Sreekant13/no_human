@@ -327,7 +327,7 @@ async def client(store, tmp_path):
     app.state.config = load_config(tmp_path / "config.yaml")
     app.state._grill_sessions = {}
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 
