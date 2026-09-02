@@ -1096,13 +1096,24 @@ async def test_ci_log_excerpt_refuses_cleartext_http(monkeypatch):
     assert rec["constructed"] is False
 
 
-async def test_ci_log_excerpt_returns_empty_when_no_controller_configured(monkeypatch):
+async def test_ci_log_excerpt_returns_empty_when_no_controller_configured(monkeypatch, caplog):
+    """SSO credentials set but no `ci_gate.jenkins_controller`: no request, and
+    the operator is told why the excerpt is missing (the silent "" was a
+    support round-trip); without SSO credentials there is nothing to warn about."""
     from no_human.vcs.pr_watcher import default_ci_log_excerpt
 
     rec = _patch_ci_log(monkeypatch, controller="")
-    out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
+    with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+        out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
     assert out == ""
     assert rec["constructed"] is False
+    assert "ci_gate.jenkins_controller is empty" in caplog.text
+
+    caplog.clear()
+    _patch_ci_log(monkeypatch, controller="", sso=None)
+    with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+        assert await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42") == ""
+    assert "jenkins_controller" not in caplog.text
 
 
 async def test_ci_log_excerpt_fetches_matching_host_with_auth_and_ca_bundle(monkeypatch):

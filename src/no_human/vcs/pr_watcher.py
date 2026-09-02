@@ -707,7 +707,14 @@ async def default_ci_log_excerpt(link: str) -> str:
     controller_host = (urlparse(ci_gate.get("jenkins_controller") or "").hostname or "").lower()
     link_host = (urlparse(link).hostname or "").lower()
     # Credentials and the fetch go ONLY to the configured Jenkins controller.
-    if not controller_host or link_host != controller_host:
+    if not controller_host:
+        if load_env_var("SSO_USERNAME"):
+            log.warning(
+                "SSO credentials are set but ci_gate.jenkins_controller is empty; "
+                "the CI log excerpt is disabled until it names the Jenkins host")
+        return ""
+    if link_host != controller_host:
+        log.debug("CI log excerpt skipped: %s is not the configured Jenkins controller", link_host)
         return ""
     # The credentials live in ~/.no_human/.env; the server process does not
     # export them, so reading os.environ alone would always come up empty.
