@@ -175,7 +175,7 @@ async def test_api_metrics_window_serves_the_attempt_attributed_figure(store, tm
     app.state.store = store
     app.state.config = load_config(tmp_path / "c.yaml")
     async with AsyncClient(transport=ASGITransport(app=app),
-                           base_url="http://t") as c:
+                           base_url="http://localhost") as c:
         body = (await c.get("/api/metrics/window")).json()
         bad = await c.get("/api/metrics/window", params={"hours": 0})
 
@@ -196,7 +196,7 @@ async def test_api_metrics_window_empty_db_is_zeros_not_a_crash(tmp_path):
         app.state.store = empty
         app.state.config = load_config(tmp_path / "c2.yaml")
         async with AsyncClient(transport=ASGITransport(app=app),
-                               base_url="http://t") as c:
+                               base_url="http://localhost") as c:
             body = (await c.get("/api/metrics/window")).json()
     finally:
         await empty.close()
