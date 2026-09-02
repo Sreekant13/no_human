@@ -38,7 +38,14 @@ import pytest
 from no_human import doctor as doctor_mod
 from no_human.testing import ui_evidence
 
-_PLAYWRIGHT_ABSENT = importlib.util.find_spec("playwright.async_api") is None
+# Parent package first: `find_spec("playwright.async_api")` RAISES
+# ModuleNotFoundError (rather than returning None) when `playwright` itself
+# is absent — measured 2026-09-02 as a collection ERROR on the public CI,
+# which installs no e2e group. A provisioned dev machine can never see this.
+_PLAYWRIGHT_ABSENT = (
+    importlib.util.find_spec("playwright") is None
+    or importlib.util.find_spec("playwright.async_api") is None
+)
 _skip_if_absent = pytest.mark.skipif(
     _PLAYWRIGHT_ABSENT,
     reason="playwright not installed in this environment (uv sync --group e2e)",
