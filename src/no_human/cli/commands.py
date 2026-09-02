@@ -7295,6 +7295,11 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         publish_refusals,
         success_headline,
     )
+    from ..eval.quota_halt import (
+        QUOTA_HALT_CONSECUTIVE_DEAD,
+        QuotaHaltDetector,
+        resume_command,
+    )
     from ..review.reviewer import AdversarialReviewer
 
     try:
@@ -7512,9 +7517,12 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         # serial loop. The checkpoint lock keeps per-completion saves atomic.
         pool = asyncio.Semaphore(parallel)
         ckpt_lock = asyncio.Lock()
+        halt = QuotaHaltDetector()
 
         async def _run_spec(spec, trial: int = 0):
             async with pool:
+                if halt.stopped:
+                    return
                 # Built outside the print: rich reads a bracketed span as
                 # markup, and an interpolated conditional is not a shape the
                 # print guard can prove safe. escape() covers both.
@@ -7589,7 +7597,9 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                 # with --resume.
                 async with ckpt_lock:
                     scores.append(score)
-                    NorthStarCard(scores=scores, created_at=_now_iso(),
+                    halt.observe(score)
+                    NorthStarCard(scores=halt.scored(scores),
+                                  created_at=_now_iso(),
                                   corpus_available=corpus_available,
                                   trials=trials,
                                   label=label).save(ckpt)
@@ -7601,8 +7611,9 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             *(_run_spec(s, t) for s in specs for t in range(trials)
               if (s.id, t) not in done_keys))
 
-        card = NorthStarCard(scores=scores, created_at=_now_iso(), label=label,
-                             corpus_available=corpus_available, trials=trials)
+        card = NorthStarCard(scores=halt.scored(scores), created_at=_now_iso(),
+                             label=label, corpus_available=corpus_available,
+                             trials=trials, halted_reason=halt.reason)
         prev_file = Path(prev_path) if prev_path else RESULTS_DIR / "latest.json"
         previous = NorthStarCard.load(prev_file)
         result = northstar_gate(card, previous, tier_expected=tier_expected)
@@ -7622,7 +7633,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             out = RESULTS_DIR / f"{_slug(label)}-{stamp}-{n}.json"
             n += 1
         card.save(out)
-        ckpt.unlink(missing_ok=True)   # completed cleanly — no partial to resume
+        halt.keep_or_clear(ckpt)   # survives a quota halt; unlinked on clean completion
         agg = card.as_dict()["aggregate"]
         console.print(
             # The interval travels with the number everywhere it is printed.
@@ -7640,6 +7651,16 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                 console.print(f"  ⚠ {escape(str(r))}")
         else:
             console.print(f"[dim]publish it with:  nh bench publish {escape(out.name)}[/]")
+        if halt.stopped:
+            cmd = resume_command(full=full, quick=quick, limit=limit,
+                                 specs_dir=specs_dir, label=label,
+                                 parallel=parallel, trials=trials)
+            console.print(f"[bold red]quota saturation — halted after "
+                          f"{int(QUOTA_HALT_CONSECUTIVE_DEAD)} consecutive zero-token "
+                          f"specs; {len(halt.dropped)} unscored spec(s) left to "
+                          f"re-run[/]")
+            console.print(f"[dim]resume with:  {escape(cmd)}[/]")
+            sys.exit(1)
         if not result.passed:
             console.print("[bold red]north-star gate FAILED:[/]")
             for r in result.reasons:

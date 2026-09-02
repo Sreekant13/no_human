@@ -123,7 +123,15 @@ FROZEN_FUNCTION_LINES = {
     # baseline so the full suite is green again; growth from here fails.
     "agent/claude_backend.py:ClaudeBackend.stream": 407,
     "core/orchestrator.py:Orchestrator._run_review": 386,
-    "cli/commands.py:bench_run": 377,
+    # 377 -> 398 (+21): quota-saturation mid-run halt. `bench_run` now builds
+    # a `QuotaHaltDetector`, threads `halt.observe(score)`/`halt.scored(...)`
+    # through the per-spec checkpoint save inside `_run_spec`, and prints the
+    # halt banner + `--resume` re-invocation command (`resume_command`) and
+    # `sys.exit(1)` once `halt.stopped`. Estimated cc cost was thought to be
+    # smaller before this landed; measured cc is 58, still under the 60
+    # function-cc ceiling so no new `FROZEN_FUNCTION_CC` entry is needed.
+    # Measured on this tree with the scanner below.
+    "cli/commands.py:bench_run": 398,
     # Grew to 304 (> 300) when D3.1 (2026-08-31, auto-activation pipeline)
     # threaded `learning.auto_manage`/`learning.auto_activate_daily_cap`
     # through `nh serve`'s `HarvestJob` construction — the kill switch's own
@@ -327,7 +335,10 @@ FROZEN_FILE_LINES = {
     # from the (package, chromium) pair instead of the package layer alone
     # — a package-present/chromium-missing install must not render green —
     # plus one extra docstring sentence naming the new third row state.
-    "cli/commands.py": 8356,
+    # 8356 -> 8377 (+21): quota-saturation mid-run halt (`bench_run` growth
+    # above) plus the `quota_halt` import block. Measured on this tree with
+    # the scanner below.
+    "cli/commands.py": 8377,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`

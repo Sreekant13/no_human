@@ -269,6 +269,12 @@ class NorthStarCard:
     # confident "0", indistinguishable from a run that measured zero
     # unscoreable specs. Presence, not truthiness, mirrors ``ci_recorded``.
     unscoreable_recorded: bool = True
+    # Set by `bench_run` when a quota-saturation halt cut the run short
+    # (`quota_halt.HALTED_REASON_QUOTA`); "" for a run that completed (or a
+    # legacy file predating this field). A run-status flag, not an aggregate
+    # statistic — it never changes what `publish_refusals` decides; a halted
+    # partial is already refused by the ordinary coverage rules.
+    halted_reason: str = ""
 
     # ------------------------------ counts --------------------------------- #
 
@@ -689,6 +695,11 @@ class NorthStarCard:
                 "escalation_specs": self.escalation_specs,
             },
             "override_reasons": self.override_reasons,
+            # Top-level, not inside `aggregate`: `aggregate` is spread onto
+            # the web `_bench_payload` and consumed field-by-field by
+            # `bench_compare`, and a run-status flag is not an aggregate
+            # statistic.
+            "halted_reason": self.halted_reason,
             # Sorted so a saved card is deterministic regardless of execution
             # order — `--parallel` completes specs in a nondeterministic order,
             # and the tracked per-task report renders scores in list order, so
@@ -758,7 +769,8 @@ class NorthStarCard:
                              created_at=data.get("created_at", ""),
                              label=data.get("label", ""),
                              override_reasons=list(
-                                 data.get("override_reasons") or []))
+                                 data.get("override_reasons") or []),
+                             halted_reason=data.get("halted_reason", ""))
 
 
 def sample_phrase(card: NorthStarCard) -> str:
