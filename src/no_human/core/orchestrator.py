@@ -17582,6 +17582,32 @@ SIX of them read a checkpoint and TWO do not — but do
         "status or deferral note — so it is not reproduced here. Nothing was "
         "written in its place: read the commits and the diff for what changed."
     )
+    # Used only on the mechanical-summary path (`_mechanical_changes_summary`
+    # produced content): the "nothing was written in its place" clause of
+    # `_NO_SUMMARY_BLOCK` above would be false there, since a mechanical
+    # summary IS written. Keeps the two pinned substrings
+    # ("**No implementation summary was produced.**", "was not a report of
+    # the work") that existing tests/UI copy rely on.
+    _NO_SUMMARY_NOTE = (
+        "**No implementation summary was produced.** The coder's final "
+        "message was not a report of the work — it was a status or "
+        "deferral note, so it is not reproduced here."
+    )
+    _MECHANICAL_LABEL = (
+        "_Auto-generated summary (the coder produced no implementation report):_"
+    )
+    _MECH_MAX_COMMITS = 10
+    _MECH_MAX_FILES = 15
+    # Rewritten by export_guard/check_release_manifest on every landing, so they
+    # appear in ~every diffstat and drown the real files. Named, not pattern-matched.
+    _DERIVED_LEDGER_BASENAMES = frozenset(
+        {"RELEASE_MANIFEST.txt", "EXPORT_CLASSIFICATION.txt"}
+    )
+    # Coders routinely paste a worktree path into a commit subject; numstat
+    # paths need no such scrub — they are repo-relative by construction.
+    _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:\\[^\s]*|(?:/[\w.+@%-]+){2,}/?)")
+    _MECH_ELISION_RE = re.compile(r"^- _… and (\d+) more (commits|files)_$")
+    _MECH_OMITTED_NOTE = "_(derived ledger files omitted)_"
 
     @staticmethod
     def _normalize_for_marker_match(text: str) -> str:
@@ -18930,6 +18956,8 @@ SIX of them read a checkpoint and TWO do not — but do
 
     def _summary_section(
         self, result, *, max_visible: int | None = None, trim_marker: str = "",
+        repo: "GitRepo | None" = None, base: str | None = None,
+        mechanical: str | None = None,
     ) -> str:
         """The rendered body of `## Changes` (C1 + H13, then the 2026-08-21
         cap): the coder's report, cleaned, with its `CRITERION:` lines made a
@@ -18938,10 +18966,29 @@ SIX of them read a checkpoint and TWO do not — but do
         ``max_visible``/``trim_marker`` are D1.1's whole-body-budget escape
         hatch — see `_fold_report`'s docstring; `_pr_body` is the only
         caller that ever passes them.
+
+        When the coder's final message fails `_is_non_report_summary`, this
+        used to return `_NO_SUMMARY_BLOCK` unconditionally, leaving the reader
+        with nothing describing the change (operator report on PR #996). If
+        ``repo``/``base`` are available, a mechanical fallback — commit
+        subjects and a diffstat, nothing inferred — replaces it instead;
+        ``mechanical`` lets `_pr_body` compute that once and pass it to both
+        of its `_summary_section` calls so a budget re-render never re-shells
+        to git. Absent a mechanical summary (no repo, unresolvable base, git
+        failure, empty range), the unchanged `_NO_SUMMARY_BLOCK` still renders
+        — its "nothing was written in its place" claim stays true there.
         """
         cleaned = self._clean_summary((getattr(result, "final_text", "") or "").strip())
         if self._is_non_report_summary(cleaned):
-            return self._NO_SUMMARY_BLOCK
+            mech = (
+                mechanical if mechanical is not None
+                else self._mechanical_changes_summary(repo, base)
+            )
+            if not mech:
+                return self._NO_SUMMARY_BLOCK
+            return self._trim_mechanical(
+                f"{self._NO_SUMMARY_NOTE}\n\n{mech}",
+                max_visible=max_visible, trim_marker=trim_marker)
         return self._fold_report(
             self._compact_criterion_lines(self._reformat_summary_markdown(cleaned)),
             max_visible=max_visible, trim_marker=trim_marker)
@@ -19045,6 +19092,176 @@ SIX of them read a checkpoint and TWO do not — but do
                      f"({k} more paragraph{'s' if k != 1 else ''})</summary>\n\n"
                      + "\n\n".join(folded) + "\n\n</details>")
         return body
+
+    def _mechanical_changes_summary(
+        self, repo: "GitRepo | None", base: str | None,
+    ) -> str:
+        """A fallback `## Changes` body for when the coder's final message
+        failed `_is_non_report_summary`: commit subjects plus a diffstat,
+        nothing inferred about what the change *does*. Returns `""` on any
+        inability to produce content — no repo, no base, an unresolvable
+        base, an empty range, or a git failure — so the caller
+        (`_summary_section`) can fall back to the unchanged `_NO_SUMMARY_BLOCK`.
+
+        Wrapped end-to-end in `try/except`: this runs inside `_pr_body`, whose
+        draft-PR caller swallows exceptions into an advisory — an evidence
+        nicety must never cost a delivery.
+
+        Two-dot commit range (what the branch *adds*) vs three-dot diff range
+        (what a reviewer actually *reads*) — the same asymmetry
+        `commits_ahead`/`head_commit` already use; `commit_subjects`/
+        `numstat` on `GitRepo` each pick the matching one.
+        """
+        if repo is None or not base:
+            return ""
+        try:
+            subjects = repo.commit_subjects(base)
+            stats = repo.numstat(base)
+        except Exception as exc:  # noqa: BLE001 — a summary aid never raises
+            self._advisory(f"mechanical PR-body summary failed: {exc}")
+            return ""
+
+        commit_lines = [
+            f"- {self._inline_cell(self._ABS_PATH_RE.sub('[path]', subject), 120)}"
+            for subject in subjects[: self._MECH_MAX_COMMITS]
+        ]
+
+        dropped = False
+        kept: list[tuple[str, int, int]] = []
+        for path, ins, dels in stats:
+            if PurePosixPath(path).name in self._DERIVED_LEDGER_BASENAMES:
+                dropped = True
+                continue
+            kept.append((path, ins, dels))
+        # Lines-changed descending, ties alphabetical: puts the highest-signal
+        # files first, ahead of any elision tail. A reversible presentation
+        # choice, not a completeness claim — every file is still counted.
+        kept.sort(key=lambda e: (-(e[1] + e[2]), e[0]))
+        file_lines = [
+            f"- `{self._inline_cell(path, None)}` +{ins}/-{dels}"
+            for path, ins, dels in kept[: self._MECH_MAX_FILES]
+        ]
+
+        return self._render_mechanical(
+            base, commit_lines, len(subjects),
+            file_lines, len(kept), dropped,
+        )
+
+    @staticmethod
+    def _render_mechanical(
+        base: str,
+        commit_lines: list[str], total_commits: int,
+        file_lines: list[str], total_files: int,
+        dropped: bool,
+    ) -> str:
+        """Assemble the commits/files sections from already visible-truncated
+        line lists plus each list's ORIGINAL total. Shared by
+        `_mechanical_changes_summary` (applying the 10/15 caps) and
+        `_trim_mechanical` (applying a further budget cut), so an elision
+        line always counts every dropped item, not only the ones dropped by
+        the fixed cap. Never `##`/`###`: a heading here would collide with
+        `_pr_body`'s own section structure. Returns `""` when there is
+        nothing to say at all (never an empty labeled section).
+        """
+        parts = [Orchestrator._MECHANICAL_LABEL]
+        if commit_lines or total_commits:
+            section = [f"**Commits (first-parent, vs `{base}`)**", *commit_lines]
+            hidden = total_commits - len(commit_lines)
+            if hidden > 0:
+                section.append(f"- _… and {hidden} more commits_")
+            parts.append("\n".join(section))
+        if file_lines or total_files or dropped:
+            section = ["**Files changed**", *file_lines]
+            hidden = total_files - len(file_lines)
+            if hidden > 0:
+                section.append(f"- _… and {hidden} more files_")
+            if dropped:
+                section.append(Orchestrator._MECH_OMITTED_NOTE)
+            parts.append("\n".join(section))
+        if len(parts) == 1:
+            return ""
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _trim_mechanical(
+        cls, text: str, *, max_visible: int | None, trim_marker: str = "",
+    ) -> str:
+        """Budget participation for the mechanical fallback — the equivalent
+        of `_fold_report`'s `max_visible`/`trim_marker` escape hatch, but for
+        a section that must never gain a `<details>` fold (that label would
+        falsely attribute mechanical text to the coder).
+
+        When *text* exceeds `max_visible`, whole rendered lines are dropped
+        from the end — files before commits, since commits are the
+        higher-signal half — and each section's elision tail is recomputed
+        against what actually remains, so it counts budget-dropped lines too,
+        not only the ones the fixed 10/15 caps already dropped. No line is
+        ever cut mid-word: only whole `- ...` items are removed. The note and
+        `_MECHANICAL_LABEL` are never dropped; if even they exceed the cap,
+        note + label (+ marker) is returned as-is — a size budget is a safety
+        margin, not a precision instrument, the same trade `_fold_report`
+        makes for a `NOT-MET` paragraph.
+        """
+        if max_visible is None or len(text) <= max_visible:
+            return text
+
+        parts = text.split("\n\n")
+        note, label = parts[0], parts[1]
+        blocks = []
+        for raw in parts[2:]:
+            lines = raw.split("\n")
+            heading = lines[0]
+            kind = "commits" if "Commits" in heading else "files"
+            items: list[str] = []
+            hidden = 0
+            omitted = False
+            for ln in lines[1:]:
+                m = cls._MECH_ELISION_RE.match(ln)
+                if m:
+                    hidden = int(m.group(1))
+                    continue
+                if ln == cls._MECH_OMITTED_NOTE:
+                    omitted = True
+                    continue
+                items.append(ln)
+            blocks.append({
+                "kind": kind, "heading": heading, "items": items,
+                "hidden": hidden, "omitted": omitted,
+            })
+
+        def render() -> str:
+            out = [note, label]
+            for b in blocks:
+                if not (b["items"] or b["hidden"] or (b["kind"] == "files" and b["omitted"])):
+                    continue
+                block_lines = [b["heading"], *b["items"]]
+                if b["hidden"]:
+                    block_lines.append(f"- _… and {b['hidden']} more {b['kind']}_")
+                if b["kind"] == "files" and b["omitted"]:
+                    block_lines.append(cls._MECH_OMITTED_NOTE)
+                out.append("\n".join(block_lines))
+            return "\n\n".join(out)
+
+        current = render()
+        while len(current) > max_visible:
+            target = next((b for b in blocks if b["kind"] == "files" and b["items"]), None)
+            if target is None:
+                target = next((b for b in blocks if b["kind"] == "commits" and b["items"]), None)
+            if target is not None:
+                target["items"].pop()
+                target["hidden"] += 1
+                current = render()
+                continue
+            droppable = next((b for b in blocks if b["kind"] == "files"), None) \
+                or next((b for b in blocks if b["kind"] == "commits"), None)
+            if droppable is None:
+                break
+            blocks.remove(droppable)
+            current = render()
+
+        if trim_marker:
+            current += f"\n\n{trim_marker}"
+        return current
 
     @staticmethod
     def _ordered_post_tool_hooks(receipt_hook, lint_hook, scope_hook) -> list:
@@ -19206,7 +19423,15 @@ SIX of them read a checkpoint and TWO do not — but do
                     f"## Changes\n{changes_text}\n\n{assumptions}{superseded}"
                     f"{verification}{ui_evidence_section}{footer}")
 
-        body = _assemble(self._summary_section(result))
+        # Computed ONCE, before the first `_assemble`: `_mechanical_changes_
+        # summary` shells out to git (one `log`, one `diff`), and passing the
+        # result to BOTH `_summary_section` calls below means a budget
+        # re-render never re-shells — see `test_the_budget_rerender_does_
+        # not_reshell_to_git`. Cheap and try/except-guarded even on the
+        # (common) report path, where it is computed but never used.
+        mech = self._mechanical_changes_summary(repo, base)
+        body = _assemble(self._summary_section(
+            result, repo=repo, base=base, mechanical=mech))
         # D1.1's hard size budget, ENFORCED — not merely asserted by a test
         # against a fixture that happens to be small. Measured EXCLUDING
         # `criteria_block`: acceptance criteria are the task's own verbatim
@@ -19233,7 +19458,8 @@ SIX of them read a checkpoint and TWO do not — but do
             # never hide) outranks the size budget on that one, rare shape.
             trimmed_cap = max(0, self._REPORT_VISIBLE_CHARS - over - len(marker) - 50)
             body = _assemble(self._summary_section(
-                result, max_visible=trimmed_cap, trim_marker=marker))
+                result, max_visible=trimmed_cap, trim_marker=marker,
+                repo=repo, base=base, mechanical=mech))
         return body
 
     def _gather_evidence(

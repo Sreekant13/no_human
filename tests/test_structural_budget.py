@@ -278,7 +278,14 @@ FROZEN_FILE_LINES = {
     # `_warn_profile_divergence` from `_usable_profile`) and this branch's
     # disclosure work above, plus the review-round comment completion (+2).
     # Measured on the merge result with the scanner below, never summed.
-    "core/orchestrator.py": 20673,
+    # 20673 -> 20899 (+226): mechanical PR-body fallback for a
+    # classifier-rejected coder final message — `_mechanical_changes_summary`,
+    # `_render_mechanical`, `_trim_mechanical`, and the new constants
+    # (`_MECHANICAL_LABEL`, `_MECH_MAX_COMMITS`/`_MECH_MAX_FILES`,
+    # `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus threading
+    # `repo`/`base`/`mechanical` through `_summary_section` and `_pr_body`.
+    # Measured on this tree with the scanner below.
+    "core/orchestrator.py": 20899,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

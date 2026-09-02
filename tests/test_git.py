@@ -100,3 +100,48 @@ def test_default_branch_local_only_never_touches_the_network(tmp_path, monkeypat
     assert any("remote" in a for a in calls), (
         "the network fallback should still exist for non-request callers"
     )
+
+
+def _branch(tmp_path) -> GitRepo:
+    """A real two-branch repo (`main` + `feat/x`) for `numstat`/`commit_
+    subjects` pins — reuses `_git_repo`'s bootstrap-commit trick."""
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-qb", "feat/x"],
+                    check=True)
+    return repo
+
+
+def test_numstat_reports_a_binary_file_as_0_0_but_still_lists_it(tmp_path):
+    repo = _branch(tmp_path)
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02\xff")
+    repo.commit_all("add a binary file")
+
+    stats = repo.numstat("main")
+
+    assert ("blob.bin", 0, 0) in stats
+
+
+def test_numstat_strips_only_the_surrounding_quotes_of_a_quoted_path(tmp_path):
+    """Git's default `core.quotepath` wraps a non-ASCII path in quotes AND
+    octal-escapes each non-ASCII byte (`"caf\\303\\251.txt"` for `café.txt`).
+    `numstat` strips only the wrapping quotes — it must NOT try to decode the
+    octal escapes itself, or it risks mangling a path git didn't actually
+    have."""
+    repo = _branch(tmp_path)
+    (tmp_path / "café.txt").write_text("bonjour\n")
+    repo.commit_all("add a non-ascii filename")
+
+    stats = repo.numstat("main")
+    paths = [p for p, _, _ in stats]
+
+    assert paths == [r"caf\303\251.txt"]
+    assert not any(p.startswith('"') or p.endswith('"') for p in paths)
+
+
+def test_numstat_and_commit_subjects_are_empty_for_an_unresolvable_base(tmp_path):
+    repo = _branch(tmp_path)
+    (tmp_path / "a.txt").write_text("2\n")
+    repo.commit_all("touch a.txt")
+
+    assert repo.numstat("no-such-branch") == []
+    assert repo.commit_subjects("no-such-branch") == []
