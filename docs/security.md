@@ -38,7 +38,11 @@ merge** button and `nh approve` are that action: they squash-land the PR as a
 local commit under the operator identity and push it (§7, `vcs/approve_merge.py`)
 — a human runs them, never the agent. `approval.auto_merge_on_approval` defaults
 to `false` and nothing in the code reads it: no state change, webhook or timer
-merges anything; only that human command does.
+merges anything; only that human command does. Every coder subprocess is
+stamped with an agent-session mark (`agent/session_mark.py`); the `nh` CLI, the
+board's gate-ending routes and `land_task` itself (`vcs/approve_merge.py`) each
+refuse a caller that carries it, so a marked process cannot land a PR by any of
+the three paths, in-process included.
 
 ## 3. Deterministic VCS under a distinct identity
 
@@ -399,6 +403,38 @@ The CLI, the desktop app and the MCP bridge talk to no_human's **own** API on
 `cli/commands.py:print_no_task_matching:78`), and the transcript-research reader probes a language
 server on localhost (`history/extractor.py:65-72`). These never leave the
 machine, and `server.host` defaults to `127.0.0.1`.
+
+That API is unauthenticated, and a loopback address is not an authentication
+boundary on its own: a page the operator visits while the board is up can reach
+`127.0.0.1:8420` from the browser. `api/local_boundary.py` closes that in one
+place — every request must carry a loopback `Host` (else 400; the DNS-rebinding
+defence), a state-changing request whose `Origin` is present and not loopback is
+refused (403), the CORS grant is exact-host loopback only, and the `/ws`
+handshake repeats the `Host`/`Origin` gate because a WebSocket bypasses CORS. A
+local non-browser client — the `nh` CLI, the MCP bridge — sends no `Origin` and
+is unaffected: a same-user process is inside the trust boundary (an attacker
+with shell as the nh user is out of scope). **Consequence:** a board bound to a
+non-loopback interface (`nh start --host 0.0.0.0`, the container image's
+default) still binds, but a browser addressing it by a LAN name or IP gets
+`400 bad_host`; reach it through an SSH tunnel or a loopback port-forward
+instead. The one credential-carrying fetch that follows forge-supplied data,
+the Jenkins console-log excerpt, sends its SSO credentials only to
+`ci_gate.jenkins_controller` over verified TLS (`ci_gate.jenkins_ca_bundle`
+names an internal CA) — any other host gets no request at all.
+
+The coder subprocess (both backends) does **not** inherit the launcher's
+ambient secrets. `agent/child_env.py` removes every environment variable whose
+NAME is credential-shaped (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`,
+`*CREDENTIAL*`, `SSH_AUTH_SOCK`, `GOOGLE_APPLICATION_CREDENTIALS`, the whole
+`AWS_*`/`GCP_*`/`AZURE_*` namespaces) except the credential that pays for that
+child (`ANTHROPIC_*`/`CLAUDE_*` for Claude, `OPENAI_*` for Codex) and the
+agent-session mark — so a prompt injection in the child cannot read
+`GITHUB_TOKEN`, a cloud key or an integration token out of `env`. The runtime's
+own `git push`/PR-open run in the parent and are unaffected. Inside the child,
+`gh` and `git` fall back to the keyring/`hosts.yml` login, an ssh-agent-only key
+is unusable, and `AWS_PROFILE`/`AWS_REGION` are gone too; a task whose tests
+need one of those variables must get it from the machine, not from the
+launcher's shell.
 
 ### What you actually control
 

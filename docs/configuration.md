@@ -106,8 +106,8 @@ modes the key lives only in this `.env` file, never in `config.yaml`.
 
 ```yaml
 server:
-  host: 127.0.0.1
-  port: 8420                      # nh dashboard / API bind
+  host: 127.0.0.1                 # the API refuses a non-loopback Host header (400)
+  port: 8420                      # even when bound wider — docs/security.md §7
 
 llm:
   auth_mode: subscription         # subscription (default) | api_key — see auth modes below
