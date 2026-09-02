@@ -131,7 +131,13 @@ FROZEN_FUNCTION_LINES = {
     # smaller before this landed; measured cc is 58, still under the 60
     # function-cc ceiling so no new `FROZEN_FUNCTION_CC` entry is needed.
     # Measured on this tree with the scanner below.
-    "cli/commands.py:bench_run": 398,
+    # 398 -> 400 (+2): pin-rederivation follow-up (no-human/89acc73f-2) adds
+    # one `console.print(escape(pin_rederivation_note(card)))` call after the
+    # publish summary, surfacing the recorded-branch/HEAD-fallback disclosure
+    # in the terminal, not just the markdown report. Already present on this
+    # branch before the quota-halt bump above; never previously reflected in
+    # the ratchet. Measured on the merge result with the scanner below.
+    "cli/commands.py:bench_run": 400,
     # Grew to 304 (> 300) when D3.1 (2026-08-31, auto-activation pipeline)
     # threaded `learning.auto_manage`/`learning.auto_activate_daily_cap`
     # through `nh serve`'s `HarvestJob` construction — the kill switch's own
@@ -142,7 +148,12 @@ FROZEN_FUNCTION_LINES = {
     # an inline enable+glob gate + the ui_evidence_block call. Reviewed on
     # its merits (the block is inert until a profile opts in); frozen here.
     "core/orchestrator.py:Orchestrator._build_implement_prompt": 371,
-    "eval/northstar_card.py:render_northstar_md": 332,
+    # 332 -> 333 (+1): pin-rederivation follow-up adds one
+    # `pin_rederivation_note(card),` line to the markdown body list so the
+    # published report carries the same recorded-branch/HEAD-fallback
+    # disclosure as the terminal (see the `bench_run` note above). Measured
+    # on the merge result with the scanner below.
+    "eval/northstar_card.py:render_northstar_md": 333,
     "core/orchestrator.py:Orchestrator._reformat_summary_markdown": 327,
     "core/orchestrator.py:Orchestrator._generate_plan": 322,
     "core/orchestrator.py:Orchestrator._scan_leaf_blocks": 319,
@@ -349,7 +360,21 @@ FROZEN_FILE_LINES = {
     # 8356 -> 8377 (+21): quota-saturation mid-run halt (`bench_run` growth
     # above) plus the `quota_halt` import block. Measured on this tree with
     # the scanner below.
-    "cli/commands.py": 8377,
+    # 8377 -> 8411 (+34): pin-rederivation follow-up (no-human/89acc73f-2).
+    # `bench_build` reloads the freshly-written specs and prints the
+    # repaired/not-re-derivable disclosure counts instead of a bare "N specs
+    # written" (+17, incl. the AST-guard docstring explaining the int(...)
+    # wrapping); `bench_run` and `bench_report` each gain one
+    # `console.print(escape(pin_rederivation_note(card)))` call plus its
+    # import (+4); `_compare_side` gains the `recorded` parameter, its
+    # disambiguating branch, and an expanded docstring (+16); the two
+    # `bench_compare` call sites thread `cmp.rederived_recorded_a/b` (net
+    # +0, existing lines widened); `bench_report`'s import line wraps to two
+    # lines for `pin_rederivation_note` (+1); net -4 from removed/collapsed
+    # lines the disclosure and docstring rewrites replaced. Measured on this
+    # tree with the scanner below (43 added - 9 removed per
+    # `git diff --numstat 8356553f6 -- src/no_human/cli/commands.py`).
+    "cli/commands.py": 8411,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`

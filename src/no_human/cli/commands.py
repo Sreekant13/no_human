@@ -7156,7 +7156,9 @@ def _spec_set_key(specs, trials: int = 1) -> str:
                    "GITIGNORED; raw specs hold verbatim conversation content).")
 def bench_build(days, roots, out_dir):
     """Build benchmark specs from ALL conversation sources."""
-    from ..eval.bench_task import GENERATED_DIR, build_bench_tasks
+    from ..eval.bench_task import (GENERATED_DIR, build_bench_tasks,
+                                   load_bench_tasks, spec_pin_not_rederivable,
+                                   spec_pin_rederived)
     from ..history.claude_code import extract_claude_code_transcripts
     from ..history.extractor import IDENotRunningError, extract_transcripts
 
@@ -7172,7 +7174,22 @@ def bench_build(days, roots, out_dir):
     target = Path(out_dir) if out_dir else GENERATED_DIR
     written = build_bench_tasks(transcripts, out_dir=target)
     runnable = sum(1 for _ in written)  # count; runnable split shown by report
-    console.print(f"[green]{runnable} specs written[/] → {escape(str(target))}")
+    # Reloaded rather than counted off `written` (a list of paths, not specs):
+    # a history rewrite can leave a spec's recorded pin unreachable, and
+    # disclosure of that repair is mandatory here — a rebuild that silently
+    # re-derived pins must never look identical to a clean one.
+    _rebuilt = load_bench_tasks(target)
+    rederived = sum(1 for s in _rebuilt if spec_pin_rederived(s))
+    not_rederivable = sum(1 for s in _rebuilt if spec_pin_not_rederivable(s))
+    # int(...) wrapping: not a type-safety concern (both are already ints from
+    # sum()) but the AST guard (tests/_bench_ast_guard.py) only recognizes
+    # Constant/len/int/float/round/sum/abs/escape calls/JoinedStr/BinOp as
+    # provably safe by shape — a bare Name would need a per-name allowlist
+    # entry in tests/test_bench_print_escape.py instead, which is exactly the
+    # enumeration that guard's docstring says it replaced.
+    console.print(f"[green]{runnable} specs written[/] · "
+                 f"{int(rederived)} pin(s) re-derived · "
+                 f"{int(not_rederivable)} not re-derivable → {escape(str(target))}")
     console.print("[dim]curate the core subset by copying reviewed specs up "
                   "into eval/northstar_tasks/ and setting subset: core[/]")
 
@@ -7292,6 +7309,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         RESULTS_DIR,
         NorthStarCard,
         northstar_gate,
+        pin_rederivation_note,
         publish_refusals,
         success_headline,
     )
@@ -7644,6 +7662,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             f"median cost ratio {agg['median_cost_ratio']} (basis: {agg['median_cost_ratio_basis']}) · "
             f"corrections avoided {agg['corrections_avoided']} → "
             f"{out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}")
+        console.print(escape(pin_rederivation_note(card)))
         refusals = publish_refusals(card, previous)
         if refusals:
             console.print("[yellow]not publishable as the baseline:[/]")
@@ -7933,11 +7952,25 @@ def _load_results_json(name: str) -> tuple[dict, Path]:
     return data, path
 
 
-def _compare_side(label: str, created: str, rate: float, specs: int) -> str:
+def _compare_side(label: str, created: str, rate: float, specs: int,
+                  rederived: int = 0, recorded: bool = True) -> str:
     """One run's headline line, built as plain text so the caller can escape it
-    whole — the label comes out of a results FILE and can hold `[/x]`."""
+    whole — the label comes out of a results FILE and can hold `[/x]`.
+
+    ``rederived`` defaults to 0 rather than being required: a results file
+    predating `pin_rederived_spec_count` still has to render a line. But a
+    default-0 count is ambiguous with a genuine zero, so ``recorded``
+    (``Comparison.rederived_recorded_a/b``) disambiguates: when the field
+    was never in that results file at all, this prints `unrecorded` instead
+    of claiming `0 re-derived pin(s)` — a count this function was never
+    actually handed."""
+    if not recorded:
+        rederived_text = "pin re-derivation: unrecorded (results file predates the field)"
+    else:
+        rederived_text = f"{rederived} re-derived pin(s)"
     return (f"{label or '(unlabelled)'} · {created or 'undated'} · "
-            f"{rate:.1%} of {specs} measured spec(s)")
+            f"{rate:.1%} of {specs} measured spec(s) · "
+            f"{rederived_text}")
 
 
 @bench.command("compare")
@@ -7991,8 +8024,8 @@ def bench_compare(run_a: str, run_b: str, canary_files, cost_top: int,
 
     console.print("[bold]paired per-spec comparison[/] "
                   f"({escape(path_a.name)} → {escape(path_b.name)})")
-    console.print(f"  A (baseline) {escape(_compare_side(cmp.label_a, cmp.created_a, cmp.rate_a, cmp.specs_a))}")
-    console.print(f"  B (change)   {escape(_compare_side(cmp.label_b, cmp.created_b, cmp.rate_b, cmp.specs_b))}")
+    console.print(f"  A (baseline) {escape(_compare_side(cmp.label_a, cmp.created_a, cmp.rate_a, cmp.specs_a, cmp.rederived_a, cmp.rederived_recorded_a))}")
+    console.print(f"  B (change)   {escape(_compare_side(cmp.label_b, cmp.created_b, cmp.rate_b, cmp.specs_b, cmp.rederived_b, cmp.rederived_recorded_b))}")
     console.print(f"  [dim]{escape(headline_caveat())}[/]")
     console.print("")
 
@@ -8199,8 +8232,8 @@ def bench_report(reviewer_recall: bool):
         return
 
     from ..eval.northstar_card import (
-        REPORT_MD, RESULTS_DIR, NorthStarCard, publish_refusals,
-        render_northstar_md)
+        REPORT_MD, RESULTS_DIR, NorthStarCard, pin_rederivation_note,
+        publish_refusals, render_northstar_md)
 
     card = NorthStarCard.load(RESULTS_DIR / "latest.json")
     if card is None:
@@ -8251,6 +8284,7 @@ def bench_report(reviewer_recall: bool):
 
     REPORT_MD.write_text(_render_report_or_refuse(card))
     console.print(f"[green]report rendered[/] → {REPORT_MD}")
+    console.print(escape(pin_rederivation_note(card)))
     _print_pr_outcome_block()
 
 

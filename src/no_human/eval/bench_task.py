@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -526,6 +527,188 @@ def _pin_for(repo_path: Path, branch: str, started: str) -> str:
         return ""
 
 
+# A history rewrite (rebase, filter-repo, force-push) can make a spec's
+# recorded pin unreachable in the very repo it was cut from. Re-derivation
+# repairs that at BUILD time only — never at run time (`check_repo_map`'s
+# probe and skip path are unchanged) — and refuses by name rather than ever
+# guessing a replacement commit.
+# The date was parseable but still refused: `_rederive_pin` found nothing
+# at-or-before it on the recorded branch (or its HEAD fallback).
+PIN_NOT_REDERIVABLE = ("pin unreachable and no commit at-or-before the "
+                       "recorded start: not re-derivable")
+# The recorded start itself is missing or not a parsable ISO timestamp —
+# refused before ever calling git (`--before=<garbage>` silently reads as
+# "now", see `_ISO_PREFIX` below).
+PIN_START_UNPARSABLE = ("pin unreachable and the recorded start is missing "
+                        "or not a parsable timestamp: not re-derivable")
+# One set for every consumer that needs "was this refused for a pin
+# reason" without enumerating both names itself.
+PIN_REFUSAL_REASONS = frozenset({PIN_NOT_REDERIVABLE, PIN_START_UNPARSABLE})
+
+
+def spec_pin_not_rederivable(spec: "BenchTask") -> bool:
+    """Was this spec refused re-derivation, under either named reason?"""
+    return spec.skip_reason in PIN_REFUSAL_REASONS
+
+
+# `git --before=<garbage>` silently reads an unparsable date as "now" and
+# hands back today's tip disguised as a "derived" pin. This is the guard: a
+# `started` that does not even look like an ISO timestamp is refused, never
+# handed to git.
+_ISO_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+
+
+def _pin_reachable(repo_path: Path, pin: str) -> bool | None:
+    """Tri-state probe: does *pin* still resolve to a commit in *repo_path*?
+
+    Mirrors ``check_repo_map``'s own ``git cat-file -e <pin>^{commit}`` probe
+    and its 5s timeout exactly, so "reachable" means the same thing at build
+    time as it does at run time. ``None`` — the probe itself did not run to
+    completion (no ``git``, a cold mount timing out) — is FAIL-CLOSED: an
+    unverified probe must never be read as "unreachable" and trigger a
+    rewrite of a pin that was never actually broken.
+    """
+    try:
+        rc = subprocess.run(
+            ["git", "-C", str(repo_path), "cat-file", "-e", f"{pin}^{{commit}}"],
+            capture_output=True, timeout=5,
+        ).returncode
+    except subprocess.TimeoutExpired:
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return rc == 0
+
+
+class _ProbeUnverifiable(Exception):
+    """A git probe did not run to completion (timeout, missing ``git``, a
+    cold mount). Distinct from a probe that ran and returned a negative
+    answer — a transient failure must never be read as a confirmed "no"."""
+
+
+def _branch_exists(repo_path: Path, branch: str) -> bool:
+    """Did ``git`` actually confirm ``branch`` is missing? Raises
+    ``_ProbeUnverifiable`` when the check itself could not complete, so a
+    transient failure is never conflated with "branch confirmed absent" —
+    the same fail-closed shape as ``_pin_reachable``."""
+    try:
+        rc = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", branch],
+            cwd=repo_path, capture_output=True, timeout=5,
+        ).returncode
+    except subprocess.TimeoutExpired as exc:
+        raise _ProbeUnverifiable(str(exc)) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _ProbeUnverifiable(str(exc)) from exc
+    return rc == 0
+
+
+def _rederive_pin(repo_path: Path, branch: str, started: str) -> str:
+    """Re-derive a dead pin by date: the tip of the spec's own recorded
+    ``branch`` as of ``started``, reusing the untouched ``_pin_for`` (same
+    ``branch or "HEAD"`` rule it has always used — no new default-branch
+    discovery, that is a human-gated decision).
+
+    One added fallback: if ``branch`` no longer exists in the rewritten repo
+    — the common case, since a rewrite that drops a pin often drops the
+    branch that produced it too — fall back to ``HEAD`` rather than refuse.
+    Empty string when no commit exists at or before ``started`` on either
+    ref: the caller refuses by name instead of guessing.
+
+    Raises ``_ProbeUnverifiable`` when the branch-existence check itself
+    could not complete (timeout / cold mount / missing ``git``): the caller
+    must leave the spec untouched rather than silently re-deriving against
+    HEAD on the unproven assumption that the recorded branch is gone.
+    """
+    use_branch = branch or "HEAD"
+    if use_branch != "HEAD" and not _branch_exists(repo_path, use_branch):
+        use_branch = "HEAD"
+    return _pin_for(repo_path, use_branch, started)
+
+
+def spec_pin_rederived(spec: "BenchTask") -> bool:
+    """Was this spec's pin re-derived by date from a rewritten history,
+    rather than being the commit the source session actually ran against?
+    One predicate for every consumer (`northstar.py`'s scoring path,
+    reports, comparisons)."""
+    return bool(spec.repo.get("pin_rederived"))
+
+
+class _PinRepairKind(Enum):
+    """Four outcomes for one spec's recorded pin. Never a fifth: this is a
+    closed decision, not an extensible one — a new outcome here means a new
+    named refusal reason too, not a silent guess."""
+    UNTOUCHED = "untouched"   # pin decision left exactly as recorded
+    REACHABLE = "reachable"   # recorded pin still resolves — no change
+    REDERIVED = "rederived"   # dead pin replaced by a date-derived one
+    REFUSED = "refused"       # dead pin, no replacement — named refusal
+
+
+@dataclass(frozen=True)
+class _PinRepair:
+    kind: _PinRepairKind
+    pin: str = ""            # REDERIVED only: the new pin
+    pin_original: str = ""   # REDERIVED/REFUSED only: the dead pin to keep
+    reason: str = ""         # REFUSED only: PIN_NOT_REDERIVABLE or PIN_START_UNPARSABLE
+
+
+def _repair_pin(probe_path: Path | None, *, recorded_pin: str,
+                recorded_branch: str, pin_original: str,
+                started: str) -> _PinRepair:
+    """Decide what, if anything, one spec's recorded pin needs on rebuild.
+    The single repair site shared by the transcript loop and the sweep
+    (`_sweep_unreached_specs`), so both apply identical fail-closed,
+    refuse-by-name rules.
+
+    UNTOUCHED — pin empty/``"HEAD"``, no probe-able git repo at
+    *probe_path*, the reachability probe itself did not run to completion
+    (``_pin_reachable`` returns ``None``), or the branch-existence check
+    could not complete (``_ProbeUnverifiable``). The caller must leave the
+    pin DECISION alone — carry the recorded ``pin``/``pin_original``/
+    ``pin_rederived`` forward exactly as read; nothing else about this
+    outcome says the rest of the spec can't still refresh.
+    REACHABLE — the recorded pin still resolves. Caller carries the
+    existing repo fields forward unchanged; this, not a skip-write, is what
+    makes a resolvable-pin rebuild byte-identical (``_pin_for`` and this
+    function are both deterministic on unchanged inputs).
+    REDERIVED — the recorded pin is confirmed dead and a replacement exists
+    at-or-before *started* on *recorded_branch* (or its HEAD fallback, see
+    ``_rederive_pin``).
+    REFUSED — the recorded pin is confirmed dead and either *started* is
+    missing/unparsable (``PIN_START_UNPARSABLE``) or no replacement exists
+    on the branch (``PIN_NOT_REDERIVABLE``). The dead pin is preserved as
+    ``pin_original``, never silently replaced by a freshly-computed live
+    one under a spec claiming to record the original tree.
+    """
+    if not recorded_pin or recorded_pin == "HEAD":
+        return _PinRepair(_PinRepairKind.UNTOUCHED)
+    if (probe_path is None or not probe_path.is_dir()
+            or not (probe_path / ".git").exists()):
+        return _PinRepair(_PinRepairKind.UNTOUCHED)
+
+    reachable = _pin_reachable(probe_path, recorded_pin)
+    if reachable is None:
+        return _PinRepair(_PinRepairKind.UNTOUCHED)
+    if reachable:
+        return _PinRepair(_PinRepairKind.REACHABLE)
+
+    resolved_original = pin_original or recorded_pin
+    if not started or not _ISO_PREFIX.match(started):
+        return _PinRepair(_PinRepairKind.REFUSED, reason=PIN_START_UNPARSABLE,
+                          pin_original=resolved_original)
+
+    try:
+        new_pin = _rederive_pin(probe_path, recorded_branch, started)
+    except _ProbeUnverifiable:
+        return _PinRepair(_PinRepairKind.UNTOUCHED)
+
+    if new_pin:
+        return _PinRepair(_PinRepairKind.REDERIVED, pin=new_pin,
+                          pin_original=resolved_original)
+    return _PinRepair(_PinRepairKind.REFUSED, reason=PIN_NOT_REDERIVABLE,
+                      pin_original=resolved_original)
+
+
 def build_bench_tasks(
     transcripts: list[Transcript], *, out_dir: Path = GENERATED_DIR,
 ) -> list[Path]:
@@ -533,11 +716,41 @@ def build_bench_tasks(
     ``_first_request`` (the initial user message) is copied; assistant text
     never reaches the spec. Dedupes resumed/continued sessions by the hash of
     that first request. Non-runnable conversations are still written (with
-    ``runnable: false`` + reason) so coverage accounting stays honest."""
+    ``runnable: false`` + reason) so coverage accounting stays honest.
+
+    Every spec named by a transcript is rebuilt from that transcript on
+    every call — a changed source (edited/re-extracted transcript) refreshes
+    ``title``/``original`` (tokens, wall-clock, corrections) rather than
+    freezing them at first-write forever. This can only overwrite a spec's
+    GENERATED fields: hand-curated fields (acceptance criteria, holdout,
+    judge rubric) live in the same YAML but this builder only ever emits the
+    generated ones (see ``BenchTask.to_dict``) into ``out_dir``
+    (``eval/northstar_tasks/generated``, gitignored) — the tracked, curated
+    copies under ``eval/northstar_tasks/`` are a separate, human-curated
+    step, never overwritten by this function.
+
+    Also the ONLY writer that may repair a pin a history rewrite made
+    unreachable (`_repair_pin`, shared with `_sweep_unreached_specs` below):
+    an existing spec whose recorded pin no longer resolves gets a
+    date-derived replacement with ``pin_rederived: true`` and the dead pin
+    preserved as ``pin_original``, or — if no replacement exists, or
+    ``started`` is missing/unparsable — a named refusal
+    (``PIN_NOT_REDERIVABLE`` / ``PIN_START_UNPARSABLE``) rather than a
+    guess. A spec whose pin still resolves has its repo fields carried
+    forward unchanged; combined with deterministic rebuilding of everything
+    else, a clean rebuild is byte-identical without needing a skip-write.
+    Nothing here runs at replay time; the runner's skip behaviour for a
+    still-unreachable pin is unchanged.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     seen_requests: set[str] = set()
+    # Probe-path translation only (never written into a spec): a TRACKED
+    # spec's `repo.path` is vendor-neutral and resolves nowhere on its own;
+    # the local, gitignored map restores the real checkout for the
+    # reachability probe exactly as `load_bench_tasks` does for a run.
+    mapping = load_repo_map()
 
     for t in transcripts:
         request = _first_request(t)
@@ -549,6 +762,20 @@ def build_bench_tasks(
         seen_requests.add(req_hash)
 
         tid = f"ns-{hashlib.sha256(t.cascade_id.encode()).hexdigest()[:8]}"
+        p = out_dir / f"{tid}.yaml"
+
+        existing_data: dict[str, Any] = {}
+        if p.exists():
+            try:
+                loaded = yaml.safe_load(p.read_text())
+            except yaml.YAMLError:
+                log.warning("%s: malformed existing spec YAML — treating as absent", tid)
+                loaded = None
+            if isinstance(loaded, dict):
+                existing_data = loaded
+            elif loaded:
+                log.warning("%s: existing spec YAML is not a mapping — treating as absent", tid)
+
         # Claude Code carries cwd; Windsurf carry workspace URIs — the  # term-ok: real IDE names
         # original 89-conversation corpus is ALL workspaces-shaped.
         cwd = getattr(t, "cwd", "") or ""
@@ -556,19 +783,80 @@ def build_bench_tasks(
             from ..history.analyzer import _project_from_workspaces
             cwd = _project_from_workspaces(getattr(t, "workspaces", []) or [])
         branch = getattr(t, "git_branch", "") or ""
+        # The corpus is the record: a `started` already recorded on the spec
+        # beats one re-extracted from a transcript that may have moved on.
+        existing_provenance = dict(existing_data.get("source") or {})
+        started = str(existing_provenance.get("started")
+                      or getattr(t, "started", "") or "")
+
+        existing_repo = dict(existing_data.get("repo") or {})
+        recorded_pin = str(existing_repo.get("pin") or "")
+
         runnable, skip_reason, pin = True, "", ""
+        repo_override: dict[str, Any] | None = None
 
         repo_path = Path(cwd) if cwd else None
         if repo_path is None or not repo_path.is_dir():
             runnable, skip_reason = False, f"repo missing: {cwd or '(unknown cwd)'}"
         elif not (repo_path / ".git").exists():
             runnable, skip_reason = False, f"not a git repo: {cwd}"
+        elif recorded_pin:
+            # An existing spec's recorded pin is the record of what the
+            # session actually ran against — repair it (via the shared
+            # `_repair_pin`) rather than blindly recomputing a fresh one.
+            # This carries a resolvable pin's repo fields forward unchanged
+            # (REACHABLE) and converges a rewritten-history pin
+            # (REDERIVED/REFUSED); it never runs for a brand-new spec.
+            translated = (remap_repo_path(str(repo_path), mapping)
+                         if mapping else str(repo_path))
+            probe_path = Path(translated)
+            repair = _repair_pin(
+                probe_path, recorded_pin=recorded_pin,
+                recorded_branch=str(existing_repo.get("branch") or ""),
+                pin_original=str(existing_repo.get("pin_original") or ""),
+                started=started)
+
+            if repair.kind is _PinRepairKind.REDERIVED:
+                pin = repair.pin
+                repo_override = {
+                    "path": existing_repo.get("path", cwd),
+                    "pin": pin,
+                    "pin_original": repair.pin_original,
+                    "pin_rederived": True,
+                    "branch": existing_repo.get("branch", branch),
+                }
+                runnable, skip_reason = True, ""
+            elif repair.kind is _PinRepairKind.REFUSED:
+                pin = recorded_pin
+                repo_override = dict(existing_repo)
+                repo_override["pin_original"] = repair.pin_original
+                runnable, skip_reason = False, repair.reason
+            else:
+                # UNTOUCHED or REACHABLE — the pin DECISION is left exactly
+                # as recorded. Only a confirmed-reachable pin (never an
+                # unverified probe, which proves nothing either way) may
+                # clear a stale pin-refusal stamp, and only a stamp that was
+                # actually a pin refusal — this branch runs only once the
+                # repo-validity checks above already passed, so it must
+                # never clear an unrelated `repo missing:`/`not a git
+                # repo:` reason recorded earlier.
+                pin = recorded_pin
+                repo_override = dict(existing_repo)
+                prev_runnable = bool(existing_data.get("runnable", True))
+                prev_reason = str(existing_data.get("skip_reason") or "")
+                if (repair.kind is _PinRepairKind.REACHABLE and not prev_runnable
+                        and prev_reason in PIN_REFUSAL_REASONS):
+                    runnable, skip_reason = True, ""
+                else:
+                    runnable, skip_reason = prev_runnable, prev_reason
         else:
-            pin = _pin_for(repo_path, branch, getattr(t, "started", ""))
+            pin = _pin_for(repo_path, branch, started)
             if not pin:
                 pin = "HEAD"  # advisory fallback; curator may flip runnable
 
-        started = getattr(t, "started", "") or ""
+        repo = repo_override if repo_override is not None else {
+            "path": cwd, "pin": pin, "branch": branch}
+
         ended = getattr(t, "ended", "") or ""
         wall = 0.0
         if started and ended:
@@ -595,8 +883,9 @@ def build_bench_tasks(
                          else "claude_code"),
                 "session": t.cascade_id,
                 "label": getattr(t, "source", "") or "",
+                "started": started,
             },
-            repo={"path": cwd, "pin": pin, "branch": branch},
+            repo=repo,
             original={
                 "tokens": dict(getattr(t, "usage", {}) or {}),
                 "wall_clock_s": round(wall, 1),
@@ -606,8 +895,86 @@ def build_bench_tasks(
             runnable=runnable,
             skip_reason=skip_reason,
         )
-        p = out_dir / f"{tid}.yaml"
         p.write_text(yaml.safe_dump(spec.to_dict(), sort_keys=False,
                                     allow_unicode=True, width=100))
         written.append(p)
+
+    _sweep_unreached_specs(out_dir, written, mapping)
     return written
+
+
+def _sweep_unreached_specs(out_dir: Path, written: list[Path],
+                           mapping: dict[str, str]) -> None:
+    """Repair pins on spec files the transcript loop above never visited —
+    a spec whose source session has aged out of the transcript export (or
+    was deleted/rotated) still sits on disk with a dead pin forever unless
+    something revisits it. Build-time only, using the same `_repair_pin` as
+    the transcript loop; never runs at replay time.
+
+    Skips every path already in ``written`` (the transcript loop just
+    repaired it — the loop's own repair must never be double-applied here)
+    and every file that is not valid spec YAML (logged, left untouched).
+    Writes only on REDERIVED or REFUSED, and only if the serialized bytes
+    actually changed, so re-sweeping an already-repaired file is a true
+    no-op — a dead spec with no ``source.started`` at all is refused as
+    ``PIN_START_UNPARSABLE`` every time, never guessed.
+    """
+    visited = set(written)
+    specs = sorted(out_dir.glob("*.yaml")) + sorted(out_dir.glob("*.yml"))
+    for p in specs:
+        if p in visited:
+            continue
+        try:
+            loaded = yaml.safe_load(p.read_text())
+        except yaml.YAMLError:
+            log.warning("%s: malformed spec YAML — sweep leaving it alone", p.name)
+            continue
+        if not isinstance(loaded, dict):
+            if loaded:
+                log.warning("%s: spec YAML is not a mapping — sweep leaving it alone", p.name)
+            continue
+
+        existing_repo = dict(loaded.get("repo") or {})
+        recorded_pin = str(existing_repo.get("pin") or "")
+        if not recorded_pin or recorded_pin == "HEAD":
+            continue
+
+        repo_path_str = str(existing_repo.get("path") or "")
+        if not repo_path_str:
+            continue
+        translated = (remap_repo_path(repo_path_str, mapping)
+                     if mapping else repo_path_str)
+        probe_path = Path(translated)
+
+        started = str((loaded.get("source") or {}).get("started") or "")
+        repair = _repair_pin(
+            probe_path, recorded_pin=recorded_pin,
+            recorded_branch=str(existing_repo.get("branch") or ""),
+            pin_original=str(existing_repo.get("pin_original") or ""),
+            started=started)
+
+        if repair.kind is _PinRepairKind.REDERIVED:
+            new_data = dict(loaded)
+            new_data["repo"] = {
+                "path": existing_repo.get("path", repo_path_str),
+                "pin": repair.pin,
+                "pin_original": repair.pin_original,
+                "pin_rederived": True,
+                "branch": existing_repo.get("branch", ""),
+            }
+            new_data["runnable"] = True
+            new_data["skip_reason"] = ""
+        elif repair.kind is _PinRepairKind.REFUSED:
+            new_data = dict(loaded)
+            new_repo = dict(existing_repo)
+            new_repo["pin_original"] = repair.pin_original
+            new_data["repo"] = new_repo
+            new_data["runnable"] = False
+            new_data["skip_reason"] = repair.reason
+        else:
+            continue  # UNTOUCHED or REACHABLE — nothing to write
+
+        new_text = yaml.safe_dump(new_data, sort_keys=False,
+                                  allow_unicode=True, width=100)
+        if new_text != p.read_text():
+            p.write_text(new_text)

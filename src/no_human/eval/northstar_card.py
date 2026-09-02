@@ -269,6 +269,13 @@ class NorthStarCard:
     # confident "0", indistinguishable from a run that measured zero
     # unscoreable specs. Presence, not truthiness, mirrors ``ci_recorded``.
     unscoreable_recorded: bool = True
+    # Did the file this card came from record the pin_rederived field at
+    # all? True for any card built in memory. False for a loaded file
+    # predating this field — WITHOUT this flag a pre-change results file
+    # would render a confident "0 of N", indistinguishable from a run that
+    # measured zero re-derived pins. Presence, not truthiness, mirrors
+    # ``unscoreable_recorded``.
+    pin_rederived_recorded: bool = True
     # Set by `bench_run` when a quota-saturation halt cut the run short
     # (`quota_halt.HALTED_REASON_QUOTA`); "" for a run that completed (or a
     # legacy file predating this field). A run-status flag, not an aggregate
@@ -552,6 +559,25 @@ class NorthStarCard:
                     if _score_field(s, "unscoreable")})
 
     @property
+    def pin_rederived_specs(self) -> int:
+        """Rows scored against a pin re-derived by date from a rewritten
+        history (``bench_task.build_bench_tasks`` — never at run time)
+        rather than the pin the original task actually saw. Counted over
+        ``measured_scores``, not ``ran``: a re-derived pin on a row that
+        never measured anything (skipped/dead) does not touch the ratio a
+        reader is being warned about."""
+        return sum(1 for s in self.measured_scores
+                   if _score_field(s, "pin_rederived"))
+
+    @property
+    def pin_rederived_spec_count(self) -> int:
+        """Distinct specs with at least one MEASURED trial run against a
+        re-derived pin. See ``dead_spec_count`` for why rows and distinct
+        specs are both needed."""
+        return len({s.task_id for s in self.measured_scores
+                    if _score_field(s, "pin_rederived")})
+
+    @property
     def total_nh_tokens(self) -> int:
         return sum(s.nh_tokens for s in self.ran)
 
@@ -683,6 +709,11 @@ class NorthStarCard:
                 # not a denominator change.
                 "unscoreable_specs": self.unscoreable_specs,
                 "unscoreable_spec_count": self.unscoreable_spec_count,
+                # Measured rows/specs scored against a pin re-derived by date
+                # from a rewritten history — a partially-re-derived corpus
+                # must never be mistaken for a full-fidelity baseline.
+                "pin_rederived_specs": self.pin_rederived_specs,
+                "pin_rederived_spec_count": self.pin_rederived_spec_count,
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
                 "corpus_available": self.corpus_available,
@@ -750,6 +781,7 @@ class NorthStarCard:
             nh_role_tokens=s.get("nh_role_tokens") or {},
             nh_role_models=s.get("nh_role_models") or {},
             unscoreable=bool(s.get("unscoreable", False)),
+            pin_rederived=bool(s.get("pin_rederived", False)),
         ) for s in data.get("scores", [])]
         agg = data.get("aggregate") or {}
         return NorthStarCard(scores=scores,
@@ -766,6 +798,7 @@ class NorthStarCard:
                              # one, and that card is refused for other reasons.
                              ci_recorded="success_ci_low" in agg,
                              unscoreable_recorded="unscoreable_specs" in agg,
+                             pin_rederived_recorded="pin_rederived_specs" in agg,
                              created_at=data.get("created_at", ""),
                              label=data.get("label", ""),
                              override_reasons=list(
@@ -925,6 +958,41 @@ def unmeasured_specs(card: NorthStarCard) -> tuple[int, int]:
     reads as a *higher* success rate over the handful that survived.
     """
     return card.skipped + card.dead_specs, card.total
+
+
+def pin_rederivation_note(card: NorthStarCard) -> str:
+    """The `bench report`/`bench compare` disclosure line for
+    ``pin_rederived_spec_count``: history rewrites make a spec's recorded
+    pin unreachable, and `nh bench build` repairs it by re-deriving a pin
+    from the spec's own recorded start date rather than guessing or
+    dropping the spec (see ``bench_task.build_bench_tasks``). A run that
+    measured some specs against a re-derived pin ran against TODAY's
+    ancestor of that date, not the tree the original task actually saw —
+    a partially-re-derived corpus must never be mistaken for a
+    full-fidelity baseline, so this is surfaced unconditionally, including
+    the 0 case.
+
+    Three states, mirroring ``unscoreable_recorded``'s presence-vs-truthiness
+    split (a results file predating this field records nothing — an absence
+    of measurement, not a measured zero); counted over ``measured_scores``,
+    the same population every success figure divides over.
+    """
+    if not card.pin_rederived_recorded:
+        return ("- Specs replayed against a re-derived pin: **not recorded** "
+                "— this results file predates the field; the 0 it would "
+                "otherwise show is an absence of measurement, not a "
+                "measured zero")
+    k = card.pin_rederived_spec_count
+    total = len(card.measured_scores)
+    if k == 0:
+        return (f"- Specs replayed against a re-derived pin: **0** of "
+                f"{total} measured — every measured spec ran against the "
+                f"pin the original task actually saw")
+    return (f"- Specs replayed against a re-derived pin: **{k}** of {total} "
+            f"measured  ⚠ these ran against a commit date-derived from a "
+            f"rewritten history (`pin_rederived`), not the tree the "
+            f"original task actually saw — read this run as PARTIALLY "
+            f"re-derived, never as a full-fidelity baseline")
 
 
 def publish_refusals(card: NorthStarCard,
@@ -1387,6 +1455,7 @@ def render_northstar_md(card: NorthStarCard,
            if card.unscoreable_recorded else
            "  ⚠ **not recorded** — this results file predates the field; the "
            "0 is an absence of measurement, not a measured zero"),
+        pin_rederivation_note(card),
         f"- **Original-session follow-ups avoided on DELIVERED tasks: "
         f"{agg['corrections_avoided_delivered']}** (proxy for corrections)"
         f"  ·  a further "
