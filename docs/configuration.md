@@ -215,6 +215,9 @@ git:
   approve_identity:               # who a human merge is attributed to
     name: ""                      # empty -> resolved from this repo's git
     email: ""                     # config (user.name/user.email)
+  merge_identity_name: ""         # flat aliases for the same merge identity;
+  merge_identity_email: ""        # lower precedence than approve_identity,
+                                   # higher than the repo's own git config
 
 `approve_merge.enabled` is what makes `nh approve` LAND the pull request:
 squash the branch into one commit, push it to the default branch, and close
@@ -236,6 +239,15 @@ would use; it is deliberately never `git.agent_identity_name`/`_email`. Set
 both fields to override per install. If neither the config nor git yields
 both `name` and `email`, `nh approve` refuses with an explicit message
 rather than guessing.
+
+`git.merge_identity_name`/`.email` are flat aliases for the same merge
+identity, for installs where a flat pair of keys is more convenient to
+template or override than the nested `approve_identity` block. Resolution
+order, highest precedence first: `git.approve_identity.{name,email}`, then
+`git.merge_identity_name`/`.email`, then the repo's own resolved
+`user.name`/`user.email`. Like `approve_identity`, these are never a fallback
+to `git.agent_identity_name`/`_email` — an unresolvable identity still
+refuses rather than attributing the merge commit to the agent.
 
 safety:
   max_files_changed: null         # no size cap by default; set an int to escalate
@@ -706,6 +718,33 @@ ui_evidence:
                    # install: the browser fetches whatever the page references, so
                    # this is the key the egress allowlist charges that channel to.
 ```
+
+The switch above is the install-wide kill switch. The *per-repo* half — telling
+the walk which dev server to boot — lives in `<repo>/.no_human/project.yml`
+(and its mirrored DB row), not `~/.no_human/config.yaml`:
+
+```yaml
+# <repo>/.no_human/project.yml
+ui_evidence:
+  enabled: true
+  start_cmd: npm run dev
+  base_url: http://localhost:5173
+```
+
+Nothing wrote this before no-human-67: a repo could have Playwright installed
+and the kill switch on, and the walk still had no `start_cmd`/`base_url` to
+boot. `nh onboard <repo>` now detects a `dev` script in the repo's own
+`package.json` — only when a known framework (vite, `@sveltejs/kit`, next,
+nuxt, `react-scripts`, astro, `@angular/cli`, `@vue/cli-service`) is also a
+declared dependency, so the port is read off the framework, never guessed —
+and offers a single "Enable visual-proof walks?" (Yes/No, default No) prompt.
+Accepting writes the block above to both `project.yml` and the DB row in one
+step; declining, or a repo with no `dev` script, writes nothing. Once
+`ui_evidence` is configured — by this prompt or by hand — it is never
+suggested again: manual config always wins. `nh doctor` names the same gap
+("visual-proof walks: repo not configured — detected `npm run dev` on :5173,
+enable?") for any known repo that still has no `ui_evidence` configured; it is
+an advisory only and never affects doctor's exit code.
 
 ## Timeouts read straight from your config
 

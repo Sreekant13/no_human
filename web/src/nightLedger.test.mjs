@@ -24,19 +24,38 @@ test("counts done / real-failed / needs-you inside the window only", () => {
   assert.equal(s.quiet, false);
 });
 
-test("cost sums the API's cost_usd across every task in the window", () => {
-  // ledgerSummary sums `taskCost(t)` per task, and taskCost is now a pure read of
-  // `t.cost_usd` — the API (core/cost.py) already priced coder + reviewer + aux
-  // per-model before this field ever reaches the board. PR #104 review found the
-  // ledger once reading attempt-level names that do not exist on tasks — priced
-  // everything at $0 with a test written to the bug; the guard now is that the
-  // ledger's total is exactly the sum of each task's own API-priced cost_usd.
+// The old "cost sums cost_usd across tasks in the window" test's premise WAS
+// the bug: it filtered tasks by `updated_at` and summed each survivor's
+// LIFETIME `cost_usd`, so closing an old task with no new spend swept its
+// whole historical cost into "last 24h". `ledgerSummary` no longer reads
+// `cost_usd`/`total_tokens` off tasks at all — `spend` (the server's
+// attempt-attributed `/api/metrics/window` payload) is the only source.
+test("cost and tokens are the server's window figure, never re-derived from task rows", () => {
   const s = ledgerSummary([
-    t("done", 1, { cost_usd: 3.30, cost_model: "claude-sonnet-5" }),
-    t("done", 2, { cost_usd: 1.75, cost_model: "gpt-5.3-codex" }),
-  ], NOW);
-  assert.equal(s.cost, 5.05);
-  assert.ok(s.cost > 0);
+    t("done", 1, { cost_usd: 999, total_tokens: 999_999 }),
+    t("done", 2, { cost_usd: 999, total_tokens: 999_999 }),
+  ], NOW, undefined, { cost_usd: 1.25, tokens: 40 });
+  assert.equal(s.cost, 1.25);
+  assert.equal(s.tokens, 40);
+});
+
+test("a task closed in the window with lifetime cost contributes nothing to the ledger's cost", () => {
+  // JS mirror of repro #1: a task with a large lifetime cost_usd, closed
+  // (touched) inside the window, but the server says nothing NEW was spent.
+  const s = ledgerSummary(
+    [t("failed", 1, { cost_usd: 18.68 })], NOW, undefined,
+    { cost_usd: 0, tokens: 0 },
+  );
+  assert.equal(s.cost, 0);
+  assert.equal(s.tokens, 0);
+  assert.equal(s.failed, 1); // the event itself still counts — only cost is zeroed
+});
+
+test("no server figure (old daemon, 404) shows no spend line rather than a wrong one", () => {
+  const s = ledgerSummary([t("done", 1)], NOW, undefined, null);
+  assert.equal(s.cost, 0);
+  assert.equal(s.tokens, 0);
+  assert.equal(s.done, 1);
 });
 
 test("a window with no events AND no spend is quiet; spend alone is not", () => {
@@ -44,8 +63,9 @@ test("a window with no events AND no spend is quiet; spend alone is not", () => 
   assert.equal(quiet.quiet, true);
   assert.equal(quiet.cost, 0);
   // An in-flight task that burned real tokens is NOT a quiet night (review
-  // finding 4: "quiet" must never hide spend).
-  const burning = ledgerSummary([t("implementing", 1, { cost_usd: 1.5 })], NOW);
+  // finding 4: "quiet" must never hide spend) — the burn is now reported by
+  // the server's window figure, not a per-task field.
+  const burning = ledgerSummary([t("implementing", 1)], NOW, undefined, { cost_usd: 1.5, tokens: 500 });
   assert.equal(burning.quiet, false);
   assert.ok(burning.cost > 0);
 });
@@ -67,4 +87,18 @@ test("window is configurable", () => {
   const s = ledgerSummary([t("done", 30)], NOW, 48 * 3600_000);
   assert.equal(s.done, 1);
   assert.equal(LEDGER_WINDOW_MS, 24 * 3600_000);
+});
+
+// Mixed-format regression: `updated_at`/`created_at` mix naive-space
+// 'YYYY-MM-DD HH:MM:SS' (implicitly UTC) and iso-offset strings from the same
+// DB column. `new Date("2026-07-17 04:00:00")` parses in the HOST's local
+// timezone rather than UTC, so on a host west of UTC this naive-space row
+// (2h before NOW) could get pushed outside the 24h window entirely. Routed
+// through timestampMs, the naive-space string is always parsed as UTC, so it
+// counts regardless of the machine's TZ.
+test("a naive-space updated_at inside the window is counted regardless of TZ parsing", () => {
+  const s = ledgerSummary([
+    { status: "done", updated_at: "2026-07-17 04:00:00" }, // NOW is 2026-07-17T06:00:00Z
+  ], NOW);
+  assert.equal(s.done, 1);
 });

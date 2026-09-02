@@ -36,7 +36,7 @@ from ..blockers import human_gate_armed
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import (DEFAULT_CONFIG, active_auth_profile, parallelism_enabled,
                       pid_alive, process_start_token, worktree_isolation_enabled)
-from ..vcs.pr_watcher import orphan_landed_evidence
+from ..vcs.pr_watcher import landing_sha_candidates, orphan_landed_evidence
 from ..vcs.task_pr import resolve_task_pr
 from .bounds import QuotaExhausted
 from .db import Store
@@ -44,7 +44,10 @@ from . import plan_gate
 from . import slot_wait
 from .events import EventPersister
 from .infra_breaker import infra_breaker
-from .task import LANDED_RECONCILABLE, TaskStatus, priority_rank
+from .task import (
+    LANDED_RECONCILABLE, TERMINAL_LANDED_RECONCILABLE, TaskStatus,
+    priority_rank,
+)
 from .worktree import salvage_dead_worktrees, sweep_stale_worktrees
 
 log = logging.getLogger("no_human.scheduler")
@@ -1097,6 +1100,121 @@ class Scheduler:
             log.warning("landed-orphan reconciliation failed for %s: %s",
                         t.id[:8], exc)
             return False
+
+    async def _terminal_landed_evidence(self, t, base: str) -> dict | None:
+        """Gather + probe evidence for one TERMINAL candidate row — the
+        per-row body factored out of `_reconcile_landed_terminal` to keep
+        that method's complexity down.
+
+        Candidate shas come from two places: a free-text `cancel_reason`
+        (via `landing_sha_candidates` — regex only, never resolved through a
+        forge API) and the row's own last attempt commit. Each candidate is
+        tried against `orphan_landed_evidence` alongside the recorded
+        `pr_url`, first truthy result wins. If there are no sha candidates at
+        all but a `pr_url` is recorded, one call is made with `commit_sha=""`
+        so the PR's squash-subject scan still runs. No candidates and no
+        `pr_url` — `None`, no git subprocess spawned.
+        """
+        ctx = t.context or {}
+        pr_url = await self.store.latest_attempt_pr_url(t.id)
+        branch_info = await self.store.latest_attempt_branch(t.id)
+        commit_sha = (branch_info or {}).get("commit_sha") or ""
+        candidates = landing_sha_candidates(str(ctx.get("cancel_reason") or ""))
+        if commit_sha and commit_sha not in candidates:
+            candidates = [*candidates, commit_sha]
+        if candidates:
+            for cand in candidates:
+                evidence = await orphan_landed_evidence(
+                    t.repo_path, base, commit_sha=cand, pr_url=pr_url)
+                if evidence:
+                    return evidence
+            return None
+        if pr_url:
+            return await orphan_landed_evidence(
+                t.repo_path, base, commit_sha="", pr_url=pr_url)
+        return None
+
+    async def _reconcile_one_landed_terminal(self, t) -> bool:
+        """True when a TERMINAL (failed/cancelled) row's recorded work is
+        provably reachable from its base branch, in which case it is
+        reconciled to DONE via `Store.reconcile_landed_terminal` instead of
+        staying failed forever. The TERMINAL-row twin of
+        `_reconcile_landed_orphan` — same fail-open-on-ambiguity contract,
+        same LOCAL-GIT-ONLY probe, same post-probe re-check before writing.
+        """
+        try:
+            if t.status not in TERMINAL_LANDED_RECONCILABLE:
+                return False
+            ctx = t.context or {}
+            base = ctx.get("base_branch")
+            if not base or not t.repo_path:
+                # Never guess a base branch — a row without one is skipped
+                # untouched, same as `_reconcile_landed_orphan`.
+                return False
+            evidence = await self._terminal_landed_evidence(t, base)
+            if not evidence:
+                return False
+            # Re-check terminality: the probe just ran arbitrary-duration git
+            # subprocesses, during which a human could have restored/retried
+            # this row out from under us.
+            current = await self.store.get_task(t.id)
+            if current is None or current.status is not TaskStatus.FAILED:
+                return False
+            reconciled = await self.store.reconcile_landed_terminal(
+                current, evidence=evidence,
+                event={
+                    "source": "orchestrator", "kind": "terminal_reconciled",
+                    "text": (f"reconciled: work landed while failed/cancelled "
+                             f"({evidence['kind']} {evidence['sha'][:8]} "
+                             f"on {base}) — {t.id[:8]} completed instead of "
+                             "staying failed"),
+                    "ts": time.time(),
+                },
+            )
+            if reconciled is None:
+                return False
+            self._on_event(
+                "terminal_reconciled",
+                f"{t.id[:8]} was failed/cancelled but had already landed on "
+                f"{base} — reconciled to DONE")
+            return True
+        except Exception as exc:  # noqa: BLE001 — the sweep must never block on this
+            log.warning("landed-terminal reconciliation failed for %s: %s",
+                        t.id[:8], exc)
+            return False
+
+    async def _reconcile_landed_terminal(self, *, limit: int = 200) -> int:
+        """Startup-only: complete TERMINAL failed/cancelled rows whose
+        recorded work already landed on their base branch, instead of
+        leaving them failed forever with no path back to DONE.
+
+        This is `TERMINAL_LANDED_RECONCILABLE` / `Store.reconcile_landed_terminal`'s
+        sweep — the terminal-row twin of `_reconcile_landed_orphan`, which
+        only ever runs against non-terminal (`LANDED_RECONCILABLE`) rows
+        found by `_recover_orphans` and is otherwise left untouched by this
+        method. Runs once at startup, not on a per-tick cadence: each
+        candidate row can cost several git subprocesses
+        (`_terminal_landed_evidence`), and `landed_sha IS NULL` in
+        `Store.landed_reconcilable_terminal_tasks` already makes a repeat
+        pass a cheap no-op, so there is no benefit to running this more
+        often than once per boot. Must never block boot — every failure
+        mode here is caught and logged, never raised.
+        """
+        try:
+            candidates = await self.store.landed_reconcilable_terminal_tasks(
+                limit=limit)
+        except Exception:  # noqa: BLE001 — the sweep must never block boot
+            log.exception("startup: fetching landed-terminal candidates failed")
+            return 0
+        reconciled = 0
+        for t in candidates:
+            if await self._reconcile_one_landed_terminal(t):
+                reconciled += 1
+        if reconciled:
+            log.info(
+                "startup: reconciled %d terminal row(s) whose recorded work "
+                "had already landed", reconciled)
+        return reconciled
 
     async def _read_heartbeat_with_retry(self) -> dict | None:
         """Read the id=1 heartbeat row, retrying a bounded number of times on
@@ -2242,6 +2360,13 @@ class Scheduler:
         # recover a checkpoint, and a row left open on a task that already
         # FINISHED is not a checkpoint to resume from — it is debris.
         await self._reconcile_terminal_task_attempts()
+        # Also startup-only, and also before the orphan sweep: a TERMINAL
+        # failed/cancelled row whose recorded work already landed on its
+        # base branch has the same "no path back to DONE" problem as an
+        # orphan whose requeue would duplicate shipped work — see
+        # `_reconcile_landed_terminal`. Bounded git cost per candidate row is
+        # why this runs once per boot, not on the tick's hot path.
+        await self._reconcile_landed_terminal()
         await self._sweep_stale_worktrees()
         # AFTER the sweep (which only reclaims TERMINAL leftovers and never
         # touches this) and BEFORE orphan recovery: an IMPLEMENTING task's

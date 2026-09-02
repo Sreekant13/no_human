@@ -18,6 +18,13 @@ contextBridge.exposeInMainWorld("nhSetup", {
   // First-run requirements check (claude/node on PATH) — see nh:requirements
   // in main.mjs for what it returns and why the setup screen needs it.
   requirements: () => ipcRenderer.invoke("nh:requirements"),
+  // "Use my existing Claude Code sign-in": a status probe (read-only, safe to
+  // call on load) and the click-triggered import itself (never called
+  // automatically — see nh:claude-import-token in main.mjs). Both return
+  // plain {ok}/{detected}/{error} shapes; the credential value never crosses
+  // this bridge.
+  claudeSignInStatus: () => ipcRenderer.invoke("nh:claude-signin-status"),
+  importClaudeSignIn: () => ipcRenderer.invoke("nh:claude-import-token"),
 });
 
 // `npm_package_version` is set by `npm run`, and NOTHING sets it in a packaged

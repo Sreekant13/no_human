@@ -832,6 +832,33 @@ verify_rc=0
 "${PY}" "${ROOT}/scripts/verify_artefact.py" "${v_mnt}" \
   --repo "${ROOT}" ${allow_dirty} ${local_flag} ${expect_flag} || verify_rc=$?
 
+# codesign/spctl/stapler (above) answer WHO built this and WHETHER APPLE SAW
+# IT; verify_artefact.py answers WHICH SOURCE it was built from. Neither asks
+# what the app ITSELF believes about being updatable. The 0.1.8 DMG was
+# signed, notarized (after the fact) and stapled — every check above would
+# have passed — yet its app.asar carried nhCanAutoUpdate=false, so every
+# install of that release had "Download now" permanently disabled with only
+# the Open-downloads fallback working. Not piped (a pipe would swallow the rc
+# under `set -euo pipefail`), and run while ${v_mnt} is still mounted.
+#
+# The helper lives in a TRACKED sibling file, so every real checkout of this
+# repo has it — ROOT is derived from where make-dmg.sh itself sits (see the
+# top of this script), and packaging/check-update-stamp.sh sits right beside
+# it. The only place it can be missing is a harness that builds its own
+# synthetic ${ROOT} without copying packaging/ at all — that is a fixture
+# gap in an unrelated suite (tests/test_verify_artefact.py's _dmg_harness,
+# which predates this check and exercises board-provenance behaviour only),
+# not a real, shippable checkout. Skip rather than hard-fail there; this
+# script's own tests (tests/test_dmg_stamp_acceptance.py) copy the helper in
+# and assert the check actually runs and decides the exit status.
+stamp_rc=0
+if [ -f "${ROOT}/packaging/check-update-stamp.sh" ]; then
+  bash "${ROOT}/packaging/check-update-stamp.sh" "${v_mnt}/no_human.app" || stamp_rc=$?
+else
+  echo "WARN: packaging/check-update-stamp.sh not found at ${ROOT} — skipping" >&2
+  echo "      the update-stamp check (this checkout is missing the helper)." >&2
+fi
+
 hdiutil detach "${v_dev}" -force >/dev/null
 trap - EXIT
 
@@ -906,6 +933,14 @@ if [ "${verify_rc}" != "0" ]; then
   echo "FAIL: ${DMG##*/} does not match ${held_against} (verify_artefact.py rc=${verify_rc})." >&2
   echo "      This is the failure that shipped once already: a clean, correctly" >&2
   echo "      signed build of the WRONG TREE. Do not distribute this file." >&2
+  exit 1
+fi
+
+if [ "${stamp_rc}" != "0" ]; then
+  echo "" >&2
+  echo "FAIL: ${DMG##*/} carries an update stamp that disables in-app updates" >&2
+  echo "      (check-update-stamp.sh rc=${stamp_rc}) — see above for the observed" >&2
+  echo "      stamp and which notary credentials are missing." >&2
   exit 1
 fi
 

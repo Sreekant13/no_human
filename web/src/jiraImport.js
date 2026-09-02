@@ -8,6 +8,8 @@
  * know an import happened.
  */
 
+import { parseTimestamp } from "./parseTimestamp.js";
+
 /** title = "KEY: summary"; description = the issue's own description plus a
  * traceability line back to the ticket (always appended, even when the issue
  * has no description of its own). */
@@ -130,8 +132,8 @@ export function jiraEmptyMessage(query) {
  * real date. */
 export function formatIssueUpdated(updated) {
   if (!updated) return null;
-  const d = new Date(updated);
-  if (Number.isNaN(d.getTime())) return null;
+  const d = parseTimestamp(updated);
+  if (!d) return null;
   return `Updated ${d.toLocaleDateString()}`;
 }
 

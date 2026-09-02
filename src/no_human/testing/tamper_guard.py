@@ -22,8 +22,11 @@ refactors don't trip it.
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 # What counts as a test file, by path. conftest.py is test-support code: it can
 # silently rewrite how the whole suite runs, so it must be snapshotted too.
@@ -233,6 +236,17 @@ def is_test_file(path: str) -> bool:
     return bool(_TEST_FILE_RE.search(path))
 
 
+def is_binary_content(source: str) -> bool:
+    """True for content that is not decodable text — a NUL byte is the sniff
+    git itself uses. A binary blob (e.g. a ``.tgz`` fixture under ``tests/``)
+    holds no tests, so counting it is meaningless; before this, such a file
+    killed the guard at scoring with a ``UnicodeDecodeError`` (first hit
+    2026-08-09, SWE-bench run). The sniff is on ``"\\x00"`` rather than a
+    decode-failure check so it survives an ``errors="replace"`` decode done
+    upstream by the caller that reads the raw git blob."""
+    return "\x00" in source
+
+
 def count_tests(source: str) -> int:
     return len(_TEST_DECL.findall(source))
 
@@ -369,6 +383,13 @@ def check(
     paths = {p for p in before if is_test_file(p)} | {
         p for p in after if is_test_file(p)
     }
+    binary_paths = {
+        p for p in paths
+        if is_binary_content(before.get(p, "")) or is_binary_content(after.get(p, ""))
+    }
+    for p in binary_paths:
+        log.debug("tamper guard: skipping binary test-path file %s", p)
+    paths -= binary_paths
 
     tb = ta = ab = aa = 0
     sb = sa = autb = auta = ffb = ffa = 0
@@ -453,7 +474,10 @@ def check(
     # would already fire; the case this catches is precisely the one where it does
     # NOT — a file disappearing without a trace in the numbers. The guard fires and a
     # human justifies it, which is how it is meant to work.
-    deleted = [p for p in before if p not in after]
+    deleted = [
+        p for p in before
+        if p not in after and not is_binary_content(before[p])
+    ]
     tampered = (
         bool(deleted) or ta < tb or aa < ab or sa_cmp > sb_cmp
         or auta > autb or ffa > ffb

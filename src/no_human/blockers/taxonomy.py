@@ -189,6 +189,63 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _prose(value: Any, absent: str | None = "") -> str | None:
+    """Agent-emitted blocker JSON sometimes carries a prose field as a LIST of
+    lines (measured 2026-09-01, task 019d8175: `evidence: [...]` reached
+    `render_report`'s `.strip()` and crashed the scheduler, killing the attempt
+    before its blocker was ever rendered). Same contract as options below:
+    agent shapes must not need a migration. Lists join to lines; None means
+    absent (`absent` keeps Optional fields None so `if b.question:` branches
+    keep their meaning)."""
+    if value is None:
+        return absent
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(v) for v in value)
+    return str(value)
+
+
+def _machine_scalar(value: Any) -> str | None:
+    """`wake_condition` is NOT prose — the watcher prefix-dispatches on it and
+    `parse_duration` sums every duration-shaped match in the string, so joining
+    a list would FABRICATE a satisfiable condition (measured: ["after:2h",
+    "and PR org/repo#12 merged"] joins into a condition that self-fires at
+    +2h12m, the 12 minutes lifted out of the PR number, the merge half never
+    checked). A single-element list unwraps; anything longer is not one
+    machine-checkable condition, so it becomes None — which never self-fires
+    and still escalates to a human via the max_park timeout."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return str(value[0])
+        return None
+    return str(value)
+
+
+def _tried(value: Any) -> list[str]:
+    """Same boundary, same contract as `_prose`: `{"tried": "I tried X"}` must
+    not shred into per-character bullets in the report, and `{"tried": 3}` must
+    not raise out of `parse_blocker` (the call site has no guard — the exact
+    failure mode of the 2026-09-01 incident)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _confidence(value: Any) -> float:
+    """`{"confidence": "high"}` raised ValueError out of the same unguarded
+    call site. An unparseable confidence means the agent did not supply one:
+    0.0 — which routes toward escalation, the conservative direction."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class BlockerOption:
     """One answer a human can give, optionally carrying the action that makes it
@@ -619,16 +676,16 @@ class Blocker:
         return cls(
             category=BlockerCategory.coerce(data.get("category", "NOVEL_UNKNOWN")),
             transient=bool(data.get("transient", False)),
-            wake_condition=data.get("wake_condition"),
-            root_cause_hypothesis=data.get("root_cause_hypothesis", ""),
-            confidence=float(data.get("confidence", 0.0) or 0.0),
-            tried=list(data.get("tried", []) or []),
-            question=data.get("question"),
+            wake_condition=_machine_scalar(data.get("wake_condition")),
+            root_cause_hypothesis=_prose(data.get("root_cause_hypothesis")),
+            confidence=_confidence(data.get("confidence")),
+            tried=_tried(data.get("tried")),
+            question=_prose(data.get("question"), absent=None),
             options=[BlockerOption.coerce(o) for o in (data.get("options") or [])],
             resume_branch=data.get("resume_branch", ""),
             resume_commit=data.get("resume_commit", ""),
-            goal=data.get("goal", ""),
-            evidence=data.get("evidence", ""),
+            goal=_prose(data.get("goal")),
+            evidence=_prose(data.get("evidence")),
             raised_at=data.get("raised_at", _now()),
             # Round-trips so a blocker rehydrated from `task.blocker` keeps the
             # provenance the run established. `parse_blocker` OVERWRITES this

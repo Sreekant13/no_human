@@ -100,7 +100,14 @@ FROZEN_FUNCTION_LINES = {
     # (#935 derived-artefact keystone) landing grew the conflict watcher
     # without re-freezing; nh approve runs change-scoped tests only, so the
     # ratchet never fired at land time. Repaired (measured) on this merge.
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 434,
+    # 434 -> 441 (+7): 2026-09-01 trust-the-local-merge fix (forge-vs-local
+    # mergeability flip-flop) — the empty-conflict-set branch now zeroes the
+    # stale-flags counter, records the observability-only
+    # `pr_conflict_local_clean_checks` counter, and emits a named
+    # `pr_conflict_local_clean` event instead of deferring/escalating at a
+    # bound; the docstring also gained a paragraph explaining why the local
+    # merge is authoritative. Measured on this merge.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 441,
     # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
     # write wired into `_finalize` (review findings #1/#7). Measured on the
     # D1.1 squash-merge result.
@@ -231,7 +238,39 @@ FROZEN_FILE_LINES = {
     # writes through `carry_human_hold` so a durable human pause survives a
     # machine blocker rewrite. Re-anchored on this rebased tree (main had
     # independently grown the file to 20513 lines by the time this landed).
-    "core/orchestrator.py": 20523,
+    # 20577 -> 20592 (+15 net on this rebased tree, per the scanner's own
+    # `len(Path(...).read_text().splitlines())` metric): `_maybe_capture_ui_
+    # evidence` now emits the honesty-floor skip line (with remedy) instead
+    # of `""` when the UI-evidence gate qualifies but playwright is
+    # unavailable. Re-anchored on this rebase (main had independently grown
+    # the file to 20577 lines by the time this landed).
+    # 20592 -> 20625 (+33 per the scanner's own
+    # `len(Path(...).read_text().splitlines())` metric, which counts 3
+    # pre-existing Unicode line-separator characters — U+0085/U+2028/U+2029 —
+    # that `wc -l` does not; the file grew +30 by `wc -l`): the honesty-floor
+    # disclosure policy is now self-consistent — the three previously-silent
+    # `return ""` exits (no manifest written, `ui_evidence.run` raising, and
+    # a walk that ran but captured zero shots) now go through the same
+    # `_ui_evidence_skipped` builder as the missing-playwright case, each
+    # naming what was lost (sanitized: exception class only, reason
+    # newline/backtick-stripped and truncated to ~120 chars — the PR body is
+    # a public/untrusted-readable surface). Only the gate-says-no exit
+    # (`ui_evidence_should_run` is False) stays silent, since there is
+    # nothing to disclose. Measured on this landing.
+    # 20625 -> 20636 (+11 per the scanner's own metric): the honesty-floor
+    # comment above `_UI_EVIDENCE_SKIPPED_SECTION` and the
+    # `_maybe_capture_ui_evidence` docstring no longer claim "every exit
+    # discloses" — both now state the actual boundary: disclosure covers
+    # every gated-but-no-shots outcome, but `_deliver_ui_evidence`'s own
+    # pre-existing "" (shots captured, then delivery fails — push rejected,
+    # non-GitHub remote, a `current_branch`/commit error) is unchanged and
+    # out of scope here. Comments only, no behaviour change.
+    # 20612+20636 -> 20673: merge of two independent landings — main's
+    # profile-divergence advisory (+35: `_profile_divergence_warned` latch +
+    # `_warn_profile_divergence` from `_usable_profile`) and this branch's
+    # disclosure work above, plus the review-round comment completion (+2).
+    # Measured on the merge result with the scanner below, never summed.
+    "core/orchestrator.py": 20673,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -266,7 +305,29 @@ FROZEN_FILE_LINES = {
     # 8204 -> 8214 (+10): D3.1 — `nh serve` threads learning.auto_manage /
     # auto_activate_daily_cap into HarvestJob (kill-switch wiring). Measured
     # on the D3.1 landing result.
-    "cli/commands.py": 8214,
+    # 8214 -> 8285 (+71): `nh doctor` gains the visual-proof-walks row and
+    # `--fix-walks`/`--dry-run` consent-first provisioning flow. Measured on
+    # this landing.
+    # 8285 -> 8297 (+12): `visual_walks_row()`'s docstring no longer claims
+    # "Pure and read-only" (it now names the loop-safe `playwright.async_api`
+    # -import probe it actually calls), and the `--fix-walks` "already
+    # available" branch's chromium remedy text grew a one-line clarification
+    # so it agrees, by construction, with `nh doctor`'s plain row. Measured
+    # on this landing.
+    # 8262+8297 -> 8350: merge of two independent landings — main's
+    # no-human-67 follow-up (`nh onboard` one-confirm ui_evidence offer +
+    # per-repo doctor rendering, incl. the ProjectYmlPersistError review fix)
+    # and this branch's `--fix-walks` flow above, plus the two-layer
+    # reconciliation comment in `doctor` (dependency row first, per-repo
+    # config rows after; the whole block then extracted to
+    # _print_visual_walks so the merged doctor() stays under the 300-line
+    # function budget). Measured on the merge result with the scanner
+    # below, never summed.
+    # 8352 -> 8356 (+4): `_print_visual_walks` now derives `walks_colour`
+    # from the (package, chromium) pair instead of the package layer alone
+    # — a package-present/chromium-missing install must not render green —
+    # plus one extra docstring sentence naming the new third row state.
+    "cli/commands.py": 8356,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -318,7 +379,29 @@ FROZEN_FILE_LINES = {
     # 5760 -> 5797 (+37): P5 — opt-in ?limit/?offset pagination on GET
     # /api/tasks (validated Query params + docstring rationale). Measured on
     # the P5 merge result.
-    "api/app.py": 5797,
+    # 5797 -> 5807 (+10): GET /api/metrics/window — attempt-attributed "last
+    # 24h" spend (core/metrics.py:window_spend), fixing the board banner
+    # sweeping a closed task's LIFETIME cost into the window on a bare
+    # `updated_at` touch. Re-anchored on rebase onto the P5 merge result.
+    # 5807 -> 5882 (+75): no-human-67 follow-up — `RepoUiEvidenceRequest` +
+    # `POST /api/onboarding/repos/ui-evidence` (the wizard's one-action
+    # confirm; re-derives the suggestion server-side, dual-writes via
+    # `persist_profile`), plus the `ui_evidence` carry-forward fix and
+    # response block in `onboarding_onboard_repo` (a re-derive no longer
+    # silently wipes a previously-accepted ui_evidence). Measured via
+    # `len(Path(...).read_text().splitlines())` on the landing tree.
+    # 5882 -> 5889 (+7): review-round fix — `onboarding_ui_evidence` now
+    # catches `ProjectYmlPersistError` and 500s instead of answering
+    # `{"ok": True, "enabled": True}` when project.yml could not be written
+    # (persist_profile also skips the DB write in that case, so the two
+    # artifacts never disagree). Measured on this branch's tree.
+    # 5889 -> 5904 (+15): rebased in — show_config grows
+    # `coder_backend_effective` / `coder_backend_default`
+    # (resolve_backend_name(cfg.data) vs DEFAULT_CONFIG["worker"]["backend"])
+    # so the composer's coder-backend disclosure caption can gate on the
+    # EFFECTIVE backend, not just the picker. Measured directly against the
+    # rebased tree (`wc -l src/no_human/api/app.py`).
+    "api/app.py": 5904,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -374,7 +457,14 @@ FROZEN_FILE_LINES = {
     # 4841 -> 4859 (+18): P5 — SQL-pushed pagination in Store.list_tasks with
     # the rowid tie-break + its rationale docstring. Measured on the P5 merge
     # result.
-    "core/db.py": 4859,
+    # 4859 -> 4945 (+86): terminal-landed-reconciliation (narrowed refile of
+    # the shipped-metrics-blindness ticket) — the `terminal_reconcile` CAS
+    # mode threaded through `set_status`/`_write_status`, plus
+    # `Store.reconcile_landed_terminal` and
+    # `Store.landed_reconcilable_terminal_tasks`, the TERMINAL-row twin of
+    # `Store.reconcile_landed_orphan` above. Measured on this tree with the
+    # scanner below.
+    "core/db.py": 4945,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.
@@ -398,7 +488,11 @@ FROZEN_FILE_LINES = {
     # `worker.abort_non_converging`/`convergence_check_after_turns`/
     # `convergence_window_turns` defaults, with the docstring justifying
     # them (see `core.bounds.ConvergenceTracker`). Measured on this tree.
-    "config.py": 3328,
+    # 3328 -> 3340 (+12): the `git.merge_identity_name`/`_email` flat-alias
+    # config keys (second-tier resolution between `approve_identity` and the
+    # repo's own git config, never a fallback to `agent_identity_*`) and
+    # their explanatory comment. Re-anchored on rebase.
+    "config.py": 3340,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
@@ -411,11 +505,11 @@ FROZEN_FILE_LINES = {
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.
-    # 2711 -> 2733 (+22): human-hold durability fix (SCRUM-22 regression) —
-    # the `human_stopped` guard hoisted above the `AWAITING_APPROVAL` branch
-    # in `_evaluate` and the new hold check in `_resume` (returns
-    # `"skipped_human_stopped"`). Measured on this change.
-    "blockers/wake.py": 2733,
+    # 2711 -> 2718 (+7): 2026-09-01 trust-the-local-merge fix, same cause as
+    # the FROZEN_FUNCTION_LINES entry above — the whole-file delta equals the
+    # function's delta since no other function in the file changed. Measured
+    # on this merge.
+    "blockers/wake.py": 2740,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies
@@ -437,7 +531,17 @@ FROZEN_FILE_LINES = {
     # wired into `_recover_orphans` after the existing `_row_is_live` check.
     # Re-anchored on rebase onto main (measured directly on this tree with
     # the scanner below).
-    "core/scheduler.py": 2848,
+    # 2848 -> 2973 (+125): terminal-landed-reconciliation (narrowed refile of
+    # the shipped-metrics-blindness ticket) — the TERMINAL-row twin of the
+    # orphan sweep above: `_terminal_landed_evidence`,
+    # `_reconcile_one_landed_terminal`, and `_reconcile_landed_terminal`
+    # (probes a FAILED/cancelled row's `cancel_reason`/attempt commit/PR
+    # against the base branch, reusing `orphan_landed_evidence` verbatim, and
+    # calls `Store.reconcile_landed_terminal` on landed evidence instead of
+    # leaving the row failed forever); wired into `_run`'s startup sequence
+    # next to `_reconcile_terminal_task_attempts`. Measured on this tree with
+    # the scanner below.
+    "core/scheduler.py": 2973,
 }
 
 

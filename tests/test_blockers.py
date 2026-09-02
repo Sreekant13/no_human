@@ -2438,3 +2438,65 @@ async def test_the_attributed_rung_needs_a_dead_shaped_row_and_a_ladder(
     want = tuple(expected)
     ids = [old_id] if want[2] == "LADDER" else want[2]
     assert (v[0], v[1], v[2], v[3]) == (want[0], want[1], ids, want[3]), v
+
+
+def test_prose_fields_normalise_from_agent_list_output():
+    """Measured 2026-09-01 (task 019d8175): an agent emitted `evidence` as a
+    JSON array of lines; `render_report`'s `.strip()` then crashed the
+    scheduler (`'list' object has no attribute 'strip'`) and the attempt died
+    terminally before its blocker was ever rendered. Agent-emitted shapes must
+    not need a migration (same contract as options above): list prose joins to
+    lines, None means absent."""
+    b = Blocker.from_dict({
+        "category": "NOVEL_UNKNOWN",
+        "evidence": ["$ cmd", "line two"],
+        "goal": ["implement", "X"],
+        "root_cause_hypothesis": None,
+        "question": ["should I", "continue?"],
+        "wake_condition": ["ci green"],
+    })
+    assert b.evidence == "$ cmd\nline two"
+    assert b.goal == "implement\nX"
+    assert b.root_cause_hypothesis == ""
+    assert b.question == "should I\ncontinue?"
+    assert b.wake_condition == "ci green"   # single-element list unwraps
+    # absent stays absent — render's `if b.question` branch must not flip
+    empty = Blocker.from_dict({"category": "NOVEL_UNKNOWN"})
+    assert empty.question is None
+    assert empty.wake_condition is None
+    # and the crash site itself renders the exact joined block, not a repr
+    out = render_report(b, task_title="t", task_id="abcdef123456")
+    assert "$ cmd\nline two" in out
+    assert "['" not in out
+
+
+def test_wake_condition_list_never_joins_into_a_fake_condition():
+    """`wake_condition` is machine-checkable, not prose: the watcher's
+    `parse_duration` sums every duration-shaped match anywhere in the string,
+    so joining ["after:2h", "and PR org/repo#12 merged"] would fabricate a
+    condition that self-fires at +2h12m — the 12 minutes lifted out of the PR
+    number, the merge half never checked. More than one element is not ONE
+    condition: it becomes None, which never self-fires and still escalates to
+    a human via the max_park timeout."""
+    b = Blocker.from_dict({
+        "category": "NOVEL_UNKNOWN",
+        "wake_condition": ["after:2h", "and PR org/repo#12 merged"],
+    })
+    assert b.wake_condition is None
+
+
+def test_tried_and_confidence_normalise_from_agent_shapes():
+    """The same unguarded parse_blocker call site: `{"tried": 3}` raised
+    TypeError, `{"confidence": "high"}` raised ValueError, and a bare string
+    `tried` shredded into per-character report bullets via list()."""
+    b = Blocker.from_dict({
+        "category": "NOVEL_UNKNOWN",
+        "tried": "restarted the server",
+        "confidence": "high",
+    })
+    assert b.tried == ["restarted the server"]
+    assert b.confidence == 0.0   # unparseable -> escalate-leaning default
+    assert Blocker.from_dict({"category": "NOVEL_UNKNOWN", "tried": 3}).tried == ["3"]
+    out = render_report(b, task_title="t", task_id="abcdef123456")
+    assert "- restarted the server" in out
+    assert "- r\n" not in out

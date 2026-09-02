@@ -140,7 +140,7 @@ named here.
   and line and quote the lines they are about. Same destination as the push.
 - **PR receipt and status polling** — `gh` / `glab` calls for the PR's head SHA
   and its mergeability (`vcs/pr_watcher.py:default_pr_state`, `vcs/receipts.py`), plus
-  `git fetch origin` (`vcs/git.py:GitRepo.remote_branch_relation:884`, `:GitRepo.fetch:916`),
+  `git fetch origin` (`vcs/git.py:GitRepo._have_remote_commit:836`, `:GitRepo.fetch:916`),
   while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
@@ -312,8 +312,8 @@ named here.
   `~/.no_human/config.yaml` or `NH_NO_UPDATE_CHECK=1`
   (`updates.py:57`, which also covers CI).
 - **The desktop app checks GitHub Releases at startup**, once a day
-  (`desktop/main.mjs:234` → `desktop/updater.mjs:113`, called at startup from
-  `desktop/main.mjs:1039`, feed `provider: github, owner: no-human-ai, repo:
+  (`desktop/main.mjs:240` → `desktop/updater.mjs:113`, called at startup from
+  `desktop/main.mjs:1098`, feed `provider: github, owner: no-human-ai, repo:
   no_human` — `desktop/electron-builder.config.cjs:366`). It never downloads on its own
   (`autoDownload` is off, `desktop/updater.mjs:66`). **This is a separate code
   path from the PyPI check above and neither `NH_NO_UPDATE_CHECK` nor

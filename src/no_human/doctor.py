@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -409,6 +410,203 @@ def codex_row(config: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+#: Shown before any install runs and echoed back in the unavailable row, so
+#: the human sees the cost of consenting before they type "y" and again in
+#: `nh doctor`'s plain listing.
+WALKS_DOWNLOAD_SIZE = "~120MB"
+
+WALKS_AVAILABLE_LINE = "visual-proof walks: available"
+
+WALKS_UNAVAILABLE_LINE = (
+    f"visual-proof walks: unavailable - playwright not installed "
+    f"({WALKS_DOWNLOAD_SIZE} to install playwright + chromium)"
+)
+
+WALKS_CHROMIUM_MISSING_LINE = (
+    "visual-proof walks: package installed, chromium missing - "
+    "run nh doctor --fix-walks"
+)
+
+WALKS_NOT_VERIFIED_LINE = (
+    "visual-proof walks: playwright installed, chromium not verified "
+    "(could not resolve the browser cache directory)"
+)
+
+
+def _playwright_registry_dir() -> Path | None:
+    """Where playwright's browser registry directory *would* live on this
+    OS, derived purely from documented cache-directory conventions — never
+    by importing ``playwright`` or starting any process. Mirrors playwright's
+    own resolution order without depending on its internals, so a partial or
+    absent install still resolves a path.
+
+    Returns ``None`` when the location cannot be determined by pure path
+    logic (unsupported platform, missing required env var, unresolvable
+    home directory, or ``PLAYWRIGHT_BROWSERS_PATH=0`` — which means browsers
+    live inside the package tree, not at a fixed convention path) — never a
+    guess.
+    """
+    try:
+        override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        if override:
+            if override == "0":
+                return None
+            return Path(override)
+        if sys.platform == "darwin":
+            return Path.home() / "Library/Caches/ms-playwright"
+        if sys.platform.startswith("linux"):
+            xdg_cache = os.environ.get("XDG_CACHE_HOME")
+            base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+            return base / "ms-playwright"
+        if sys.platform == "win32":
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if not local_appdata:
+                return None
+            return Path(local_appdata) / "ms-playwright"
+        return None
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        return None
+
+
+def _resolve_playwright_chromium_status() -> str:
+    """Filesystem-only check of whether a chromium browser is present in
+    playwright's registry directory. Starts no process, spawns no driver,
+    never imports ``playwright`` — pure path existence/listing logic. The
+    single monkeypatch seam tests use to fake the three (+fallback) states.
+
+    Returns ``"present"`` (registry dir exists with a ``chromium*`` entry),
+    ``"missing"`` (registry dir absent, or present with no ``chromium*``
+    entry), or ``"not-verified"`` (the registry path could not be
+    determined, or listing it raised — permission error or otherwise;
+    honest non-answer rather than a guess).
+    """
+    try:
+        registry_dir = _playwright_registry_dir()
+        if registry_dir is None:
+            return "not-verified"
+        if not registry_dir.is_dir():
+            return "missing"
+        for entry in registry_dir.iterdir():
+            if entry.name.startswith("chromium"):
+                return "present"
+        return "missing"
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        return "not-verified"
+
+
+def visual_walks_row(
+    *, available: bool | None = None, chromium: str | None = None
+) -> dict[str, Any]:
+    """Two-layer summary of whether visual-proof (Playwright) walks can run
+    in this environment: ``{"available": bool, "chromium": str | None,
+    "line": str}``.
+
+    ``available`` is the *import* layer, unchanged from before this
+    function grew a chromium layer — it means only that the underlying
+    probe (:func:`testing.ui_evidence.playwright_available`) can import the
+    ``playwright`` package, not that the chromium binary it would launch is
+    present on disk. That narrower contract is deliberate: the previous
+    binary check started ``playwright.sync_api.sync_playwright()``, which
+    raises inside a running ``asyncio`` loop, so it silently returned
+    "unavailable" for every real caller (both ``nh doctor``'s async ``_go``
+    and the orchestrator's ``_maybe_capture_ui_evidence`` run under a
+    loop). ``row["available"]`` keeps that exact meaning so
+    ``nh doctor --fix-walks``'s "already available" branch keeps behaving
+    exactly as it does today.
+
+    ``chromium`` is the new, separate layer: whether a chromium browser
+    build is present in playwright's registry directory, checked with pure
+    filesystem path logic (:func:`_resolve_playwright_chromium_status`) —
+    no process, no driver, no ``import playwright``. It is only probed when
+    the package layer is available; when the package itself is missing,
+    chromium is reported as ``None`` (not probed — there is nothing to
+    launch it with). If the registry location can't be determined or
+    listing it fails, it honestly reports ``"not-verified"`` rather than
+    guessing.
+
+    Both probes are wrapped in ``except Exception`` so a broken/partial
+    playwright install reads as unavailable/not-verified rather than
+    crashing the command that prints it. This is deliberately
+    advisory-shaped: the caller decides whether to surface the unavailable
+    line at all, and it is never appended to a :class:`Diagnosis`'s
+    ``contradictions``/``evidence_gaps`` — an optional feature being off
+    must never fail ``d.healthy`` or the exit code.
+
+    ``available``/``chromium`` are injectable overrides for tests; the
+    normal call site passes neither and lets both probes live.
+    """
+    if available is None:
+        try:
+            from .testing.ui_evidence import playwright_available
+
+            available = playwright_available()
+        except Exception:  # noqa: BLE001 — a diagnostic must never raise
+            available = False
+    if available and chromium is None:
+        try:
+            chromium = _resolve_playwright_chromium_status()
+        except Exception:  # noqa: BLE001 — a diagnostic must never raise
+            chromium = "not-verified"
+    elif not available:
+        chromium = None
+    if not available:
+        line = WALKS_UNAVAILABLE_LINE
+    elif chromium == "present":
+        line = WALKS_AVAILABLE_LINE
+    elif chromium == "missing":
+        line = WALKS_CHROMIUM_MISSING_LINE
+    else:
+        line = WALKS_NOT_VERIFIED_LINE
+    return {
+        "available": available,
+        "chromium": chromium,
+        "line": line,
+    }
+
+
+def walks_install_plan() -> list[list[str]]:
+    """The ordered argv list :func:`walks_provision.install_walks` runs to
+    make visual-proof walks available, in order. Never executes anything —
+    this is the plan an install prints for consent (dry-run) and the plan
+    it follows once consent is given.
+
+    Package-manager choice is a human-gated decision the ticket left to a
+    minimal defensible default rather than resolving outright: uv-first —
+    ``uv sync --group e2e`` — when ``uv`` is on PATH *and* this process is
+    running from a resolvable project checkout (:func:`_running_checkout`,
+    the same resolver :func:`editable_install_problem` uses); pip otherwise
+    (``python -m pip install "playwright>=1.50"``). ``playwright install
+    chromium`` always runs last, even when the ``playwright`` package
+    already imports — an interrupted/corrupted browser download otherwise
+    reads as "installed" because the *package* is present while the
+    *binary* is not.
+
+    Scope: this only provisions a CLI install running from a resolvable
+    project checkout with ``uv`` on PATH, or one with a working
+    ``python -m pip``. A ``uvx``-ephemeral run (often no ``pip``) and the
+    desktop/DMG distribution have no provisioning path today — neither is
+    wired to this plan or to ``nh doctor --fix-walks``.
+    """
+    import shutil
+
+    steps: list[list[str]] = []
+    checkout = _running_checkout()
+    if shutil.which("uv") and checkout is not None:
+        steps.append(["uv", "sync", "--group", "e2e", "--project", str(checkout)])
+    else:
+        steps.append([sys.executable, "-m", "pip", "install", "playwright>=1.50"])
+    steps.append([sys.executable, "-m", "playwright", "install", "chromium"])
+    return steps
+
+
+def walks_plan_description() -> str:
+    """Human-readable rendering of :func:`walks_install_plan`, one line per
+    step — what ``nh doctor --fix-walks --dry-run`` prints instead of
+    running anything.
+    """
+    return "\n".join(f"  $ {' '.join(step)}" for step in walks_install_plan())
+
+
 @dataclass
 class Diagnosis:
     mechanisms: list[dict[str, Any]] = field(default_factory=list)
@@ -421,10 +619,72 @@ class Diagnosis:
     # OPENAI_API_KEY presence). None-shaped ({"selected": False}, []) unless the
     # codex backend is actually in play — see `codex_readiness`.
     codex: dict[str, Any] | None = None
+    # no-human-67 follow-up: one row per known repo profile, from
+    # `ui_evidence_rows` — current ui_evidence state plus a suggestion when the
+    # repo has a detected `npm run dev` convention and isn't configured yet.
+    # Read-only and additive: never affects `healthy` (see `advisories`).
+    ui_evidence: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def healthy(self) -> bool:
         return not self.contradictions and not self.evidence_gaps
+
+
+def ui_evidence_rows(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """no-human-67 follow-up: one row per known repo profile — current
+    ui_evidence state, plus a suggestion when the repo has a detected
+    `npm run dev` convention and isn't configured yet (manual config wins:
+    `ui_evidence_suggestion` itself returns None once a repo is configured).
+
+    Takes the already-fetched ``Store.list_profiles()`` rows (pure, no DB
+    I/O here) so this stays trivially testable and reusable by both `nh
+    doctor` and, later, any other surface that wants the same rows. Repos
+    whose directory no longer exists are skipped — nothing useful to detect
+    or suggest for a repo that isn't on disk anymore."""
+    from .onboard import ui_evidence_suggestion
+    from .profile import ProjectProfile
+
+    rows: list[dict[str, Any]] = []
+    for row in profiles:
+        repo_path = row.get("repo_path") or ""
+        if not repo_path or not Path(repo_path).expanduser().is_dir():
+            continue
+        try:
+            profile = ProjectProfile.from_dict(json.loads(row["data"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+        ui = profile.ui_evidence or {}
+        rows.append({
+            "repo_path": repo_path,
+            "configured": bool(ui.get("enabled") or ui.get("start_cmd") or ui.get("base_url")),
+            "enabled": bool(ui.get("enabled")),
+            "start_cmd": ui.get("start_cmd") or "",
+            "base_url": ui.get("base_url") or "",
+            "suggestion": ui_evidence_suggestion(profile, repo_path),
+        })
+    return rows
+
+
+async def _apply_ui_evidence_advisories(d: "Diagnosis", store: Store) -> None:
+    """Fill `d.ui_evidence` and append one advisory per unconfigured repo with
+    a detected dev-server convention. Same rule as every other optional check
+    in `diagnose`: read-only, additive, never touches `d.healthy` (advisories
+    only, never contradictions/evidence_gaps), and never raises."""
+    try:
+        profiles = await store.list_profiles()
+        d.ui_evidence = ui_evidence_rows(profiles)
+        for row in d.ui_evidence:
+            sug = row.get("suggestion")
+            if sug:
+                d.advisories.append(
+                    "VISUAL-PROOF WALKS NOT CONFIGURED: "
+                    f"{row['repo_path']} — detected `{sug['start_cmd']}` on "
+                    f":{sug['port']}, enable? Run `nh onboard {row['repo_path']}` "
+                    "and answer yes, or set ui_evidence in "
+                    ".no_human/project.yml."
+                )
+    except Exception:  # noqa: BLE001 — a diagnostic must never CRASH `nh doctor`
+        pass
 
 
 async def _kind_stats(store: Store) -> dict[str, tuple[int, float]]:
@@ -791,6 +1051,27 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
             except OSError:
                 pass
 
+    # The documented `.no_human/project.yml` is a DECOY once a confirmed DB
+    # row exists: `Orchestrator._usable_profile` prefers the row, so an edit
+    # to the file has no effect and used to say nothing. Advisory, never a
+    # contradiction — a stale file is a documentation drift, not a state
+    # contradiction, and an advisory must not fail the doctor gate.
+    try:
+        from .profile import ProjectProfile, profile_divergence
+        for row in await store.list_profiles():
+            db_prof = ProjectProfile.from_dict(json.loads(row["data"]))
+            on_disk = ProjectProfile.load(row["repo_path"])
+            keys = profile_divergence(db_prof, on_disk)
+            if keys:
+                d.advisories.append(
+                    f"PROFILE DIVERGENCE: {row['repo_path']}/.no_human/project.yml "
+                    "differs from the confirmed profile on: "
+                    f"{', '.join(keys)} - the confirmed profile wins; "
+                    "re-onboard or use the API to update"
+                )
+    except Exception:  # noqa: BLE001 — a diagnostic must never crash `nh doctor`
+        pass
+
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():
@@ -841,4 +1122,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
                 f"task {task_id[:8]} is 'escalated' with an empty blocker — "
                 "a human was summoned with nothing to decide on."
             )
+
+    # Visual-proof (ui_evidence) provisioning gap (no-human-67 follow-up).
+    await _apply_ui_evidence_advisories(d, store)
     return d

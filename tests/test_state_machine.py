@@ -5,9 +5,11 @@ import pytest
 from no_human.core.task import (
     IllegalTransition,
     LANDED_RECONCILABLE,
+    TERMINAL_LANDED_RECONCILABLE,
     Task,
     TaskStatus,
     assert_landed_reconciliation,
+    assert_terminal_landed_reconciliation,
     assert_transition,
     can_transition,
 )
@@ -170,6 +172,32 @@ def test_landed_reconciliation_edges_are_legal_only_via_the_narrow_gate():
     assert S.TESTING in LANDED_RECONCILABLE
     assert_landed_reconciliation(S.IMPLEMENTING)  # must not raise
     assert_landed_reconciliation(S.TESTING)  # must not raise
+
+
+def test_terminal_landed_reconciliation_edge_is_legal_only_via_its_narrow_gate():
+    """The TERMINAL-row twin of the test above: a FAILED row (cancelled or
+    not — there is no separate CANCELLED status) whose recorded work is
+    provably reachable from the base branch is completed to DONE by
+    `Store.reconcile_landed_terminal`, but ONLY through
+    `assert_terminal_landed_reconciliation` — a separate, narrower gate from
+    both `ALLOWED_TRANSITIONS` (still refusing FAILED->DONE, unchanged) and
+    `LANDED_RECONCILABLE` (which does NOT gain FAILED; that set stays exactly
+    IMPLEMENTING/REVIEWING/TESTING/AWAITING_APPROVAL). Widening either of
+    those instead would make FAILED->DONE legal for every plain
+    `set_status(task, DONE)` call — exactly the "resurrect a row without
+    reachable evidence" failure mode this feature must not introduce."""
+    assert not can_transition(S.FAILED, S.DONE)
+    with pytest.raises(IllegalTransition):
+        assert_transition(S.FAILED, S.DONE)
+
+    assert S.FAILED not in LANDED_RECONCILABLE
+    assert S.FAILED in TERMINAL_LANDED_RECONCILABLE
+    assert_terminal_landed_reconciliation(S.FAILED)  # must not raise
+
+    for other in (S.CONTEXT, S.IMPLEMENTING):
+        assert other not in TERMINAL_LANDED_RECONCILABLE
+        with pytest.raises(IllegalTransition):
+            assert_terminal_landed_reconciliation(other)
 
 
 def test_landed_reconciliation_guard_still_refuses_failed_and_early_states():

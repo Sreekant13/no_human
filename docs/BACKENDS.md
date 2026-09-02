@@ -257,6 +257,14 @@ real subscription/enterprise OAuth token to a third-party server, so it is
 overridden to empty rather than left to whichever credential the CLI happens to
 prefer.
 
+**Your model must support extended thinking.** The harness enables thinking on
+coder sessions, and a server whose model rejects it fails the attempt on turn
+one (measured 2026-09-01: `qwen2.5-coder` behind an Anthropic-compatible proxy
+returned HTTP 500 "does not support thinking" before any token; a
+thinking-capable model on the same stack ran normally). Capability is on the
+model, not the harness: pick one that both supports thinking and is strong
+enough to drive an agent loop.
+
 **`llm.local_base_url` is validated, not trusted, before any subprocess
 starts** (`config.assert_local_backend_mode`):
 
@@ -293,6 +301,19 @@ Claude harness:
   `role="coder"` ever consults `worker.backend` (`resolve_backend_name`) or a
   task's `--backend`, so a `local` run still bills Anthropic for everything
   except the implementer.
+
+**A dead local server parks as infra, never as a quota wall.** If the coder's
+SDK session dies before producing any tokens (a proxy/server 500, a model that
+rejects a capability the CLI requested, an unreachable base URL), the
+classifier used to route this into `paused_quota` — which names a
+*subscription* reset. `local`'s child env has no subscription (`_local_child_env`
+always blanks `CLAUDE_CODE_OAUTH_TOKEN`), so that park would sit forever
+waiting on a reset that can never come. `local_run_without_subscription`
+(`agent/backend.py`) detects this — true only when the resolved backend is
+`local` **and** the actual child env carries no OAuth token — and routes the
+death to a `TRANSIENT_INFRA` park instead, with a 30-minute auto-retry wake and
+the local server's own error text (its stderr/500 body) carried in the
+blocker's evidence. `backend=claude` quota routing is unchanged.
 
 ## Adding a fourth backend
 

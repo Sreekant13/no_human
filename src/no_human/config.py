@@ -1625,6 +1625,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # these to override per install. If neither is set nor resolvable, `nh
         # approve` refuses rather than inventing one.
         "approve_identity": {"name": "", "email": ""},
+        # Flat-key aliases for the same merge identity, read by
+        # `_resolve_approve_identity` with LOWER precedence than
+        # `approve_identity` (which wins if both are set) and HIGHER
+        # precedence than the repo-local `git config` resolution. Left EMPTY
+        # on purpose, same default-from-git-config behaviour as
+        # `approve_identity` above — set these instead of `approve_identity`
+        # when a flat pair of keys is more convenient to template/override.
+        # Deliberately NOT a fallback to `agent_identity_name`/`_email`: an
+        # unresolvable identity still refuses at `preconditions` (constraint
+        # #2 — the merge commit must never be attributed to the agent).
+        "merge_identity_name": "",
+        "merge_identity_email": "",
     },
     "safety": {
         # No size cap by default. A line/file count is a proxy for "scope

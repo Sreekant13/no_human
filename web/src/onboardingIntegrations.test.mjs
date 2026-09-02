@@ -117,7 +117,29 @@ test("the chip's on/off follows the draft, but 'Ready' still needs the server", 
 test("the Launch summary counts integrations from the server specs", () => {
   const summary = src.slice(src.indexOf('{step.key === "summary" &&'));
   assert.match(summary, /setupSummary\(integrations\)/);
-  assert.match(summary, /Integrations on/);
+  assert.match(summary, /Tracker &amp; notification integrations on/);
+});
+
+// Bug report (2026-09-01): the product ships NINE integrations (github/gitlab/
+// jira/monday/linear/slack/teams/jenkins/circleci — all nine render in
+// Settings → Integrations, see integrations.test.mjs), but GET
+// /api/integrations/setup only discovers the FIVE config-block ones
+// (jira/linear/monday/slack/teams — the issue_tracker + notifications kinds).
+// The forge/CI kinds (github/gitlab/jenkins/circleci) are configured per-repo
+// under `ci.*` and are deliberately absent from that endpoint. The row used to
+// say bare "Integrations on 0 of 5", which reads as the product's full
+// integration count. The label must say what it counts instead of silently
+// scoping the word "Integrations" to a five-item subset.
+test("the Launch summary's integrations row names its own scope, not the product total", () => {
+  const summary = src.slice(src.indexOf('{step.key === "summary" &&'),
+                             src.indexOf("{readiness && !readiness.error && readiness.usable === 0"));
+  // The row must not present a bare "Integrations on" — that reads as "all of
+  // them" when the product ships nine and this endpoint only ever returns
+  // five (config-block: jira/linear/monday/slack/teams).
+  assert.doesNotMatch(summary, /<span>Integrations on<\/span>/,
+    "a bare 'Integrations on' label misrepresents a 5-of-9 subset as the total");
+  // The replacement label states its scope in the copy itself.
+  assert.match(summary, /<span>Tracker &amp; notification integrations on<\/span>/);
 });
 
 test("saving sends only changed values and re-seeds from the response", () => {

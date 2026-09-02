@@ -138,11 +138,13 @@ def test_convergence_abort_is_not_raised_below_the_threshold(store, tmp_path):
         "convergence_check_after_turns": 20, "convergence_window_turns": 5,
     })
     orch._active_task_id = "task-1"
-    _arm(orch, ConvergenceTracker.from_config(orch.config.get("worker")))
+    tracker = ConvergenceTracker.from_config(orch.config.get("worker"))
+    _arm(orch, tracker)
 
     for i in range(15):  # under min_turns=20 — must never raise
         orch._agent_sink(_read(i), role=CODER_ROLE)
         orch._agent_sink(_USAGE, role=CODER_ROLE)
+    assert tracker.non_converging_reason is None
 
 
 @pytest.mark.parametrize("role", ["planner", "reviewer", "aggregator"])
@@ -154,11 +156,15 @@ def test_only_the_implementer_session_convergence_aborts(store, tmp_path, role):
         "convergence_check_after_turns": 5, "convergence_window_turns": 3,
     })
     orch._active_task_id = "task-1"
-    _arm(orch, ConvergenceTracker.from_config(orch.config.get("worker")))
+    tracker = ConvergenceTracker.from_config(orch.config.get("worker"))
+    _arm(orch, tracker)
 
     for i in range(20):
         orch._agent_sink(_read(i), role=role)
         orch._agent_sink(_USAGE, role=role)  # must not raise
+    # Non-coder roles return before `conv.tick()` — the tracker must never
+    # have been advanced at all, not merely "not yet past threshold".
+    assert tracker._turns == 0
 
 
 # --------------------------- 2. converging fixture --------------------------- #
@@ -171,13 +177,16 @@ def test_file_edits_keep_a_long_run_from_aborting(store, tmp_path):
         "convergence_check_after_turns": 5, "convergence_window_turns": 3,
     })
     orch._active_task_id = "task-1"
-    _arm(orch, ConvergenceTracker.from_config(orch.config.get("worker")))
+    tracker = ConvergenceTracker.from_config(orch.config.get("worker"))
+    _arm(orch, tracker)
 
     for i in range(30):
         orch._agent_sink(_read(i), role=CODER_ROLE)
         if i % 2 == 0:  # every 2 turns — inside the window=3
             orch._agent_sink(_edit(f"src/calc_{i}.py"), role=CODER_ROLE)
         orch._agent_sink(_USAGE, role=CODER_ROLE)  # must never raise
+    assert tracker.non_converging_reason is None
+    assert tracker._turns == 30
 
 
 def test_test_runner_invocations_keep_a_long_run_from_aborting(store, tmp_path):
@@ -187,13 +196,16 @@ def test_test_runner_invocations_keep_a_long_run_from_aborting(store, tmp_path):
         "convergence_check_after_turns": 5, "convergence_window_turns": 3,
     })
     orch._active_task_id = "task-1"
-    _arm(orch, ConvergenceTracker.from_config(orch.config.get("worker")))
+    tracker = ConvergenceTracker.from_config(orch.config.get("worker"))
+    _arm(orch, tracker)
 
     for i in range(30):
         orch._agent_sink(_read(i), role=CODER_ROLE)
         if i % 2 == 0:  # every 2 turns — inside the window=3
             orch._agent_sink(_test_run(), role=CODER_ROLE)
         orch._agent_sink(_USAGE, role=CODER_ROLE)  # must never raise
+    assert tracker.non_converging_reason is None
+    assert tracker._turns == 30
 
 
 def test_a_non_test_bash_command_is_not_progress(store, tmp_path):
@@ -463,7 +475,8 @@ def test_a_mention_followed_by_a_real_run_still_counts(store, tmp_path):
         "convergence_check_after_turns": 5, "convergence_window_turns": 3,
     })
     orch._active_task_id = "task-1"
-    _arm(orch, ConvergenceTracker.from_config(orch.config.get("worker")))
+    tracker = ConvergenceTracker.from_config(orch.config.get("worker"))
+    _arm(orch, tracker)
     compound = AgentEvent("tool_use", tool_name="Bash",
                           tool_input={"command": "rg pytest && pytest -q"})
 
@@ -472,6 +485,8 @@ def test_a_mention_followed_by_a_real_run_still_counts(store, tmp_path):
         if i % 2 == 0:
             orch._agent_sink(compound, role=CODER_ROLE)
         orch._agent_sink(_USAGE, role=CODER_ROLE)  # must never raise
+    assert tracker.non_converging_reason is None
+    assert tracker._turns == 30
 
 
 def test_a_git_log_mentioning_a_runner_is_not_progress(store, tmp_path):

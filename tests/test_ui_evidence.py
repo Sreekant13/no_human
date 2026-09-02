@@ -603,6 +603,53 @@ async def test_run_not_run_when_launch_fails(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# playwright_available() — package import only; no chromium binary probe
+# ---------------------------------------------------------------------------
+
+
+def test_playwright_available_false_when_package_missing(monkeypatch):
+    monkeypatch.setattr(ui_evidence, "_import_playwright", lambda: None)
+    assert ui_evidence.playwright_available() is False
+
+
+def test_playwright_available_true_when_package_importable(monkeypatch):
+    """The narrowed contract: package-present is enough, regardless of
+    whatever chromium binary state exists on disk. The binary check was
+    removed because its only implementation started `sync_playwright()`,
+    which raises inside a running asyncio loop and made this probe return
+    False for every provisioned production caller — see
+    `playwright_available.__doc__`."""
+    monkeypatch.setattr(ui_evidence, "_import_playwright", lambda: object())
+    assert ui_evidence.playwright_available() is True
+
+
+def test_playwright_available_has_no_chromium_binary_seam(monkeypatch):
+    """A package-present/binary-missing partial install now reads
+    available: the walk runs, `_open`'s launch fails, and the empty-shots
+    disclosure path in `orchestrator.py` is what surfaces that gap, not
+    this probe. Also pins that there is no leftover chromium-path attribute
+    left to stub — the removed seam stays removed."""
+    assert not hasattr(ui_evidence, "_chromium_executable_path")
+    monkeypatch.setattr(ui_evidence, "_import_playwright", lambda: object())
+    assert ui_evidence.playwright_available() is True
+
+
+def test_playwright_available_delegates_to_import_playwright_only(monkeypatch):
+    """The probe's entire body is `_import_playwright() is not None` — pin
+    that nothing else (env vars, cached paths, binary lookups) can flip the
+    result behind `_import_playwright`'s back."""
+    calls = []
+
+    def _fake():
+        calls.append(1)
+        return "sentinel"
+
+    monkeypatch.setattr(ui_evidence, "_import_playwright", _fake)
+    assert ui_evidence.playwright_available() is True
+    assert calls == [1]
+
+
+# ---------------------------------------------------------------------------
 # Console capture, summary_line, serialisation
 # ---------------------------------------------------------------------------
 

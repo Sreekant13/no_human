@@ -136,6 +136,12 @@ async def test_ui_touching_diff_invokes_the_walk_and_embeds_the_pr_media(
 
     calls: list[dict] = []
     monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    # This test exercises the walk actually running — pin playwright as
+    # present so it passes identically whether or not the `e2e` dependency
+    # group happens to be installed on the machine running the suite (the
+    # honesty-floor gate added in `_maybe_capture_ui_evidence` has its own
+    # dedicated coverage in `test_ui_evidence_missing_playwright_pr_line.py`).
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
     monkeypatch.setattr(GitRepo, "remote_url",
                         lambda self, remote="origin": "https://github.com/acme/widget.git")
     fake_open_pr, opens = _fake_open_pr()
@@ -289,6 +295,10 @@ async def test_ui_touching_diff_with_no_manifest_written_skips_the_walk(
 
     calls: list[dict] = []
     monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    # Isolate "no manifest" from the (separately-tested) "no playwright"
+    # honesty-floor path — pin playwright as present so this test's
+    # empty-section assertion below is about the manifest, not the gate.
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
     fake_open_pr, opens = _fake_open_pr()
     monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
 
@@ -303,4 +313,8 @@ async def test_ui_touching_diff_with_no_manifest_written_skips_the_walk(
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
     assert calls == [], f"no manifest was written; run() must not be called: {calls}"
-    assert "## UI evidence" not in opens[-1]["body"], opens[-1]["body"]
+    # The walk is skipped, but the honesty floor means skipped is disclosed,
+    # not silently rendered as an empty section.
+    assert "## UI evidence" in opens[-1]["body"], opens[-1]["body"]
+    assert "no `.no_human/ui_evidence.json` walk manifest" in opens[-1]["body"], \
+        opens[-1]["body"]

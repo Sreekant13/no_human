@@ -1929,6 +1929,30 @@ class WakeWatcher:
         CONFLICTING survives it. That is precisely the live shape, and it is
         why ancestry cannot be used instead: the squash has no lineage back to
         the branch.
+
+        TRUST THE LOCAL MERGE (2026-09-01). Measured live on four consecutive
+        review-passed deliveries in one day (99e67f5e, a9c4f0f4, a5753a8a,
+        11d5ff46): every landing rewrites RELEASE_MANIFEST.txt and
+        EXPORT_CLASSIFICATION.txt, which flips GitHub's cached ``mergeable``
+        to CONFLICTING for every OTHER open PR, while a fresh local
+        three-way merge of the branch against a freshly fetched base finds no
+        conflicting path at all. That used to defer, then escalate at a
+        bound ("… 4 consecutive checks disagree. Advise, or take over?"),
+        forcing a human to take over work that was already mergeable. The
+        local check is authoritative here: it runs a real merge against refs
+        fetched THIS tick, whereas the forge's verdict is async and cached
+        against whatever base tip it last saw. A *definite* empty
+        conflicting-path set (enumeration succeeded, found nothing, even
+        after the fetch-and-retry above) can never be a real conflict a coder
+        round could act on, so it is treated exactly like a definite
+        MERGEABLE: reset the round bookkeeping and fall through with no
+        escalation, ever, on this class. This cannot mask a genuine
+        conflict — a *non-empty* or unresolvable (``None``) local result
+        still opens a coder round or escalates below, unchanged — and the
+        approve path (``land_task``) re-runs its own squash merge at land
+        time and refuses any unmerged path outside the tolerated ledger
+        files, so a wrong "clean" verdict here would still be caught before
+        anything reaches ``main``.
         """
         if self._pr_mergeable is None:
             return None
@@ -2069,14 +2093,14 @@ class WakeWatcher:
         # is a stale side — the watcher's refs predate the push that made
         # the forge flip (every landing moves RELEASE_MANIFEST.txt under
         # every open PR), or the forge's asynchronous `mergeable` predates a
-        # fix already pushed. An EMPTY set is not something a coder can
-        # rebase against, and it used to fall through to a paid coder round
-        # labelled "could not enumerate" (task 855f1263: 2026-08-21, one
-        # round per open PR per landing). Fetch, ask again; if fresh refs
-        # still see nothing, defer to the next tick (the forge re-computes
-        # within seconds) — bounded like the rebase rounds, then escalate
-        # with both facts rather than guess.
-        stale_flags = 0
+        # fix already pushed. Fetch, ask again; a *definite* empty result
+        # (enumeration succeeded and found nothing, even after the fetch
+        # retry) is trusted outright — see TRUST THE LOCAL MERGE in the
+        # docstring above. This used to defer and then escalate at a bound
+        # (task 855f1263: 2026-08-21; the 2026-09-01 measurement of 4/4
+        # review-passed deliveries needing a human takeover in one day) — it
+        # does neither anymore. A non-empty or still-unresolvable (``None``)
+        # retry result is a real signal and falls through unchanged below.
         if (conflict_paths is not None and not conflict_paths
                 and not enumerate_error):
             try:
@@ -2109,50 +2133,33 @@ class WakeWatcher:
                     f"fetch (fetch_ok={fetched}) it names "
                     f"{len(again)} path(s)")
             elif again is not None:
-                stale_flags = int(ctx.get("pr_conflict_stale_flags") or 0) + 1
-                # Not a round: nothing was dispatched. Give the increment
-                # above back so deferrals never count toward the rebase bound.
+                # A definite empty set after a fresh fetch: trust it. Give
+                # back the round increment (nothing was dispatched) and zero
+                # the stale-flags counter — there is no more bound to feed.
+                # `pr_conflict_local_clean_checks` is observability-only: it
+                # is incremented for visibility but never compared against
+                # anything, so it can never itself become an escalation
+                # trigger. Returning `None` here is the same value the
+                # MERGEABLE branch returns above, so the tick falls through
+                # to the comment-resume / CI / integration rungs exactly as
+                # if the forge had reported MERGEABLE — the task stays
+                # AWAITING_APPROVAL and reachable by `nh approve`.
+                clean_checks = int(
+                    ctx.get("pr_conflict_local_clean_checks") or 0) + 1
                 task.context = await self.store.merge_context(
-                    task.id, {"pr_conflict_stale_flags": stale_flags,
-                              "pr_conflict_rounds": rounds - 1})
-                if stale_flags > self.max_pr_conflict_rounds:
-                    if await self._is_terminal(task):
-                        return None
-                    data = task.blocker or {}
-                    data["category"] = "NOVEL_UNKNOWN"
-                    data["question"] = (
-                        f"PR {url} is reported CONFLICTING by the forge, but "
-                        f"a local merge of freshly fetched {base_branch} and "
-                        f"{branch_name} finds no conflicting path — "
-                        f"{stale_flags} consecutive checks disagree. Advise, "
-                        "or take over?")
-                    data["root_cause_hypothesis"] = (
-                        f"forge/local disagreement on PR conflict state: {url}")
-                    data["evidence"] = (
-                        f"gh pr view -> CONFLICTING / {merge_state or 'UNKNOWN'}; "
-                        f"git merge-tree after fetch (fetch_ok={fetched}) -> "
-                        f"no conflicting paths, {stale_flags} time(s) in a row")
-                    task.blocker = data
-                    await self.store.update_task_columns(task)
-                    await self.store.set_status(
-                        task, TaskStatus.ESCALATED, validate=False)
-                    await self._emit(
-                        task, "escalated_pr_conflict",
-                        f"{task.id[:8]} PR {url} CONFLICTING per the forge but "
-                        f"clean locally {stale_flags} checks in a row — no "
-                        "coder round opened",
-                    )
-                    return "escalated_pr_conflict"
+                    task.id, {"pr_conflict_stale_flags": 0,
+                              "pr_conflict_rounds": rounds - 1,
+                              "pr_conflict_local_clean_checks": clean_checks})
                 await self._emit(
-                    task, "pr_conflict_deferred",
+                    task, "pr_conflict_local_clean",
                     f"{task.id[:8]} PR {url} CONFLICTING per the forge "
                     f"(mergeStateStatus={merge_state or 'UNKNOWN'}) but a "
                     f"local merge after git fetch (fetch_ok={fetched}) finds "
-                    f"no conflicting path — check {stale_flags}/"
-                    f"{self.max_pr_conflict_rounds + 1}; deferring to the next "
-                    "tick, no coder round opened",
+                    "no conflicting path — trusting the local merge, no "
+                    f"escalation, no coder round opened ({clean_checks} "
+                    "check(s) so far)",
                 )
-                return "deferred_pr_conflict"
+                return None
         if conflict_paths and ctx.get("pr_conflict_stale_flags"):
             # A real conflict set ends the disagreement streak.
             task.context = await self.store.merge_context(

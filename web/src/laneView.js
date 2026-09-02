@@ -3,6 +3,8 @@
 // (Board.jsx: last_activity || updated_at || created_at), NOT bare updated_at.
 // Pure so it's node --test'd; the count badge keeps showing the true total.
 
+import { timestampMs, compareDesc } from "./parseTimestamp.js";
+
 const defaultTs = (x) =>
   (x && (x.last_activity || x.updated_at || x.created_at)) || "";
 
@@ -21,11 +23,14 @@ export function topByRecency(items, n, tsOf = defaultTs) {
   }
   // Stable desc sort: equal timestamps keep input order (JS sort is stable, and
   // the comparator returns 0 on a tie). Copy first — never mutate the caller's.
-  const sorted = [...items].sort((a, b) => {
-    const ta = tsOf(a) || "";
-    const tb = tsOf(b) || "";
-    return ta < tb ? 1 : ta > tb ? -1 : 0;
-  });
+  // Compares through timestampMs (epoch ms), not the raw string: `tsOf` values
+  // come straight off `*_at` fields, and the DB stores both naive-space
+  // 'YYYY-MM-DD HH:MM:SS' and iso-offset '...+00:00' timestamps in the same
+  // column — ' ' < 'T' lexically, so a raw `<`/`>` always ranked a naive-space
+  // row as older than an iso-offset row from the same date regardless of age.
+  const sorted = [...items].sort((a, b) =>
+    compareDesc(timestampMs(tsOf(a)), timestampMs(tsOf(b))),
+  );
   const take = Math.max(0, n | 0);
   return {
     visible: sorted.slice(0, take),

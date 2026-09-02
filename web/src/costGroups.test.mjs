@@ -42,11 +42,20 @@ test("sums whatever cost_usd each task already carries — no row dropped or dou
   assert.equal(row.tasks, 3);
 });
 
-test("agrees with the sidebar ledger for the same tasks", () => {
-  // The real cross-surface check. An earlier version of this test asserted
-  // `row.cost === taskCost(t)` — but costByProject CALLS taskCost, so it asserted x === x
-  // and would have stayed green through the very bug that failed this branch's review.
-  // This one actually runs the ledger.
+// This test used to assert the Stats rollup and the sidebar ledger priced the
+// same tasks IDENTICALLY — both summed each task's lifetime `cost_usd`. That
+// shared basis was itself the bug this file's sibling (nightLedger.js) was
+// fixed for: closing/cancelling an old task bumps `updated_at` with no new
+// spend, so summing lifetime `cost_usd` over "touched in the window" tasks
+// swept the WHOLE stale total into "last 24h" (~3.5x inflation on a live
+// board). The fix moved the ledger's cost onto the server's attempt-attributed
+// `/api/metrics/window` figure (`spend`), a genuinely different basis
+// (window-of-activity vs. lifetime-per-task) — so the two surfaces are now
+// EXPECTED to disagree on the same task list. What must still hold: the
+// ledger never falls back to re-deriving a total from the tasks' own
+// `cost_usd` (that fallback would silently resurrect the bug), and it reports
+// exactly whatever `spend` it was handed.
+test("the ledger's window cost is NOT the Stats lifetime rollup — they are different bases by design", () => {
   const now = Date.now();
   const recent = (over) => ({
     ...over,
@@ -60,10 +69,17 @@ test("agrees with the sidebar ledger for the same tasks", () => {
   ];
   const rollup = totalCost(costByProject(tasks));
   assert.ok(rollup > 0, "fixture priced at zero — the assertion below would be vacuous");
-  assert.ok(
-    Math.abs(ledgerSummary(tasks, now).cost - rollup) < 1e-9,
-    "the Stats rollup and the sidebar ledger price the same tasks differently",
-  );
+
+  // No server figure yet (or an old daemon that 404s): the ledger must show
+  // zero, NOT silently sum the tasks' own lifetime cost_usd like it used to.
+  assert.equal(ledgerSummary(tasks, now).cost, 0);
+
+  // With a server figure supplied, the ledger reports THAT value verbatim —
+  // even when it is nowhere near the Stats lifetime rollup for the very same
+  // tasks, because it is pricing a different thing (recent attempt activity).
+  const windowSpend = { cost_usd: 0.42, tokens: 100 };
+  assert.equal(ledgerSummary(tasks, now, undefined, windowSpend).cost, windowSpend.cost_usd);
+  assert.notEqual(windowSpend.cost_usd, rollup);
 });
 
 test("groups case-insensitively, keeping the first spelling seen", () => {

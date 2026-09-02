@@ -380,6 +380,76 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "grill_questions_outcomes": grill_questions,
     }
 
+
+WINDOW_HOURS_DEFAULT = 24
+
+
+async def window_spend(store: Store, *, hours: float = 24.0, now: str | None = None) -> dict[str, Any]:
+    """Spend that OCCURRED in the trailing window — attempt-attributed, not
+    task-attributed.
+
+    The board's "last 24h" banner used to filter TASKS by `updated_at` and sum
+    each survivor's LIFETIME `cost_usd`. Closing or cancelling an old task
+    bumps `updated_at` with no new spend, so its entire historical cost swept
+    into "last 24h" (measured ~3.5x inflation: a stale $18.68 task closed
+    overnight alone accounted for most of the gap). `tasks` is not queried at
+    all here — that is the whole fix. An attempt counts when ITS OWN activity
+    falls in the window: it started in the window, it ended in the window (a
+    long attempt that began earlier), or it is still open (`in_progress` with
+    no `completed_at` yet).
+
+    Timestamps are mixed-format: `started_at` is SQLite's `datetime('now')`
+    default ("YYYY-MM-DD HH:MM:SS"), `completed_at` is Python `db._now()`
+    (ISO-T, e.g. "...+00:00"). `julianday()` parses both alike; a string `>=`
+    would not (see `core/health.py:_median_attempt_seconds`, same columns).
+    `julianday(NULL)` is NULL, so a NULL side of an OR is simply false.
+    """
+    if now is not None:
+        cutoff_expr = "julianday(?) - ?"
+        cutoff_args: tuple[Any, ...] = (now, hours / 24.0)
+    else:
+        cutoff_expr = "julianday('now') - ?"
+        cutoff_args = (hours / 24.0,)
+
+    # `since` (ISO, response-only) — derived from the SAME cutoff expression
+    # so a caller never sees a figure that disagrees with the filter below.
+    since_row = await store.query_one(f"SELECT datetime({cutoff_expr})", cutoff_args)
+    since = since_row[0] if since_row else None
+
+    where = (
+        f"WHERE julianday(started_at) >= ({cutoff_expr}) "
+        f"OR julianday(completed_at) >= ({cutoff_expr}) "
+        f"OR (completed_at IS NULL AND status = 'in_progress')"
+    )
+    cost_cols = ["models"]
+    for prefix in USAGE_ROLES:
+        tokens_col, read_col, creation_col = usage_columns_for(prefix)
+        output_col = "output_tokens" if prefix == "" else f"{prefix}output_tokens"
+        cost_cols += [tokens_col, read_col, creation_col, output_col]
+    rows = await store.query(
+        f"SELECT {', '.join(cost_cols)} FROM attempts {where}",
+        cutoff_args + cutoff_args)
+    attempt_dicts = [dict(zip(cost_cols, r)) for r in rows]
+    cost_usd, cost_model = attempts_cost(attempt_dicts)
+
+    tokens = 0
+    for prefix in USAGE_ROLES:
+        tokens_col, read_col, creation_col = usage_columns_for(prefix)
+        for d in attempt_dicts:
+            tokens += int(d.get(tokens_col) or 0)
+            tokens += int(d.get(read_col) or 0)
+            tokens += int(d.get(creation_col) or 0)
+
+    return {
+        "hours": hours,
+        "since": since,
+        "cost_usd": cost_usd,
+        "cost_model": cost_model,
+        "tokens": tokens,
+        "attempts": len(attempt_dicts),
+    }
+
+
 async def playbook_outcomes(store) -> list[dict]:
     """D2 #5 (agent-a June-2026): which playbooks actually PAY?
 

@@ -19,23 +19,87 @@ function serve(handler) {
 }
 
 test("probe: up only when /api/tasks answers 2xx", async () => {
+  let seen = null;
   const { srv, origin } = await serve((req, res) => {
-    if (req.url === "/api/tasks") { res.end("[]"); return; }
+    seen = req.url;
+    if (req.url.split("?")[0] === "/api/tasks") { res.end("[]"); return; }
     res.statusCode = 404; res.end();
   });
   try {
     assert.equal(await probe(origin), "up");
+    assert.equal(seen, "/api/tasks?limit=1");
   } finally { srv.close(); }
 });
 
 test("probe: down on refused connection and on 5xx", async () => {
   assert.equal(await probe("http://127.0.0.1:1"), "down");
+  let count = 0;
   const { srv, origin } = await serve((_req, res) => {
+    count += 1;
     res.statusCode = 500; res.end();
   });
   try {
     assert.equal(await probe(origin), "down");
+    assert.equal(count, 1);
   } finally { srv.close(); }
+});
+
+test("probe: a first-request timeout is retried once and the second answer wins", async () => {
+  let count = 0;
+  const held = [];
+  const { srv, origin } = await serve((req, res) => {
+    count += 1;
+    if (count === 1) { held.push(req.socket); return; }
+    res.end("[]");
+  });
+  try {
+    assert.equal(await probe(origin, 200, 20), "up");
+    assert.equal(count, 2);
+  } finally {
+    for (const sock of held) sock.destroy();
+    srv.close();
+  }
+});
+
+test("probe: a server that never answers is 'down', bounded", async () => {
+  let count = 0;
+  const held = [];
+  const { srv, origin } = await serve((req) => {
+    count += 1;
+    held.push(req.socket);
+  });
+  try {
+    const t0 = Date.now();
+    const result = await probe(origin);
+    const elapsed = Date.now() - t0;
+    assert.equal(result, "down");
+    assert.ok(elapsed < 4000, `expected < 4000ms, got ${elapsed}ms`);
+    assert.equal(count, 2);
+  } finally {
+    for (const sock of held) sock.destroy();
+    srv.close();
+  }
+});
+
+test("probe: never throws", async () => {
+  const result1 = await probe("http://127.0.0.1:1");
+  assert.equal(typeof result1, "string");
+  assert.ok(["up", "down"].includes(result1));
+
+  const result2 = await probe("not-a-url");
+  assert.equal(typeof result2, "string");
+  assert.ok(["up", "down"].includes(result2));
+
+  const { srv, origin } = await serve((req) => {
+    req.socket.destroy();
+  });
+  try {
+    const result3 = await probe(origin, 200, 20);
+    assert.equal(typeof result3, "string");
+    assert.ok(["up", "down"].includes(result3));
+  } finally {
+    srv.close();
+  }
 });
 
 test("waitForServer: resolves true once the server comes up", async () => {

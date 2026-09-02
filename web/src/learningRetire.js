@@ -9,6 +9,8 @@
 //
 // Pure functions, `node --test`'d, same shape as learningGroups.js/learningCard.js.
 
+import { timestampMs } from "./parseTimestamp.js";
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 // A human-readable label for how stale a candidate is. A missing/null/
@@ -19,7 +21,7 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 export function retireLabel(item, { now = Date.now() } = {}) {
   const lastUsed = item && item.last_used_at;
   if (!lastUsed) return "never used";
-  const usedMs = Date.parse(lastUsed);
+  const usedMs = timestampMs(lastUsed);
   if (Number.isNaN(usedMs)) return "never used";
   const days = Math.max(0, Math.floor((now - usedMs) / MS_PER_DAY));
   return `unused for ${days} day${days === 1 ? "" : "s"}`;
@@ -36,7 +38,7 @@ export function retireCandidates(items, dismissedIds, { days = 90, now = Date.no
     .filter((it) => {
       const lastUsed = it.last_used_at;
       if (!lastUsed) return true;             // never used -> always a candidate
-      const usedMs = Date.parse(lastUsed);
+      const usedMs = timestampMs(lastUsed);
       if (Number.isNaN(usedMs)) return true;   // unparseable -> treat as stale, not fresh
       return usedMs <= cutoffMs;               // fresh (used within the window) excluded
     })

@@ -4,6 +4,12 @@ All notable changes to no_human. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Development now happens directly in this repository: changes land here as
+  commits and pull requests rather than arriving through a periodic export.
+
 ## [0.1.9] — 2026-09-01
 
 The evidence release. PR bodies shrink to final results with the full receipts
@@ -129,6 +135,24 @@ a file descriptor per attempt.
 
 - **Dead-click and heatmap capture are pinned off** in the analytics init; the
   never-pre-tick proposals privacy guard now lives in Settings.
+
+### Fixed — the review loop and PR body
+
+- **A review-passed PR whose local merge is clean no longer escalates to a
+  human just because GitHub's cached `mergeable` says CONFLICTING.** Every
+  landing rewrites `RELEASE_MANIFEST.txt`/`EXPORT_CLASSIFICATION.txt`, which
+  flips the forge's asynchronous `mergeable` to CONFLICTING for every other
+  open PR even though a fresh local three-way merge against refs fetched the
+  same tick finds no conflicting path at all. That contradiction used to
+  defer and then escalate once it persisted past a bound (measured live: 4/4
+  review-passed deliveries in one day needed a human takeover) — a *definite*
+  empty local conflict-path set is now trusted outright, the round bookkeeping
+  resets, and the task falls through to the approve path exactly as if the
+  forge had reported MERGEABLE. A genuine source-code conflict is unaffected:
+  a non-empty or unresolvable local result still opens a coder round or
+  escalates at the bound, unchanged, and generated-file-only conflicts still
+  route through the existing derived-artefact resolver from commit
+  `26dc16248`.
 
 ### Fixed — tests & docs
 

@@ -24,6 +24,7 @@ from .task import (
     Task,
     TaskStatus,
     assert_landed_reconciliation,
+    assert_terminal_landed_reconciliation,
     assert_transition,
 )
 
@@ -1552,6 +1553,7 @@ class Store:
         human_override: bool = False,
         event: dict[str, Any] | None = None,
         reconciliation_gate: Callable[[TaskStatus], None] | None = None,
+        terminal_reconcile: bool = False,
     ) -> Task | None:
         """Transition a task, enforcing the legal-transition map by default.
 
@@ -1605,6 +1607,24 @@ class Store:
         every write still passes through an explicit, raising check —
         either the general map alone, or the general map followed by a
         named narrower one — never neither.
+
+        `terminal_reconcile=True` is a THIRD, narrow CAS mode — distinct from
+        both the default guard and `human_override` — for exactly one
+        caller: `reconcile_landed_terminal` below, completing a TERMINAL
+        failed/cancelled row (`FAILED`, optionally with a `cancel_reason`)
+        whose recorded work is verifiably on the base branch. The default
+        CAS guard refuses ANY write to a row that reads FAILED with a
+        `cancel_reason` — a deliberate protection against clobbering a
+        human's explicit cancel — which is also, precisely, the write this
+        reconciliation needs to make. Passing `terminal_reconcile=True`
+        swaps the CAS `WHERE` for the tight form `id = ? AND status = ?`
+        (the literal `FAILED` value): the write lands ONLY if the row is
+        STILL `failed` at commit time — narrower than `human_override`
+        (which skips the CAS entirely and can stomp any row in any state);
+        this still refuses a row a concurrent human `retry`/`shipped` call
+        already moved off `FAILED`. Ignored when `human_override=True` (that
+        already bypasses the CAS outright). `SilentCompletion` (DONE
+        requires an `event`) still applies unchanged.
         """
         if validate:
             try:
@@ -1614,7 +1634,8 @@ class Store:
                     raise
                 reconciliation_gate(task.status)
         return await self._write_status(
-            task, new_status, human_override=human_override, event=event)
+            task, new_status, human_override=human_override, event=event,
+            terminal_reconcile=terminal_reconcile)
 
     @serialized_write
     async def _write_status(
@@ -1624,6 +1645,7 @@ class Store:
         *,
         human_override: bool = False,
         event: dict[str, Any] | None = None,
+        terminal_reconcile: bool = False,
     ) -> Task | None:
         """The CAS write + DONE-event guard + phase recording shared by every
         validated transition. The only caller is `set_status` itself, which
@@ -1646,6 +1668,12 @@ class Store:
         is already decorated, so this nests into the SAME lock —
         `_critical()` is reentrant per (Store, owning asyncio task), see its
         own docstring — never a second, competing acquisition.
+
+        `terminal_reconcile=True` (only `reconcile_landed_terminal` passes
+        it) narrows the CAS `WHERE` to `id = ? AND status = ?` — see
+        `set_status`'s docstring for why that specific, tighter clause is
+        needed and how it still refuses a row a concurrent human write
+        already moved off `FAILED`.
         """
         # Checked AFTER the caller's own transition check on purpose: an
         # illegally-shaped transition (e.g. CONTEXT -> DONE) must still raise
@@ -1673,6 +1701,12 @@ class Store:
             cur = await self.db.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                 (new_status.value, now, task.id),
+            )
+        elif terminal_reconcile:
+            cur = await self.db.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (new_status.value, now, task.id, TaskStatus.FAILED.value),
             )
         else:
             cur = await self.db.execute(
@@ -1802,6 +1836,57 @@ class Store:
             task, TaskStatus.DONE, event=event,
             reconciliation_gate=assert_landed_reconciliation,
         )
+
+    @serialized_write
+    async def reconcile_landed_terminal(
+        self, task: Task, *, evidence: dict[str, Any], event: dict[str, Any],
+    ) -> Task | None:
+        """The TERMINAL-row twin of `reconcile_landed_orphan`.
+
+        A row that already went FAILED (with or without a `cancel_reason` —
+        there is no separate CANCELLED status) but whose recorded work is
+        provably reachable from the base branch is completed to DONE here,
+        through `assert_terminal_landed_reconciliation` — the same shape of
+        validated, evidence-gated transition as the orphan reconciler, never
+        a bypass. `terminal_reconcile=True` narrows `_write_status`'s CAS
+        guard to require the row still be exactly FAILED at write time, so a
+        concurrent human action (or a second sweep) can't clobber or
+        double-apply this.
+        """
+        assert_terminal_landed_reconciliation(task.status)
+        sha = evidence.get("sha")
+        kind = evidence.get("kind")
+        base = evidence.get("base")
+        if not sha or kind not in ("commit", "pr") or not base:
+            raise ValueError(
+                f"reconcile_landed_terminal: malformed evidence {evidence!r}")
+        await self.merge_context(
+            task.id, {"landed_sha": sha, "landed_reconciled_from": "failed"})
+        return await self.set_status(
+            task, TaskStatus.DONE, event=event,
+            reconciliation_gate=assert_terminal_landed_reconciliation,
+            terminal_reconcile=True,
+        )
+
+    async def landed_reconcilable_terminal_tasks(
+        self, limit: int = 200) -> list[Task]:
+        """Bounded candidate set for `Scheduler._reconcile_landed_terminal`:
+        FAILED rows (cancelled or not) that haven't already been reconciled,
+        that carry a `repo_path` to probe and a recorded `base_branch` — a
+        row without one is never guessed at and is skipped untouched (see
+        `context["base_branch"]` requirement)."""
+        rows = await self._fetchall(
+            "SELECT * FROM tasks "
+            "WHERE status = ? "
+            "  AND json_extract(context,'$.landed_sha') IS NULL "
+            "  AND json_extract(context,'$.landed_override_sha') IS NULL "
+            "  AND COALESCE(TRIM(repo_path),'') <> '' "
+            "  AND COALESCE(json_extract(context,'$.base_branch'),'') <> '' "
+            "ORDER BY updated_at DESC, rowid DESC "
+            "LIMIT ?",
+            (TaskStatus.FAILED.value, limit),
+        )
+        return [Task.from_row(dict(r)) for r in rows]
 
     @serialized_write
     async def update_task(self, task: Task) -> Task:

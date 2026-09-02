@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterable, Literal
 from urllib.parse import quote as _url_quote
 
 from ..agent.advisory import advisory_backend
-from ..agent.backend import AgentEvent, CodingBackend, resolve_backend_name
+from ..agent.backend import AgentEvent, CodingBackend, local_run_without_subscription, resolve_backend_name
 from ..agent.claude_backend import ClaudeBackend
 from ..agent.claude_backend import (
     TRANSPORT_DIAGNOSIS_MARKER as _TRANSPORT_BLOCKER_MARKER,
@@ -1462,6 +1462,9 @@ class Orchestrator:
         # `_raise_blocker` reads this to add the caveat to the persisted
         # blocker's evidence — the checkpoint succeeded, but unverified.
         self._last_checkpoint_unverified: str = ""
+        # `_park_local_infra`'s evidence fallback when `AgentResult.final_text`
+        # is empty; reset per attempt in `_arm_attempt_budget`.
+        self._last_coder_error_text: str = ""
         # Latched by `_build_supervisor`'s `on_decision` closure the moment
         # the supervisor's own side-channel LLM call observes a subscription
         # session/weekly-limit wall (`agent.supervisor`'s `quota_park`
@@ -1472,6 +1475,11 @@ class Orchestrator:
         # nothing to see. Checked (and cleared) right alongside that
         # existing check so either signal parks the task the same way.
         self._supervisor_quota_wall: str | None = None
+        # One-shot latch: `.no_human/project.yml` diverging from the confirmed
+        # DB profile is advised ONCE per orchestrator (one task execution),
+        # not once per `_usable_profile` call — it is called 6+ times per
+        # attempt.
+        self._profile_divergence_warned: bool = False
 
     # ----------------------------- events ---------------------------------- #
 
@@ -2174,6 +2182,10 @@ class Orchestrator:
                         f"crossed {ceiling[2]} ({ceiling[1]:,})"
                     )
             return
+        # A zero-token SDK death returns no `final_text`; the error prose
+        # arrives via an event instead, so keep it for `_park_local_infra`.
+        if event.text and event.kind in ("text", "assistant", "result", "error"):
+            self._last_coder_error_text = event.text[:1000]
         # Feed assistant prose to the supervisor so it sees what the agent SAYS
         # (where "I can't access X" / unverified assumptions surface), not just
         # the tools it runs. Best-effort; the hook only acts on its check cadence.
@@ -5170,9 +5182,9 @@ class Orchestrator:
                     "quota_pause",
                     "fleet paused — 3 consecutive zero-token/auth SDK "
                     "failures across distinct tasks")
-            # `infra=True`: the park spares the attempt, the breaker above
-            # decides the fleet — the pool clock is NOT armed by this park.
-            raise QuotaExhausted(infra_reason, infra=True)
+            return await self._park_local_infra(
+                task, infra_reason, repo=repo, branch=branch,
+                attempt_id=attempt_id, evidence=result.final_text or "")
 
         # Refusal → fail-fast (Broker). A model refusal is a COMPLETED turn the
         # agent declined (stop_reason="refusal", is_error False, no diff) — so it
@@ -7813,6 +7825,21 @@ class Orchestrator:
             outcome = replace(outcome, detail=f"{outcome.detail} Last: {tried[-1]}")
         return outcome
 
+    async def _park_local_infra(self, task: Task, reason: str, *, repo: GitRepo | None = None, branch: str | None = None, attempt_id: str | None = None, evidence: str = "") -> TaskOutcome:
+        """Zero-token SDK death against `backend=local` -> TRANSIENT_INFRA, never `paused_quota`; else re-raise `QuotaExhausted(infra=True)` for the ordinary park."""
+        if not local_run_without_subscription(self.config, backend_name=self._task_backend(task)):
+            raise QuotaExhausted(reason, infra=True)
+        detail = (evidence or self._last_coder_error_text or reason)[:1000]
+        backend_name = self._task_backend(task) or "local"
+        blocker = Blocker(
+            category=BlockerCategory.TRANSIENT_INFRA, transient=True, confidence=0.8,
+            wake_condition=f"after:{_INFRA_SESSION_WAKE_AFTER}", goal=task.title,
+            root_cause_hypothesis=f"backend: {backend_name} — died before producing tokens ({reason}); no local subscription to reset.",
+            question="Check the local server/proxy is reachable and supports the requested capabilities, then resume.",
+            evidence=f"local backend said: {detail}" if detail else reason,
+        )
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch, attempt_id=attempt_id)
+
     async def _escalate_timeout_streak(
         self, task: Task, repo: GitRepo, branch: str | None
     ) -> TaskOutcome:
@@ -9677,6 +9704,13 @@ class Orchestrator:
 
     async def _park_quota(self, task: Task, exc: QuotaExhausted, *,
                           repo: GitRepo | None = None) -> TaskOutcome:
+        # Defence in depth: a raise site other than the coder call site
+        # (planner, repro corrective round) must not land a local-backend
+        # infra death here waiting on a quota reset that can't help.
+        if getattr(exc, "infra", False) and local_run_without_subscription(
+            self.config, backend_name=self._task_backend(task)
+        ):
+            return await self._park_local_infra(task, str(exc), repo=repo)
         # Name the exhausted subscription: a wall park stops the whole pool, and with
         # more than one profile configured "quota exhausted" alone does not tell
         # the operator which token to top up or switch away from.
@@ -9943,7 +9977,10 @@ class Orchestrator:
         tip a delivery offers. Everything else fails closed: a reviewer must
         never verify an unpushable checkpoint and turn it into approval proof.
         """
-        del task  # The policy is solely about the candidate delivery tree.
+        # `task` is needed below to enumerate THIS task's own pushed agent
+        # branches (attempt 2+ pushes to a distinct branch — see
+        # branch_prefix usage at ~4407 — so the offered branch alone can
+        # undercount what this task has actually shipped to the remote).
         try:
             head = repo.head_sha().strip()
         except Exception as exc:  # noqa: BLE001 — unreadable means unshippable
@@ -10045,6 +10082,27 @@ class Orchestrator:
                 False, ship_ref
         if relation == "up_to_date":
             label = f"{head[:12]} (pushed branch {branch}, not on {ship_ref})"
+            return True, head, label, "", False, ship_ref
+        # `branch` itself isn't up to date — but constraint #2 forbids the
+        # agent merging to `ship_ref`, so attempt 2+ pushes to a DIFFERENT,
+        # attempt-suffixed branch of this same task (~4407) while `branch`
+        # here still names an earlier/unpushed one. Before refusing, check
+        # whether one of THIS task's other pushed branches already contains
+        # `head` — sibling branches only, never any remote ref, so a
+        # foreign task's branch can't satisfy this claim.
+        prefix_cfg = (self.config.get("git") or {}).get("branch_prefix") or "no-human/"
+        stem = f"{prefix_cfg}{task.id[:8]}"
+        try:
+            sibling_names = await asyncio.to_thread(
+                repo.remote_branches_containing, head, [stem, f"{stem}-*"])
+        except Exception:  # noqa: BLE001 — sibling check is best-effort proof only
+            sibling_names = []
+        sibling_names = [
+            name for name in sibling_names
+            if name != branch and re.fullmatch(rf"{re.escape(stem)}(-\d+)?", name)
+        ]
+        if sibling_names:
+            label = f"{head[:12]} (pushed branch {sibling_names[0]}, not on {ship_ref})"
             return True, head, label, "", False, ship_ref
         relation_reason = {
             "behind": "the remote branch contains commits the reviewer did not judge",
@@ -12786,6 +12844,7 @@ class Orchestrator:
         it); fall back to the repo's ``.no_human/project.yml``."""
         from ..profile import ProjectProfile
         prof = None
+        hit_cand = None
         candidates = [str(repo_path)]
         primary = self._primary_repo_path(repo_path)
         if primary:
@@ -12796,7 +12855,10 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 log.warning("profile lookup failed: %s", exc)
             if prof is not None:
+                hit_cand = cand
                 break
+        if prof is not None:
+            self._warn_profile_divergence(hit_cand, prof)
         if prof is None:
             for cand in candidates:
                 try:
@@ -12810,6 +12872,32 @@ class Orchestrator:
         # The repo's own `.no_human.yml` may fill routing rules the operator's
         # profile leaves empty (never replace them) — see project_config.py.
         return apply_repo_config(prof, self._repo_config(repo_path))
+
+    def _warn_profile_divergence(self, repo_path, db_prof) -> None:
+        """Advise ONCE when the documented `.no_human/project.yml` disagrees
+        with the confirmed DB profile that actually wins. Never syncs and
+        never changes precedence — confirmation is a human gate (`nh onboard`
+        / the API); the file alone cannot confer trust."""
+        if self._profile_divergence_warned:
+            return
+        from ..profile import ProjectProfile, profile_divergence
+        try:
+            on_disk = ProjectProfile.load(repo_path)
+        except Exception:  # noqa: BLE001 — a corrupt yml must never break a task
+            on_disk = None
+        if on_disk is None:
+            return
+        keys = profile_divergence(db_prof, on_disk)
+        if not keys:
+            return
+        self._profile_divergence_warned = True
+        self.emit(
+            "profile_divergence",
+            "project.yml differs from the confirmed profile on: "
+            f"{', '.join(keys)} - the confirmed profile wins; "
+            "re-onboard or use the API to update",
+            keys=keys, repo_path=str(repo_path),
+        )
 
     def _repo_config(self, repo_path) -> dict[str, Any]:
         """The repo's `.no_human.yml`, read ONCE per repo per orchestrator and
@@ -13107,6 +13195,7 @@ class Orchestrator:
         still holds `task` and can resolve it once for both of them.
         """
         self._attempt_backend = self._task_backend(task)
+        self._last_coder_error_text = ""
         remaining = await self._attempt_spendable_tokens(task)
         self._begin_attempt_accounting(
             task.id, remaining_tokens=remaining,
@@ -19769,6 +19858,37 @@ SIX of them read a checkpoint and TWO do not — but do
     #: at a glance, not scrolled through like the branch it links to.
     _UI_EVIDENCE_MAX_EMBEDDED_SHOTS = 6
 
+    #: The honesty floor: when the diff qualifies for a visual-proof walk
+    #: (`ui_evidence_should_run` says yes) but playwright isn't installed in
+    #: this environment, the PR body must say so instead of silently
+    #: rendering "" — a customer install (pip/uvx, no `--group e2e`) must
+    #: never look identical to "nothing to show here". See
+    #: `_ui_evidence_skipped` immediately below: the SAME policy covers
+    #: every other way a gated walk can end up with NO SHOTS CAPTURED (no
+    #: manifest, the walk raising, zero shots) — once the gate says yes,
+    #: every exit up through "were any shots captured?" discloses. That
+    #: boundary is deliberate: shots that WERE captured but then failed to
+    #: DELIVER (e.g. push rejected, non-GitHub remote, `current_branch`
+    #: erroring, or every captured file missing from disk at commit time —
+    #: `_deliver_ui_evidence`'s `if not committed_paths` exit) are that
+    #: method's own pre-existing "", a delivery failure rather than a walk
+    #: that produced nothing, and unchanged here.
+    _UI_EVIDENCE_SKIPPED_SECTION = (
+        "## UI evidence\n"
+        "Visual proof skipped: playwright not installed - run "
+        "`nh doctor --fix-walks` to enable\n\n"
+    )
+
+    @classmethod
+    def _ui_evidence_skipped(cls, reason: str) -> str:
+        """Render the same `## UI evidence` shape as `_UI_EVIDENCE_SKIPPED_SECTION`
+        for every OTHER gated-but-empty walk outcome (no manifest, the walk
+        raising, zero shots) — one honest line naming what was lost, never
+        `""`. `reason` is caller-sanitized (exception class name only, or a
+        truncated/newline-stripped driver string) before it reaches here;
+        this function does not sanitize."""
+        return f"## UI evidence\nVisual proof skipped: {reason}\n\n"
+
     #: `owner/repo` from a github.com remote, https or ssh form, optional
     #: `.git` suffix and trailing slash. GitHub Enterprise hosts (`git.
     #: github_hosts`) are recognized as GitHub for PR purposes elsewhere in
@@ -19794,8 +19914,20 @@ SIX of them read a checkpoint and TWO do not — but do
     ) -> str:
         """D1.2: after tests pass, run the coder-authored browser walk
         (`testing/ui_evidence.py`) for real and return a rendered PR-body
-        media section — "" for every case where there is nothing to show
-        (non-UI change, no manifest, unreachable dev server, no shots).
+        media section. Honesty floor UP THROUGH deciding whether any shots
+        exist to deliver: `""` ONLY when the diff never qualified for a walk
+        (`ui_evidence_should_run` says no — nothing was skipped, there was
+        nothing to do). Every other empty outcome before that decision —
+        playwright missing, no manifest, the walk raising, unreachable dev
+        server, zero shots — discloses via `_ui_evidence_skipped`/
+        `_UI_EVIDENCE_SKIPPED_SECTION` instead of silently rendering `""`.
+        Past that point this method just forwards `_deliver_ui_evidence`'s
+        return value verbatim: if shots WERE captured but delivery then
+        fails (e.g. push rejected, non-GitHub remote, a `current_branch`/
+        commit error, or none of the captured files still on disk at commit
+        time), that method's own pre-existing "" comes back unchanged — a
+        delivery failure after real proof was produced, not a walk that
+        had nothing to show.
 
         Gating is `config.ui_evidence_should_run`: the diff vs *base* (best-
         effort; an unreadable diff reads as "no UI paths touched", the same
@@ -19820,13 +19952,19 @@ SIX of them read a checkpoint and TWO do not — but do
         if not ui_evidence_should_run(self.config, changed_paths, extra_globs=extra_globs):
             return ""
 
+        if not ui_evidence.playwright_available():
+            self._advisory("ui evidence skipped: playwright not installed")
+            return self._UI_EVIDENCE_SKIPPED_SECTION
+
         manifest_path = Path(repo.path) / ui_evidence.MANIFEST
         if not manifest_path.is_file():
             # The coder never wrote a walk — `ui_evidence.run` would say so
             # too (verdict "not_run", reason "no manifest"), but skipping
             # the temp dir + subprocess dance entirely here is cheaper and
-            # every bit as honest: nothing ran, nothing to report.
-            return ""
+            # every bit as honest: nothing ran, so disclose that instead of
+            # rendering "" (honesty floor, `_ui_evidence_skipped` above).
+            return self._ui_evidence_skipped(
+                "the coder wrote no `.no_human/ui_evidence.json` walk manifest")
 
         out_dir = ui_evidence.default_out_dir(task.id)
         try:
@@ -19834,20 +19972,32 @@ SIX of them read a checkpoint and TWO do not — but do
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
             # promise; it fails the same way every other evidence gather here
-            # does — advisory, never a reason the PR doesn't ship.
+            # does — advisory, never a reason the PR doesn't ship. Disclose
+            # the exception CLASS ONLY: `str(exc)` can carry an absolute
+            # repo path or a multi-line traceback, and a PR body is a
+            # publish surface. The full text still reaches `nh logs` via
+            # `self._advisory` above.
             self._advisory(f"ui evidence run raised: {exc}")
             shutil.rmtree(out_dir, ignore_errors=True)
-            return ""
+            return self._ui_evidence_skipped(f"the walk errored ({type(exc).__name__})")
 
         if not result.shots:
             # `not_run` (no reachable dev server, bad manifest) or a `failed`
-            # walk that broke before its first shot — nothing to embed.
-            # `result.reason` already reaches `nh logs`/the walk's own
-            # `result.json`; repeating it in the PR body is not this
-            # section's job (mirrors `_verification_section` staying silent
-            # rather than growing a NOT-RUN row for every possible gate).
+            # walk that broke before its first shot — nothing to embed. This
+            # is also where a package-present/binary-missing playwright
+            # install now surfaces (`playwright_available()` no longer
+            # checks the chromium binary — see `ui_evidence.py`), so this
+            # path carries real diagnostic weight, not just a corner case.
+            # `result.reason` (falling back to `result.verdict`) is
+            # driver/coder-supplied text: newline-stripped, backticks
+            # stripped, and truncated so it cannot forge Markdown or break
+            # out of this section.
             shutil.rmtree(out_dir, ignore_errors=True)
-            return ""
+            reason = (result.reason or result.verdict or "unknown").strip()
+            reason = reason.replace("\n", " ").replace("`", "'")
+            if len(reason) > 120:
+                reason = reason[:117] + "..."
+            return self._ui_evidence_skipped(f"the walk captured no shots ({reason})")
 
         try:
             return self._deliver_ui_evidence(repo, task.id, out_dir, result)

@@ -3782,6 +3782,16 @@ async def metrics(request: Request) -> dict[str, Any]:
     return data
 
 
+@app.get("/api/metrics/window")
+async def metrics_window(request: Request, hours: float = 24.0) -> dict[str, Any]:
+    """Spend that OCCURRED in the trailing window — attempt-attributed, so
+    closing/cancelling an old task (bumping only `updated_at`) adds zero."""
+    from ..core.metrics import window_spend
+    if not (0 < hours <= 168):
+        raise HTTPException(status_code=400, detail="hours must be in (0, 168]")
+    return await window_spend(_store(request), hours=hours)
+
+
 @app.get("/api/autonomy")
 async def autonomy_report(request: Request, days: int | None = None) -> dict[str, Any]:
     """Autonomy telemetry (megaplan P0): mid-flight-touchpoint rate vs.
@@ -4272,20 +4282,35 @@ async def show_config(request: Request) -> dict[str, Any]:
       its own — a duplicated rule here is exactly what could disagree with
       the CLI/API's own refusal. The task composer greys out an option (and
       shows this ``reason``) using this field instead.
+    * ``coder_backend_effective`` — ``agent.backend.resolve_backend_name``
+      applied to THIS config: what the coder will actually run on right now,
+      whether that came from an explicit ``worker.backend`` or the function's
+      own ``"claude"`` fallback. The composer must never re-derive this
+      precedence itself (a second copy in JS could silently diverge from the
+      one function `make_backend` actually calls).
+    * ``coder_backend_default`` — the pristine default
+      (``DEFAULT_CONFIG["worker"]["backend"]``) ``coder_backend_effective`` is
+      compared against, so the composer can tell "this install configured
+      something non-default" from "nothing was edited" without naming a
+      backend of its own. Precedent: ``core/backend_settings.py`` already
+      ships ``"default": "claude"`` on ``/api/coder-backend`` the same way.
 
-    All three are computed fresh on every call (not config data), so they
+    All five are computed fresh on every call (not config data), so they
     can never be "scrubbed" or otherwise altered by ``_scrub_secrets``.
     """
     cfg = request.app.state.config
     data = copy.deepcopy(cfg.data)
     scrubbed = _scrub_secrets(data)
-    from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS
+    from ..agent.backend import CLAUDE_PINNED_ROLES, SUPPORTED_BACKENDS, resolve_backend_name
+    from ..config import DEFAULT_CONFIG
     from ..core.backend_settings import describe_backend
     scrubbed["coder_backends"] = list(SUPPORTED_BACKENDS)
     scrubbed["claude_pinned_roles"] = list(CLAUDE_PINNED_ROLES)
     scrubbed["coder_backend_availability"] = [
         describe_backend(name, cfg.data) for name in SUPPORTED_BACKENDS
     ]
+    scrubbed["coder_backend_effective"] = resolve_backend_name(cfg.data)
+    scrubbed["coder_backend_default"] = DEFAULT_CONFIG["worker"]["backend"]
     return scrubbed
 
 
@@ -5014,6 +5039,15 @@ class RepoProveRequest(BaseModel):
 class RepoConfirmRequest(BaseModel):
     repo_path: str
 
+class RepoUiEvidenceRequest(BaseModel):
+    """The wizard's one-action confirm for the ui_evidence suggestion
+    (no-human-67 follow-up). ``enabled`` is the human's Yes/No answer, never a
+    client-supplied start_cmd/base_url — the server re-derives the suggestion
+    itself so a stale or tampered client body can never write commands into a
+    profile that get run later."""
+    repo_path: str
+    enabled: bool = False
+
 class HistoryAnalyzeRequest(BaseModel):
     days: int = 30
     # Scope the scan to the repos the user selected (spec §3 B5). Empty = every
@@ -5191,6 +5225,14 @@ async def onboarding_onboard_repo(
     # `confirmed` (the human's "use this repo") holds while the test command it
     # was confirmed against is still proven; otherwise the gate has nothing to run.
     carry_confirmed = bool(prior and prior.confirmed and carried_proven.get("test_cmd"))
+    # ui_evidence must survive a re-derive the same way proofs do: this
+    # endpoint builds a brand-new ProjectProfile on every call, and
+    # store.upsert_profile REPLACES the whole DB row from it — omitting
+    # ui_evidence here would silently wipe a manually-configured (or
+    # previously offered-and-accepted) ui_evidence block on every re-onboard.
+    carry_kwargs: dict[str, Any] = {}
+    if prior:
+        carry_kwargs["ui_evidence"] = dict(prior.ui_evidence)
     profile = ProjectProfile(
         repo_path=str(repo),
         ecosystem=derived.ecosystem,
@@ -5209,8 +5251,13 @@ async def onboarding_onboard_repo(
         notes=(prior.notes if (prior and carried_proven) else
                "derived in onboarding wizard (unproven — prove it to give the "
                "review gate a test command to run)"),
+        **carry_kwargs,
     )
     await store.upsert_profile(profile)
+
+    from ..onboard import ui_evidence_suggestion
+
+    sug = ui_evidence_suggestion(profile, str(repo))
     return {
         "ok": True,
         "repo_path": str(repo),
@@ -5220,6 +5267,15 @@ async def onboarding_onboard_repo(
         "lint_cmd": profile.lint_cmd,
         "required_credentials": profile.required_credentials,
         "proven": bool(profile.proven.get("test_cmd")),
+        "ui_evidence": {
+            "configured": bool(profile.ui_evidence.get("enabled")
+                                or profile.ui_evidence.get("start_cmd")
+                                or profile.ui_evidence.get("base_url")),
+            "enabled": bool(profile.ui_evidence.get("enabled")),
+            "start_cmd": profile.ui_evidence.get("start_cmd") or "",
+            "base_url": profile.ui_evidence.get("base_url") or "",
+            "suggestion": sug,
+        },
     }
 
 
@@ -5394,6 +5450,57 @@ async def onboarding_confirm_repo(
         log.warning("could not write project.yml for %s: %s", repo, exc)
     await store.upsert_profile(prof)
     return {"ok": True, **_profile_readiness(prof)}
+
+
+@app.post("/api/onboarding/repos/ui-evidence")
+async def onboarding_ui_evidence(
+    body: RepoUiEvidenceRequest, request: Request
+) -> dict[str, Any]:
+    """The wizard's one-action confirm for the ui_evidence suggestion
+    (no-human-67 follow-up): declining writes nothing, accepting writes
+    ``ui_evidence`` to BOTH project.yml and the DB row via the standard
+    profile-persist path.
+
+    The suggestion is always re-derived HERE from the repo's own
+    package.json, never trusted from the request body — ``body.enabled`` is
+    the only thing the client controls. A profile that is already manually
+    configured (``ui_evidence_suggestion`` returns ``None`` in that case) is
+    left untouched: manual config always wins, this never re-prompts or
+    overwrites it.
+    """
+    store = _store(request)
+    repo = Path(body.repo_path).expanduser().resolve()
+
+    from ..onboard import (
+        ProjectYmlPersistError, apply_ui_evidence_suggestion, persist_profile,
+        ui_evidence_suggestion,
+    )
+    from ..profile import ProjectProfile
+
+    prof = await store.get_profile(str(repo)) or ProjectProfile.load(repo)
+    if prof is None:
+        raise HTTPException(404, f"no profile for {body.repo_path!r} — onboard it first")
+
+    sug = ui_evidence_suggestion(prof, str(repo))
+    if not body.enabled:
+        # Decline: no writes at all, regardless of whether a suggestion
+        # exists — "not now" must be a true no-op.
+        return {"ok": True, "enabled": False, "ui_evidence": dict(prof.ui_evidence)}
+    if sug is None:
+        raise HTTPException(
+            422,
+            f"no `npm run dev` convention detected for {body.repo_path!r} "
+            "(or ui_evidence is already configured) — nothing to enable",
+        )
+    apply_ui_evidence_suggestion(prof, sug)
+    try:
+        await persist_profile(store, prof)
+    except ProjectYmlPersistError as exc:
+        # Neither artifact may be reported as configured when only one of
+        # them could be written — persist_profile already skipped the DB
+        # write to avoid exactly that split-brain state.
+        raise HTTPException(500, str(exc)) from exc
+    return {"ok": True, "enabled": True, "ui_evidence": dict(prof.ui_evidence)}
 
 
 async def _gather_history(

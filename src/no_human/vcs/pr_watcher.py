@@ -1514,6 +1514,47 @@ async def orphan_landed_evidence(
     return None
 
 
+#: Matches a bare git commit sha (full 40-hex or the git-standard 9-hex
+#: abbreviation) as a whole token — the `(?<!...)`/`(?!...)` hex-boundary
+#: guards keep this from matching the *middle* of a longer hex run.
+_SHA_TOKEN = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{40}|[0-9a-fA-F]{9})(?![0-9a-fA-F])")
+
+#: Bounds how many candidate shas `landing_sha_candidates` can hand back, so
+#: a caller that probes each one with `commit_is_ancestor` (a git subprocess)
+#: has a fixed worst case per row rather than one proportional to however
+#: much free text a `cancel_reason` happens to contain.
+_MAX_LANDING_SHA_CANDIDATES = 5
+
+
+def landing_sha_candidates(text: str) -> list[str]:
+    """Pull candidate commit shas out of free text (e.g. a `cancel_reason`).
+
+    PURE — no git, no network, no I/O of any kind; just a regex scan. This is
+    deliberately the *only* thing free text is ever allowed to yield: a sha
+    to hand to `orphan_landed_evidence`'s existing `commit_sha=` ancestry
+    check. It never extracts or resolves a PR *number* from text — that
+    would require a forge-API lookup to turn into a commit, which is exactly
+    the free-text-PR-number-to-commit question this feature does not answer.
+
+    De-duplicated, case-normalised to lowercase, in first-seen order within
+    each length class, all 40-hex matches before any 9-hex match (a full sha
+    is unambiguous; a 9-hex one is a probabilistic abbreviation), and capped
+    at `_MAX_LANDING_SHA_CANDIDATES`.
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    long_matches: list[str] = []
+    short_matches: list[str] = []
+    for m in _SHA_TOKEN.finditer(text):
+        token = m.group(1).lower()
+        if token in seen:
+            continue
+        seen.add(token)
+        (long_matches if len(token) == 40 else short_matches).append(token)
+    return (long_matches + short_matches)[:_MAX_LANDING_SHA_CANDIDATES]
+
+
 async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
     """Whether ``branch``'s changes are actually present in ``base``, checked
     by tree CONTENT rather than commit ancestry.

@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { MAC_KEYCHAIN_SERVICE } from "./setupGate.mjs";
 
 export const DEFAULT_PORT = 8420;
 
@@ -36,21 +37,45 @@ export function configuredPort(
 export const DEFAULT_ORIGIN = `http://127.0.0.1:${configuredPort()}`;
 
 /**
- * Probe the nh server. Resolves "up" | "down".
- * Uses /api/tasks (cheap, always registered) rather than the SPA catch-all,
- * which would 200 even for a half-up static server.
+ * Single probe attempt. Resolves "up" (2xx), "down" (a real non-2xx HTTP
+ * response — server state, not transient, so callers must not retry it), or
+ * "unreachable" (abort/timeout, ECONNREFUSED, DNS failure, socket reset —
+ * transient, safe to retry).
  */
-export async function probe(origin = DEFAULT_ORIGIN, timeoutMs = 1500) {
+async function probeOnce(origin, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${origin}/api/tasks`, { signal: ctrl.signal });
+    const res = await fetch(`${origin}/api/tasks?limit=1`, { signal: ctrl.signal });
     return res.ok ? "up" : "down";
   } catch {
-    return "down";
+    return "unreachable";
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Probe the nh server. Resolves "up" | "down". Never throws.
+ * Uses /api/tasks?limit=1 (P5 opt-in pagination, landed 0.1.9 in
+ * src/no_human/api/app.py — `limit: int | None = Query(default=None, ge=1,
+ * le=1000)`) rather than the full task list, which on a large fleet can be
+ * >1MB just to answer "is a server up". Backward-compatible with an 0.1.8
+ * server: unknown query params are ignored there and the full list still
+ * comes back as a valid 200.
+ * Retries once after retryDelayMs on a transient ("unreachable") failure —
+ * a single 1500ms timeout during a DB write burst previously read as "down"
+ * mid-launch and sent the shell down the spawn path, producing the
+ * pid-lock/"another instance is already running" error screen against a
+ * perfectly healthy server. A real non-2xx HTTP response is not retried:
+ * it reflects server state, not a transient timing issue.
+ */
+export async function probe(origin = DEFAULT_ORIGIN, timeoutMs = 1500, retryDelayMs = 300) {
+  const first = await probeOnce(origin, timeoutMs);
+  if (first !== "unreachable") return first;
+  await new Promise((r) => setTimeout(r, retryDelayMs));
+  const second = await probeOnce(origin, timeoutMs);
+  return second === "up" ? "up" : "down";
 }
 
 /**
@@ -250,6 +275,89 @@ export async function resolveClaudeCli(env = process.env, execFileFn = execFile,
 export async function resolveNodeBin(env = process.env, execFileFn = execFile,
                                      exists = fs.existsSync) {
   return resolveOnPath("node", ["node.exe"], env, execFileFn, exists);
+}
+
+/**
+ * Probe whether `claude` reports an active sign-in. Read-only/idempotent —
+ * never mutates any state. Returns the numeric exit code, or `null` when the
+ * command could not be run at all (spawn failure or timeout) — callers must
+ * treat `null` the same as "unknown", not as "signed out". Injectable
+ * `execFileFn` so tests never need a real `claude` binary. Never throws,
+ * never logs stdout/stderr (nothing about a sign-in's status is a secret,
+ * but the discipline is kept uniform with runClaudeSetupToken below).
+ */
+export async function claudeAuthStatus(cliPath, execFileFn = execFile) {
+  return new Promise((resolve) => {
+    try {
+      execFileFn(cliPath, ["auth", "status"],
+                 { timeout: 20000, windowsHide: true },
+                 (err) => resolve(err ? (typeof err.code === "number" ? err.code : null) : 0));
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Run `claude setup-token` and hand back its raw exit code and captured
+ * streams for setupGate's classifySetupTokenOutput to interpret — this
+ * function does no interpretation itself and never logs either stream (the
+ * whole point of the split is that a secret can pass through here without
+ * ever reaching console/log output). `stdin: "ignore"` so a CLI that wants
+ * an interactive prompt fails fast/exits rather than hanging the handler;
+ * the 20s timeout is the same backstop, surfaced as the `{code:null,
+ * stdout:"", stderr:"timeout"}` shape on a kill so the caller can tell a
+ * timeout apart from a clean empty run.
+ */
+export async function runClaudeSetupToken(cliPath, execFileFn = execFile) {
+  return new Promise((resolve) => {
+    try {
+      execFileFn(cliPath, ["setup-token"],
+                 { timeout: 20000, windowsHide: true, stdin: "ignore" },
+                 (err, stdout, stderr) => {
+        if (err && err.killed) {
+          resolve({ code: null, stdout: "", stderr: "timeout" });
+          return;
+        }
+        const code = err ? (typeof err.code === "number" ? err.code : null) : 0;
+        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+      });
+    } catch {
+      resolve({ code: null, stdout: "", stderr: "timeout" });
+    }
+  });
+}
+
+/**
+ * macOS only: does the login Keychain hold a Claude Code sign-in item?
+ * `claude auth status` (above) is the primary signal; this is the fallback
+ * for "the binary exists but isn't the one that's signed in" / "auth
+ * status itself is unavailable" cases. Confirmed empirically (2026-09
+ * against a real signed-in `claude` 2.1.252 install) that macOS Claude
+ * Code CLI credentials live here, NOT in a `~/.claude/.credentials.json`
+ * file (that only exists on linux) — see setupGate.mjs's
+ * claudeCredentialPaths for the full note.
+ *
+ * `security find-generic-password -s "<service>"` WITHOUT `-w` never prints
+ * the secret — only item metadata (service/account/dates) goes to stdout,
+ * which this function doesn't even read — so this keeps the same
+ * existence-check-only discipline as the fs-path checks on other
+ * platforms. Off-platform, or on any spawn/exec error, fails closed to
+ * false. Injectable execFileFn/platform so tests never touch a real
+ * Keychain unless they explicitly fake `security` on PATH.
+ */
+export async function macClaudeKeychainExists(execFileFn = execFile,
+                                              platform = process.platform) {
+  if (platform !== "darwin") return false;
+  return new Promise((resolve) => {
+    try {
+      execFileFn("security", ["find-generic-password", "-s", MAC_KEYCHAIN_SERVICE],
+                 { timeout: 5000, windowsHide: true },
+                 (err) => resolve(!err));
+    } catch {
+      resolve(false);
+    }
+  });
 }
 
 /**

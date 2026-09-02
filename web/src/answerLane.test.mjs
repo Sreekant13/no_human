@@ -73,6 +73,20 @@ test("ties break deterministically by id", () => {
   assert.deepEqual(fresh.map((x) => x.id), ["a", "b", "c"]);
 });
 
+// Mixed-format regression: the DB stores both naive-space 'YYYY-MM-DD HH:MM:SS'
+// and iso-offset '...+00:00' timestamps in the same column, and ' ' < 'T'
+// lexically — a raw string comparison always ranked a naive-space row as
+// older than an iso-offset row from the same date, regardless of actual age.
+test("a genuinely newer naive-space row outranks an older iso-offset one", () => {
+  const items = [
+    { id: "iso-old", created_at: "2026-07-25T10:00:00+00:00" },
+    { id: "naive-new", created_at: "2026-07-25 11:00:00" },
+  ];
+  const { fresh, stale } = partitionAnswerLane(items, NOW);
+  assert.deepEqual(fresh.map((x) => x.id), ["naive-new", "iso-old"]);
+  assert.equal(stale.length, 0);
+});
+
 test("empty/undefined input returns empty lists, never throws", () => {
   assert.deepEqual(partitionAnswerLane([], NOW), { fresh: [], stale: [] });
   assert.deepEqual(partitionAnswerLane(undefined, NOW), { fresh: [], stale: [] });

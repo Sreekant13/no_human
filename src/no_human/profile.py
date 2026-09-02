@@ -177,6 +177,53 @@ class ProjectProfile:
         return bool(auto_confirm_proven and self.test_cmd and self.proven.get("test_cmd"))
 
 
+# Fields the product itself writes to only ONE side of the yml/DB pair during
+# normal operation, so a mismatch on them is not evidence a human edited
+# project.yml — it is the product's own write pattern. Comparing them makes
+# `profile_divergence` fire permanently on repos nobody hand-edited:
+#   - `wiki_commit`: `docs_gen`'s wiki refresh (scheduler.py's periodic job
+#     and `nh docs generate`) calls `profile.save()` on the yml only — it
+#     never calls `store.upsert_profile`, so the DB row keeps the pre-refresh
+#     SHA forever.
+#   - `default_attempt_tokens` / `default_lifetime_tokens` / `default_budget_unit`:
+#     `nh repo config` (SCRUM-26 per-repo budget overrides) calls
+#     `store.upsert_profile` only — it never calls `profile.save()`, so the
+#     yml keeps the pre-write values forever.
+# `repo_path` is excluded for the same reason (on-disk file never has it),
+# just on both sides. Only fields a human sets via `nh onboard --confirm` /
+# the API's confirm step (which write both sides together) are compared.
+_MACHINE_MANAGED_FIELDS = frozenset({
+    "repo_path",
+    "wiki_commit",
+    "default_attempt_tokens",
+    "default_lifetime_tokens",
+    "default_budget_unit",
+})
+
+
+def profile_divergence(
+    db_profile: "ProjectProfile | None", yml_profile: "ProjectProfile | None"
+) -> list[str]:
+    """Field names where a repo's `.no_human/project.yml` differs from the
+    CONFIRMED DB profile. Empty when either side is absent or they agree.
+
+    Normalization is the dataclass itself: both sides are already
+    ``ProjectProfile`` instances, so YAML vs JSON parsing differences
+    ('yes' -> True, ints, missing keys -> field defaults) are resolved by
+    ``from_dict`` before anything is compared. Fields the product itself
+    writes to only one side (:data:`_MACHINE_MANAGED_FIELDS`) are excluded —
+    they diverge by design, not because a human edited the file.
+    """
+    if db_profile is None or yml_profile is None:
+        return []
+    a = db_profile.to_dict()
+    b = yml_profile.to_dict()
+    return sorted(
+        k for k in a
+        if k not in _MACHINE_MANAGED_FIELDS and a[k] != b.get(k)
+    )
+
+
 def apply_default_task_config(
     profile: "ProjectProfile | None", task_config: dict[str, Any]
 ) -> dict[str, Any]:

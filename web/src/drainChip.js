@@ -13,6 +13,8 @@
 // guess. tone is a closed string token ("ok"/"warn"/"error"), consumed
 // elsewhere as `tone-${tone}` classes — no CSS vars are introduced here.
 
+import { parseTimestamp } from "./parseTimestamp.js";
+
 export function formatDrainEta(seconds) {
   if (seconds == null) return "no estimate";
   if (seconds < 3600) return `~${Math.max(1, Math.round(seconds / 60))} min to drain`;
@@ -25,8 +27,8 @@ export function formatDrainEta(seconds) {
 // own cooldown clock (never re-derived here); this only formats it.
 export function formatPausedUntil(iso) {
   if (!iso) return "unknown time";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "unknown time";
+  const d = parseTimestamp(iso);
+  if (!d) return "unknown time";
   const hh = String(d.getHours()).padStart(2, "0");
   const mm = String(d.getMinutes()).padStart(2, "0");
   return `${hh}:${mm}`;

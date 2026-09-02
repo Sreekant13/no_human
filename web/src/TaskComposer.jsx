@@ -10,6 +10,7 @@ import { formatBytes } from "./formatBytes.js";
 import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { loadDraft, saveDraft, clearDraft, mergeWithSeed } from "./composerDraft.js";
+import { coderBackendCaption, effectiveCoderBackend } from "./coderBackendCaption.js";
 import PathInput from "./PathInput.jsx";
 import QueueNotice from "./QueueNotice.jsx";
 
@@ -336,6 +337,15 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   // picker below offers nothing (not a guess) while it is in flight.
   const backendOptions = config?.coder_backends ?? [];
   const claudePinnedRoles = config?.claude_pinned_roles ?? [];
+  // "" (the picker's config-default option) is not necessarily claude — an
+  // install can set worker.backend: codex and leave the picker untouched, so
+  // the disclosure must gate on the EFFECTIVE backend (an explicit pick, or
+  // else the server's own resolved value vs its own default), never on the
+  // picker alone. effectiveCoderBackend owns that precedence from
+  // GET /api/config's coder_backend_effective/coder_backend_default — no
+  // second copy of it here.
+  const effectiveBackend = effectiveCoderBackend(backend, config);
+  const backendCaption = coderBackendCaption(effectiveBackend, claudePinnedRoles);
   // `coder_backend_availability` is core.backend_settings.describe_backend's
   // output for every SUPPORTED_BACKENDS entry — the SAME call
   // core.runtime.assert_task_backend_usable makes that build_orchestrator
@@ -884,10 +894,12 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
                   A backend this install cannot run right now is disabled AT
                   THE POINT OF CHOICE (coder_backend_availability, the same
                   check core.runtime.assert_task_backend_usable runs), not
-                  just blocked at submit. Affects the coder ONLY: reviewer/
-                  planner/supervisor/utility/intake stay on Claude regardless
-                  of this choice (see the title/help text below and
-                  CLAUDE_PINNED_ROLES). */}
+                  just blocked at submit. Affects the coder ONLY: the roles
+                  in CLAUDE_PINNED_ROLES stay on Claude regardless of this
+                  choice — the tooltip above always says so; the disclosure
+                  paragraph below is conditional, shown only when the
+                  EFFECTIVE backend (this pick, or else the config's own
+                  resolved value) is non-default. */}
               {backendOptions.length > 0 && (
                 <SelectPill
                   onPanel
@@ -957,17 +969,16 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
             </div>
           </div>
 
-          {/* Always visible, not just on hover (the SelectPill's title tooltip
-              says the same thing) — a reviewer or an operator glancing at the
-              form must not be able to come away believing this choice picks
-              who reviews the work, only who codes it. */}
-          {backendOptions.length > 0 && (
-            <p className="mt-2 px-5 font-ui text-sm text-text-muted">
-              Coder backend only
-              {claudePinnedRoles.length > 0
-                ? ` — ${claudePinnedRoles.join(", ")} always run on Claude, no matter what you pick here.`
-                : "."}
-            </p>
+          {/* Shown only once the choice can actually differ from the config
+              default (the SelectPill's title tooltip says the same thing on
+              hover, at every step) — that's the moment a reviewer or an
+              operator glancing at the form could otherwise assume this
+              picks who reviews the work, not just who codes it. On the
+              default there is nothing non-default to disclose, so the
+              caption stays out of the primary flow. coderBackendCaption
+              owns the copy and the gate (see CLAUDE_PINNED_ROLES / d35aa60e). */}
+          {backendOptions.length > 0 && backendCaption && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">{backendCaption}</p>
           )}
 
           {selectedBackendUnavailable && (

@@ -191,17 +191,65 @@ test("the composer's backend picker options are server-derived, never a hardcode
     "the picker must not hardcode its own copy of SUPPORTED_BACKENDS");
 });
 
-test("the picker states, in the UI, that the choice affects the coder only", () => {
+test("the picker states, in the UI, that the choice affects the coder only — once the choice is non-default", () => {
   // Pinned roles must likewise be server-derived (agent.backend.CLAUDE_PINNED_ROLES
   // via /api/config's claude_pinned_roles), never a second literal that could
   // drift from the one make_backend actually enforces.
   assert.match(composerJsx, /claudePinnedRoles\s*=\s*config\?\.claude_pinned_roles\s*\?\?\s*\[\]/);
-  // The statement must be in permanently-visible UI text, not only a hover
-  // tooltip, so a user glancing at the form can't come away believing a
-  // local/Codex model reviews its own work.
-  assert.match(composerJsx, /Coder backend only/);
-  assert.match(composerJsx, /claudePinnedRoles\.join\(", "\)/);
-  assert.match(composerJsx, /always run on Claude/);
+  // 2026-09-01 operator feedback: the statement used to render unconditionally
+  // ("Coder backend only…"), which put backend-internals jargon in front of
+  // every user even on the config default. It now lives in coderBackendCaption
+  // (own test file), called with the EFFECTIVE backend (independent review
+  // 2026-09-02: the picker's raw value alone missed a `worker.backend`-configured
+  // install whose picker was left untouched), and the composer must not keep a
+  // second hardcoded copy of the copy or the role list.
+  assert.match(
+    composerJsx,
+    /import\s*\{\s*coderBackendCaption\s*,\s*effectiveCoderBackend\s*\}\s*from\s*["']\.\/coderBackendCaption\.js["']/,
+  );
+  assert.match(composerJsx, /effectiveCoderBackend\(\s*backend\s*,\s*config\s*\)/);
+  assert.match(composerJsx, /coderBackendCaption\(\s*effectiveBackend\s*,\s*claudePinnedRoles\s*\)/);
+  assert.doesNotMatch(composerJsx, /Coder backend only/);
+
+  // Reviewer finding 2026-09-02: `doesNotMatch(/reviewer.*planner.*supervisor/)`
+  // passed only because `.` never crosses newlines, while a hardcoded
+  // multi-line "reviewer/\nplanner/supervisor/..." role list sat right there
+  // in a comment a few lines up — the assertion was vacuous. Strip comments
+  // first, then check across newlines with `[\s\S]`, and prove the check can
+  // actually fail (positive controls: the stripper didn't gut the file, and
+  // the regex itself is live against a synthetic hit).
+  const composerNoComments = composerJsx
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(composerNoComments, /reviewer[\s\S]*planner[\s\S]*supervisor/);
+  // Positive control 1: the comment stripper must not have gutted the file —
+  // real, still-present source must survive it.
+  assert.match(composerNoComments, /claudePinnedRoles/);
+  assert.match(composerNoComments, /coderBackendCaption/);
+  // Positive control 2: the (comment-stripped) regex itself must be able to
+  // fail — a fixture that cannot fail proves nothing.
+  assert.match("reviewer\nplanner\nsupervisor", /reviewer[\s\S]*planner[\s\S]*supervisor/);
+  // Positive control 3: the SAME regex, run against a synthetic string built
+  // the way the stripper's OUTPUT is shaped (comment markers removed, code
+  // left intact), still catches a role list that survived stripping — proof
+  // this is a live check on `composerNoComments`, not just on raw literals.
+  const syntheticLeak = composerNoComments + "\nconst x = 'reviewer, planner, supervisor';\n";
+  assert.match(syntheticLeak, /reviewer[\s\S]*planner[\s\S]*supervisor/);
+
+  // The render must be gated on the helper's return, not unconditional —
+  // that gate is the whole fix, so pin it here too, not only in the helper's
+  // own test file. Whitespace-tolerant so reformatting (prettier, etc.)
+  // cannot silently defeat a single-space-sensitive regex.
+  assert.match(composerJsx, /backendOptions\.length\s*>\s*0\s*&&\s*backendCaption\s*&&\s*\(/);
+
+  // Stale-comment fix: the picker's tooltip always discloses the coder-only
+  // scope now (title prop, every render); the caption <p> below is the
+  // conditional one. The old comment pointed at "the title/help text below"
+  // as if it too were conditional — that phrasing must be gone, replaced by
+  // a comment that actually names CLAUDE_PINNED_ROLES.
+  assert.doesNotMatch(composerJsx, /see the title\/help text below/);
+  assert.match(composerJsx, /CLAUDE_PINNED_ROLES/);
 });
 
 test("a backend the server reports UNAVAILABLE is refused at COMPOSE TIME, showing the server's reason", () => {

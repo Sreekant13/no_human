@@ -37,7 +37,7 @@ let probes = 0;
 // the one they run against.
 let knownRepos = "[]";
 const server = http.createServer((q, s) => {
-  if (q.url === "/api/tasks") probes += 1;   // one per navigation run
+  if (q.url.split("?")[0] === "/api/tasks") probes += 1;   // one per navigation run
   if (q.url === "/api/repos") { s.end(knownRepos); return; }
   s.end("[]");
 });
@@ -292,6 +292,241 @@ test("nh:requirements reports resolved claude/node the same shape the setup scre
   if (!res.claude.ok) assert.equal(res.claude.version, "",
     "a missing claude must not report a version");
 });
+
+// --- Claude Code existing sign-in (nh:claude-signin-status / nh:claude-import-token) --- //
+// resolveClaudeCli() (server.mjs) is called with NO arguments at every call site in
+// main.mjs, so it reads process.env / execFile / fs.existsSync FRESH on every
+// invocation — there is no memoized resolution to defeat. That lets each test below
+// fake the `claude` CLI by pointing PATH (and the login shell resolveOnPath shells out
+// to) at a throwaway script for the duration of one call, then restoring both, instead
+// of needing a process-wide stub in place before main.mjs's single top-level import.
+const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "nh-fake-claude-"));
+const fakeShellPath = path.join(fakeBinDir, "fake-shell.sh");
+const fakeClaudePath = path.join(fakeBinDir, "claude");
+// A minimal non-login shell: resolveOnPath always invokes `$SHELL -lc "command -v
+// claude"`; this drops the "-l" (login) semantics entirely and just runs the given
+// command string, so it never depends on the host's real login shell or rc files.
+fs.writeFileSync(fakeShellPath, "#!/bin/sh\nexec /bin/sh -c \"$2\"\n", { mode: 0o755 });
+// The fake `claude` binary: behaviour is entirely driven by env vars so one script
+// serves every test below without being rewritten per case.
+fs.writeFileSync(fakeClaudePath, [
+  "#!/bin/sh",
+  "if [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then",
+  "  exit \"${NH_FAKE_AUTH_STATUS:-1}\"",
+  "fi",
+  "if [ \"$1\" = \"setup-token\" ]; then",
+  "  if [ -n \"$NH_FAKE_SETUP_STDOUT\" ]; then printf '%s' \"$NH_FAKE_SETUP_STDOUT\"; fi",
+  "  if [ -n \"$NH_FAKE_SETUP_STDERR\" ]; then printf '%s' \"$NH_FAKE_SETUP_STDERR\" >&2; fi",
+  "  exit \"${NH_FAKE_SETUP_CODE:-0}\"",
+  "fi",
+  "exit 1",
+].join("\n") + "\n", { mode: 0o755 });
+// Fake `security` (macOS Keychain CLI): shadows the real /usr/bin/security
+// only for the duration of a withFakeClaude() call, same as the fake
+// `claude` above. macClaudeKeychainExists (server.mjs) shells out to
+// `security find-generic-password -s "<service>"` WITHOUT `-w`, so this
+// fixture never needs to simulate returning an actual secret — only the
+// exit code, matching the real binary's existence-check-only contract.
+const fakeSecurityPath = path.join(fakeBinDir, "security");
+fs.writeFileSync(fakeSecurityPath, [
+  "#!/bin/sh",
+  "if [ \"$1\" = \"find-generic-password\" ]; then",
+  "  if [ \"$NH_FAKE_KEYCHAIN_HAS_ITEM\" = \"1\" ]; then",
+  "    echo 'keychain: \"fake\"'; exit 0",
+  "  fi",
+  "  echo 'security: item not found' >&2; exit 44",
+  "fi",
+  "exit 1",
+].join("\n") + "\n", { mode: 0o755 });
+test.after(() => fs.rmSync(fakeBinDir, { recursive: true, force: true }));
+
+const IS_WIN = process.platform === "win32";
+
+/**
+ * Run `fn` with PATH/SHELL pointed at the fake `claude` above (so
+ * resolveClaudeCli() resolves to it) and NH_FAKE_* controlling its behaviour, then
+ * restore both env vars — and any behaviour vars — unconditionally. POSIX-only:
+ * resolveOnPath's Windows branch never shells out, so every test using this helper
+ * is skipped on win32.
+ */
+async function withFakeClaude(behaviorEnv, fn) {
+  const savedPath = process.env.PATH;
+  const savedShell = process.env.SHELL;
+  const savedBehavior = {};
+  for (const k of Object.keys(behaviorEnv)) savedBehavior[k] = process.env[k];
+  process.env.PATH = `${fakeBinDir}${path.delimiter}${savedPath || ""}`;
+  process.env.SHELL = fakeShellPath;
+  Object.assign(process.env, behaviorEnv);
+  try {
+    return await fn();
+  } finally {
+    process.env.PATH = savedPath;
+    process.env.SHELL = savedShell;
+    for (const k of Object.keys(behaviorEnv)) {
+      if (savedBehavior[k] === undefined) delete process.env[k];
+      else process.env[k] = savedBehavior[k];
+    }
+  }
+}
+
+test("nh:claude-signin-status and nh:claude-import-token refuse any sender that is not the setup screen",
+  async () => {
+    const status = stub.calls.ipc.get("nh:claude-signin-status");
+    const importTok = stub.calls.ipc.get("nh:claude-import-token");
+    assert.ok(status && importTok, "both handlers must be registered");
+    for (const url of BOARD_PAGES) {
+      assert.deepEqual(await status(from(url)), { detected: false },
+        `accepted a signin-status probe from ${url}`);
+      const res = await importTok(from(url));
+      assert.equal(res.ok, false, `accepted an import from ${url}`);
+      assert.match(res.error, /not permitted/i);
+    }
+  });
+
+test("test_existing_credential_button_renders: nh:claude-signin-status reports detected when `claude auth status` succeeds",
+  { skip: IS_WIN && "resolveOnPath's shell probe is POSIX-only in this fixture" },
+  async () => {
+    const status = stub.calls.ipc.get("nh:claude-signin-status");
+    const res = await withFakeClaude({ NH_FAKE_AUTH_STATUS: "0" },
+      () => status(from(SETUP_URL)));
+    assert.deepEqual(res, { detected: true, via: "cli" });
+  });
+
+test("test_fallback_ui_identical_to_current_state: nh:claude-signin-status reports not-detected when claude is not on PATH",
+  { skip: IS_WIN && "resolveOnPath's shell probe is POSIX-only in this fixture" },
+  async () => {
+    const status = stub.calls.ipc.get("nh:claude-signin-status");
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "nh-no-claude-"));
+    const savedPath = process.env.PATH;
+    const savedShell = process.env.SHELL;
+    process.env.PATH = emptyDir;
+    process.env.SHELL = fakeShellPath;
+    let res;
+    try {
+      res = await status(from(SETUP_URL));
+    } finally {
+      process.env.PATH = savedPath;
+      process.env.SHELL = savedShell;
+      fs.rmSync(emptyDir, { recursive: true, force: true });
+    }
+    assert.deepEqual(res, { detected: false, via: "no-cli" },
+      "with no claude on PATH and no credential store, the fallback must match today's shape");
+  });
+
+// Reviewer finding on the prior attempt: the macOS store-fallback path was
+// "unproven on the measured platform" — it assumed a credential FILE that
+// does not exist there. These two tests exercise the real fix
+// (macClaudeKeychainExists, server.mjs) end-to-end through the actual IPC
+// handler, with a fake `security` standing in for the real Keychain CLI, so
+// the "auth status fails, Keychain has/hasn't the item" branch is proven by
+// a run rather than by a pure-function unit test alone. darwin-only: off
+// darwin, macClaudeKeychainExists short-circuits to false before ever
+// invoking `security`, so there is nothing platform-specific to exercise.
+test("test_existing_credential_button_renders: nh:claude-signin-status falls back to the macOS Keychain when `claude auth status` fails",
+  { skip: process.platform !== "darwin" && "macOS-only: exercises the Keychain fallback path" },
+  async () => {
+    const status = stub.calls.ipc.get("nh:claude-signin-status");
+    const res = await withFakeClaude(
+      { NH_FAKE_AUTH_STATUS: "1", NH_FAKE_KEYCHAIN_HAS_ITEM: "1" },
+      () => status(from(SETUP_URL)));
+    assert.deepEqual(res, { detected: true, via: "store" },
+      "a failed `claude auth status` must still detect a sign-in via the Keychain item");
+  });
+
+test("test_fallback_ui_identical_to_current_state: nh:claude-signin-status stays not-detected when the Keychain item is absent too",
+  { skip: process.platform !== "darwin" && "macOS-only: exercises the Keychain fallback path" },
+  async () => {
+    const status = stub.calls.ipc.get("nh:claude-signin-status");
+    const res = await withFakeClaude(
+      { NH_FAKE_AUTH_STATUS: "1", NH_FAKE_KEYCHAIN_HAS_ITEM: "0" },
+      () => status(from(SETUP_URL)));
+    assert.deepEqual(res, { detected: false },
+      "neither `claude auth status` nor the Keychain has a sign-in, so it must fail closed");
+  });
+
+test("test_token_noninteractive_retrieval_and_persistence: click writes the token to .env and it survives a fresh read",
+  { skip: IS_WIN && "resolveOnPath's shell probe is POSIX-only in this fixture" },
+  async () => {
+    const importTok = stub.calls.ipc.get("nh:claude-import-token");
+    const token = "sk-ant-oat01-fromclaudecode";
+    const res = await withFakeClaude(
+      { NH_FAKE_AUTH_STATUS: "0", NH_FAKE_SETUP_CODE: "0", NH_FAKE_SETUP_STDOUT: token },
+      () => importTok(from(SETUP_URL)));
+    // This fixture keeps a live stub server bound to ORIGIN for the whole file (see
+    // the top-of-file `http.createServer` / `server.listen`), which every save-path
+    // test in this file (e.g. "saving against someone else's live server...") hits
+    // as an "already running" foreign server — finishSave() reports needsRestart
+    // rather than ok:true there. The write-to-disk contract under test here is the
+    // same either way, so accept both shapes and require the write actually happened.
+    assert.ok(res.ok === true || res.needsRestart === true,
+      `import must either succeed or explicitly say restart is needed, not fail hard: `
+      + JSON.stringify(res));
+    assert.match(envText(), new RegExp(`CLAUDE_CODE_OAUTH_TOKEN=${token}`),
+      "the retrieved token must be written under the OAuth-subscription key");
+    // Persistence: re-read from disk independently of any in-memory state.
+    const reread = fs.readFileSync(path.join(home, ".no_human", ".env"), "utf8");
+    assert.match(reread, new RegExp(token));
+  });
+
+test("test_env_file_permissions_600: the .env written by the non-interactive import stays 0600",
+  { skip: IS_WIN && "POSIX file-mode bits are not meaningful on Windows" },
+  async () => {
+    const importTok = stub.calls.ipc.get("nh:claude-import-token");
+    await withFakeClaude(
+      { NH_FAKE_AUTH_STATUS: "0", NH_FAKE_SETUP_CODE: "0",
+        NH_FAKE_SETUP_STDOUT: "sk-ant-oat01-permcheck" },
+      () => importTok(from(SETUP_URL)));
+    const mode = fs.statSync(path.join(home, ".no_human", ".env")).mode & 0o777;
+    assert.equal(mode.toString(8), "600", `.env must be 0600, was 0${mode.toString(8)}`);
+  });
+
+test("test_token_interactive_paste_path: a browser-required response falls back to manual paste, and writes nothing",
+  { skip: IS_WIN && "resolveOnPath's shell probe is POSIX-only in this fixture" },
+  async () => {
+    const importTok = stub.calls.ipc.get("nh:claude-import-token");
+    const before = envText();
+    const res = await withFakeClaude(
+      { NH_FAKE_AUTH_STATUS: "1", NH_FAKE_SETUP_CODE: "0",
+        NH_FAKE_SETUP_STDOUT: "Visit https://claude.ai/setup-token to continue" },
+      () => importTok(from(SETUP_URL)));
+    assert.equal(res.ok, false);
+    assert.equal(res.interactive, true, `expected an interactive fallback, got ${JSON.stringify(res)}`);
+    assert.equal(envText(), before, "an interactive-required response must not write to .env");
+  });
+
+test("test_credential_not_leaked_to_logs: neither a successful nor a failed import ever logs the token",
+  { skip: IS_WIN && "resolveOnPath's shell probe is POSIX-only in this fixture" },
+  async () => {
+    const importTok = stub.calls.ipc.get("nh:claude-import-token");
+    const token = "sk-ant-oat01-shouldneverbelogged";
+    const seen = [];
+    const realLog = console.log, realErr = console.error, realWarn = console.warn;
+    console.log = (...a) => { seen.push(a.join(" ")); };
+    console.error = (...a) => { seen.push(a.join(" ")); };
+    console.warn = (...a) => { seen.push(a.join(" ")); };
+    try {
+      // Success path: the token also appears on stderr (some CLIs echo progress
+      // there) — it must not leak via either stream.
+      await withFakeClaude(
+        { NH_FAKE_AUTH_STATUS: "0", NH_FAKE_SETUP_CODE: "0",
+          NH_FAKE_SETUP_STDOUT: token, NH_FAKE_SETUP_STDERR: `progress: ${token}` },
+        () => importTok(from(SETUP_URL)));
+      // Failure path: a non-zero exit with token-shaped text present must still
+      // never surface it, even in the returned error message.
+      const failRes = await withFakeClaude(
+        { NH_FAKE_AUTH_STATUS: "0", NH_FAKE_SETUP_CODE: "1",
+          NH_FAKE_SETUP_STDOUT: `boom ${token}`, NH_FAKE_SETUP_STDERR: `also ${token}` },
+        () => importTok(from(SETUP_URL)));
+      assert.equal(JSON.stringify(failRes).includes(token), false,
+        "the IPC response itself must never carry the raw token");
+    } finally {
+      console.log = realLog;
+      console.error = realErr;
+      console.warn = realWarn;
+    }
+    assert.equal(seen.some((line) => line.includes(token)), false,
+      `the token leaked into console output: ${JSON.stringify(seen)}`);
+  });
 
 // --- nh:open-path ("Open repo", Task 6) ------------------------------------ //
 
