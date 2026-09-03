@@ -196,6 +196,16 @@ export function agentSummary(allEvents, agent) {
 
 // ── whole-task digest (Activity page header) ─────────────────────────────── //
 
+// The models line is clipped at 110 chars and a four-role production string is
+// already 113 — an appended suffix could never render there. The non-default
+// reviewer is therefore its own digest fact, read from the `role_backends`
+// event kwarg (never clipped).
+export function nonDefaultReviewer(modelsEvent) {
+  const entry = modelsEvent?.role_backends?.reviewer;
+  if (!entry || !entry.backend) return null;
+  return { non_default_reviewer: entry.backend, model: entry.model || "" };
+}
+
 export function taskSummary(events) {
   if (!events.length) return null;
   const attempts = events.filter((e) => e.kind === "attempt_start").length;
@@ -239,6 +249,11 @@ export function taskSummary(events) {
   if (tests) facts.push(["Tests", clip(tests.text, 60)]);
   if (budget) facts.push(["Budget", clip(budget.text, 60)]);
   if (models) facts.push(["Models", clip(models.text, 110)]);
+  const reviewerBackend = nonDefaultReviewer(models);
+  if (reviewerBackend) {
+    facts.push(["Reviewer backend",
+      `${reviewerBackend.non_default_reviewer}${reviewerBackend.model ? ` ${reviewerBackend.model}` : ""} (chosen in Settings)`]);
+  }
   if (pr) facts.push(["PR", pr.text]);
   const ci_gate = events.filter(
     (e) => e.kind === "ci_gate_pass" || e.kind === "ci_gate_fail").pop();
@@ -257,5 +272,6 @@ export function taskSummary(events) {
       ...failReasons,
       ...(lastBlocker ? [{ text: `Last blocker: ${lastBlocker}`, resolved: false }] : []),
     ],
+    non_default_reviewer: reviewerBackend,
   };
 }

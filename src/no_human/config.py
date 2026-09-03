@@ -722,9 +722,9 @@ def assert_local_backend_mode(base_url: str | None) -> ScrubReport:
 
     Called ONLY when ``worker.backend`` is ``"local"``, and IN ADDITION to
     :func:`assert_subscription_mode` — not instead of it, for the same
-    per-vendor reason :func:`assert_codex_api_key_mode` states: the reviewer,
-    planner, supervisor and utility tiers stay on Claude regardless of what
-    the coder runs on.
+    per-vendor reason :func:`assert_codex_api_key_mode` states: planner,
+    supervisor and utility stay on Claude; the reviewer defaults to Claude too,
+    but Settings can override it, disclosed on the task detail.
 
     ``base_url`` must point at a server this machine trusts by construction —
     localhost or a literal loopback/RFC1918 IP address, http or https. A DNS
@@ -1327,11 +1327,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # this key meant anything. "codex" routes the CODER, and only the coder,
         # to the OpenAI Codex CLI on the operator's own OPENAI_API_KEY.
         #
-        # Reviewer, planner, supervisor and utility stay on Claude regardless:
-        # the review gate and all four model tiers are pinned by ID in the
-        # project's non-negotiable constraints, and the 2026-08-01 amendment
-        # that sanctioned a second backend moved neither. See
-        # `agent.backend.CLAUDE_PINNED_ROLES`.
+        # Planner, supervisor and utility stay on Claude regardless: those three
+        # model tiers are pinned by ID in the project's non-negotiable constraints,
+        # and the 2026-08-01 amendment that sanctioned a second backend moved none
+        # of them. See `agent.backend.CLAUDE_PINNED_ROLES`. The reviewer defaults to
+        # Claude too, but Settings can override it, disclosed on the task detail.
         "backend": "claude",
         # P2 (turn-cap convergence early-abort): a coder attempt can spend
         # its whole 500-turn budget (`bounds.max_turns_per_attempt`, left

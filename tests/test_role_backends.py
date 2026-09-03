@@ -500,24 +500,45 @@ async def _orchestrator(store, config_path, events):
     )
 
 
-async def test_emit_models_default_reviewer_adds_no_disclosure(tmp_path):
+# A four-role production-shaped models dict, stamped with an auth profile
+# (as every real run is) — long enough that an appended suffix (the old
+# disclosure mechanism) could never render past the 110-char clip
+# `web/src/summaries.js` applies to the "Models" fact.
+_PROD_MODELS = {
+    "coder": "claude-sonnet-5",
+    "planner": "claude-opus-5",
+    "reviewer": "claude-opus-4-8",
+    "supervisor": "claude-sonnet-5",
+}
+
+
+async def test_emit_models_default_reviewer_adds_no_disclosure(tmp_path, monkeypatch):
     from no_human.core.db import Store
 
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.active_auth_profile", lambda: "personal"
+    )
     store = await Store(tmp_path / "t.db").connect()
     try:
         events = []
         orch = await _orchestrator(store, tmp_path / "config.yaml", events)
-        orch._emit_models({"coder": "claude-sonnet-5"})
+        orch._emit_models(_PROD_MODELS)
         (event,) = [e for e in events if e["kind"] == "models"]
+        assert len(event["text"]) >= 110
         assert "role_backends" not in event
         assert "reviewer-backend=" not in event["text"]
     finally:
         await store.close()
 
 
-async def test_emit_models_non_default_reviewer_discloses_backend_and_model(tmp_path):
+async def test_emit_models_non_default_reviewer_discloses_backend_and_model(
+    tmp_path, monkeypatch
+):
     from no_human.core.db import Store
 
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.active_auth_profile", lambda: "personal"
+    )
     config_path = tmp_path / "config.yaml"
     load_config(config_path)  # materialize a real config.yaml first
     set_role_backend("reviewer", "codex", "gpt-5-codex", config_path=config_path)
@@ -526,11 +547,51 @@ async def test_emit_models_non_default_reviewer_discloses_backend_and_model(tmp_
     try:
         events = []
         orch = await _orchestrator(store, config_path, events)
-        orch._emit_models({"coder": "claude-sonnet-5"})
+        # The disclosed backend tracks what actually got CONSTRUCTED, not just
+        # the resolver's opinion — stub the reviewer object the way
+        # `AdversarialReviewer.from_config` would set it up.
+        orch.reviewer = _StubBackend()
+        orch.reviewer.backend_name = "codex"
+        orch._emit_models(_PROD_MODELS)
         (event,) = [e for e in events if e["kind"] == "models"]
+        assert len(event["text"]) >= 110
+        assert "reviewer-backend=" not in event["text"]
         assert event["role_backends"] == {
             "reviewer": {"backend": "codex", "model": "gpt-5-codex"}
         }
-        assert "reviewer-backend=codex (chosen in Settings)" in event["text"]
+    finally:
+        await store.close()
+
+
+async def test_emit_models_disclosed_backend_tracks_constructed_reviewer_not_resolver(
+    tmp_path, monkeypatch
+):
+    """S4: `AdversarialReviewer.backend_name` — not just the config resolver
+    — is the source of the disclosed backend (`_emit_models`'s `constructed
+    or reviewer_effective["backend"]`). A stub reviewer built on a DIFFERENT
+    backend than config resolves to must win, proving the field is actually
+    CONSUMED rather than written-and-ignored.
+    """
+    from no_human.core.db import Store
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.active_auth_profile", lambda: "personal"
+    )
+    config_path = tmp_path / "config.yaml"
+    load_config(config_path)  # materialize a real config.yaml first
+    # Config says "codex", but the reviewer that actually got CONSTRUCTED
+    # (e.g. because it was injected directly, bypassing from_config) reports
+    # itself as "local" — disclosure must reflect what actually ran.
+    set_role_backend("reviewer", "codex", "gpt-5-codex", config_path=config_path)
+
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        events = []
+        orch = await _orchestrator(store, config_path, events)
+        orch.reviewer = _StubBackend()
+        orch.reviewer.backend_name = "local"
+        orch._emit_models(_PROD_MODELS)
+        (event,) = [e for e in events if e["kind"] == "models"]
+        assert event["role_backends"]["reviewer"]["backend"] == "local"
     finally:
         await store.close()

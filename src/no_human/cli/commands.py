@@ -990,8 +990,8 @@ def task() -> None:
               help="Ask a few questions to refine the spec (default: on; --no-grill to skip).")
 @click.option("--backend", default=None, type=click.Choice(list(SUPPORTED_BACKENDS)),
               help="Run THIS task's coder on the named backend instead of "
-                   "`worker.backend` from config. Only the coder moves; reviewer, "
-                   "planner, supervisor and utility stay on Claude.")
+                   "`worker.backend` from config. Only the coder moves; planner, supervisor "
+                   "and utility stay on Claude, and the reviewer unless overridden in Settings.")
 @click.option("--approve-plan", is_flag=True, default=False,
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")

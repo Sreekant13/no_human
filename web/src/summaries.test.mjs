@@ -133,3 +133,37 @@ test("task digest carries the CI_GATE verdict", () => {
   const s = taskSummary(evs);
   assert.ok(s.facts.some(([k, v]) => k === "CI_GATE" && v === "integration passed"));
 });
+
+// A four-role production-shaped models string — long enough that an appended
+// suffix (the old disclosure mechanism) could never render past the 110-char
+// clip on the "Models" fact. The reviewer backend must instead surface as its
+// own, un-clipped digest fact sourced from the `role_backends` event kwarg.
+const PROD_MODELS_TEXT =
+  "coder=claude-sonnet-5 · planner=claude-opus-4-8 · reviewer=claude-opus-4-8 · "
+  + "supervisor=claude-sonnet-5 · auth=personal";
+
+test("task digest: a non-default reviewer backend renders as its own fact past the 110-char models clip", () => {
+  assert.ok(PROD_MODELS_TEXT.length > 110);
+  const s = taskSummary([
+    { ts: 1, kind: "attempt_start", text: "attempt 1/3" },
+    {
+      ts: 2, kind: "models", text: PROD_MODELS_TEXT,
+      role_backends: { reviewer: { backend: "codex", model: "gpt-5-codex" } },
+    },
+  ]);
+  const modelsFact = s.facts.find(([l]) => l === "Models")[1];
+  assert.ok(modelsFact.endsWith("…"));
+  const reviewerFact = s.facts.find(([l]) => l === "Reviewer backend")[1];
+  assert.match(reviewerFact, /codex/);
+  assert.match(reviewerFact, /chosen in Settings/);
+  assert.equal(s.non_default_reviewer.non_default_reviewer, "codex");
+});
+
+test("task digest: a default reviewer adds no reviewer-backend fact", () => {
+  const s = taskSummary([
+    { ts: 1, kind: "attempt_start", text: "attempt 1/3" },
+    { ts: 2, kind: "models", text: PROD_MODELS_TEXT },
+  ]);
+  assert.equal(s.facts.find(([l]) => l === "Reviewer backend"), undefined);
+  assert.equal(s.non_default_reviewer, null);
+});

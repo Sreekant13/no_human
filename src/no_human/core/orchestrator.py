@@ -3428,11 +3428,12 @@ class Orchestrator:
         Constraint §6d: `models["reviewer"]` stays the model id ONLY — the
         `attempts`/task-detail column shape and `core/cost.py`'s parsing of
         it are out of scope and unchanged. A non-default reviewer backend is
-        disclosed ADDITIONALLY, appended to the human-readable `detail`
-        string and carried as its own `role_backends` event kwarg, read from
-        the SAME resolver `_reviewer_attribution`/`AdversarialReviewer.
-        from_config` use (`role_backend_settings.effective_role_backend`) —
-        never a second opinion of what actually got constructed.
+        disclosed ONLY as its own `role_backends` event kwarg — NOT appended
+        to `detail` anymore: the board clips that line at 110 chars and the
+        four-role production base string is already 113, so an appended
+        suffix could never render. `web/src/summaries.js` reads
+        `role_backends.reviewer` and renders it as its own un-clipped
+        "Reviewer backend" digest fact.
         """
         detail = " · ".join(f"{r}={m}" for r, m in models.items())
         profile = active_auth_profile()
@@ -3442,14 +3443,15 @@ class Orchestrator:
         reviewer_effective = effective_role_backend(self.config, "reviewer")
         role_backends: dict[str, dict[str, str]] = {}
         if not reviewer_effective["is_default"]:
+            # The resolver says WHETHER the reviewer is non-default; the
+            # constructed reviewer object (when one exists) says WHAT
+            # actually got built, so an injected/stubbed reviewer's real
+            # backend wins over a second-guess of the config.
+            constructed = getattr(self.reviewer, "backend_name", None)
             role_backends["reviewer"] = {
-                "backend": reviewer_effective["backend"],
+                "backend": constructed or reviewer_effective["backend"],
                 "model": reviewer_effective["model"],
             }
-            detail = (
-                f"{detail} · reviewer-backend={reviewer_effective['backend']} "
-                "(chosen in Settings)"
-            )
         self.emit(
             "models", detail, models=models, auth_profile=profile,
             **({"role_backends": role_backends} if role_backends else {}),

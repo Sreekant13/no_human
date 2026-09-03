@@ -2439,7 +2439,7 @@ def test_every_line_citation_currently_resolves_exactly():
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2188` inside
-    `update_attempt` and `orchestrator.py:4623` inside `_run_attempt` — not
+    `update_attempt` and `orchestrator.py:4625` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
@@ -2476,13 +2476,21 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     added 28 lines above this call inside orchestrator.py during the rebase
     onto origin/main, moving it from 4571 to 4599; re-verified against the
     code, not carried forward blind.
+
+    Re-anchored again 2026-09-03 (second): the reviewer role-backend
+    disclosure-rendering slice (`_emit_models` dropping the appended
+    `detail` suffix in favour of the `role_backends` kwarg alone, plus its
+    updated docstring) added 2 net lines above `_run_attempt`'s
+    `update_attempt(attempt_id, branch_name=branch)` call inside
+    orchestrator.py, moving the citation from 4623 to 4625; re-verified
+    against the code, not carried forward blind.
     """
     assert "db.py:2188" in known_issues_doc, (
         "the traceback no longer cites db.py:2188 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:4623" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4623 — this test is "
+    assert "orchestrator.py:4625" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:4625 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -2502,8 +2510,8 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
     assert 1 <= 4599 <= len(orch_lines), "orchestrator.py is now shorter than line 4599"
-    assert "self.store.update_attempt(" in orch_lines[4622], (
-        f"orchestrator.py:4623 is now {orch_lines[4622]!r}, not the "
+    assert "self.store.update_attempt(" in orch_lines[4624], (
+        f"orchestrator.py:4625 is now {orch_lines[4624]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (

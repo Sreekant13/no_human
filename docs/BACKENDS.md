@@ -10,12 +10,16 @@ The default is unchanged and always will be the default unless you change it.
 | Model | `llm.primary_model` | `llm.codex_model` (per-mode default — see below) | `llm.local_model` |
 | Install | `npm install -g @anthropic-ai/claude-code` | `npm install -g @openai/codex` | none — reuses the Claude CLI |
 
-Everything except the coder — reviewer, planner, supervisor, utility, intake —
-stays on Claude regardless of this setting. The review gate and the four model tiers are
-fixed by the project's non-negotiable constraints, and the amendment that
-sanctioned a second *coding* backend moved none of them. So selecting `codex`
-means your run bills **two** vendors: OpenAI for the implementer, Anthropic for
-everything else. Both credentials must be present.
+Everything except the coder — planner, supervisor, utility, intake — stays on
+Claude regardless of this setting; those model tiers are fixed by the
+project's non-negotiable constraints, and the amendment that sanctioned a
+second *coding* backend moved none of them. The reviewer stays on Claude
+(`claude-opus-4-8`) by DEFAULT too, but an explicit `llm.role_backends.reviewer`
+Settings choice is honored independent of the coder's backend — disclosed on
+the task detail as its own "Reviewer backend" fact and in the PR body, never
+silently. So selecting `codex` for the coder (and leaving the reviewer at its
+default) means your run bills **two** vendors: OpenAI for the implementer,
+Anthropic for everything else. Both credentials must be present.
 
 ## Switching
 
@@ -243,8 +247,10 @@ LOCAL_LLM_API_KEY=whatever-your-server-expects
 
 **The child process env is exactly three entries**, injected into that one
 subprocess's environment only — never into `os.environ`, never into any other
-role's session (reviewer/planner/supervisor/utility all stay on Claude
-regardless of this setting, per `CLAUDE_PINNED_ROLES`):
+role's session (planner/supervisor/utility stay on Claude regardless of this
+setting, per `CLAUDE_PINNED_ROLES`; the reviewer stays on Claude too unless an
+explicit `llm.role_backends.reviewer` Settings choice says otherwise, which is
+independent of and unaffected by this local-backend setting):
 
 | Variable | Value |
 |---|---|

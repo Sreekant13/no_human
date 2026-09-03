@@ -327,7 +327,7 @@ FROZEN_FILE_LINES = {
     # sentence alongside the byte-unchanged timeout sentence (task:
     # _kill_dev_server test coverage). Measured with the scanner below after
     # rebasing onto the role-backend landing, never summed by hand.
-    "core/orchestrator.py": 21134,
+    "core/orchestrator.py": 21136,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -475,7 +475,11 @@ FROZEN_FILE_LINES = {
     # so the composer's coder-backend disclosure caption can gate on the
     # EFFECTIVE backend, not just the picker. Measured directly against the
     # rebased tree (`wc -l src/no_human/api/app.py`).
-    "api/app.py": 5904,
+    # 5904 -> 5914 (+10): whitelist `role_backends` through `_format_events`
+    # and `task_events_stream` (§6d part 2) — the non-default reviewer
+    # disclosure kwarg was dropped before reaching the board otherwise.
+    # Measured directly (`wc -l src/no_human/api/app.py`).
+    "api/app.py": 5914,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

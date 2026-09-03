@@ -3272,6 +3272,12 @@ def _format_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # node with the model that actually ran it.
             if kind == "models" and isinstance(e.get("models"), dict):
                 entry["models"] = e["models"]
+            # Constraint §6d part 2: a non-default reviewer backend is
+            # disclosed as its own `role_backends` kwarg (never appended to
+            # the clipped `text`) — whitelist it through like `models` above,
+            # or `web/src/summaries.js`'s `nonDefaultReviewer` never sees it.
+            if kind == "models" and isinstance(e.get("role_backends"), dict):
+                entry["role_backends"] = e["role_backends"]
             # The substance of a supervisor decision lives in `message`, not
             # `text` — dropping it made the Supervisor look like it only ever
             # said "continue"/"correct" while its corrections carried real,
@@ -3462,6 +3468,10 @@ async def task_events_stream(task_id: str, request: Request):
                               "text": text, "source": source}
                 if kind == "models" and isinstance(e.get("models"), dict):
                     frame_data["models"] = e["models"]
+                # Mirror the _format_events whitelist so a live-streamed
+                # reviewer disclosure matches the replayed log (§6d part 2).
+                if kind == "models" and isinstance(e.get("role_backends"), dict):
+                    frame_data["role_backends"] = e["role_backends"]
                 if isinstance(e.get("message"), str) and e["message"]:
                     frame_data["message"] = e["message"]
                 for key in _VERDICT_META:

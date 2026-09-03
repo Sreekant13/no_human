@@ -526,11 +526,14 @@ Claude ids refused, unsupported/unavailable backends refused with the
 credential each backend's normal construction path requires — Codex's
 `llm.codex_auth_mode`, local's loopback/RFC1918 check) plus one more: an
 unknown role name in `role_backends` is a `422`, never silently ignored. A
-non-default reviewer choice is disclosed, never silent: the task-detail
-models line gets an appended `reviewer-backend=<name> (chosen in Settings)`
-and the PR body's evidence table gets an additional `| Reviewer model | ... |`
-row — the existing `| Independent review | ... |` verdict row is untouched
-either way.
+non-default reviewer choice is disclosed, never silent: the `models` event
+carries a `role_backends.reviewer` `{backend, model}` kwarg which
+`web/src/summaries.js` renders as its own, un-clipped "Reviewer backend"
+digest fact on the task detail (the models line itself is clipped at 110
+chars — a four-role production string is already past that, so an appended
+suffix there could never render) — and the PR body's evidence table gets an
+additional `| Reviewer model | ... |` row — the existing
+`| Independent review | ... |` verdict row is untouched either way.
 
 **`nh config models`** (no args) prints the same five roles/current
 values/options `GET /api/models` returns, from a freshly loaded config file
@@ -547,9 +550,13 @@ endpoints — it adds no new server behavior. It renders one row per role in
 the order `GET /api/models` returns them, each row's `<select>` built
 entirely from that role's `options`: an option the server marked
 `requires_backend` is rendered `disabled`, with the server's
-`disabled_reason` as the option's title (the coder role is the only one that
-can have such an option today — the other four roles are pinned to Claude
-ids, so there is nothing on their menu to disable). A role whose `note` is
+`disabled_reason` as the option's title (the coder role is the only one with
+such a menu rendered today — part 3 ships the reviewer's picker). Planner,
+supervisor and utility model ids stay pinned to Claude with no override
+front door; the reviewer's *backend* may already be overridden via
+`llm.role_backends.reviewer` (disclosed on the task detail and in the PR
+body), even though its Settings-pane picker is not live in this slice. A
+role whose `note` is
 non-empty (every pinned role) shows it under the row; the reviewer row alone
 may also carry a `cost_note` — the same evidence sentence documented next to
 `review_model`'s default, describing the operator's A/B revert — and no
