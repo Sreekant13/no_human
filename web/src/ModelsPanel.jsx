@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { fetchModels, saveModels, fetchCoderBackend, saveCoderBackend, fetchWorkers, saveWorkers } from "./api.js";
-import { modelsPanelView, pendingBody, resetBody, applyError } from "./modelsPanelView.js";
+import { modelsPanelView, pendingBody, resetBody, applyError, reviewerBackendView } from "./modelsPanelView.js";
 import {
   backendPanelView,
   submitBody as backendSubmitBody,
@@ -375,24 +375,14 @@ export default function ModelsPanel() {
   const dirty = pendingBody(payload, pending, pendingRoleBackend);
   const hasChanges = Object.keys(dirty).length > 0;
 
-  // The reviewer row's effective backend after folding in any unsaved pick —
-  // `null` for every other role (they carry no `row.backend` at all).
-  const reviewerRow = view.rows.find((r) => r.role === "reviewer");
-  const reviewerEffective = !reviewerRow
-    ? null
-    : pendingRoleBackend === undefined
-      ? reviewerRow.backend
-      : pendingRoleBackend === null
-        ? { backend: "", model: "", isDefault: true }
-        : { backend: pendingRoleBackend.backend, model: pendingRoleBackend.model, isDefault: false };
-  // Mirrors the server's own availability check (same data CoderBackendRow's
-  // Save gate already uses) so Save disables client-side on the identical
-  // rule the PUT would refuse with — never a second, divergent guess.
-  const reviewerSubmittable =
-    !reviewerEffective || reviewerEffective.isDefault
-      ? true
-      : !!reviewerEffective.model.trim() &&
-        (backendOptions.find((o) => o.id === reviewerEffective.backend)?.disabled !== true);
+  // The reviewer row's saved/pending/selected derivation, all in one place —
+  // `null` for every other role (they carry no `backend` block at all).
+  // `submittable` here mirrors the server's own availability check (same
+  // data CoderBackendRow's Save gate already uses) so Save disables
+  // client-side on the identical rule the PUT would refuse with — never a
+  // second, divergent guess.
+  const reviewerView = reviewerBackendView(payload, pendingRoleBackend, backendOptions);
+  const reviewerSubmittable = !reviewerView || reviewerView.submittable;
 
   return (
     <div className="memory-panel models-panel">
@@ -444,32 +434,44 @@ export default function ModelsPanel() {
               </span>
               {row.note && <div className="ntm-hint">{row.note}</div>}
               {row.costNote && <div className="ntm-hint">{row.costNote}</div>}
-              {row.role === "reviewer" && row.backend && (
+              {row.role === "reviewer" && reviewerView && (
                 <div className="reviewer-backend-override">
                   <div className="ntm-hint" data-testid="reviewer-backend-disclosure">
-                    {reviewerEffective.isDefault ? (
-                      <>Effective reviewer backend: default (<code>{row.default}</code>)</>
+                    {reviewerView.saved.isDefault ? (
+                      <>Reviewer backend: default (<code>{reviewerView.defaultModel}</code>)</>
                     ) : (
                       <>
-                        Effective reviewer backend: <code>{reviewerEffective.backend}</code>{" "}
-                        <code>{reviewerEffective.model}</code> — overrides the default
-                        reviewer (<code>{row.default}</code>), chosen in Settings.
+                        Reviewer backend: <code>{reviewerView.saved.backend}</code>{" "}
+                        <code>{reviewerView.saved.model}</code> — overrides the default
+                        reviewer (<code>{reviewerView.defaultModel}</code>), chosen in Settings.
                       </>
                     )}
                   </div>
+                  {reviewerView.unsaved && (
+                    <div className="ntm-hint" data-testid="reviewer-backend-pending">
+                      {reviewerView.selected.isDefault ? (
+                        <>Pending: default — applies on Save.</>
+                      ) : (
+                        <>
+                          Pending: <code>{reviewerView.selected.backend}</code>{" "}
+                          <code>{reviewerView.selected.model}</code> — applies on Save.
+                        </>
+                      )}
+                    </div>
+                  )}
                   <label className="auth-label">
                     Reviewer backend override
                     <select
                       className="new-task-select"
                       aria-label="Reviewer backend override"
-                      value={reviewerEffective.isDefault ? "" : reviewerEffective.backend}
+                      value={reviewerView.selected.isDefault ? "" : reviewerView.selected.backend}
                       onChange={(e) => {
                         const val = e.target.value;
                         setError(null);
                         if (val === "") { setPendingRoleBackend(null); return; }
                         setPendingRoleBackend({
                           backend: val,
-                          model: reviewerEffective.isDefault ? "" : reviewerEffective.model,
+                          model: reviewerView.selected.isDefault ? "" : reviewerView.selected.model,
                         });
                       }}
                     >
@@ -481,22 +483,22 @@ export default function ModelsPanel() {
                       ))}
                     </select>
                   </label>
-                  {!reviewerEffective.isDefault && (
+                  {!reviewerView.selected.isDefault && (
                     <label className="auth-label">
                       Reviewer model
                       <input
                         type="text"
                         className="new-task-input"
                         aria-label="Reviewer model"
-                        value={reviewerEffective.model}
+                        value={reviewerView.selected.model}
                         onChange={(e) => {
                           setError(null);
-                          setPendingRoleBackend({ backend: reviewerEffective.backend, model: e.target.value });
+                          setPendingRoleBackend({ backend: reviewerView.selected.backend, model: e.target.value });
                         }}
                       />
                     </label>
                   )}
-                  {!reviewerEffective.isDefault && !reviewerSubmittable && (
+                  {!reviewerView.selected.isDefault && !reviewerView.submittable && (
                     <div className="ntm-hint">
                       Pick an available backend and set a model id to enable Save.
                     </div>
@@ -512,6 +514,7 @@ export default function ModelsPanel() {
         <button
           type="button"
           className="btn btn-approve"
+          data-testid="models-save"
           disabled={!hasChanges || saving || !reviewerSubmittable}
           onClick={() => commit(dirty)}
         >

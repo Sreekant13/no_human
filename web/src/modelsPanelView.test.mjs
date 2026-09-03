@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { modelsPanelView, pendingBody, resetBody, applyError } from "./modelsPanelView.js";
+import { modelsPanelView, pendingBody, resetBody, applyError, reviewerBackendView } from "./modelsPanelView.js";
 
 // One fixture payload shared by every test below — the shape GET /api/models
 // actually returns (see core/model_settings.py::models_payload). Nothing in
@@ -159,6 +159,10 @@ test("neither view-model file hardcodes a model id, vendor prefix, or config key
     assert.doesNotMatch(src, /gpt-/, `${name} names a gpt- id`);
     assert.doesNotMatch(src, /primary_model|review_model|planner_model|supervisor_model|utility_model/,
       `${name} spells out a config key`);
+    // Constraint §6d: the reviewer backend picker's options must come from
+    // the server's own GET /api/coder-backend payload (backendOptions), not
+    // a second hand-rolled `["claude", ...]`-shaped SUPPORTED_BACKENDS copy.
+    assert.doesNotMatch(src, /\[\s*["']claude["']\s*,/, `${name} hardcodes a backend id list`);
   }
 });
 
@@ -423,4 +427,110 @@ test("pendingBody(payload, {}, null) is idempotent once the reviewer is already 
   assert.deepEqual(first, {});
   const second = pendingBody(p, {}, null);
   assert.deepEqual(second, first);
+});
+
+// --- 6d part 3: reviewerBackendView (saved/pending/selected derivation) --- //
+
+test("reviewerBackendView returns null when the reviewer row carries no backend block", () => {
+  assert.equal(reviewerBackendView(payload(), undefined, []), null);
+  assert.equal(reviewerBackendView(payload(), null, []), null);
+  assert.equal(reviewerBackendView(null, undefined, []), null);
+});
+
+test("reviewerBackendView reports saved.isDefault and defaultModel when the reviewer is unset (on default)", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  const view = reviewerBackendView(p, undefined, []);
+  assert.deepEqual(view.saved, { backend: "claude", model: "claude-opus-4-8", isDefault: true });
+  assert.equal(view.defaultModel, p.roles[1].default);
+  assert.deepEqual(view.selected, view.saved);
+  assert.equal(view.unsaved, false);
+});
+
+test("reviewerBackendView reports the chosen backend/model when the reviewer has an explicit choice", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "codex", model: "gpt-5-codex", is_default: false };
+  const view = reviewerBackendView(p, undefined, []);
+  assert.deepEqual(view.saved, { backend: "codex", model: "gpt-5-codex", isDefault: false });
+  assert.deepEqual(view.selected, view.saved);
+});
+
+test("reviewerBackendView.unsaved is false for an omitted (undefined) pending pick", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  assert.equal(reviewerBackendView(p, undefined, []).unsaved, false);
+});
+
+test("reviewerBackendView.unsaved is true for a pending pick that differs from the saved state", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  const view = reviewerBackendView(p, { backend: "codex", model: "gpt-5-codex" }, []);
+  assert.equal(view.unsaved, true);
+  assert.deepEqual(view.selected, { backend: "codex", model: "gpt-5-codex", isDefault: false });
+});
+
+test("reviewerBackendView.unsaved is false for a pending pick identical to the saved one", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "codex", model: "gpt-5-codex", is_default: false };
+  const view = reviewerBackendView(p, { backend: "codex", model: "gpt-5-codex" }, []);
+  assert.equal(view.unsaved, false);
+});
+
+test("reviewerBackendView.unsaved is true for a pending null (clear) only when currently non-default", () => {
+  const nonDefault = payload();
+  nonDefault.roles[1].backend = { backend: "codex", model: "gpt-5-codex", is_default: false };
+  assert.equal(reviewerBackendView(nonDefault, null, []).unsaved, true);
+
+  const alreadyDefault = payload();
+  alreadyDefault.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  assert.equal(reviewerBackendView(alreadyDefault, null, []).unsaved, false);
+});
+
+test("reviewerBackendView.submittable is false for a blank (or whitespace-only) model", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  const view = reviewerBackendView(p, { backend: "codex", model: "   " }, []);
+  assert.equal(view.submittable, false);
+});
+
+test("reviewerBackendView.submittable is false when the selected backend option is disabled", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  const options = [{ id: "codex", disabled: true, reason: "not configured" }];
+  const view = reviewerBackendView(p, { backend: "codex", model: "gpt-5-codex" }, options);
+  assert.equal(view.submittable, false);
+});
+
+test("reviewerBackendView.submittable is true for an available backend with a non-blank model", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  const options = [{ id: "codex", disabled: false }];
+  const view = reviewerBackendView(p, { backend: "codex", model: "gpt-5-codex" }, options);
+  assert.equal(view.submittable, true);
+});
+
+test("reviewerBackendView.submittable is always true when selected is on default, regardless of options", () => {
+  const p = payload();
+  p.roles[1].backend = { backend: "claude", model: "claude-opus-4-8", is_default: true };
+  assert.equal(reviewerBackendView(p, undefined, []).submittable, true);
+  assert.equal(reviewerBackendView(p, null, []).submittable, true);
+});
+
+// --- 6d part 3: ModelsPanel.jsx source pins (wiring, not behaviour) --- //
+
+test("ModelsPanel.jsx imports and calls reviewerBackendView, server-derived options only", () => {
+  const src = readFileSync(new URL("./ModelsPanel.jsx", import.meta.url), "utf8");
+  assert.match(src, /import\s*\{[^}]*reviewerBackendView[^}]*\}\s*from\s*["']\.\/modelsPanelView\.js["']/,
+    "must import reviewerBackendView from modelsPanelView.js");
+  assert.match(src, /reviewerBackendView\(/, "must call reviewerBackendView");
+  assert.match(src, /backendOptions\.map\(/, "the option list must be rendered from backendOptions");
+  assert.match(src, /<option value="">/, "a clear-to-default option must be present");
+  assert.match(src, /data-testid="models-save"/, "the panel's Save button needs an unambiguous selector");
+  assert.match(src, /data-testid="reviewer-backend-pending"/, "the unsaved-pick line needs its own hook");
+});
+
+test("ModelsPanel.jsx's Save button still goes through pendingBody, not a second hand-rolled body", () => {
+  const src = readFileSync(new URL("./ModelsPanel.jsx", import.meta.url), "utf8");
+  assert.match(src, /const dirty = pendingBody\(payload, pending, pendingRoleBackend\)/);
+  assert.match(src, /commit\(dirty\)/, "Save must submit the pendingBody-derived body");
 });

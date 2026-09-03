@@ -132,6 +132,66 @@ export function resetBody(payload) {
   return out;
 }
 
+// reviewerBackendView(payload, pendingRoleBackend, backendOptions) -> the
+// reviewer backend picker's whole saved/pending/selected derivation, pulled
+// out of the JSX so it's testable without a renderer. `backendOptions` is
+// the caller's own already-fetched `backendPanelView(...).options` list
+// (this module still does no I/O of its own — no second "which backends
+// exist" fetch invented here).
+//
+// Returns `null` when there is no reviewer role, or the reviewer role
+// carries no `backend` block at all (an older server, or a role outside
+// ROLE_BACKEND_ROLES) — the caller must not render the picker in that case,
+// same degrade rule the rest of the pane already follows.
+//
+// Otherwise:
+//   - `saved`: `{backend, model, isDefault}` straight off the reviewer row's
+//     own `backend` field — the server's own answer, never re-derived;
+//   - `defaultModel`: the reviewer row's `default` id, shown next to the
+//     word "default";
+//   - `pending`: `pendingRoleBackend`, echoed verbatim;
+//   - `selected`: `saved` folded with `pending` — `undefined` keeps `saved`,
+//     `null` becomes `{backend: "", model: "", isDefault: true}`, and an
+//     explicit `{backend, model}` becomes `{..., isDefault: false}`;
+//   - `unsaved`: true iff `pendingBody(payload, {}, pendingRoleBackend)`
+//     would carry a `role_backends` key — reuses that function's own
+//     three-state contract rather than re-deriving the comparison;
+//   - `submittable`: true when `selected.isDefault`; otherwise true only if
+//     the trimmed model is non-empty AND the selected backend is not a
+//     `disabled` entry in `backendOptions`.
+export function reviewerBackendView(payload, pendingRoleBackend, backendOptions = []) {
+  const roles = payload?.roles;
+  const reviewer = Array.isArray(roles) ? roles.find((r) => r.role === "reviewer") : null;
+  if (!reviewer || !reviewer.backend) return null;
+
+  const saved = {
+    backend: reviewer.backend.backend,
+    model: reviewer.backend.model,
+    isDefault: !!reviewer.backend.is_default,
+  };
+  const selected =
+    pendingRoleBackend === undefined
+      ? saved
+      : pendingRoleBackend === null
+        ? { backend: "", model: "", isDefault: true }
+        : { backend: pendingRoleBackend.backend, model: pendingRoleBackend.model, isDefault: false };
+  const unsaved = "role_backends" in pendingBody(payload, {}, pendingRoleBackend);
+  const submittable =
+    selected.isDefault
+      ? true
+      : !!selected.model.trim() &&
+        backendOptions.find((o) => o.id === selected.backend)?.disabled !== true;
+
+  return {
+    saved,
+    defaultModel: reviewer.default,
+    pending: pendingRoleBackend,
+    selected,
+    unsaved,
+    submittable,
+  };
+}
+
 // A failed Save (422, network error, or any other throw): the server wrote
 // nothing (apply_model_changes validates every submitted key before writing
 // any of them), so the truthful UI reverts every pending edit, not just the
