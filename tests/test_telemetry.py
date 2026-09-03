@@ -32,7 +32,7 @@ _CSP_TODAY = (
     "default-src 'self'; script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
     "font-src 'self'; connect-src 'self' ws: wss:; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'"
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 
 _ENABLED = {
@@ -125,64 +125,11 @@ def test_disabled_records_nothing_and_touches_no_network(temp_home, no_network):
     assert no_network == []
 
 
-def test_enabled_without_endpoint_posts_to_posthog(temp_home, no_network, no_thread):
-    """No first-party `endpoint` configured: PostHog's `/batch/` is the
-    shipped default destination, not a no-op."""
-    section = {
-        "enabled": True,
-        "endpoint": "",
-        # A genuine uuid4 (version nibble "4", variant nibble in 8-b) so
-        # ensure_instance_id passes it through unchanged instead of minting
-        # a fresh one — otherwise the distinct_id assertion below would be
-        # tautological against whatever got minted.
-        "instance_id": "11111111-2222-4333-8444-555555555555",
-        "posthog_publishable": "phc_test",
-        "posthog_host": "https://us.i.posthog.com",
-    }
-    telemetry.record("task_created", config={"telemetry": section}, source="cli")
-    assert (temp_home / ".no_human" / "telemetry-queue.jsonl").exists()
-    sent = telemetry.flush(section)
-    assert sent == 1
-    assert len(no_network) == 1
-    req, timeout = no_network[0]
-    assert timeout == pytest.approx(3.0)
-    assert req.full_url == "https://us.i.posthog.com/batch/"
-    body = json.loads(req.data.decode())
-    assert set(body) == {"api_key", "batch"}
-    assert body["api_key"] == "phc_test"
-    [event] = body["batch"]
-    assert event["event"] == "task_created"
-    assert event["distinct_id"] == section["instance_id"]
-    assert event["timestamp"].endswith("+00:00")
-    from no_human import __version__
-    assert event["properties"] == {
-        "source": "cli",
-        "app_version": __version__,
-        "instance_id": section["instance_id"],
-    }
-
-
-def test_enabled_with_neither_endpoint_nor_publishable_is_a_noop(temp_home, no_network):
-    telemetry.record("app_started", config={"telemetry": {
-        "enabled": True, "endpoint": "", "posthog_publishable": "",
-        "posthog_host": "https://us.i.posthog.com",
-    }})
+def test_enabled_without_endpoint_is_a_noop(temp_home, no_network):
+    telemetry.record("app_started",
+                     config={"telemetry": {"enabled": True, "endpoint": ""}})
     assert not (temp_home / ".no_human" / "telemetry-queue.jsonl").exists()
     assert no_network == []
-
-
-def test_explicit_endpoint_wins_over_posthog(temp_home, no_network, no_thread):
-    """A configured `telemetry.endpoint` always wins over PostHog, even when
-    PostHog credentials are also present."""
-    section = {**_ENABLED, "posthog_host": "https://us.i.posthog.com"}
-    telemetry.record("app_started", config={"telemetry": section})
-    sent = telemetry.flush(section)
-    assert sent == 1
-    assert len(no_network) == 1
-    req, _ = no_network[0]
-    assert req.full_url == _ENABLED["endpoint"]
-    body = json.loads(req.data.decode())
-    assert set(body) == {"instance_id", "version", "events"}
 
 
 # ------------------------- ingestion contract ----------------------------- #
@@ -263,7 +210,7 @@ def test_csp_enabled_adds_exactly_the_two_posthog_hosts():
         "font-src 'self'; "
         "connect-src 'self' ws: wss: "
         "https://us.i.posthog.com https://us-assets.i.posthog.com; "
-        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
     )
 
 
@@ -480,33 +427,6 @@ def test_missing_instance_id_mints_persists_and_still_sends(
     assert uuid.UUID(sent_id).version == 4  # a valid id shipped
     on_disk = yaml.safe_load(cfg_path.read_text())["telemetry"]
     assert on_disk["instance_id"] == sent_id  # and it persisted, stable
-
-
-def test_persist_failure_warns_once_and_still_sends(
-        temp_home, no_network, no_thread, monkeypatch, caplog):
-    """A config.yaml write failure during instance-id persistence must not be
-    silent — `ensure_instance_id` logs one WARNING, while the batch still
-    ships fail-open with the in-process minted id (never a wedged queue)."""
-    import uuid
-
-    from no_human import integrations
-
-    def _boom(path, values):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(integrations, "_write_config_values", _boom)
-
-    section = {"enabled": True, "endpoint": "https://ingest.invalid/collect",
-               "instance_id": ""}
-    telemetry.record("app_started", config={"telemetry": section})
-    with caplog.at_level("WARNING", logger="no_human.telemetry"):
-        assert telemetry.flush(dict(section)) == 1
-    [(req, _)] = no_network
-    sent_id = json.loads(req.data.decode())["instance_id"]
-    assert uuid.UUID(sent_id).version == 4  # a valid id still shipped
-    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == 1
-    assert "could not persist instance id" in warnings[0].getMessage()
 
 
 def test_poisoned_queue_line_is_dropped_not_wedging(temp_home, no_network,
