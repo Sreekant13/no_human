@@ -347,7 +347,14 @@ FROZEN_FILE_LINES = {
     # dev server that proxied straight at the real `:8420` board. Measured on
     # this rebased tree with the scanner below (`len(Path(...).read_text().
     # splitlines())`), never summed by hand.
-    "core/orchestrator.py": 21188,
+    #
+    # 21188 -> 21191 (+3): follow-up to the hermetic-backend walk (PR #1015
+    # review) — `_maybe_capture_ui_evidence` now passes `auth_mode=` into
+    # `ui_evidence.hermetic_backend` and, on a pre-existing dev server it
+    # cannot bind to the hermetic target, DISCLOSES and still runs the walk
+    # instead of skipping it. Measured with the scanner below, never summed
+    # by hand.
+    "core/orchestrator.py": 21191,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -608,7 +615,10 @@ FROZEN_FILE_LINES = {
     # 3340 -> 3544 (+204): the role_backends config surface (single-write-path
     # validation, load-time catalog/availability alignment, set_role_backend).
     # Measured on the merge result with the scanner below, never summed.
-    "config.py": 3544,
+    # 3544 -> 3546 (+2): telemetry.endpoint's DEFAULT_CONFIG comment
+    # re-worded for PostHog-by-default routing (telemetry.py:_destination).
+    # Measured on this tree.
+    "config.py": 3546,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

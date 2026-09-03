@@ -2,12 +2,14 @@
 
 Default ON (`telemetry.enabled: true` — consent). The onboarding and Settings
 toggles were removed (operator, 2026-08-26): the one opt-out now is
-`config.yaml` `telemetry.enabled: false`. Note server-side events ALSO require a configured `endpoint`, which
-ships empty, so this queue stays inert until an endpoint is set even with
-consent on. When enabled AND endpointed, a CLOSED allowlist of event kinds is
+`config.yaml` `telemetry.enabled: false`. With no `telemetry.endpoint`
+configured, server-side events post to PostHog's `/batch/` endpoint on
+`telemetry.posthog_host` instead; setting `telemetry.endpoint` (the
+first-party ingestion Lambda) always takes precedence over PostHog. When
+enabled AND a destination resolves, a CLOSED allowlist of event kinds is
 buffered to ``~/.no_human/telemetry-queue.jsonl``
-and flushed in small batches by a daemon thread to the first-party ingestion
-endpoint. Everything is fail-open: a dead endpoint, a full disk or a malformed
+and flushed in small batches by a daemon thread to that destination.
+Everything is fail-open: a dead endpoint, a full disk or a malformed
 queue line can never break a task run — the only exception `record` raises on
 purpose is ``ValueError`` for an event kind or prop outside the allowlist,
 because an unlisted event is a privacy bug, not an operational hiccup.
@@ -18,10 +20,14 @@ validated against `_ALLOWED_EVENTS` — kind AND prop names are closed sets.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # Closed allowlist: event kind -> allowed prop names. Anything else raises.
 _ALLOWED_EVENTS: dict[str, frozenset[str]] = {
@@ -33,14 +39,18 @@ _ALLOWED_EVENTS: dict[str, frozenset[str]] = {
     "feature_used": frozenset({"name"}),
 }
 
-# Mirror of the server's per-event validation. The server rejects a batch
-# WHOLESALE on one bad event and a rejected batch stays queued, so every
-# check the server enforces must be enforced here too or one bad line
-# wedges all flushing behind invisible 400s: exact key set, allowlisted
-# name, allowlisted prop KEYS, ts an int (not bool) in the server's
-# 2020-2100 band, and prop VALUES str<=128 / int<2^31 / bool.
-_MIN_TS = 1577836800          # 2020-01-01, the server's lower bound
-_MAX_TS = 4102444800          # 2100-01-01, the server's upper bound
+# Mirror of the first-party Lambda's per-event validation. The Lambda
+# rejects a batch WHOLESALE on one bad event and a rejected batch stays
+# queued, so every check it enforces must be enforced here too or one bad
+# line wedges all flushing behind invisible 400s: exact key set, allowlisted
+# name, allowlisted prop KEYS, ts an int (not bool) in the Lambda's
+# 2020-2100 band, and prop VALUES str<=128 / int<2^31 / bool. PostHog's
+# `/batch/` is far more permissive, but the same filtering is kept for it
+# too: it is the one enforcement of the privacy allowlist regardless of
+# destination, and a line rejected by one destination should not ship to
+# the other unfiltered.
+_MIN_TS = 1577836800          # 2020-01-01, the Lambda's lower bound
+_MAX_TS = 4102444800          # 2100-01-01, the Lambda's upper bound
 _MAX_PROP_STR = 128
 
 
@@ -108,13 +118,32 @@ def _conf(config: dict[str, Any] | None) -> dict[str, Any]:
     return section if isinstance(section, dict) else {}
 
 
+def _destination(section: dict[str, Any]) -> tuple[str, str] | None:
+    """Resolve where a batch ships, or ``None`` if nothing is configured.
+
+    An explicit `telemetry.endpoint` (the first-party ingestion Lambda)
+    always wins when set. Otherwise, PostHog's `/batch/` endpoint on
+    `telemetry.posthog_host` is the shipped default — used whenever both a
+    host and a publishable client token are present.
+    """
+    endpoint = str(section.get("endpoint") or "").strip()
+    if endpoint:
+        return ("lambda", endpoint)
+    publishable = str(section.get("posthog_publishable") or "").strip()
+    host = str(section.get("posthog_host") or "").strip().rstrip("/")
+    if publishable and host:
+        return ("posthog", f"{host}/batch/")
+    return None
+
+
 def enabled(config: dict[str, Any] | None = None) -> bool:
     section = _conf(config)
-    return bool(section.get("enabled")) and bool(str(section.get("endpoint") or "").strip())
+    return bool(section.get("enabled")) and _destination(section) is not None
 
 
 def record(kind: str, config: dict[str, Any] | None = None, **props: Any) -> None:
-    """Queue one telemetry event. No-op unless consented AND endpoint set.
+    """Queue one telemetry event. No-op unless consented AND a destination
+    resolves (`telemetry.endpoint`, else PostHog).
 
     Raises ``ValueError`` for a kind or prop name outside `_ALLOWED_EVENTS`
     (validated even when disabled — an unlisted event is a bug either way).
@@ -129,13 +158,13 @@ def record(kind: str, config: dict[str, Any] | None = None, **props: Any) -> Non
             f"telemetry: props {sorted(unknown)!r} not allowed for {kind!r}")
     try:
         section = _conf(config)
-        if not (bool(section.get("enabled"))
-                and str(section.get("endpoint") or "").strip()):
+        if not (bool(section.get("enabled")) and _destination(section)):
             return
-        # Wire field is "name" — the ingestion Lambda's closed contract
-        # (telemetry_lambda/handler.py validates event.get("name")). Found
-        # live 2026-08-16: the first deploy sent "kind" and every batch got
-        # a 400; the queue never drained. The wire name is pinned by test.
+        # "name" is the QUEUE-LINE field (this on-disk contract, pinned by
+        # test) — not the PostHog wire field, which is "event" (see
+        # `_posthog_body`, :231). For the Lambda, "name" IS the wire field
+        # too: found live 2026-08-16, the first deploy sent "kind" and every
+        # batch got a 400; the queue never drained.
         event = {"name": kind, "ts": int(time.time()), "props": props}
         _append(event)
         _spawn_flush(section)
@@ -164,14 +193,16 @@ def _spawn_flush(section: dict[str, Any]) -> None:
     ).start()
 
 
-def _usable_instance_id(section: dict[str, Any]) -> str:
-    """The Lambda 400s the WHOLE batch unless instance_id is a uuid4 string.
+def ensure_instance_id(section: dict[str, Any]) -> str:
+    """The first-party Lambda 400s the WHOLE batch unless instance_id is a
+    uuid4; PostHog accepts any `distinct_id`, canonical or not.
 
-    The GUI consent toggle mints one — but the hand-edited-config.yaml
-    activation path (the only way to set `endpoint` today) doesn't, and an
-    empty id would wedge the queue behind invisible 400s (review round 2).
-    So flush validates, and mints + best-effort-persists when needed: the
-    batch always ships with a valid id; persistence keeps it stable.
+    Config may hold no id, a hand-edited non-uuid4 value, or a valid one in a
+    non-canonical form — this validates, canonicalizes, and mints +
+    best-effort-persists when needed: the batch always ships with a valid id;
+    persistence keeps it stable across runs. Public because both the Lambda
+    and PostHog code paths need it, and callers may want to ensure an id
+    exists before enabling telemetry.
     """
     import uuid
     raw = str(section.get("instance_id") or "")
@@ -179,7 +210,7 @@ def _usable_instance_id(section: dict[str, Any]) -> str:
         parsed = uuid.UUID(raw)
         if parsed.version == 4:
             # CANONICALIZED: uuid.UUID also accepts braced/dashless/urn
-            # forms, which the server's exact-36-char check rejects — a
+            # forms, which the Lambda's exact-36-char check rejects — a
             # hand-edited id in any of those forms would wedge every batch
             # while validating fine here (review round 3).
             return str(parsed)
@@ -191,23 +222,48 @@ def _usable_instance_id(section: dict[str, Any]) -> str:
         from .config import CONFIG_PATH
         from .integrations import _write_config_values
         _write_config_values(CONFIG_PATH, {"telemetry.instance_id": minted})
-    except Exception:
-        pass  # fail-open: an unpersisted id still beats a wedged queue
+    except Exception as exc:  # noqa: BLE001
+        # fail-open: an unpersisted id still beats a wedged queue — but warn
+        # once so a persistently-failing config.yaml write is visible instead
+        # of silently re-minting a new id (and re-triggering this) every run.
+        log.warning(
+            "telemetry: could not persist instance id to config.yaml: %s", exc)
     return minted
+
+
+def _posthog_body(section: dict[str, Any], events: list[dict[str, Any]],
+                   version: str) -> dict[str, Any]:
+    """Build a PostHog `/batch/` request body from already-validated events."""
+    instance_id = ensure_instance_id(section)
+    batch = [{
+        "event": ev["name"],
+        "distinct_id": instance_id,
+        "timestamp": datetime.fromtimestamp(ev["ts"], timezone.utc).isoformat(),
+        "properties": {
+            **ev.get("props", {}),
+            "app_version": version,
+            "instance_id": instance_id,
+        },
+    } for ev in events]
+    return {
+        "api_key": str(section.get("posthog_publishable") or ""),
+        "batch": batch,
+    }
 
 
 def flush(section: dict[str, Any] | None = None,
           config: dict[str, Any] | None = None) -> int:
-    """POST up to `FLUSH_BATCH` queued events to the ingestion endpoint.
+    """POST up to `FLUSH_BATCH` queued events to the resolved destination.
 
     Returns the number of events actually sent (0 on any failure — the queue
     keeps them for a later flush; fail-open, 3s timeout, stdlib urllib only).
     """
     if section is None:
         section = _conf(config)
-    endpoint = str(section.get("endpoint") or "").strip()
-    if not (bool(section.get("enabled")) and endpoint):
+    dest = _destination(section)
+    if not (bool(section.get("enabled")) and dest):
         return 0
+    kind, endpoint = dest
     try:
         path = _queue_path()
         with _LOCK:
@@ -235,8 +291,9 @@ def flush(section: dict[str, Any] | None = None,
                 continue
             events.append(event)
         if not events:
-            # Every line in this batch was corrupt/non-conforming. The server
-            # 400s an empty events array, and lines are only removed after a
+            # Every line in this batch was corrupt/non-conforming. The Lambda
+            # 400s an empty events array, and an empty PostHog batch is
+            # equally pointless to send; lines are only removed after a
             # successful POST — so POSTing here would wedge the queue behind
             # the poisoned head forever (review round 4: organically reachable
             # via >=50 reset-clock lines). Delete the batch, send nothing.
@@ -250,11 +307,14 @@ def flush(section: dict[str, Any] | None = None,
                 path.write_text("\n".join(kept) + "\n" if kept else "")
             return 0
         from . import __version__  # the same string `nh --version` prints
-        body = json.dumps({
-            "instance_id": _usable_instance_id(section),
-            "version": __version__,
-            "events": events,
-        }).encode()
+        if kind == "posthog":
+            body = json.dumps(_posthog_body(section, events, __version__)).encode()
+        else:
+            body = json.dumps({
+                "instance_id": ensure_instance_id(section),
+                "version": __version__,
+                "events": events,
+            }).encode()
         import urllib.request
         req = urllib.request.Request(
             endpoint, data=body,

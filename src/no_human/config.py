@@ -2300,9 +2300,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # invariants.py) bans cloud deployment identifiers from the local
         # product's source, so the hosted ingestion URL arrives as
         # configuration (config.yaml `telemetry.endpoint`) exactly like
-        # `team_brain.control_plane_url` — never as a constant here. With
-        # consent ON but no endpoint, server-side events stay a no-op;
-        # browser-side PostHog telemetry is independent of this key.
+        # `team_brain.control_plane_url` — never as a constant here. With no
+        # endpoint configured, server-side events go to PostHog's `/batch/`
+        # endpoint on `posthog_host` instead (telemetry.py:_destination); an
+        # explicit `telemetry.endpoint` always wins over PostHog. Browser-side
+        # PostHog telemetry is independent of this key.
         "endpoint": "",
         # Anonymous instance id: minted (uuid4) SERVER-SIDE on first enable by
         # the consent endpoint and persisted to config.yaml via the shared

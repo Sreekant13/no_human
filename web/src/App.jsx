@@ -1358,6 +1358,35 @@ export default function App() {
             onClick={() => setPage("about")}
             title="What no_human is, docs, and contact"
           />
+          {/* One-time nudge from the "!" — shown after onboarding until
+              Settings opens on ANY pane or the popup is dismissed
+              (`popupDismissed`, a strictly weaker condition than the
+              badge's own `aiConfigDone` below — the badge needs the
+              Second-brain pane specifically; this popup does not). Not
+              while onboarding is still checking (null) or in progress
+              (false). Rendered as a flow sibling here (not inside
+              .nh-settings-navwrap) so it can never absolutely-overlap the
+              Finish-setup row below it. */}
+          {!popupDismissed && onboarded === true && !settingsOpen && (
+            <div className="nh-aiconfig-nudge" role="dialog" aria-label="Complete AI configuration">
+              <button
+                type="button"
+                className="nh-aiconfig-nudge-x"
+                aria-label="Dismiss"
+                onClick={dismissAiConfig}
+              >×</button>
+              <div className="nh-aiconfig-nudge-title">Complete AI configuration</div>
+              <div className="nh-aiconfig-nudge-body">
+                Review your rules, pick the model for each role, and seed your
+                second brain — all in Settings.
+              </div>
+              <button
+                type="button"
+                className="btn btn-approve nh-aiconfig-nudge-cta"
+                onClick={() => openSettings("learnings")}
+              >Open Settings</button>
+            </div>
+          )}
           {/* The minimal path's leftover steps, as a compact affordance directly
               above Settings — not the old board-body card (real-user feedback:
               it "took half the screen" and every row deep-linked to the wrong
@@ -1370,6 +1399,8 @@ export default function App() {
               onDone={(step) => markDeferredDone(step).then((r) => setDeferred(r.deferred || [])).catch(() => {})}
             />
           )}
+          {/* Settings row wrapper — no longer scopes the AI-config popup (moved
+              above as a flow sibling); kept for the row's own positioning. */}
           <div className="nh-settings-navwrap">
             <NavRow
               icon={<IconGear />}
@@ -1390,33 +1421,6 @@ export default function App() {
               onClick={() => openSettings()}
               className="nh-settings-row"
             />
-            {/* One-time nudge from the "!" — shown after onboarding until
-                Settings opens on ANY pane or the popup is dismissed
-                (`popupDismissed`, a strictly weaker condition than the
-                badge's own `aiConfigDone` above — the badge needs the
-                Second-brain pane specifically; this popup does not). Not
-                while onboarding is still checking (null) or in progress
-                (false). */}
-            {!popupDismissed && onboarded === true && !settingsOpen && (
-              <div className="nh-aiconfig-nudge" role="dialog" aria-label="Complete AI configuration">
-                <button
-                  type="button"
-                  className="nh-aiconfig-nudge-x"
-                  aria-label="Dismiss"
-                  onClick={dismissAiConfig}
-                >×</button>
-                <div className="nh-aiconfig-nudge-title">Complete AI configuration</div>
-                <div className="nh-aiconfig-nudge-body">
-                  Review your rules, pick the model for each role, and seed your
-                  second brain — all in Settings.
-                </div>
-                <button
-                  type="button"
-                  className="btn btn-approve nh-aiconfig-nudge-cta"
-                  onClick={() => openSettings("learnings")}
-                >Open Settings</button>
-              </div>
-            )}
           </div>
         </div>
       </aside>

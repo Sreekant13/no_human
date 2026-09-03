@@ -541,15 +541,98 @@ async def test_booted_dev_server_is_disclosed_in_the_pr_body_and_stopped(
     assert "already running" not in body, body
 
 
+async def test_booted_dev_server_receives_the_hermetic_backends_vite_api_target(
+        repo_env, tmp_path, store, monkeypatch):
+    """D2-hermetic bugfix (2026-09-03): `_maybe_capture_ui_evidence` only
+    ever hands `dev_server` the ARMED hermetic backend's own `api_target`
+    (`extra_env={"VITE_API_TARGET": hb.api_target} if hb else None` in
+    `core/orchestrator.py`) — never the manifest's real `base_url` — so the
+    booted `npm run dev`/`start_cmd` proxies `/api` at the throwaway,
+    isolated `nh start`, never the operator's live `:8420` board. That line
+    had NO test going through the orchestrator path before this one: every
+    prior assertion on a booted dev server's spawn env only exercised
+    `ui_evidence.dev_server` directly (`tests/test_ui_evidence_hermetic_
+    backend.py`), so mutating this call site to `extra_env=None` left every
+    existing test green. This test goes red on that exact mutation."""
+    base_url = "http://127.0.0.1:5198"
+    start_cmd = "python -m http.server 5198"
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"z\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+    fake_proc = _FakeDevServerProc()
+
+    def reachable(url):
+        return url == base_url + "/"
+
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_recorder(spawn_calls, fake_proc),
+        reachable=reachable,
+        kill=_kill_recorder(kill_calls),
+    )
+    # `_wire_armed_hermetic_backend` leaves `pick_port` at its default
+    # (`lambda: 54321`), so an armed backend's `api_target` is deterministic:
+    # `http://127.0.0.1:54321`.
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
+
+    calls: list[dict] = []
+    monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url=base_url)
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, boot the dev server against the hermetic backend",
+                 repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(spawn_calls) == 1, spawn_calls
+    env = spawn_calls[0]["kwargs"].get("env") or {}
+    assert env.get("VITE_API_TARGET") == "http://127.0.0.1:54321", env
+    # Never the manifest's real base_url — that's the whole point of the
+    # hermetic backend.
+    assert env.get("VITE_API_TARGET") != base_url
+
+
 async def test_pre_existing_dev_server_is_disclosed(
         repo_env, tmp_path, store, monkeypatch):
-    """D2-hermetic (2026-09-03): when something already answers at the
+    """D2-hermetic bugfix (2026-09-03): when something already answers at the
     manifest's `base_url`, the harness cannot verify that pre-existing
     server proxies at the hermetic backend rather than the operator's live
     `:8420` board — the exact blast radius the hermetic backend exists to
-    close — so it must never spawn or kill anything AND must never run the
-    walk against it; it only discloses the skip. This REPLACES the pre-
-    hermetic walk-and-disclose behavior for this scenario (PLAN.md)."""
+    close. fa053f7da made that case SKIP the walk entirely, but that lost
+    real (if not-provably-hermetic) evidence a task used to ship — the
+    INTAKE resolution for this bugfix is to RESTORE the walk-and-disclose
+    behavior pre-fa053f7da: the walk still runs against whatever is
+    listening, it just never spawns or kills anything (that server was
+    already there), and the PR body honestly says this walk was not
+    hermetic instead of silently rendering as if it were."""
     base_url = "http://127.0.0.1:5299"
     start_cmd = "python -m http.server 5299"
 
@@ -599,16 +682,18 @@ async def test_pre_existing_dev_server_is_disclosed(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
-    assert calls == [], f"a pre-existing server that can't bind to the hermetic " \
-        f"backend must never be walked: {calls}"
+    assert len(calls) == 1, f"a pre-existing server must still be walked " \
+        f"(disclosed, not skipped): {calls}"
     assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
     assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
 
     body = opens[-1]["body"]
     assert "## UI evidence" in body, body
     assert (
-        f"Visual proof skipped: a pre-existing dev server at {base_url} "
-        "could not be bound to the hermetic backend" in body
+        f"Dev server was already running at {base_url} before the walk; "
+        "the harness did not start it, did not verify which checkout it "
+        "serves, and could not bind it to this walk's hermetic backend "
+        "— this walk was not hermetic." in body
     ), body
     assert "booted by the harness" not in body, body
 
@@ -619,15 +704,14 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     — `_base_url_problem` only checks scheme + loopback hostname, so a value
     carrying a backtick or an embedded newline in its path still passes
     validation (`urlsplit` ignores those characters for `.hostname`, but the
-    raw string keeps them). D2-hermetic (2026-09-03): a pre-existing server
-    can no longer be walked at all (see
-    `test_pre_existing_dev_server_is_disclosed`) — this is now the
-    regression test for the `hermetic_backend_not_bound` skip line's own
-    sanitization, which must sanitize the coder-controlled `base_url`
-    exactly like the sibling `booted`/`boot-failed` disclosures sanitize
-    their own coder/manifest-controlled strings: strip newlines, replace
-    backticks, and cap the length — never inject the raw manifest string
-    into the PR body."""
+    raw string keeps them). D2-hermetic bugfix (2026-09-03): a pre-existing
+    server is walked again (see `test_pre_existing_dev_server_is_disclosed`)
+    — this is the regression test for the "Dev server was already running"
+    disclosure sentence's own sanitization, which must sanitize the
+    coder-controlled `base_url` exactly like the sibling `booted`/
+    `boot-failed` disclosures sanitize their own coder/manifest-controlled
+    strings: strip newlines, replace backticks, and cap the length — never
+    inject the raw manifest string into the PR body."""
     raw_base_url = "http://127.0.0.1:5299/evil`)\ninjected"
     start_cmd = "python -m http.server 5299"
 
@@ -678,8 +762,8 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
-    assert calls == [], f"a pre-existing server that can't bind to the hermetic " \
-        f"backend must never be walked: {calls}"
+    assert len(calls) == 1, f"a pre-existing server must still be walked " \
+        f"(disclosed, not skipped): {calls}"
     assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
     assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
 
@@ -689,9 +773,11 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     assert "`)\ninjected" not in body, body
     assert "evil`)" not in body, body
     assert (
-        "Visual proof skipped: a pre-existing dev server at "
+        "Dev server was already running at "
         "http://127.0.0.1:5299/evil') injected "
-        "could not be bound to the hermetic backend" in body
+        "before the walk; the harness did not start it, did not verify "
+        "which checkout it serves, and could not bind it to this walk's "
+        "hermetic backend — this walk was not hermetic." in body
     ), body
 
 

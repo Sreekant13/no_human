@@ -270,6 +270,13 @@ test("shortReason: first sentence only, leading dash stripped, one line, capped 
   assert.equal(shortReason(undefined), "");
 });
 
+test("shortReason uses no regex lookbehind (Safari < 16.4 parses it at load)", () => {
+  const src = readFileSync(here + "backendPanelView.js", "utf8");
+  assert.ok(!src.includes("(?<="), "must not contain a lookbehind");
+  assert.ok(!src.includes("(?<!"), "must not contain a negative lookbehind");
+  assert.equal(shortReason("Set llm.local_base_url. Then restart."), "Set llm.local_base_url.");
+});
+
 test("options carry a one-line short reason; available options carry an empty one", () => {
   const view = backendPanelView(payload({
     options: [

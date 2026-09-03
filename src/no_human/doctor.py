@@ -679,9 +679,11 @@ async def _apply_ui_evidence_advisories(d: "Diagnosis", store: Store) -> None:
                 d.advisories.append(
                     "VISUAL-PROOF WALKS NOT CONFIGURED: "
                     f"{row['repo_path']} — detected `{sug['start_cmd']}` on "
-                    f":{sug['port']}, enable? Run `nh onboard {row['repo_path']}` "
-                    "and answer yes, or set ui_evidence in "
-                    ".no_human/project.yml."
+                    f":{sug['port']}. Enabling means no_human will RUN this "
+                    "command to start your dev server during visual-proof "
+                    f"walks (and stop it after) — enable? Run `nh onboard "
+                    f"{row['repo_path']}` and answer yes, or set ui_evidence "
+                    "in .no_human/project.yml."
                 )
     except Exception:  # noqa: BLE001 — a diagnostic must never CRASH `nh doctor`
         pass

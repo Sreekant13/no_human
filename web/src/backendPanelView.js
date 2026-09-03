@@ -50,7 +50,7 @@ export function backendPanelView(payload) {
 export function shortReason(reason) {
   const text = String(reason || "").trim().replace(/^[—–-]\s*/, "");
   if (!text) return "";
-  const first = text.split(/\n|(?<=\.)\s/)[0].trim();
+  const first = (text.match(/^[^\n]*?\.(?=\s|$)|^[^\n]*/) || [""])[0].trim();
   return first.length > 140 ? `${first.slice(0, 139).trimEnd()}…` : first;
 }
 

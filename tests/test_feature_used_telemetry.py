@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -282,14 +283,35 @@ def test_call_sites_use_constants_not_literals():
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_no_endpoint_records_nothing_on_disk(client, monkeypatch, tmp_path):
-    """Real `record` (no monkeypatch): consent now defaults ON, but the default
-    `endpoint` is empty, and `record` no-ops unless enabled AND endpoint set —
-    so nothing hits disk. Does not re-test `record`'s internals — tests/
-    test_telemetry.py owns those."""
+async def test_default_config_queues_events_via_posthog(
+        client, monkeypatch, tmp_path):
+    """Real `record` (no monkeypatch): consent defaults ON, and — since a
+    default install ships PostHog credentials — an unset `telemetry.endpoint`
+    no longer means inert: a real API call now queues its event for
+    PostHog's `/batch/` destination (creating a task via the API fires a
+    `feature_used` event, not `task_created` — that one only fires once the
+    orchestrator actually runs the task). Does not re-test `record`'s
+    internals or the wire body — tests/test_telemetry.py owns those."""
     monkeypatch.setenv("HOME", str(tmp_path))
     r = await client.post("/api/tasks", json={
         "title": "Fix it", "source": "jira", "external_id": "NO-3",
+    })
+    assert r.status_code == 201, r.text
+    queue = tmp_path / ".no_human" / "telemetry-queue.jsonl"
+    assert queue.exists()
+    events = [json.loads(ln) for ln in queue.read_text().splitlines() if ln.strip()]
+    assert events
+
+
+@pytest.mark.asyncio
+async def test_consent_off_records_nothing_on_disk(client, monkeypatch, tmp_path):
+    """Real `record` (no monkeypatch), `telemetry.enabled: false`: `record`
+    no-ops regardless of destination — the one opt-out still works. Does not
+    re-test `record`'s internals — tests/test_telemetry.py owns those."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app.state.config.data["telemetry"]["enabled"] = False
+    r = await client.post("/api/tasks", json={
+        "title": "Fix it", "source": "jira", "external_id": "NO-4",
     })
     assert r.status_code == 201, r.text
     assert not (tmp_path / ".no_human" / "telemetry-queue.jsonl").exists()

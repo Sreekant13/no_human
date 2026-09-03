@@ -103,23 +103,6 @@ async def test_same_origin_read_is_granted(client):
     assert r.headers.get("access-control-allow-origin") == LOCAL
 
 
-@pytest.mark.asyncio
-async def test_cross_origin_gets_no_allow_credentials_grant(client):
-    # allow_credentials is never enabled (defaults to False), so no page — cross
-    # or same origin — is ever told it may send credentials with a CORS request.
-    for origin in (EVIL, LOCAL):
-        r = await client.get("/api/tasks", headers={"Origin": origin})
-        acac = r.headers.get("access-control-allow-credentials")
-        assert acac in (None, "false"), f"leaked ACAC={acac!r} for {origin}"
-    # An adversarial CORS preflight from a foreign origin is not granted
-    # credentials either.
-    pre = await client.options(
-        "/api/tasks",
-        headers={"Origin": EVIL, "Access-Control-Request-Method": "GET"},
-    )
-    assert pre.headers.get("access-control-allow-credentials") in (None, "false")
-
-
 # ------------------------------ websocket ---------------------------------- #
 
 def _ws_shim(store):

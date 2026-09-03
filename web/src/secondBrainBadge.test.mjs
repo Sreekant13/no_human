@@ -308,3 +308,36 @@ test("I2: the split-row divider/reset rules are scoped to desktop (min-width: 64
     "the mobile block must not reference .nh-navrow-split at all — on mobile the badge is display:none, " +
     "so the split branch must render identically to the plain row, untouched by any split-specific rule");
 });
+
+// ── Overlap regression: the popup must not cover the Finish-setup row ───── //
+// Playwright caught this live: the popup was absolutely anchored above the
+// Settings row and overlapped the Finish-setup entry rendered above it on
+// the minimal path, intercepting its clicks. Pinned at the static-source
+// level too, so a future refactor that reintroduces the absolute anchoring
+// fails here before it ever reaches the e2e run.
+
+test("the AI-config popup renders as a flow sibling ABOVE the Finish-setup entry, not inside .nh-settings-navwrap", () => {
+  const popupIdx = appJsx.indexOf('nh-aiconfig-nudge" role="dialog"');
+  const finishIdx = appJsx.indexOf("<FinishSetupCard");
+  const navwrapIdx = appJsx.indexOf('<div className="nh-settings-navwrap">');
+  assert.ok(popupIdx > -1, "the popup element must be found");
+  assert.ok(finishIdx > -1, "FinishSetupCard must be found");
+  assert.ok(navwrapIdx > -1, "the settings nav wrapper must be found");
+  assert.ok(popupIdx < finishIdx,
+    "the popup must render before FinishSetupCard so it sits above it in flow order");
+  assert.ok(popupIdx < navwrapIdx,
+    "the popup must render outside (before) .nh-settings-navwrap — it is a flow sibling, not anchored to the Settings row");
+});
+
+test("the popup's base rule is not absolutely positioned over the sidebar rows", () => {
+  const idx = stylesCss.indexOf(".nh-aiconfig-nudge {");
+  assert.ok(idx > -1, "the .nh-aiconfig-nudge base rule must be found");
+  const [start, end] = braceBlock(stylesCss, stylesCss.indexOf("{", idx));
+  const block = stylesCss.slice(start, end);
+  assert.doesNotMatch(block, /position:\s*absolute/,
+    "the base rule must not float the popup over neighboring rows");
+  assert.doesNotMatch(block, /bottom:\s*calc\(100% \+ 8px\)/,
+    "the base rule must not anchor the popup above another element");
+  assert.match(block, /position:\s*relative/,
+    "position:relative must be kept so the × dismiss button still anchors to the popup");
+});

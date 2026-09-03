@@ -79,25 +79,22 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   assert.deepEqual(options, {
     api_host: "https://us.i.posthog.com",
     defaults: "2026-05-30",
-    autocapture: false,
-    capture_pageview: false,
-    capture_pageleave: false,
-    capture_dead_clicks: false,
-    capture_heatmaps: false,
-    session_recording: { maskAllInputs: true },
-    person_profiles: "never",
+    autocapture: true,
+    capture_pageview: true,
+    capture_pageleave: true,
+    capture_dead_clicks: true,
+    capture_heatmaps: true,
+    capture_performance: true,
+    capture_exceptions: true,
+    session_recording: { maskAllInputs: true, recordHeaders: true, recordBody: true },
+    person_profiles: "always",
     bootstrap: { distinctID: "inst-uuid" },
   });
-  // Explicit single-key asserts so a failure names the offending option.
-  assert.equal(options.autocapture, false, "$el_text channel must be disabled");
-  assert.equal(options.capture_pageview, false, "implicit $pageview must be disabled");
-  assert.equal(options.capture_pageleave, false, "implicit $pageleave must be disabled");
-  assert.equal(options.capture_dead_clicks, false,
-    "$dead_click must not fall through to the PostHog project's server-side setting");
-  assert.equal(options.capture_heatmaps, false,
-    "$$heatmap must not fall through to the PostHog project's server-side setting");
+  // The two guarantees that survive the "everything on" posture:
+  assert.equal(options.session_recording.maskAllInputs, true, "typed input is always masked");
   assert.equal(options.session_recording.maskTextSelector, undefined,
     "maskTextSelector matches zero elements in this UI and must not be configured");
+  assert.equal(options.person_profiles, "always", "one person per install id");
 
   // app_version + the installation id registered on every event.
   assert.equal(fake.calls.register.length, 1);
@@ -106,7 +103,7 @@ test("consent → posthog-js imported once, init gets the exact masking options"
   assert.ok(registered.app_version.length > 0);
   assert.equal(registered.instance_id, "inst-uuid");
 
-  // person_profiles: "never" ⇒ identify() must never be called.
+  // the board never calls identify(): the bootstrap distinctID IS the person key.
   assert.deepEqual(fake.calls.identify, []);
 
   // screen views carry the lane NAME only

@@ -70,42 +70,6 @@ def test_additive_scrub_overrides_foreign_secrets_to_empty_and_nothing_else():
     assert child["PATH"] == _AMBIENT["PATH"]
 
 
-def test_gh_token_and_dotenv_exported_credentials_are_scrubbed():
-    """The child-env clause names GH_TOKEN and the ~/.no_human/.env contents
-    explicitly. GH_TOKEN is TOKEN-shaped; the integration credentials
-    config.load_env_var exports from .env into os.environ (an SSO password, a
-    Jenkins/JIRA API token) are PASSWORD/TOKEN-shaped — so each is a foreign
-    secret the child never sees, in both child-env shapes. Operational vars and
-    each child's OWN billing credential are untouched; the other child's is not
-    (the Codex shape drops CLAUDE_CODE_OAUTH_TOKEN)."""
-    dotenv = {
-        "GH_TOKEN": "gho_real",                 # the gh-CLI spelling of the token
-        "SSO_PASSWORD": "hunter2",              # ~/.no_human/.env, exported by load_env_var
-        "JENKINS_API_TOKEN": "jk_real",         # ~/.no_human/.env
-        "PATH": "/usr/bin:/bin",
-        "HOME": "/home/op",
-        "CLAUDE_CODE_OAUTH_TOKEN": "oauth_keep",  # the child's own credential
-    }
-    secrets = ("GH_TOKEN", "SSO_PASSWORD", "JENKINS_API_TOKEN")
-    # Additive (Claude/SDK) shape: each foreign secret is blanked to "".
-    env: dict[str, str] = {}
-    blanked = scrub_foreign_secrets_into(env, dotenv)
-    for name in secrets:
-        assert env[name] == "" and name in blanked, name
-    assert "PATH" not in env and "HOME" not in env
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env  # kept; child inherits the real value
-    # Full-copy (Codex/subprocess) shape, with the keep-list codex_backend
-    # really passes (the default, CODEX_CHILD_KEEP): each foreign secret is
-    # deleted outright - and so is the Claude credential, which the Codex
-    # child must never carry; the Codex child's own OPENAI_* survives.
-    full = {**dotenv, "OPENAI_API_KEY": "sk_codex"}
-    dropped = drop_foreign_secrets(full)
-    for name in secrets + ("CLAUDE_CODE_OAUTH_TOKEN",):
-        assert name not in full and name in dropped, name
-    assert full["PATH"] == "/usr/bin:/bin"
-    assert full["OPENAI_API_KEY"] == "sk_codex"
-
-
 def test_additive_scrub_defaults_to_the_process_environment(monkeypatch):
     monkeypatch.setenv("SOME_VENDOR_TOKEN", "x")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "keep")

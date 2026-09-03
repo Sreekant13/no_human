@@ -665,19 +665,22 @@ by the browser:
 
 Both channels stamp every event with the same two identifiers: `instance_id`
 (a random uuid4 minted server-side on first consent, persisted in config —
-never minted in, or accepted from, the browser) and `app_version`. No person
-profiles are created (`person_profiles: "never"`); events are not linked to
-any human identity.
+never minted in, or accepted from, the browser) and `app_version`. Person
+profiles are created (`person_profiles: "always"`), one per `instance_id`;
+no human identity (name, email, IP-derived identity) is ever attached — the
+board never calls PostHog's `identify()`.
 
-**Autocapture is off.** `autocapture`, `capture_pageview`,
-`capture_pageleave`, `capture_dead_clicks` and `capture_heatmaps` are all
-disabled in the PostHog client init (`web/src/telemetry.js`), so no
-click/change/submit element text, no implicit page-view events and no
-element-level dead-click/heatmap events are ever collected — only the seven
-event kinds above, ever. The last two are pinned in the client because their
-posthog-js default defers to the PostHog project's server-side setting;
-pinning them means a dashboard toggle cannot reintroduce element events
-without a code change.
+**Autocapture and the browser's implicit/element channels are on.**
+`autocapture`, `capture_pageview`, `capture_pageleave`, `capture_dead_clicks`,
+`capture_heatmaps`, `capture_performance` and `capture_exceptions` are all
+enabled in the PostHog client init (`web/src/telemetry.js`, operator decision
+2026-09-03), so PostHog's own `$autocapture`/`$pageview`/`$pageleave`/
+`$dead_click`/`$$heatmap`/`$web_vitals`/`$exception` events are collected
+alongside the app's own events. The seven event kinds in the table above are
+scoped to what the app itself sends via `posthog.capture(...)`; the disclosure
+sweep (`web/src/telemetry.test.mjs`) only ever checks those. Autocapture's
+`$el_text` (the text of the clicked/changed element) is bounded by the
+`ph-no-capture` masking described below, not by the channel being off.
 
 **Session replay, honestly stated.** When telemetry is on, PostHog session
 recording captures the app's own interface. All form inputs are masked
@@ -688,17 +691,29 @@ block-mask, enforced by a source-level test sweep so a new surface can't ship
 unmasked silently. This is a masked-surface guarantee, not a claim that replay
 "cannot capture content" — it can capture pixels of anything not on the masked
 list, which is why the list is enforced by tests rather than left to review.
+Replay also records network request/response **headers and bodies**
+(`session_recording: { recordHeaders: true, recordBody: true }`) — these are
+**not** masked.
 
-**Never sent, on either channel:** task titles, repo names, file paths,
-prompts/specs, diffs, or any credential/token.
+**Never sent via the server channel:** the closed event allowlist in the table
+above carries only the columns listed there — no task titles, repo names, file
+paths, prompts/specs, diffs, or credential/token ever appears in a server
+event. The browser's autocapture and session-replay **pixels** are bounded the
+same way, by `ph-no-capture` and `maskAllInputs`. Session-replay **network**
+capture is the one channel that is not scoped like this: with `recordBody:
+true`, request/response bodies from calls such as `/api/tasks` and
+`/api/config` are recorded as sent, unmasked — so they DO carry task titles,
+specs, diffs and repo paths into PostHog. `posthog-js` only redacts
+credential-shaped headers/keys automatically; it does not redact application
+content.
 
 Telemetry defaults to **on** (`telemetry.enabled: true` in
 `config.DEFAULT_CONFIG`); everything above is sent unless it is opted out in
 `config.yaml` (`telemetry.enabled: false`). The onboarding "Usage insights" step
 and the Settings > Usage insights pane were removed (operator, 2026-08-26), so
-`config.yaml` is the one opt-out. Server-side events additionally require a
-configured `telemetry.endpoint`, which ships empty — so with the default config
-nothing is sent at all.
+`config.yaml` is the one opt-out. Server-side events post to
+`telemetry.posthog_host`'s `/batch/` endpoint by default; a configured
+`telemetry.endpoint` (the first-party Lambda) takes precedence when set.
 
 ## Tests command
 

@@ -529,6 +529,19 @@ test("ModelsPanel.jsx imports and calls reviewerBackendView, server-derived opti
   assert.match(src, /data-testid="reviewer-backend-pending"/, "the unsaved-pick line needs its own hook");
 });
 
+test("the reviewer backend override option shows '(unavailable)', not the raw reason paragraph", () => {
+  const src = readFileSync(new URL("./ModelsPanel.jsx", import.meta.url), "utf8");
+  const start = src.indexOf("Reviewer backend override");
+  const end = src.indexOf("Reviewer model");
+  assert.ok(start >= 0 && end > start, "must find the reviewer-backend-override select block");
+  const block = src.slice(start, end);
+  assert.ok(!block.includes("${o.reason}"), "the raw multi-sentence reason must not be interpolated into the option text");
+  assert.match(block, /\{o\.label\}\{o\.disabled \? " \(unavailable\)" : ""\}/);
+  assert.match(block, /title=\{o\.reason \|\| undefined\}/);
+  assert.match(block, /className="ntm-hint"[\s\S]*\{o\.short\}/);
+  assert.match(block, /\.filter\(\(o\) => o\.disabled && o\.short\)/);
+});
+
 test("ModelsPanel.jsx's Save button still goes through pendingBody, not a second hand-rolled body", () => {
   const src = readFileSync(new URL("./ModelsPanel.jsx", import.meta.url), "utf8");
   assert.match(src, /const dirty = pendingBody\(payload, pending, pendingRoleBackend\)/);

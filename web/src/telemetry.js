@@ -5,12 +5,14 @@
 //    token in /api/config, initTelemetry returns before `posthog-js` is even
 //    IMPORTED (dynamic import) — no consent means the module never loads,
 //    no cookies, no recorder, zero bytes to PostHog.
-//  - NO AUTOCAPTURE, NO IMPLICIT PAGE EVENTS: autocapture (and the
-//    `$el_text` it stamps on every click/change/submit — here that would be
-//    task titles, repo names, file paths, PR text) plus `$pageview` /
-//    `$pageleave` are all disabled. The app sends its own `screen_viewed`
-//    event instead, carrying a lane NAME only. See the published event list
-//    in docs/configuration.md.
+//  - ALL CHANNELS ON: autocapture, `$pageview` / `$pageleave`, dead clicks,
+//    heatmaps, performance and exceptions are all enabled (operator decision
+//    2026-09-03). The app still sends its own `screen_viewed` event carrying
+//    a lane NAME only, alongside these PostHog-internal channels. The
+//    `$el_text` autocapture stamps on every click/change/submit — here that
+//    would be task titles, repo names, file paths, PR text — is bounded by
+//    the `ph-no-capture` blocks below, not by the channel being off. See the
+//    published event list in docs/configuration.md.
 //  - MASKED REPLAY: recordings capture the app's OWN interface only. All
 //    inputs are masked, and PostHog's own `.ph-no-capture` (whole-block) is
 //    hand-applied to every element that renders operator content: task
@@ -18,9 +20,12 @@
 //    backlog ticket titles. Never your code. (No blanket text-mask selector
 //    is configured: `maskTextSelector` would match zero elements in this UI,
 //    so it is deliberately unset — pinned by web/src/telemetry.test.mjs.)
+//    Replay network request/response headers and bodies ARE recorded and
+//    are NOT masked — see docs/configuration.md.
 //  - ONE IDENTIFIER: events are tagged with the same anonymous `instance_id`
 //    as the server channel (registered below), not PostHog's own generated
-//    device id. NO PERSON PROFILES: person_profiles "never".
+//    device id. `person_profiles: "always"` keys one person per install id;
+//    still no human identity, no `identify()` call.
 import { fetchVersion } from "./api.js";
 
 let posthog = null; // the initialized client, or null when not consented
@@ -54,24 +59,20 @@ export async function initTelemetry(cfg, { importer } = {}) {
     client.init(consent.key, {
       api_host: consent.host,
       defaults: "2026-05-30",
-      // The $el_text channel: autocapture stamps every click/change/submit
-      // with the element's TEXT — here that is task titles, repo names,
-      // paths, PR text. Off. So are the implicit page events; the app sends
-      // its own `screen_viewed` carrying a lane NAME only.
-      autocapture: false,
-      capture_pageview: false,
-      capture_pageleave: false,
-      // Two lazily-loaded element-level channels whose PostHog CLIENT default
-      // is "ask the project's SERVER-side setting" (posthog-js 1.417.1:
-      // dead-clicks-autocapture.js isDeadClicksEnabledForAutocapture, and
-      // heatmaps.js isEnabled falling through to _enabledServerSide). Left
-      // unset, a dashboard toggle alone would reintroduce $dead_click and
-      // $$heatmap element events with no code change. Pinned false here so
-      // the published event list is client-enforced, not dashboard-dependent.
-      capture_dead_clicks: false,
-      capture_heatmaps: false,
-      session_recording: { maskAllInputs: true },
-      person_profiles: "never",
+      // Everything PostHog offers is on (operator, 2026-09-03). Operator
+      // content is still kept out of autocapture and replay pixels by the
+      // hand-applied `ph-no-capture` blocks (posthog-js skips any element
+      // with a ph-no-capture ancestor) and by maskAllInputs. Replay network
+      // bodies are NOT masked — docs/configuration.md says so.
+      autocapture: true,
+      capture_pageview: true,
+      capture_pageleave: true,
+      capture_dead_clicks: true,
+      capture_heatmaps: true,
+      capture_performance: true,
+      capture_exceptions: true,
+      session_recording: { maskAllInputs: true, recordHeaders: true, recordBody: true },
+      person_profiles: "always",
       ...(consent.instanceId ? { bootstrap: { distinctID: consent.instanceId } } : {}),
     });
     // Stamp every event with the running app version (server's /api/version —

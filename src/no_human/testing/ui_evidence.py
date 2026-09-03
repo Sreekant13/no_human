@@ -711,6 +711,22 @@ _HERMETIC_READY_PATH = "/api/tasks"
 _HERMETIC_READY_TIMEOUT_S = 60
 
 
+def _log_tail(path, limit: int = 2048) -> str:
+    """Best-effort read of a spawned process's captured log: newline-collapsed
+    and length-capped, same shape `dev_server` stamps into its own `detail`
+    post-teardown. Never raises — a missing file, a permission error, or a
+    log that hasn't been flushed yet all just yield `""`. Callers must be
+    able to call this BEFORE yielding a failure `HermeticBackend`, so a
+    reader of `hb.detail` during the `yield` (the orchestrator's
+    `walk_skip::hermetic_backend_init_failed:` advisory) never sees an empty
+    string for a cause where a log actually exists."""
+    try:
+        data = Path(path).read_bytes()[-limit:]
+    except Exception:
+        return ""
+    return data.decode("utf-8", "replace").replace("\n", " ").strip()
+
+
 @dataclass  # NOT frozen — teardown stamps detail onto the caller's object
 class HermeticBackend:
     """What `hermetic_backend` decided and (if it spawned anything) what
@@ -742,7 +758,7 @@ class HermeticBackend:
 async def hermetic_backend(
     out_dir, *, spawn=subprocess.Popen, pick_port=_pick_ephemeral_port,
     clock=time.monotonic, sleep=asyncio.sleep, reachable=_reachable,
-    kill=_kill_dev_server, home_root=None,
+    kill=_kill_dev_server, home_root=None, auth_mode: str = "subscription",
 ):
     """Boot an ISOLATED `nh start` under a throwaway HOME so a walk step that
     clicks Save/Reset-to-defaults writes into a directory nobody will ever
@@ -756,6 +772,21 @@ async def hermetic_backend(
     the throwaway `mkdtemp` under `tmp_path`; `None` (production) uses the
     OS default temp directory, same as `default_out_dir`.
 
+    `auth_mode` is seeded into the throwaway config's `llm.auth_mode` so the
+    hermetic child's own `nh start` boots under the SAME billing path the
+    parent run is on. Left at the default (`"subscription"`), a sanctioned
+    `api_key` install's child would otherwise still default to subscription
+    mode, inherit the parent's exported `ANTHROPIC_API_KEY` (put there for
+    the parent's OWN run by `config._assert_api_key_mode`), hit
+    `assert_subscription_mode`'s strict metered-key refusal, and exit 2 —
+    silently skipping every walk on that install forever. Anything other
+    than the literal `"api_key"` normalizes to `"subscription"`. Only the
+    MODE is ever written; the throwaway config never seeds `llm.auth_profile`
+    — leaving it unset lets the child resolve its own credential exactly the
+    way any other `nh start` does (the parent's unsuffixed OAuth token in
+    subscription mode, or the parent's exported key in api_key mode), which
+    is what `auth_mode` alone is meant to select.
+
     On any failure — before or during boot — teardown still runs: kill the
     process if one was spawned and is still alive, and always remove the
     throwaway HOME. Nothing is left running or on disk outside `out_dir`.
@@ -764,6 +795,7 @@ async def hermetic_backend(
     process = None
     fh = None
     port = 0
+    normalized_auth_mode = "api_key" if auth_mode == "api_key" else "subscription"
     try:
         try:
             port = pick_port()
@@ -778,7 +810,11 @@ async def hermetic_backend(
             config.ensure_private_dir(home / ".no_human")
             config.atomic_write_0600(
                 home / ".no_human" / "config.yaml",
-                f"server:\n  host: 127.0.0.1\n  port: {port}\n",
+                "server:\n"
+                "  host: 127.0.0.1\n"
+                f"  port: {port}\n"
+                "llm:\n"
+                f"  auth_mode: {normalized_auth_mode}\n",
             )
         except Exception as exc:
             yield HermeticBackend(mode="failed", home=str(home or ""),
@@ -794,12 +830,20 @@ async def hermetic_backend(
             fh = open(out_dir / _HERMETIC_API_LOG, "wb")
             process = spawn(
                 _hermetic_start_argv(port),
-                env={**os.environ, "HOME": str(home), "USERPROFILE": str(home),
-                     "NO_HUMAN_HOME": str(home / ".no_human")},
+                # Isolation comes from HOME/USERPROFILE alone — `nh start`
+                # resolves its own private dir from those, and
+                # `config.NO_HUMAN_HOME` is computed once at import time from
+                # the environment `nh` (the parent) started under, so setting
+                # it here would name the PARENT's directory in the CHILD's
+                # env and do nothing useful with it.
+                env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
                 cwd=str(home), stdout=fh, stderr=subprocess.STDOUT,
                 **proc.hidden_console_kwargs(new_group=True),
             )
         except OSError as exc:
+            if fh is not None:
+                with contextlib.suppress(Exception):
+                    fh.close()
             yield HermeticBackend(mode="failed", home=str(home), port=port,
                                    api_target=api_target,
                                    detail=f"{type(exc).__name__}: {exc}",
@@ -815,7 +859,13 @@ async def hermetic_backend(
                 rc = process.poll()
                 if rc is not None:
                     outcome.cause = "exited-early"
-                    outcome.detail = f"exit code {rc}"
+                    with contextlib.suppress(Exception):
+                        if fh is not None:
+                            fh.flush()
+                    tail = _log_tail(out_dir / _HERMETIC_API_LOG)
+                    outcome.detail = (
+                        f"exit code {rc}: {tail}" if tail else f"exit code {rc}"
+                    )
                     break
                 try:
                     ok = reachable(probe_url)
@@ -827,21 +877,29 @@ async def hermetic_backend(
                 await sleep(_READY_POLL_S)
             else:
                 outcome.cause = "timeout"
+                with contextlib.suppress(Exception):
+                    if fh is not None:
+                        fh.flush()
+                tail = _log_tail(out_dir / _HERMETIC_API_LOG)
+                sentence = (
+                    f"no response at {probe_url} within "
+                    f"{_HERMETIC_READY_TIMEOUT_S}s"
+                )
+                outcome.detail = f"{sentence}: {tail}" if tail else sentence
 
             try:
                 yield outcome
             finally:
                 # `poll() is None` guards this so a process that exited early
-                # (or was already reaped) is never killed twice.
+                # (or was already reaped) is never killed twice. `detail` is
+                # already set (or left "" for a successful `armed` outcome)
+                # BEFORE the yield above — never stamped here — so a reader
+                # of `hb.detail` during the `yield` (the orchestrator's
+                # `walk_skip::hermetic_backend_init_failed:` advisory) always
+                # sees the same text this teardown would have computed.
                 with contextlib.suppress(Exception):
                     if process.poll() is None:
                         kill(process)
-                with contextlib.suppress(Exception):
-                    if fh is not None:
-                        fh.flush()
-                with contextlib.suppress(Exception):
-                    log_bytes = (out_dir / _HERMETIC_API_LOG).read_bytes()[-2048:]
-                    outcome.detail = log_bytes.decode("utf-8", "replace").replace("\n", " ")
         finally:
             if fh is not None:
                 with contextlib.suppress(Exception):

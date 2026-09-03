@@ -540,7 +540,6 @@ _UNDOCUMENTED_AT_BASELINE = frozenset({
     "team_brain.enabled",
     "team_brain.max_stale_days",
     "telemetry.instance_id",
-    "telemetry.posthog_host",
     "telemetry.posthog_publishable",
     "updates.enabled",
     "updates.interval_seconds",

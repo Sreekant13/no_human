@@ -86,9 +86,14 @@ section is exempt from the 6,000-visible-character body budget above: it is
 capped on its own terms (≤6 shots + 1 video link), not folded against
 `## Changes`. It also names which server it walked: "Dev server booted by
 the harness for this walk (`{start_cmd}`), stopped afterwards." when the
-harness started it itself, or "Dev server was already running at {base_url}
-before the walk; the harness did not start it and did not verify which
-checkout it serves." when something answered there beforehand.
+harness started it itself, or, when something already answered at the
+manifest's `base_url` before the walk started, "Dev server was already
+running at {base_url} before the walk; the harness did not start it, did
+not verify which checkout it serves, and could not bind it to this walk's
+hermetic backend — this walk was not hermetic." The walk still runs against
+that pre-existing server either way — the harness only disclosed, never
+refused, this case — so the screenshots and video above are still real, just
+not provably from an isolated backend.
 
 **Footer** — attempt number, branch pair, and the standing rule: no_human
 never merges. A human reviews and merges, or runs `nh approve <task>`.

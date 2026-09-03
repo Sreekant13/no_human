@@ -485,11 +485,18 @@ export default function ModelsPanel() {
                       <option value="">default</option>
                       {backendOptions.map((o) => (
                         <option key={o.id} value={o.id} disabled={o.disabled} title={o.reason || undefined}>
-                          {o.label}{o.disabled ? ` — ${o.reason}` : ""}
+                          {o.label}{o.disabled ? " (unavailable)" : ""}
                         </option>
                       ))}
                     </select>
                   </label>
+                  {backendOptions
+                    .filter((o) => o.disabled && o.short)
+                    .map((o) => (
+                      <div key={o.id} className="ntm-hint" title={o.reason}>
+                        <span aria-hidden="true">ⓘ</span> {o.label}: {o.short}
+                      </div>
+                    ))}
                   {!reviewerView.selected.isDefault && (
                     <label className="auth-label">
                       Reviewer model

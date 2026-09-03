@@ -92,6 +92,27 @@ check("the entry shows the deferred count (4)",
 check("items hidden until the entry is expanded",
   (await page.locator(".finish-setup-open").count()) === 0);
 
+// The one-time AI-config popup renders on this same path (onboarded, not yet
+// dismissed) and used to be absolutely positioned above the Settings row,
+// overlapping the Finish-setup row and swallowing its clicks. A positive
+// control first — an absence claim needs one, or the overlap checks below
+// would pass vacuously if the popup were not visible at all.
+const nudge = page.locator(".nh-aiconfig-nudge");
+const cta = page.locator(".nh-aiconfig-nudge-cta");
+check("the one-time AI-config popup is rendered on this path",
+  await cta.isVisible().catch(() => false));
+
+const overlaps = (p, q) => !!p && !!q &&
+  p.x < q.x + q.width && q.x < p.x + p.width &&
+  p.y < q.y + q.height && q.y < p.y + p.height;
+const finishBox = await finishRow.boundingBox();
+const nudgeBox = await nudge.boundingBox();
+const ctaBox = await cta.boundingBox();
+check("the AI-config popup does not overlap the Finish-setup row",
+  !overlaps(finishBox, nudgeBox), JSON.stringify({ finishBox, nudgeBox }));
+check("the popup CTA does not overlap the Finish-setup row",
+  !overlaps(finishBox, ctaBox), JSON.stringify({ finishBox, ctaBox }));
+
 // Expand it.
 await finishRow.click();
 await page.waitForTimeout(150);

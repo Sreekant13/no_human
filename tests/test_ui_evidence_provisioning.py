@@ -153,6 +153,12 @@ def test_suggestion_present_when_detected_and_unconfigured(tmp_path):
     assert sug["port"] == 5173
     assert "not configured" in sug["gap"] or "not configured" in sug["gap"].lower() \
         or "detected" in sug["gap"]
+    # execution disclosure (risk parity with test_cmd): the offer must say
+    # plainly that accepting grants the harness permission to RUN the
+    # command, not just display it — since the dev-server boot lands on
+    # every UI-touching attempt.
+    assert "will RUN this command" in sug["gap"]
+    assert "stop it after" in sug["gap"]
 
 
 def test_no_suggestion_without_dev_script(tmp_path):
@@ -290,6 +296,11 @@ async def test_diagnose_advisory_names_the_gap(store, tmp_path):
     assert d.healthy, "an advisory must never affect the healthy predicate"
     assert any("VISUAL-PROOF WALKS NOT CONFIGURED" in a for a in d.advisories)
     assert any("npm run dev" in a and ":5173" in a for a in d.advisories)
+    # execution disclosure (risk parity with test_cmd): the advisory that
+    # tells a human to enable this must say plainly the harness will RUN the
+    # command, same as the CLI offer's gap text does.
+    assert any("will RUN this command" in a and "stop it after" in a
+               for a in d.advisories)
     # side-by-side: the row carries BOTH current (unconfigured) and suggested state
     row = next(r for r in d.ui_evidence if r["repo_path"] == str(repo))
     assert row["configured"] is False

@@ -661,7 +661,9 @@ def ui_evidence_suggestion(
         return None
     gap = (
         "visual-proof walks: repo not configured — detected "
-        f"`{dev_server['start_cmd']}` on :{dev_server['port']}, enable?"
+        f"`{dev_server['start_cmd']}` on :{dev_server['port']}. Accepting "
+        "means no_human will RUN this command to start your dev server "
+        "during visual-proof walks (and stop it after) — enable?"
     )
     return {
         "start_cmd": dev_server["start_cmd"],

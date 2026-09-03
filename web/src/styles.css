@@ -414,11 +414,16 @@ html, body, #root {
 }
 .nh-navrow-badge-btn:hover { filter: brightness(1.1); }
 
-/* One-time AI-config nudge popup, anchored above the Settings nav row. */
+/* Settings nav row wrapper — no longer anchors the AI-config popup (that
+   now renders as a flow sibling above it in .nh-sidebar-foot, so it cannot
+   absolutely-overlap any row); position:relative kept for the row itself. */
 .nh-settings-navwrap { position: relative; }
+/* One-time AI-config nudge popup — a flow block (not absolutely positioned),
+   so it occupies its own space in .nh-sidebar-foot instead of overlapping
+   the rows around it. position:relative is kept only as the containing
+   block for the absolutely-positioned "×" dismiss button below. */
 .nh-aiconfig-nudge {
-  position: absolute; bottom: calc(100% + 8px); left: 0; right: 0;
-  z-index: 40;
+  position: relative;
   background: var(--surface-1); border: 1px solid var(--border);
   border-left: 3px solid var(--c-answer);
   border-radius: var(--r-md); padding: 12px 14px 14px;
@@ -628,6 +633,12 @@ html, body, #root {
   .nh-navrow-badge { display: none; }
   .nh-sidebar-foot { margin-top: 0; margin-left: auto; flex-direction: row; align-items: center; flex-shrink: 0; }
   .nh-sidebar-foot .nh-status-label { display: none; }
+  /* The foot is a horizontal row here (above) — a flow AI-config popup would
+     stretch that row to its own text width. Lift it back to an absolute
+     overlay anchored to the whole foot (not to one row inside it), so it
+     still cannot cover any foot row underneath. */
+  .nh-sidebar-foot { position: relative; }
+  .nh-aiconfig-nudge { position: absolute; bottom: calc(100% + 8px); left: 8px; right: 8px; z-index: 40; }
   /* Settings moves from a bottom-pinned, divider-topped row (vertical rail
      layout) to just another item in the row-layout foot — a left hairline
      reads as the equivalent separator once the sidebar itself is a row. It
@@ -5941,7 +5952,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   gap: var(--sp-2); margin-bottom: var(--sp-4);
 }
 .ob-repo-card {
-  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center;
   gap: 2px var(--sp-3); padding: 10px 12px;
   background: var(--surface-1); border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -5952,6 +5963,22 @@ a.so-chip-value:hover { color: var(--accent-300); }
   border-color: var(--accent-700);
   background: color-mix(in oklab, var(--accent-500) 8%, var(--surface-1));
 }
+/* A profiled card grows a status line + Prove panel below the name/path.
+   Left inside its ~210px auto-fill track, that content had nowhere to go:
+   overflow:hidden on the name/path zeroed their auto-min-size so the 1fr
+   track collapsed to ~40px ("tiny-…", "/pri…"), and the status line — which
+   has no overflow rule — wrapped one word per line instead. Once a card has
+   a Prove panel, give it the whole grid row so the left column gets its
+   width back; minmax(0, 1fr) above keeps the end-ellipsis truncation working
+   without letting min-content force a blowout. */
+.ob-repo-card:has(.ob-prove) { grid-column: 1 / -1; align-items: start; }
+.ob-repo-card:has(.ob-prove) .ob-repo-card-add { align-self: start; }
+.ob-repo-card .ob-repo-status {
+  grid-column: 1 / -1; margin-left: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ob-repo-card .ob-ui-evidence-row { grid-column: 1 / -1; }
+.ob-repo-card .ob-prove { grid-column: 1 / -1; margin-left: 0; margin-top: 6px; }
 .ob-repo-card-name {
   grid-column: 1; font-family: var(--font-ui); font-weight: 500; color: var(--text-hi);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

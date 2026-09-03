@@ -20397,7 +20397,11 @@ SIX of them read a checkpoint and TWO do not — but do
         # `api_target` (never the real one). `hb is None` (no manifest
         # base_url) reproduces today's plain `nullcontext` path unchanged.
         hb_cm = (
-            ui_evidence.hermetic_backend(out_dir) if manifest_base_url
+            ui_evidence.hermetic_backend(
+                out_dir,
+                auth_mode=((self.config.get("llm") or {}).get("auth_mode")
+                           or "subscription"),
+            ) if manifest_base_url
             else contextlib.nullcontext(None)
         )
         try:
@@ -20420,24 +20424,22 @@ SIX of them read a checkpoint and TWO do not — but do
                         # configured — the harness cannot verify that target
                         # is the hermetic one, so this is the exact live-
                         # config blast radius the hermetic backend exists to
-                        # close. Skip rather than trust it.
-                        self._advisory(
-                            "walk_skip::hermetic_backend_not_bound: pre-existing "
-                            f"dev server at {manifest_base_url}")
-                        shutil.rmtree(out_dir, ignore_errors=True)
-                        # `manifest_base_url` is coder/manifest-controlled, same
-                        # as `server.base_url` in the sibling `pre-existing`
-                        # disclosure below — sanitize it the same way (strip
-                        # newlines, replace backticks, cap length) before it
-                        # reaches the PR body; `_ui_evidence_skipped` itself
-                        # does not sanitize its `reason` argument.
+                        # close. Pre-fa053f7da (and again now): DISCLOSE, do
+                        # not skip — the walk still runs against whatever is
+                        # actually listening; only the PR body's own honesty
+                        # is what changed. `manifest_base_url` is coder/
+                        # manifest-controlled, same as `server.base_url` in
+                        # the sibling `pre-existing` disclosure in
+                        # `_deliver_ui_evidence` below — sanitize it the same
+                        # way (strip newlines, replace backticks, cap length)
+                        # before it reaches an advisory.
                         safe_url = (manifest_base_url or "").strip().replace(
                             "\n", " ").replace("`", "'")
                         if len(safe_url) > 120:
                             safe_url = safe_url[:117] + "..."
-                        return self._ui_evidence_skipped(
-                            f"a pre-existing dev server at {safe_url} "
-                            "could not be bound to the hermetic backend")
+                        self._advisory(
+                            "walk_nonhermetic::pre_existing_dev_server: "
+                            f"{safe_url}")
                     result = await ui_evidence.run(Path(repo.path), out_dir)
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
@@ -20630,9 +20632,10 @@ SIX of them read a checkpoint and TWO do not — but do
             if len(url) > 120:
                 url = url[:117] + "..."
             lines.append(
-                f"Dev server was already running at {url} before "
-                "the walk; the harness did not start it and did not verify "
-                "which checkout it serves.\n")
+                f"Dev server was already running at {url} before the walk; "
+                "the harness did not start it, did not verify which "
+                "checkout it serves, and could not bind it to this walk's "
+                "hermetic backend — this walk was not hermetic.\n")
         shown = delivered_names[: self._UI_EVIDENCE_MAX_EMBEDDED_SHOTS]
         for shot in shown:
             lines.append(f"![{shot['name']}]({_raw_url(shot['path'])})")
