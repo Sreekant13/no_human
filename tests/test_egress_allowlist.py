@@ -739,6 +739,19 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             _ON + "updates.enabled defaults to TRUE; off with "
                   "updates.enabled:false or NH_NO_UPDATE_CHECK=1"),
     },
+    "telemetry.py": {
+        "http:urllib.request": Allowed(
+            "telemetry.endpoint when you set one — anonymous uuid4 instance "
+            "id, app version and allowlisted event names/props; never task, "
+            "repo or prompt content. flush() gates on endpoint being "
+            "non-empty (telemetry.py:208-209) and the shipped default is "
+            "\"\", so a default install's flush() has nothing to send",
+            _CFG + "telemetry.endpoint — ships empty, so this channel is "
+                   "inert until you set it; telemetry.enabled must also be "
+                   "true (it defaults to true already, so endpoint is the "
+                   "real switch); off with telemetry.enabled:false in "
+                   "~/.no_human/config.yaml"),
+    },
     "testing/runner.py": {
         "exec:<dynamic>": Allowed(
             "whatever the repo's test command runs",

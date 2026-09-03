@@ -60,6 +60,76 @@ uv run nh doctor        # 頼る前に、インストールが実際に動くか
 
 ボードを使うなら`web`のビルドは省略できません。ソースのチェックアウトに`web/dist`は含まれないため、ビルドしないと`nh start`はAPIだけを提供し、UIは何も表示されません。Python 3.12以上、[uv](https://github.com/astral-sh/uv)、gitが必要です。ボードのビルドにはnpmを含むNodeも必要です。
 
+## 主な機能
+
+<table>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>コードより先に、まず計画</h3>
+      <p>チケットの内容とリポジトリを調べて分かったことから、確認できる受け入れ基準を書き出します。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-plan.png" alt="タスクの計画：理解した内容としての受け入れ基準3件、変更する2ファイル、アプローチ、テスト計画、対象外の事項、検証コマンド。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>独立したレビュアー</h3>
+      <p>コーダーのセッションを一切見ていない別のモデルが、「完了」を突き崩すよう指示されてレビューします。合否を判定し、ブロッキングの指摘はすべてファイルと行番号を挙げます。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-verdict.png" alt="レビュアーの判定：PASSED。受け入れ基準それぞれに、それを満たすファイルと行番号を添えてチェックが付き、非ブロッキングの指摘が1件、該当diff付き。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>手元のテストを、PRの表に</h3>
+      <p>ローカルで、あるいはCI経由で実行します。テストコマンドが見つからなければ<b>NOT RUN</b>と明記され、空欄にはなりません。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tests.png" alt="タスクのTest resultsパネル：CLEAN、5件中5件が成功、その下にpytestの出力。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>改ざんガード</h3>
+      <p>削除されたテスト、新たなskip、トートロジーになったアサーションを、レビューの前に数え上げます。正当化できなければ、その試行はそこで停止します。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tamper.png" alt="停止した試行：赤いTAMPER DETECTEDバナー、レビュアー判定FAILED、そして「テスト3件が削除され、正当化できる受け入れ基準がない」というブロッキングの指摘。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>修正が本当にバグを直した証明</h3>
+      <p>証拠として出されるテストは、古いコードで失敗し、新しいコードで成功しなければなりません。ゲートは両方を実行し、判定はイベントログに残ります。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-repro.png" alt="タスクのイベントログ：テスト成功、ステータスはreviewing、レビュアーの改ざんチェックはnone、再現ゲートはpass（required）、続いてlint、コミット、プルリクエスト作成。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>正直な停止</h3>
+      <p>あなたの判断が必要なときは、推測せずに具体的な質問をひとつ添えて止まります。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-question.png" alt="ボードのNeeds answerレーン：「Dedupe by user, or by digest id?」という質問を抱えて止まっているタスクが1件と、Answer questionボタン。隣にWorkingレーンとReview PRレーン。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>使っているトラッカーのチケットを、そのままボードへ</h3>
+      <p>バックログからJiraまたはLinearのチケットを選びます（monday.comのボードはポーリングで取り込みます）。着手前に一件ずつあなたと一緒にスコープを決めます。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-backlog.png" alt="Jiraから同期されたBacklog：一致するチケット4件が選択され、Start 4 tasksボタン。" width="100%" />
+    </td>
+  </tr>
+</table>
+
+<sub>画面はデモ用ワークロードを載せた実際のボードです。</sub>
+
 ## タスクを1つ動かす
 
 引数なしで`nh`を実行するとシェルが開きます。レーンの一覧、イベントのライブ表示、自然な言葉でタスクを説明できる入力欄がそろっています。以下のコマンドはすべてそのまま使えます。

@@ -150,6 +150,16 @@ def test_the_detector_actually_detects() -> None:
     assert len(detected_modules()) > 10
 
 
+def test_telemetry_egress_is_visible_not_hidden_behind_an_alias() -> None:
+    """``telemetry.py`` posts to PostHog via ``urllib.request``. It must use the
+    detectable ``import urllib.request`` form, not an aliased
+    ``from urllib import request as _x`` that this detector cannot see —
+    otherwise the module's real egress silently drops out of every guard in
+    this file and out of ``undisclosed`` in ``test_every_outbound_module_is_disclosed``."""
+    assert detected_modules().get("telemetry.py") == {
+        "urllib.request.urlopen()", "urllib.request.Request()"}
+
+
 def test_every_outbound_module_is_disclosed() -> None:
     """The drift guard. A module that gains an HTTP client or a network CLI call
     must be named in ``docs/security.md`` §7, or added to ``LOOPBACK_ONLY``."""

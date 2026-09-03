@@ -6,6 +6,7 @@
 // backend enum. Kept out of SlideOver.jsx so the "what does the operator read
 // at a glance" logic is node-testable without a DOM.
 
+import { approvedAtOf, supersededAtOf } from "./approvalState.js";
 import { routeTask } from "./boardLanes.js";
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
@@ -597,8 +598,15 @@ export function testResultVerdict(testResults) {
 // TaskOut (the drawer's detail payload) carries it under `context`;
 // TaskSummaryOut (the board's) hoists it to the top level. Same fact.
 export function taskApprovedAt(task) {
-  const at = task?.approved_at || task?.context?.approved_at;
+  const at = approvedAtOf(task);
   if (!at) return null;
+  // A later escalation/send-back/fresh-attempt superseded this approval
+  // server-side (core/db.py::_write_status stamps context.approval_
+  // superseded_at, write-once, the moment the row leaves awaiting_approval
+  // for anything other than done) — that stamp is authoritative and checked
+  // FIRST; the send_back_feedback heuristic below stays as a fallback for
+  // older servers/payloads that predate the marker.
+  if (supersededAtOf(task)) return null;
   // "Send back" returns the task to the queue for a NEW attempt with a NEW PR,
   // and it never clears approved_at server-side. An approval recorded before
   // the latest send-back is SPENT — treating it as live would lock the operator

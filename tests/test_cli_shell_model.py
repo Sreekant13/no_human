@@ -147,6 +147,31 @@ def test_needs_you_count_matches_the_loud_lane_membership():
     assert needs_you_count(tasks) == 3
 
 
+def test_an_escalated_task_with_a_stale_approval_shouts_again():
+    """The bug this ticket fixes: an approval recorded on awaiting_approval,
+    then the task escalates (or gets sent back / starts a new attempt) — the
+    row now sits in Needs Answer but still carries the old approved_at.
+    `approval_pending` must read this as NOT pending (status disagrees), so
+    `needs_you` must count it and `lane_for` must NOT put it back in review."""
+    task = _t(
+        status="escalated",
+        approved_at="2026-07-30T00:00:00Z",
+        approval_superseded_at="2026-08-01T00:00:00Z",
+    )
+    assert needs_you(task) is True
+    assert lane_for(task) == "answer"
+
+
+def test_needs_you_count_excludes_a_stale_approval_but_counts_the_escalation():
+    tasks = [
+        _t(id="a", status="awaiting_approval", approved_at="2026-07-30T00:00:00Z"),
+        _t(id="b", status="escalated", approved_at="2026-07-30T00:00:00Z",
+           approval_superseded_at="2026-08-01T00:00:00Z"),
+    ]
+    # "a" stays quiet (live approval); "b" now shouts (superseded, escalated).
+    assert needs_you_count(tasks) == 1
+
+
 # --------------------------------------------------------------------------- #
 # Grouping                                                                     #
 # --------------------------------------------------------------------------- #
@@ -262,9 +287,15 @@ def _full_task(**kw) -> dict:
     the row shape change dropped none of them."""
     base = _t(id="feedbeef1234", title="Gate must refuse to start",
               status="paused_quota", live_status="waits quota",
-              claimed=True, approved_at="2026-08-20T10:00:00Z",
+              claimed=True,
               blocker_human_stopped=True, subtask_progress="2/5 subtasks",
               total_tokens=1_234, total_cache_read=4_000_000)
+    # NOTE: `approved_at` used to live in this fixture too, rendering
+    # "approved - merge pending" alongside a `paused_quota` status. That
+    # combination is exactly the contradiction this ticket's fix closes —
+    # `approval_pending` now requires `status == awaiting_approval`, so a
+    # stale approval on a non-awaiting_approval row can no longer produce the
+    # chip. See test_the_approved_chip_only_renders_for_a_live_awaiting_approval_row.
     base.update(kw)
     return base
 
@@ -289,8 +320,7 @@ def test_every_field_visible_today_is_still_visible():
     out = render_lanes([_full_task()])
     _, meta_line = _row_lines(out, "feedbeef")
     for needle in ("waits quota", "running", "waits for its own signal",
-                   "approved - merge pending", "you stopped it",
-                   "2/5 subtasks", "4,001,234 tok"):
+                   "you stopped it", "2/5 subtasks", "4,001,234 tok"):
         assert needle in meta_line, needle
 
 
@@ -326,7 +356,7 @@ def test_a_long_title_wraps_with_a_hanging_indent_when_a_width_is_given():
 
 
 def test_a_long_meta_line_wraps_under_the_title_column_too():
-    """Seen on the live shell: a task carrying status, approved-pending and a
+    """Seen on the live shell: a task carrying status, several tags and a
     nine-digit burn put its last tag back at column 0. Tags wrap as units —
     never mid-tag — and every overflow row keeps the indent."""
     out = render_lanes([_full_task(id="abab1212", title="Short")], width=40)
@@ -343,11 +373,41 @@ def test_a_long_meta_line_wraps_under_the_title_column_too():
     assert all(len(ln) <= 40 for ln in plain), plain
     joined = " ".join(" ".join(plain).split())
     for needle in ("waits quota", "running", "waits for its own signal",
-                   "approved - merge pending", "you stopped it",
-                   "2/5 subtasks", "4,001,234 tok"):
+                   "you stopped it", "2/5 subtasks", "4,001,234 tok"):
         assert needle in joined, needle
     # a tag is never split across rows
     assert not any(ln.rstrip().endswith("-") for ln in plain)
+
+
+def test_the_approved_chip_only_renders_for_a_live_awaiting_approval_row():
+    """AC2, pinned at the RENDER level (not just the payload/predicate): the
+    board-CLI's actual row output must show "approved - merge pending" only
+    when approval is live AND status is awaiting_approval — never for a
+    stale approved_at sitting on any other status, including the exact
+    contradictory shape the 16 broken rows had (approved_at present,
+    status one of failed/escalated/implementing/paused_quota)."""
+    live = _t(id="livexxxx1111", title="Live", status="awaiting_approval",
+              approved_at="2026-08-20T10:00:00Z")
+    stale_escalated = _t(id="escxxxxx2222", title="Stale-esc", status="escalated",
+                          approved_at="2026-08-20T10:00:00Z",
+                          approval_superseded_at="2026-08-21T00:00:00Z")
+    stale_implementing = _t(id="implxxxx3333", title="Stale-impl", status="implementing",
+                             approved_at="2026-08-20T10:00:00Z",
+                             approval_superseded_at="2026-08-21T00:00:00Z")
+    contradictory_no_marker = _t(id="contrxxx4444", title="Contradictory",
+                                  status="paused_quota",
+                                  approved_at="2026-08-20T10:00:00Z")
+
+    out = render_lanes([live, stale_escalated, stale_implementing, contradictory_no_marker])
+    _, live_meta = _row_lines(out, "livexxxx")
+    _, esc_meta = _row_lines(out, "escxxxxx")
+    _, impl_meta = _row_lines(out, "implxxxx")
+    _, contra_meta = _row_lines(out, "contrxxx")
+
+    assert "approved - merge pending" in live_meta
+    assert "approved - merge pending" not in esc_meta
+    assert "approved - merge pending" not in impl_meta
+    assert "approved - merge pending" not in contra_meta
 
 
 def test_a_single_tag_wider_than_the_pane_is_broken_not_overflowed():

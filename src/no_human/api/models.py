@@ -577,6 +577,15 @@ class TaskSummaryOut(BaseModel):
     # identical to an un-reviewed one and kept shouting in "N need you" — a
     # second operator (or the Electron window) would re-review it.
     approved_at: str | None = None
+    # Stamped (write-once) by `core/db.py::_write_status` the moment a row
+    # leaves awaiting_approval for anything other than done — an escalation,
+    # a conflict-round send-back, or a fresh attempt. `approved_at` above is
+    # left untouched (audit trail); this is what lets `core/lanes.py::
+    # approval_pending` (and its JS twin, `approvalState.js::approvalLive`)
+    # tell a LIVE approval from a stale one that has already been overtaken
+    # by a later round, so the "approved - merge pending" chip can never
+    # again contradict the lane the task is actually sitting in.
+    approval_superseded_at: str | None = None
     # SCRUM-15: the scheduler has this task actively in-flight RIGHT NOW —
     # distinct from `status` being one of the "active" values, which merely
     # means it's eligible to run. `from_task` has no scheduler access, so this
@@ -728,6 +737,7 @@ class TaskSummaryOut(BaseModel):
             has_spec=bool((task.context or {}).get("spec")),
             cancelled=_operator_cancelled(task),
             approved_at=(task.context or {}).get("approved_at"),
+            approval_superseded_at=(task.context or {}).get("approval_superseded_at"),
             pr_conflict_rounds=_coerce_round_count(
                 (task.context or {}).get("pr_conflict_rounds")),
             max_pr_conflict_rounds=max_pr_conflict_rounds,

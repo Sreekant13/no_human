@@ -255,12 +255,12 @@ def flush(section: dict[str, Any] | None = None,
             "version": __version__,
             "events": events,
         }).encode()
-        from urllib import request as _urlrequest
-        req = _urlrequest.Request(
+        import urllib.request
+        req = urllib.request.Request(
             endpoint, data=body,
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        with _urlrequest.urlopen(req, timeout=_HTTP_TIMEOUT):
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT):
             pass
         with _LOCK:
             # Only what we sent is removed; anything queued meanwhile stays.

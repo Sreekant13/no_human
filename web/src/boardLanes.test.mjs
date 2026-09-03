@@ -142,6 +142,33 @@ test("B2 #19: an approved PR stops shouting in 'need you' but keeps its lane", (
   assert.equal(routeTask(approved), routeTask(unreviewed));
 });
 
+test("a STALE approval (superseded by a later escalation) shouts again in 'need you'", () => {
+  // The bug this ticket fixes: 16 rows carried approved_at while sitting in
+  // Needs Answer/Working, and isNeedsYou (like the board) kept reading them
+  // as answered because it only checked task.approved_at. `approvalLive`
+  // re-checks status too, so a task that has since moved on counts again.
+  const staleEscalated = {
+    id: "e", status: "escalated",
+    approved_at: "2026-07-15T00:00:00Z",
+    approval_superseded_at: "2026-07-16T00:00:00Z",
+  };
+  const staleImplementing = {
+    id: "i", status: "implementing",
+    approved_at: "2026-07-15T00:00:00Z",
+    approval_superseded_at: "2026-07-16T00:00:00Z",
+  };
+  const liveApproval = {
+    id: "a", status: "awaiting_approval",
+    approved_at: "2026-07-15T00:00:00Z",
+  };
+
+  assert.equal(isNeedsYou(staleEscalated), true, "escalated + stale approval must shout again");
+  assert.equal(routeTask(staleEscalated), "answer");
+  assert.equal(isNeedsYou(staleImplementing), false, "implementing was never a needs-you lane");
+  assert.equal(routeTask(staleImplementing), "working");
+  assert.equal(isNeedsYou(liveApproval), false, "a genuinely live approval still stays quiet");
+});
+
 test("a human-stopped blocked task stops shouting in 'need you' but keeps its lane", () => {
   const stopped = { id: "s", status: "blocked", blocker_human_stopped: true };
   assert.equal(isNeedsYou(stopped), false, "human already gave their answer: stop, keep parked");

@@ -1924,6 +1924,8 @@ CITATION_TABLE = (
      "Only WHETHER a non-empty token exists"),
     ("security.md", "brain/client.py:89-133", "brain/client.py",
      "cfg.control_plane_url"),
+    ("security.md", "telemetry.py:208-209", "telemetry.py",
+     'section.get("endpoint")'),
     ("security.md", "intake/mcp_bridge.py:29", "intake/mcp_bridge.py",
      "127.0.0.1:8420"),
     ("security.md", "cli/commands.py:print_no_task_matching:78", "cli/commands.py",
@@ -2438,7 +2440,7 @@ def test_every_line_citation_currently_resolves_exactly():
 
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
-    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2235` inside
+    """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2296` inside
     `update_attempt` and `orchestrator.py:4625` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
@@ -2489,9 +2491,18 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     `update_attempt(attempt_id, branch_name=branch)` call inside
     orchestrator.py, moving the citation from 4623 to 4625; re-verified
     against the code, not carried forward blind.
+
+    Re-anchored again 2026-09-03 (third): the approval-supersede write
+    site — `_write_status`'s CASE-clause stamp of
+    `context.approval_superseded_at` (all three CAS branches), the
+    in-process mirror, and the docstring explaining the contract — added
+    61 lines above `update_attempt`'s commit in db.py, moving the citation
+    from 2235 to 2296; re-verified against the code, not carried forward
+    blind. `_run_attempt`'s call site in orchestrator.py is untouched by
+    this change and stays at 4625.
     """
-    assert "db.py:2235" in known_issues_doc, (
-        "the traceback no longer cites db.py:2235 — this test is pointed at "
+    assert "db.py:2296" in known_issues_doc, (
+        "the traceback no longer cites db.py:2296 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
     assert "orchestrator.py:4625" in known_issues_doc, (
@@ -2502,13 +2513,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     db_src = (REPO / "src" / "no_human" / "core" / "db.py").read_text(encoding="utf-8")
     db_body = _function_body_source(db_src, "update_attempt")
     db_lines = db_src.splitlines()
-    assert 1 <= 2235 <= len(db_lines), "db.py is now shorter than line 2103"
-    assert db_lines[2234].strip() == "await self.db.commit()", (
-        f"db.py:2235 is now {db_lines[2234]!r}, not the commit the traceback "
+    assert 1 <= 2296 <= len(db_lines), "db.py is now shorter than line 2296"
+    assert db_lines[2295].strip() == "await self.db.commit()", (
+        f"db.py:2296 is now {db_lines[2295]!r}, not the commit the traceback "
         f"names"
     )
     assert "await self.db.commit()" in db_body, (
-        "line 2103 is no longer inside update_attempt's body"
+        "line 2296 is no longer inside update_attempt's body"
     )
 
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")

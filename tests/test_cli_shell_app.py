@@ -448,10 +448,17 @@ async def test_a_double_width_title_still_renders_correctly_at_the_app_level():
     `test_every_field_visible_today_is_still_visible` pins at the model level -
     survives alongside it."""
     title = "回归测试" * 8  # 32 code points, 64 terminal cells
+    # NOTE: this fixture used to also carry `approved_at` alongside
+    # `status="paused_quota"`, rendering "approved - merge pending" beside a
+    # paused row. That combination is exactly the stale-approval contradiction
+    # this ticket's fix closes - `approval_pending` (core/lanes.py) now
+    # requires `status == "awaiting_approval"`, so a stale approved_at on a
+    # non-awaiting_approval row can no longer produce the chip. See
+    # test_cli_shell_model.py::test_the_approved_chip_only_renders_for_a_live_awaiting_approval_row.
     app = make_app(FakeClient([_t(
         id="cjkrow00abcd", title=title, status="paused_quota",
         live_status="waits quota", claimed=True,
-        approved_at="2026-08-20T10:00:00Z", blocker_human_stopped=True,
+        blocker_human_stopped=True,
         subtask_progress="2/5 subtasks", total_tokens=1_234,
         total_cache_read=4_000_000,
     )]))
@@ -479,7 +486,7 @@ async def test_a_double_width_title_still_renders_correctly_at_the_app_level():
     )
     tag_text = reflowed(block[tag_start:])
     for needle in ("waits quota", "running", "waits for its own signal",
-                   "approved - merge pending", "you stopped it",
+                   "you stopped it",
                    "2/5 subtasks", "4,001,234 tok"):
         assert needle in tag_text, needle
 

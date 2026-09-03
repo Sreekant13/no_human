@@ -16,6 +16,8 @@
 // "Review PR" is the last POSITIVE step before Done (approve → merge → done),
 // so it sits right beside Done and is coloured with the semantic review purple
 // (--c-review) — NOT the blue of Working.
+import { approvalLive } from "./approvalState.js";
+
 export const LANES = [
   { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, staleCollapse: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
   { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent", "paused_quota"], emptyIcon: "○", emptyHint: "No tasks in flight" },
@@ -114,7 +116,12 @@ export function isNeedsYou(task) {
   // lands — it is not waiting on you any more, so it must stop shouting in
   // "N need you". It STAYS in the Review lane (routing is untouched: LANES is
   // also the routing table) but renders as "approved — merge pending".
-  if (task?.approved_at) return false;
+  // `approvalLive`, not a bare `task.approved_at`: a STALE approval —
+  // superseded by a later escalation/send-back/attempt — must NOT silence a
+  // task that has since moved into a genuinely needs-you lane (that was the
+  // bug this predicate exists to close: 16 rows counted as answered while
+  // sitting in Needs Answer).
+  if (approvalLive(task)) return false;
   // A human who explicitly stopped a parked task already gave their answer
   // (blocker.human_stopped, flattened as blocker_human_stopped). Stop it
   // shouting in "N need you", but keep its lane — routing untouched, exactly

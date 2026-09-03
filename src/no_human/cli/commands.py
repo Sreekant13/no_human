@@ -1840,8 +1840,10 @@ def task_restore_approval(task_id, reason):
                 from ..blockers import human_event
                 prior = t.status.value
                 prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
-                cleared = [k for k in ("approved_at", "already_satisfied_report")
-                           if k in (t.context or {})]
+                cleared = [k for k in (
+                    "approved_at", "already_satisfied_report",
+                    "approval_superseded_at",
+                ) if k in (t.context or {})]
                 event_text = (
                     f"{prior} → awaiting_approval: {reason}; "
                     f"false-done repair (no completion event on "
@@ -1861,7 +1863,8 @@ def task_restore_approval(task_id, reason):
                                   "`nh task show`[/]")
                     sys.exit(1)
                 t.context = await store.merge_context(
-                    t.id, {"approved_at": None, "already_satisfied_report": None})
+                    t.id, {"approved_at": None, "already_satisfied_report": None,
+                           "approval_superseded_at": None})
                 t.blocker = None
                 t.wake_check_at = None
                 await store.update_task(t)
@@ -5017,7 +5020,7 @@ def approve(task_id, list_ready, assume_yes, landed_sha, justification, base_bra
         "unresolved_head", "precondition", "skipped", "failed", "done".
         """
         t.context = await store.merge_context(
-            t.id, {"approved_at": _now_iso()})
+            t.id, {"approved_at": _now_iso(), "approval_superseded_at": None})
         # An already-satisfied claim has no PR to merge — approval IS the
         # human confirmation its terminal promised, so it completes here
         # (the agent still never merges anything; there is nothing to).

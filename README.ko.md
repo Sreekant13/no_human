@@ -90,6 +90,76 @@ uv run nh doctor        # 믿고 쓰기 전에 설치가 실제로 동작하는�
 [uv](https://github.com/astral-sh/uv), git, 그리고 보드 빌드용으로 npm이
 포함된 Node가 필요합니다.
 
+## 제품 하이라이트
+
+<table>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>코드보다 계획이 먼저</h3>
+      <p>티켓 내용과 저장소에서 찾아낸 정보로, 직접 확인할 수 있는 인수 조건을 씁니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-plan.png" alt="태스크의 계획: 이해한 내용으로서의 인수 조건 세 가지, 바꿀 파일 두 개, 접근 방식, 테스트 계획, 범위 밖 항목, 검증 명령." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>독립된 리뷰어</h3>
+      <p>코더의 세션을 전혀 본 적 없는 다른 모델이 “완료”를 반박하라는 지시를 받고 리뷰합니다. 통과 또는 실패를 판정하고, 차단 지적은 모두 파일과 줄 번호를 인용합니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-verdict.png" alt="리뷰어의 판정: PASSED. 인수 조건마다 그것을 충족하는 파일과 줄 번호가 붙은 체크 표시, 그리고 해당 diff가 붙은 비차단 지적 하나." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>당신의 테스트, PR 본문에</h3>
+      <p>로컬에서, 또는 CI를 통해 실행합니다. 테스트 명령을 찾지 못하면 <b>NOT RUN</b>이라고 적히며, 빈칸으로 남지 않습니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tests.png" alt="태스크의 Test results 패널: CLEAN, 5개 중 5개 통과, 아래에 pytest 출력." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>변조 가드</h3>
+      <p>삭제된 테스트, 새로 추가된 skip, 항상 참이 된 단언문을 리뷰 전에 집계합니다. 정당화하지 못하면 그 시도는 중단됩니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tamper.png" alt="중단된 시도: 빨간 TAMPER DETECTED 배너, 리뷰어 판정 FAILED, 그리고 “테스트 세 개가 삭제되었고 이를 정당화할 인수 조건이 없다”는 차단 지적." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>수정이 정말 그 버그를 고쳤다는 증명</h3>
+      <p>증거로 제출되는 테스트는 이전 코드에서 실패하고 새 코드에서 통과해야 합니다. 게이트가 양쪽을 모두 실행하고, 판정은 이벤트 로그에 남습니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-repro.png" alt="태스크의 이벤트 로그: 테스트 통과, 상태 reviewing, 리뷰어의 변조 검사 none, 재현 게이트 pass (required), 이어서 lint, 커밋, 풀 리퀘스트 열림." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>정직한 중단</h3>
+      <p>당신이 필요할 때는 추측하지 않고, 구체적인 질문 하나를 남기고 멈춥니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-question.png" alt="보드의 Needs answer 레인: “Dedupe by user, or by digest id?”라는 질문을 안고 멈춰 있는 태스크 하나와 Answer question 버튼. 옆에는 Working 레인과 Review PR 레인." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>쓰고 있는 트래커의 티켓을 그대로 보드로</h3>
+      <p>백로그에서 Jira 또는 Linear 티켓을 고릅니다(monday.com 보드는 폴링으로 가져옵니다). 시작 전에 하나씩 당신과 함께 범위를 정합니다.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-backlog.png" alt="Jira에서 동기화된 Backlog: 일치하는 티켓 네 개가 선택되어 있고, Start 4 tasks 버튼." width="100%" />
+    </td>
+  </tr>
+</table>
+
+<sub>화면은 데모 워크로드를 올린 실제 보드입니다.</sub>
+
 ## 태스크 하나 돌려 보기
 
 `nh`를 인자 없이 실행하면 셸이 열립니다. 레인 현황과 실시간 이벤트 로그,

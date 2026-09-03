@@ -84,6 +84,76 @@ uv run nh doctor        # 正式使用前，先确认安装确实可用
 Python 3.12+、[uv](https://github.com/astral-sh/uv)、git，以及带 npm 的
 Node（用于构建看板）。
 
+## 产品亮点
+
+<table>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>先有计划，再写代码</h3>
+      <p>可逐条核对的验收标准，由工单内容加上它在你仓库里的发现写成。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-plan.png" alt="任务的计划：我们理解到的三条验收标准、要改的两个文件、实现思路、测试计划、范围之外的事项，以及验证命令。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>独立的评审者</h3>
+      <p>换一个从未见过 coder 会话的模型，指示它去推翻“已完成”。通过或不通过；每一条阻塞性发现都引用文件和行号。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-verdict.png" alt="评审者的裁定：PASSED，每条验收标准都打了勾并标出满足它的文件和行号，另有一条非阻塞的小建议并附上它所指的 diff。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>你的测试，写在 PR 正文里</h3>
+      <p>在本地跑，或通过你的 CI 跑。找不到测试命令时写明 <b>NOT RUN</b>，绝不留白。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tests.png" alt="任务的 Test results 面板：CLEAN，5 个通过、共 5 个，下方是 pytest 输出。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>防篡改守卫</h3>
+      <p>删掉的测试、新加的 skip、被改成永远为真的断言，在评审之前逐项清点。给不出正当理由，这次尝试就此中止。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tamper.png" alt="一次被中止的尝试：红色的 TAMPER DETECTED 横幅、评审裁定 FAILED，以及一条阻塞性发现——三个测试被删除，且没有任何验收标准能为此辩护。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>证明修复修掉了那个 bug</h3>
+      <p>作为证据提交的测试必须在旧代码上失败、在新代码上通过。门禁两边都跑，结论写在事件日志里。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-repro.png" alt="任务的事件日志：测试通过、状态为 reviewing、评审者的篡改检查为 none、复现门禁为 pass（required），随后是 lint、提交和拉取请求打开。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>诚实地停下来</h3>
+      <p>需要你时，它带着一个具体的问题停下来等你，而不是去猜。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-question.png" alt="看板的 Needs answer 栏：一个任务带着问题“Dedupe by user, or by digest id?”停在那里，下方是 Answer question 按钮；旁边是 Working 和 Review PR 两栏。" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>你的工单，在你的看板上</h3>
+      <p>从待办里挑选 Jira 或 Linear 的工单（monday.com 看板则由轮询接入）。每一张在开始前都会和你一起厘清范围。</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-backlog.png" alt="从 Jira 同步过来的 Backlog：四张匹配的工单已勾选，以及 Start 4 tasks 按钮。" width="100%" />
+    </td>
+  </tr>
+</table>
+
+<sub>截图：真实看板，演示用的工作负载。</sub>
+
 ## 跑一个任务
 
 不带参数运行 `nh` 进入交互 shell：你的任务泳道、实时事件流，以及一个用

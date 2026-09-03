@@ -1392,7 +1392,19 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     """Approve and merge — squash-lands the PR under the operator identity.
     The agent itself still never merges anything on its own (constraint #2);
     this endpoint IS the human merge action `nh approve`/the GUI button
-    trigger."""
+    trigger.
+
+    Records `context.approved_at` and, in the SAME write, clears any stale
+    `context.approval_superseded_at` from an EARLIER approval round on this
+    task (e.g. one recorded, then escalated/sent-back, then re-approved after
+    a fresh attempt) — this fresh approval is live again. A later escalation,
+    conflict-round send-back, or new attempt re-stamps
+    `approval_superseded_at` on its own (`core/db.py::_write_status`,
+    triggered by the status leaving `awaiting_approval`); this endpoint never
+    stamps it itself, only clears it. `approved_at` is never cleared here or
+    anywhere — it stays a permanent audit trail; `core/lanes.py::
+    approval_pending` is the one predicate that derives the "approved - merge
+    pending" chip from both fields plus `status` together."""
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status != TaskStatus.AWAITING_APPROVAL:
@@ -1418,7 +1430,8 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     except Exception:
         pass
     try:
-        task.context = await store.merge_context(task.id, {"approved_at": _now()})
+        task.context = await store.merge_context(
+            task.id, {"approved_at": _now(), "approval_superseded_at": None})
         # An already-satisfied claim has no PR to merge — approval IS the human
         # confirmation its terminal promised, so it completes the task (the agent
         # still never merges anything; there is nothing to merge). Guarded on

@@ -421,7 +421,14 @@ FROZEN_FILE_LINES = {
     # lines the disclosure and docstring rewrites replaced. Measured on this
     # tree with the scanner below (43 added - 9 removed per
     # `git diff --numstat 8356553f6 -- src/no_human/cli/commands.py`).
-    "cli/commands.py": 8411,
+    # 8411 -> 8412 (net +3, -2 pre-existing unrelated drift already baked
+    # into the 8411 baseline): the approval-supersede repair path —
+    # `task_restore_approval`'s `cleared` tuple and its `merge_context` call
+    # both gained `"approval_superseded_at"`, and `approve()`'s
+    # `merge_context` call clears the marker on fresh approval (+7/-4 per
+    # `git diff --numstat 4db9fd316 c39dd98aa -- src/no_human/cli/commands.py`).
+    # Measured on this tree with the scanner below.
+    "cli/commands.py": 8412,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -565,7 +572,12 @@ FROZEN_FILE_LINES = {
     # 4945 -> 4991 (+46): Store.record_cancel_reason (validated cancel-reason
     # write with the json_patch carry-forward) and its docstring. Measured on
     # this tree with the scanner below.
-    "core/db.py": 4991,
+    # 4991 -> 5052 (+61): approval-supersede write site — `_write_status`'s
+    # CASE-clause stamp of `context.approval_superseded_at` on any exit from
+    # `awaiting_approval` other than `done` (write-once, all three CAS
+    # branches), the in-process mirror, and the docstring explaining the
+    # contract. Measured on this tree with the scanner below.
+    "core/db.py": 5052,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

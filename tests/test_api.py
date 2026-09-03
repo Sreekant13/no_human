@@ -888,6 +888,39 @@ async def test_approve_404(client):
     assert r.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_approved_then_escalated_task_stops_reporting_a_live_approval(client, store):
+    """The bug this AC closes: 16 rows carried `approved_at` while sitting in
+    a status other than `awaiting_approval` (failed/escalated/implementing)
+    and the board kept reading them as "approved — merge pending". Once a
+    task leaves `awaiting_approval` for anywhere but `done`, the SERIALIZED
+    board payload (TaskSummaryOut, what GET /api/tasks actually ships) must
+    carry `approval_superseded_at` and stop looking pending — not just the
+    raw DB row."""
+    from no_human.api.models import TaskSummaryOut
+
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    approved = await store.find_task(t.id)
+    assert approved.context.get("approved_at") is not None
+
+    await store.set_status(approved, TaskStatus.ESCALATED, validate=False)
+
+    escalated = await store.find_task(t.id)
+    summary = TaskSummaryOut.from_task(escalated)
+    assert summary.status == "escalated"
+    assert summary.approved_at is not None, "audit trail must survive"
+    assert summary.approval_superseded_at is not None, (
+        "the payload the board actually reads must show the supersession")
+
+    r2 = await client.get("/api/tasks")
+    assert r2.status_code == 200
+    payload = next(x for x in r2.json() if x["id"] == t.id)
+    assert payload["status"] == "escalated"
+    assert payload["approval_superseded_at"] is not None
+
+
 # --------------------------------------------------------------------------- #
 # POST /api/tasks/{id}/send-back                                               #
 # --------------------------------------------------------------------------- #

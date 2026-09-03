@@ -1273,7 +1273,10 @@ test("the board's wording for an approved task is the wording the drawer reuses"
   // The five-facts card rewrite (spec C2) moved this wording from Board.jsx's
   // own actionHint() into cardFacts.js's pure statusLine derivation.
   const cardFacts = readFileSync(join(SRC, "cardFacts.js"), "utf8");
-  const hint = cardFacts.match(/task\.approved_at\)\s*\{[^}]*?statusLine:\s*"([^"]+)"/);
+  // `approvalLive(task)`, not a bare `task.approved_at` — the stale-approval
+  // fix (approval_superseded_at) moved the guard onto the shared predicate
+  // that also checks the status hasn't moved on. See approvalState.js.
+  const hint = cardFacts.match(/approvalLive\(task\)\)\s*\{[^}]*?statusLine:\s*"([^"]+)"/);
   assert.ok(hint, "cardFacts.js's approved-task status line not found — retarget this test");
   const { label } = approveButtonState({ approvedAt: "2026-07-30T10:00:00+00:00" });
   assert.equal(label.toLowerCase(), hint[1].toLowerCase(),

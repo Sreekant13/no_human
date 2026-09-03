@@ -76,3 +76,58 @@ test("title falls back from title_short to title", () => {
   assert.equal(cardFacts({ title: "Long title", status: "pending" }).title, "Long title");
   assert.equal(cardFacts({ title: "Long title", title_short: "Short", status: "pending" }).title, "Short");
 });
+
+// The bug this ticket fixes: 16 rows carried approved_at while sitting in a
+// status other than awaiting_approval (failed/escalated/implementing), and
+// the card kept saying "Approved — merge pending". A STALE approval
+// (approval_superseded_at stamped, or the status has simply moved on) must
+// fall through to the real status line/action instead.
+test("an escalated task with a stale (superseded) approval shows the escalation, not the stale chip", () => {
+  const f = cardFacts({
+    title: "T", status: "escalated",
+    approved_at: "2026-08-01T00:00:00Z",
+    approval_superseded_at: "2026-08-02T00:00:00Z",
+    blocker_question: "Which branch?",
+  });
+  assert.notEqual(f.statusLine, "Approved — merge pending");
+  assert.equal(f.statusLine, "Which branch?");
+  assert.deepEqual(f.action, { label: "Advise or split", kind: "answer" });
+});
+
+test("an implementing task with a stale approval shows the working state, not the stale chip", () => {
+  const f = cardFacts({
+    title: "T", status: "implementing", live_status: "running: pytest",
+    approved_at: "2026-08-01T00:00:00Z",
+    approval_superseded_at: "2026-08-02T00:00:00Z",
+  });
+  assert.notEqual(f.statusLine, "Approved — merge pending");
+  assert.equal(f.statusLine, "running: pytest");
+  assert.equal(f.action, null);
+});
+
+test("awaiting_approval with a LIVE approval (no supersession stamp) still shows the chip", () => {
+  const f = cardFacts({ title: "T", status: "awaiting_approval", approved_at: "2026-08-01T00:00:00Z" });
+  assert.equal(f.statusLine, "Approved — merge pending");
+  assert.equal(f.action, null);
+});
+
+test("awaiting_approval with approved_at but ALSO superseded (contradictory shape) falls through to Review PR", () => {
+  // Shouldn't occur via the real write path (supersession only fires when a
+  // row LEAVES awaiting_approval), but the predicate is belt-and-suspenders:
+  // it re-checks status directly rather than trusting either stamp alone.
+  const f = cardFacts({
+    title: "T", status: "awaiting_approval",
+    approved_at: "2026-08-01T00:00:00Z",
+    approval_superseded_at: "2026-08-02T00:00:00Z",
+  });
+  assert.notEqual(f.statusLine, "Approved — merge pending");
+  assert.deepEqual(f.action, { label: "Review PR", kind: "review" });
+});
+
+test("the dual context.* payload shape also suppresses the stale chip", () => {
+  const f = cardFacts({
+    title: "T", status: "failed",
+    context: { approved_at: "2026-08-01T00:00:00Z", approval_superseded_at: "2026-08-02T00:00:00Z" },
+  });
+  assert.notEqual(f.statusLine, "Approved — merge pending");
+});

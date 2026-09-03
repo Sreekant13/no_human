@@ -53,6 +53,7 @@ FALLBACK_LANE = "working"
 
 _BLOCKED = "blocked"
 _PAUSED_QUOTA = "paused_quota"
+_AWAITING_APPROVAL = "awaiting_approval"
 
 
 def _field(task: Any, name: str) -> Any:
@@ -110,6 +111,32 @@ def is_waiting(task: Any) -> bool:
     if status == _PAUSED_QUOTA:
         return True
     return status == _BLOCKED and bool(_wake_condition(task))
+
+
+def approval_pending(task: Any) -> bool:
+    """True when ``task`` carries a LIVE, unresolved approval — the one
+    predicate the API payload (``TaskSummaryOut.approval_superseded_at``),
+    the CLI (``shell_lanes.py``) and the board/drawer (``approvalState.js``'s
+    ``approvalLive``) all derive the "approved - merge pending" chip and the
+    needs-you count suppression from, so none of them can ever contradict the
+    lane again.
+
+    A bare ``approved_at`` is NOT enough: ``core/db.py::_write_status``
+    stamps ``context.approval_superseded_at`` (write-once) the moment a row
+    leaves ``awaiting_approval`` for anything other than ``done``, so an
+    approval recorded before an escalation, a conflict-round send-back, or a
+    fresh attempt no longer reads as pending once the row has moved on.
+    ``approved_at`` itself is never cleared (it stays the audit trail), which
+    is why this also re-checks ``status`` directly rather than trusting the
+    stamp alone — belt and suspenders against the exact contradiction this
+    function exists to close: an approval surviving into a status it can no
+    longer speak for.
+    """
+    if not _field(task, "approved_at"):
+        return False
+    if _field(task, "approval_superseded_at"):
+        return False
+    return _status_of(task) == _AWAITING_APPROVAL
 
 
 # `nh status`'s bucketing loop (`cli/commands.py:status`), extracted so it has

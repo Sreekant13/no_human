@@ -18,6 +18,8 @@ from typing import Any
 
 from rich.cells import cell_len, chop_cells
 
+from ..core.lanes import approval_pending
+
 Task = Mapping[str, Any]
 
 
@@ -108,11 +110,14 @@ def needs_you(task: Task | None) -> bool:
 
     Two tasks sit in a gate lane but have already had their answer: an
     approved PR waiting on the merge, and a blocker the human explicitly
-    stopped. Both keep their lane and stop being counted.
+    stopped. Both keep their lane and stop being counted. A STALE approval
+    (superseded by a later escalation/send-back/attempt — see
+    `core/lanes.py::approval_pending`) does NOT suppress the count: it is not
+    an answer to whatever the task is asking now.
     """
     if not isinstance(task, Mapping):
         return False
-    if task.get("approved_at"):
+    if approval_pending(task):
         return False
     if task.get("blocker_human_stopped"):
         return False
@@ -367,7 +372,7 @@ def _task_lines(task: Task, *, selected: bool, width: int | None = None) -> list
         tags.append(("green", "running"))
     if is_waiting(task):
         tags.append(("dim", "waits for its own signal"))
-    if task.get("approved_at"):
+    if approval_pending(task):
         tags.append(("dim", "approved - merge pending"))
     if task.get("blocker_human_stopped"):
         tags.append(("dim", "you stopped it"))

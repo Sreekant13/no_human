@@ -1585,6 +1585,22 @@ class Store:
         `EventPersister`'s best-effort contract. Non-DONE transitions are
         unaffected: `event` is optional and ignored when absent.
 
+        Every write that moves a row OFF `awaiting_approval` to anything
+        other than `done` also stamps `context.approval_superseded_at`
+        (write-once — only if `approved_at` is set and no marker is already
+        recorded), in the SAME UPDATE as the status write, regardless of
+        which of the three branches below fires. `approved_at` itself is
+        never cleared — it stays a permanent audit trail of "a human
+        approved this" — but a superseded approval must stop reading as a
+        live "merge pending" once the task has escalated, failed, been sent
+        back to implementing, or otherwise left the approval gate; see
+        `core/lanes.py::approval_pending`, the one predicate every surface
+        (API payload, CLI, board, drawer) derives the chip from. `done` is
+        excluded: a completed merge is the approval's success, not its
+        supersession, and the chip is already suppressed there by the
+        `status == awaiting_approval` half of `approval_pending` regardless
+        of this marker.
+
         `reconciliation_gate` is a SECOND, NARROWER legality check consulted
         ONLY as a fallback: `assert_transition` — the general
         `ALLOWED_TRANSITIONS` map — still runs first and unconditionally
@@ -1697,20 +1713,52 @@ class Store:
         # cannot gate the event insert below: a second completion event
         # would be recorded for a status that never actually changed.
         already_there = task.status is new_status
+        was_awaiting_approval = task.status is TaskStatus.AWAITING_APPROVAL
+        # Approval-integrity marker: a row LEAVING awaiting_approval to
+        # anything other than a genuine completion (escalated/failed/blocked/
+        # awaiting_input/paused_quota, or sent back to implementing) stamps
+        # `approval_superseded_at` (write-once, guarded by the IS NULL check
+        # below) so a stale `approved_at` from an earlier round can never
+        # again read as "pending" once the task has moved on. `approved_at`
+        # itself is left untouched — it stays an audit trail, not a live
+        # flag. `done` is excluded on purpose: a completed merge is the
+        # approval's success, not its supersession, and
+        # `core/lanes.py::approval_pending` also gates on
+        # `status == awaiting_approval`, so a DONE row's chip is already
+        # suppressed regardless of this marker. This CASE runs on every
+        # branch below (human_override / terminal_reconcile / default CAS)
+        # so the fix applies no matter which write mode a given caller uses.
+        supersede_case = (
+            "context = CASE "
+            "WHEN status = ? AND ? NOT IN (?, ?) "
+            "AND json_extract(COALESCE(context, '{}'), '$.approved_at') IS NOT NULL "
+            "AND json_extract(COALESCE(context, '{}'), '$.approval_superseded_at') IS NULL "
+            "THEN json_set(COALESCE(context, '{}'), '$.approval_superseded_at', ?) "
+            "ELSE context END"
+        )
+        supersede_params = (
+            TaskStatus.AWAITING_APPROVAL.value, new_status.value,
+            TaskStatus.AWAITING_APPROVAL.value, TaskStatus.DONE.value,
+            now,
+        )
         if human_override:
             cur = await self.db.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (new_status.value, now, task.id),
+                f"UPDATE tasks SET status = ?, updated_at = ?, {supersede_case} "
+                "WHERE id = ?",
+                (new_status.value, now, *supersede_params, task.id),
             )
         elif terminal_reconcile:
             cur = await self.db.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? "
+                f"UPDATE tasks SET status = ?, updated_at = ?, {supersede_case} "
                 "WHERE id = ? AND status = ?",
-                (new_status.value, now, task.id, TaskStatus.FAILED.value),
+                (
+                    new_status.value, now, *supersede_params,
+                    task.id, TaskStatus.FAILED.value,
+                ),
             )
         else:
             cur = await self.db.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? "
+                f"UPDATE tasks SET status = ?, updated_at = ?, {supersede_case} "
                 "WHERE id = ? AND ("
                 "  status = ?"
                 "  OR NOT ("
@@ -1719,7 +1767,7 @@ class Store:
                 "  )"
                 ")",
                 (
-                    new_status.value, now, task.id,
+                    new_status.value, now, *supersede_params, task.id,
                     new_status.value,
                     TaskStatus.DONE.value, TaskStatus.FAILED.value,
                 ),
@@ -1745,6 +1793,19 @@ class Store:
             return None
         task.status = new_status
         task.updated_at = now
+        if (
+            not already_there
+            and was_awaiting_approval
+            and new_status not in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE)
+            and task.context
+            and task.context.get("approved_at")
+            and not task.context.get("approval_superseded_at")
+        ):
+            # Best-effort mirror of the CASE-clause write above onto the
+            # in-process object, so a caller reading `task.context` right
+            # after this call (without a fresh SELECT) sees the marker
+            # immediately instead of only after the next reload.
+            task.context = {**task.context, "approval_superseded_at": now}
         # D1.2: record the per-phase timeline the drawer's "ran" chip reads
         # (active_seconds = Σ phase durations). set_status is the ONE writer of
         # task.status — every orchestrator/watcher/scheduler transition routes

@@ -75,6 +75,76 @@ no `web/dist`, so without it `nh start` serves the API only and renders no UI.
 Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and Node with
 npm for the board build.
 
+## Product highlights
+
+<table>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>A plan before any code</h3>
+      <p>Acceptance criteria you can check, written from the ticket and your repo.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-plan.png" alt="The task's plan: what we understood as three acceptance criteria, the two files to change, the approach, the test plan, what is out of scope, and the verification command." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>An independent reviewer</h3>
+      <p>A second model that never saw the coder's session, told to refute "done". Pass or fail; every finding that blocks cites file and line.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-verdict.png" alt="The reviewer's verdict: PASSED, each acceptance criterion ticked with the file and line that satisfies it, one non-blocking nit with the diff it points at." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>Your tests, on the PR's face</h3>
+      <p>Run locally or through your CI. No test command found reads <b>NOT RUN</b>, never blank.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tests.png" alt="The task's Test results panel: CLEAN, 5 passed of 5 total, with the pytest output underneath." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>A tamper guard</h3>
+      <p>Deleted tests, new skips and tautological assertions are counted before review. Unjustified, the attempt stops.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-tamper.png" alt="A stopped attempt: a red TAMPER DETECTED banner, the reviewer verdict FAILED, and the blocking finding that three tests were deleted without an acceptance criterion to justify it." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>Proof the fix fixed the bug</h3>
+      <p>The tests offered as evidence must fail on the old code and pass on the new. The gate runs both, and the event log shows the verdict.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-repro.png" alt="The task's event log: tests pass, status reviewing, the reviewer's tamper check reading none, the reproduction gate reading pass, required, then lint, commit and the pull request opening." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>An honest stop</h3>
+      <p>When it needs you, it parks with one specific question instead of guessing.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-question.png" alt="The board's Needs answer lane: one task parked with its question, 'Dedupe by user, or by digest id?', and an Answer question button; the Working and Review PR lanes beside it." width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%" valign="middle">
+      <h3>Your tracker's tickets, on your board</h3>
+      <p>Pick Jira or Linear tickets from the backlog (monday.com boards are polled). Each one is scoped with you before it starts.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/highlight-backlog.png" alt="The Backlog synced from Jira: four matching tickets selected, and a Start 4 tasks button." width="100%" />
+    </td>
+  </tr>
+</table>
+
+<sub>Stills: the real board on a demo workload.</sub>
+
 ## Run one task
 
 Run `nh` with no arguments for the shell: your lanes, a live event tail, and an

@@ -13,6 +13,7 @@ import { cardBlockerLine } from "./cardBlockerLine.js";
 import { isWaiting } from "./boardLanes.js";
 import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
 import { fmtCost } from "./cost.js";
+import { approvalLive } from "./approvalState.js";
 
 export function cardFacts(task, { cost } = {}) {
   const title = task.title_short || task.title || "";
@@ -24,12 +25,16 @@ export function cardFacts(task, { cost } = {}) {
   ].filter(Boolean).join(" · ");
 
   // These three states end the story regardless of `status` — an operator
-  // cancel, an approval already given, or a human who already answered a now-
-  // stale-looking blocker. None of them leaves anything for an action button.
+  // cancel, a LIVE approval already given, or a human who already answered a
+  // now-stale-looking blocker. None of them leaves anything for an action
+  // button. `approvalLive` (not a bare `task.approved_at`) so a STALE
+  // approval — superseded by a later escalation/send-back/attempt — falls
+  // through to the real status below instead of still claiming "merge
+  // pending" on a task that has moved on.
   if (task.cancelled) {
     return { title, statusLine: "Cancelled", metaLine, action: null };
   }
-  if (task.approved_at) {
+  if (approvalLive(task)) {
     return { title, statusLine: "Approved — merge pending", metaLine, action: null };
   }
   if (task.blocker_human_stopped) {

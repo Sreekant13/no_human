@@ -396,6 +396,19 @@ config key that turns it on and the default that keeps it off.
   `team_brain.control_plane_url` to **`""`**; when set, the client exchanges
   task patterns with that URL over `https` (loopback excepted)
   (`brain/client.py:89-133`).
+- **Usage telemetry** (`telemetry.py`): a closed allowlist of event names —
+  `app_started`, `task_created`, `task_completed`, `task_failed`,
+  `approve_clicked`, `feature_used` — each carrying only the props listed in
+  `docs/configuration.md` "Usage insights", an anonymous uuid4
+  `telemetry.instance_id` and the app version, POSTed via `urllib.request` to
+  `telemetry.endpoint` when you set one. `telemetry.endpoint` defaults to
+  **`""`**, so a default install's `flush()` has nowhere to send and sends
+  nothing (`telemetry.py:208-209`) — `telemetry.enabled` itself defaults to
+  `true`, but the endpoint is what actually keeps this channel inert out of
+  the box. Never a task title, repo name, path, prompt, diff or token. Off
+  with `telemetry.enabled: false` in `~/.no_human/config.yaml`. The browser
+  board sends its own PostHog analytics and session replay on the same id
+  (same doc section) — that channel is independent of this one.
 
 ### Not egress: loopback
 
