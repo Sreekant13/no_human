@@ -14,6 +14,7 @@ the dev/CI environment happens to have the `e2e` group installed.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from pathlib import Path
@@ -171,6 +172,20 @@ async def _run_ui_task(repo_env, tmp_path, store, monkeypatch, *, playwright_ava
         run(calls) if run is not None else _fake_ui_evidence_run(calls))
     monkeypatch.setattr(
         orch_mod.ui_evidence, "playwright_available", lambda: playwright_available)
+
+    # The hermetic backend (landed after this file) would otherwise try to
+    # boot a REAL isolated `nh start` inside the test and skip the walk on
+    # its exit-2 (`walk_skip::hermetic_backend_init_failed`) — exactly the
+    # failure CI showed on 201baa8. These tests pin the DISCLOSURE paths
+    # around `run`, not the backend boot, so stub it armed; the backend's
+    # own behavior is pinned by test_ui_evidence_attempt_hook's
+    # `_wire_fake_hermetic_backend` with every seam faked.
+    @contextlib.asynccontextmanager
+    async def _armed_hermetic_backend(out_dir, **_kw):
+        yield orch_mod.ui_evidence.HermeticBackend(
+            mode="armed", api_target="http://127.0.0.1:1/")
+    monkeypatch.setattr(
+        orch_mod.ui_evidence, "hermetic_backend", _armed_hermetic_backend)
     monkeypatch.setattr(GitRepo, "remote_url",
                         lambda self, remote="origin": "https://github.com/acme/widget.git")
     fake_open_pr, opens = _fake_open_pr()
