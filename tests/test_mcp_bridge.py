@@ -3,6 +3,7 @@ against a stubbed HTTP layer (httpx.MockTransport, no real server), and the
 unreachable-API startup refusal. Never talks to a real network."""
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -17,8 +18,22 @@ def _reset_transport():
     mcp_bridge._TRANSPORT = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_base_url_cache():
+    """`_base_url` is cached for the process, so a resolved value would
+    otherwise leak into whichever test runs next."""
+    mcp_bridge._base_url.cache_clear()
+    yield
+    mcp_bridge._base_url.cache_clear()
+
+
 def _set_transport(handler):
     mcp_bridge._TRANSPORT = httpx.MockTransport(handler)
+
+
+def _config(data):
+    """Stand in for `load_config`, returning an object with a `.data` mapping."""
+    return lambda **kwargs: type("_Config", (), {"data": data})()
 
 
 async def test_tool_schemas():
@@ -155,21 +170,48 @@ def test_ensure_api_reachable_ok_when_api_up():
 
 def test_base_url_follows_server_port_from_config(monkeypatch):
     """An operator who moves the board must not be left dialling 8420."""
-    import no_human.config as config_module
-
-    class _Config:
-        data = {"server": {"host": "127.0.0.1", "port": 9999}}
-
-    monkeypatch.setattr(config_module, "load_config", lambda **kw: _Config())
-    assert mcp_bridge._resolve_base_url() == "http://127.0.0.1:9999"
+    monkeypatch.setattr(
+        mcp_bridge, "load_config", _config({"server": {"host": "127.0.0.1", "port": 9999}})
+    )
+    assert mcp_bridge._base_url() == "http://127.0.0.1:9999"
 
 
-def test_base_url_falls_back_when_config_unreadable(monkeypatch):
-    """A missing or broken config leaves a default install working as before."""
-    import no_human.config as config_module
+def test_base_url_falls_back_when_config_unreadable(monkeypatch, caplog):
+    """A missing or broken config leaves a default install working as before,
+    and says so rather than failing silently later on."""
 
-    def _boom(**kw):
+    def _boom(**kwargs):
         raise OSError("no config here")
 
-    monkeypatch.setattr(config_module, "load_config", _boom)
-    assert mcp_bridge._resolve_base_url() == "http://127.0.0.1:8420"
+    monkeypatch.setattr(mcp_bridge, "load_config", _boom)
+    with caplog.at_level(logging.WARNING):
+        assert mcp_bridge._base_url() == "http://127.0.0.1:8420"
+    assert "OSError" in caplog.text
+    assert "no config here" in caplog.text
+
+
+def test_base_url_falls_back_when_server_is_not_a_mapping(monkeypatch, caplog):
+    """`server: 8421` parses fine but is not a mapping. Warn and use the
+    default rather than raising AttributeError out of the bridge."""
+    monkeypatch.setattr(mcp_bridge, "load_config", _config({"server": 8421}))
+    with caplog.at_level(logging.WARNING):
+        assert mcp_bridge._base_url() == "http://127.0.0.1:8420"
+    assert "not a mapping" in caplog.text
+
+
+def test_reachability_check_dials_the_configured_port(monkeypatch):
+    """The operator-visible wiring: main() checks the port from the config,
+    not the BASE_URL literal."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setattr(mcp_bridge, "load_config", _config({"server": {"port": 9999}}))
+    monkeypatch.setattr(mcp_bridge.mcp, "run", lambda: None)
+    _set_transport(handler)
+
+    mcp_bridge.main()
+
+    assert seen == ["http://127.0.0.1:9999/api/tasks"]

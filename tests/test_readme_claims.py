@@ -1926,7 +1926,7 @@ CITATION_TABLE = (
      "cfg.control_plane_url"),
     ("security.md", "telemetry.py:_destination", "telemetry.py",
      "posthog_host"),
-    ("security.md", "intake/mcp_bridge.py:29", "intake/mcp_bridge.py",
+    ("security.md", "intake/mcp_bridge.py:40", "intake/mcp_bridge.py",
      "127.0.0.1:8420"),
     ("security.md", "cli/commands.py:print_no_task_matching:78", "cli/commands.py",
      "no task matching"),
