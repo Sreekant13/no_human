@@ -570,7 +570,7 @@ def test_a_real_pr_renders_under_300_visible_words_beyond_its_criteria(
     # ...and what WAS dropped is exactly the raw receipts — nothing else:
     # the report's evidence and the test verdict are still there, in full.
     for rec in fx["receipts"]:
-        assert rec["command"] not in body, rec["command"]
+        assert rec["command"] not in _scannable(body), rec["command"]
     assert "Full verification log:" in body
     assert "| Independent review | ✅ **PASSED** — 1 round |" in body
     assert "| Tests | ✅ PASS — 9380 passed, 0 failed, 0 errors |" in body
@@ -613,17 +613,27 @@ def _two_run_fixture():
     return task, receipts, test_evidence
 
 
+def _scannable(text: str) -> str:
+    """*text* with every `<details>` fold removed — what a reader sees
+    without clicking, the same cut `visible_chars` measures."""
+    return re.sub(r"<details>.*?</details>", "", text, flags=re.DOTALL)
+
+
 def test_the_body_carries_no_fenced_command_output(store, tmp_path):
     """(a) Two pytest receipts — the first failing mid-work, the second
-    passing — and NEITHER's raw output reaches the body: no fenced block,
-    no excerpt text from either run."""
+    passing — and NEITHER's raw output reaches the SCANNABLE body (what a
+    reader sees before expanding anything): no fenced block, no excerpt text
+    from either run. Since #23 the final run's excerpt does reach the body,
+    but only inside the per-kind `<details>` fold of "How I verified this";
+    the mid-work run's never does."""
     orch = _orch(store, tmp_path)
     task, receipts, test_evidence = _two_run_fixture()
     body = orch._pr_body(task, _Commit(), _Result(),
                          test_evidence=test_evidence, receipts=receipts)
-    assert "```" not in body, "a fenced code block reached the PR body"
+    assert "```" not in _scannable(body), "a fenced code block reached the scannable body"
     assert "2 failed, 3 passed in 0.81s" not in body
-    assert "5 passed in 1.02s" not in body
+    assert "5 passed in 1.02s" not in _scannable(body)
+    assert "5 passed in 1.02s" in body, "the final run's output must be one click away"
 
 
 def test_the_body_shows_only_the_final_layer_result(store, tmp_path):
@@ -689,16 +699,18 @@ def test_ui_evidence_media_section_is_excluded_from_the_body_budget(store, tmp_p
 
 
 def test_the_short_section_carries_no_receipt_text(store, tmp_path):
-    """The short section itself (not just the whole body) never embeds a
-    receipt's command or output — direct unit-level pin, independent of the
-    end-to-end fixture above."""
+    """The short section's SCANNABLE text (outside every fold) never embeds
+    a receipt's command or output, and a mid-work run's output appears
+    nowhere in it — direct unit-level pin, independent of the end-to-end
+    fixture above."""
     receipts = [_MID_WORK_RECEIPT, _FINAL_RECEIPT]
     section = Orchestrator._verification_section(
         receipts, task_id="deadbeef")
     for rec in receipts:
-        assert rec["command"] not in section
-        assert rec["output_excerpt"] not in section
-    assert "```" not in section
+        assert rec["command"] not in _scannable(section)
+        assert rec["output_excerpt"] not in _scannable(section)
+    assert _MID_WORK_RECEIPT["output_excerpt"] not in section
+    assert "```" not in _scannable(section)
     assert "nh logs deadbeef" in section
 
 
@@ -846,3 +858,102 @@ def test_the_body_budget_never_trims_the_standard_fixture(store, tmp_path):
                          receipts=_receipts())
     assert "(trimmed further to keep the PR body under its size budget)" not in body
     assert visible_chars(body) <= 6000, visible_chars(body)
+
+
+# ══════ #23: the body reads decisive-first and every verification line expands ══ #
+
+
+def test_verification_digest_folds_one_details_per_kind():
+    """One `<details>` per receipt kind, in `KINDS` order: the summary names
+    the kind and the LAST command of that kind (with the run count when
+    there were several); expanding it shows that command's captured output
+    fenced. Earlier runs of the kind stay in the full log only."""
+    receipts = [_MID_WORK_RECEIPT, _FINAL_RECEIPT, {
+        "command": "uv run ruff check src", "output_excerpt": "All checks passed!",
+        "kind": "lint", "truncated": False, "output_bytes": 18}]
+    section = Orchestrator._verification_section(receipts, task_id="deadbeef")
+    assert section.count("<details>") == 2
+    tests_at = section.index("<b>Tests</b> (2 runs, last shown) — <code>uv run pytest tests/test_webhook_retry.py -q</code>")
+    lint_at = section.index("<b>Lint</b> — <code>uv run ruff check src</code>")
+    assert tests_at < lint_at
+    assert "```\n5 passed in 1.02s\n```" in section
+    assert "```\nAll checks passed!\n```" in section
+    assert "2 failed, 3 passed" not in section
+    assert section.count("commands recorded") == 1
+    assert "3 commands recorded" in section
+    assert "**How I verified this** comment" in section
+
+
+def test_verification_summary_escapes_html_in_the_command():
+    """The command is model-chosen text rendered inside `<summary>`: a
+    `</summary>` in it must not close the element early."""
+    receipts = [{"command": "echo </summary><h1>done</h1>", "output_excerpt": "",
+                 "kind": "test", "truncated": False, "output_bytes": 0}]
+    section = Orchestrator._verification_section(receipts, task_id="deadbeef")
+    assert "</summary><h1>" not in section
+    assert "&lt;/summary&gt;&lt;h1&gt;done&lt;/h1&gt;" in section
+    assert "_nothing was captured on stdout or stderr for this command._" in section
+
+
+def test_verdict_line_precedes_the_evidence_table(store, tmp_path):
+    """The two facts a human reads first — the reviewer's verdict and the
+    test run — open the body as one quoted line, ahead of `## Evidence`,
+    worded differently from the table cells so nothing is rendered twice."""
+    orch = _orch(store, tmp_path)
+    task = _task()
+    test_evidence = {"ran": True, "ok": True, "passed": 5, "failed": 0, "errors": 0}
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=_receipts())
+    line = "> **Review passed** (2 rounds) · **Tests passed** (5 passed, 0 failed)"
+    assert body.count(line) == 1, body
+    assert body.index(line) < body.index("## Evidence")
+    assert body.count("**PASSED** — 2 rounds") == 1
+
+
+def test_verdict_line_names_a_failed_review_and_a_failed_run(store, tmp_path):
+    orch = _orch(store, tmp_path)
+    task = _task()
+    task.context["review_history"][-1] = {
+        "round": 2, "sha": "a" * 40, "passed": False, "blocking": ["still untested"]}
+    test_evidence = {"ran": True, "ok": False, "passed": 3, "failed": 2, "errors": 1}
+    body = orch._pr_body(task, _Commit(), _Result(),
+                         test_evidence=test_evidence, receipts=_receipts())
+    assert ("> **Review not passed** (2 rounds) · "
+            "**Tests failed** (3 passed, 2 failed, 1 errors)") in body
+
+
+def test_verdict_line_follows_the_runner_verdict_not_the_counts():
+    """`ok` is the runner's own verdict (`rc == 0`): `pytest && mypy` with
+    mypy failing is ok=False with 0 failed, and the headline must not read
+    as a pass when the table's row says FAIL."""
+    ev = PrEvidence(tests={"ran": True, "ok": False, "passed": 5, "failed": 0, "errors": 0})
+    assert ev.headline() == "> **Tests failed** (5 passed, 0 failed)\n\n"
+    ev = PrEvidence(tests={"ran": True, "ok": False, "passed": 0, "failed": 0, "errors": 0})
+    assert ev.headline() == "> **Tests failed**\n\n"
+    ev = PrEvidence(tests={"ran": False})
+    assert ev.headline() == "> **Tests not run**\n\n"
+    ev = PrEvidence(tests={"layers": ["unit: ✅ PASS — 5 passed, 0 failed, 0 errors"]})
+    assert ev.headline() == ""
+
+
+def test_verification_summary_folds_a_multi_line_command_onto_one_line():
+    """A heredoc-then-test command keeps its newlines in the receipt; a
+    blank line inside `<summary>` would end the HTML block and leave the
+    fold unclosed on GitHub. The summary shows it on one line, invisible
+    and direction-changing characters dropped, as `md_inline_code` does."""
+    receipts = [{"command": "cat <<'EOF' > x.py\nprint(1)\n\nEOF\nuv run pytest -q \u202e",
+                 "output_excerpt": "1 passed", "kind": "test",
+                 "truncated": False, "output_bytes": 8}]
+    section = Orchestrator._verification_section(receipts, task_id="deadbeef")
+    summary = section[section.index("<summary>"):section.index("</summary>")]
+    assert "\n" not in summary
+    assert "\u202e" not in summary
+    assert "<code>cat &lt;&lt;'EOF' &gt; x.py print(1)  EOF uv run pytest -q</code>" in summary
+
+
+def test_no_verdict_line_without_a_verdict(store, tmp_path):
+    """No review, no test run: nothing to headline, so no quoted line."""
+    orch = _orch(store, tmp_path)
+    task = Task.new("t", repo_path="/r")
+    body = orch._pr_body(task, _Commit(), _Result())
+    assert "> **" not in body

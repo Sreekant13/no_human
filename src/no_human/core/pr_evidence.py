@@ -126,6 +126,46 @@ class PrEvidence:
             return None
         return f"| CI | {self.ci_state} |"
 
+    def headline(self) -> str:
+        """#23: the facts a human reads first — the reviewer's verdict, the
+        orchestrator's own test run, the merge-policy verdict — as ONE quoted
+        line the body renders ahead of `## Evidence`. Read from the same
+        fields the table renders from, worded differently from the table
+        cells (`Review passed (2 rounds)` vs `**PASSED** — 2 rounds`) so no
+        gate output is rendered twice. "" when no gate has a verdict."""
+        parts: list[str] = []
+        rv = self.review_verdict
+        if rv and not rv.get("unmatched"):
+            n = int(rv["rounds"])
+            word = "passed" if rv["verdict"] == "PASSED" else "not passed"
+            parts.append(f"**Review {word}** ({n} round{'s' if n != 1 else ''})")
+        te = self.tests
+        if isinstance(te, dict):
+            def _n(key: str) -> int:
+                try:
+                    return int(te.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0
+            p, f, e = _n("passed"), _n("failed"), _n("errors")
+            counts = (f" ({p} passed, {f} failed" + (f", {e} errors" if e else "")
+                      + ")") if p + f + e else ""
+            if te.get("ran") is False or (te.get("invocation_error") and not counts):
+                parts.append("**Tests not run**")
+            elif "ok" in te:
+                # `ok` is the runner's own verdict (`rc == 0`), not the counts:
+                # `pytest && mypy` with mypy failing is ok=False, 0 failed.
+                parts.append(f"**Tests {'passed' if te['ok'] else 'failed'}**{counts}")
+            elif counts:
+                parts.append(f"**Tests**{counts}")
+        mp = self.merge_policy
+        if mp:
+            if mp.get("problems") or mp.get("policy_changed_in_diff"):
+                parts.append("**Merge policy** ⚠️ see below")
+            else:
+                parts.append("**Merge policy** "
+                             + ("ready" if mp.get("ready") else "not ready"))
+        return "> " + " · ".join(parts) + "\n\n" if parts else ""
+
     def verifiers_pin(self) -> str | None:
         """Re-implemented over dicts, not `verifiers.summary_line`: this
         module's own boundary is "never import the review package", and that
