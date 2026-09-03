@@ -41,9 +41,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
+import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -52,7 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
-from .. import proc
+from .. import config, proc
 
 MANIFEST = ".no_human/ui_evidence.json"
 SCHEMA_HINT = (
@@ -519,7 +522,7 @@ async def dev_server(
     repo_path, ui_conf, base_url, out_dir, *,
     spawn=subprocess.Popen, clock=time.monotonic,
     sleep=asyncio.sleep, reachable=_reachable,
-    kill=_kill_dev_server,
+    kill=_kill_dev_server, extra_env: dict | None = None,
 ):
     """Boot the repo's configured dev server if nothing already answers at
     `base_url`, poll for readiness, and tear it down (kill the process group)
@@ -530,6 +533,12 @@ async def dev_server(
     `out_dir` is a required positional: the orchestrator owns its lifecycle
     and already `rmtree`s it after the attempt. Every seam is injectable so
     tests never spawn a real subprocess, hit the network, or open a browser.
+
+    `extra_env` is merged over `os.environ` for the spawned process only
+    (e.g. `VITE_API_TARGET`, so a booted dev server proxies to a hermetic
+    backend rather than the operator's live one) — when falsy the `spawn(...)`
+    call passes NO `env=` kwarg at all, so the customer path (no hermetic
+    backend involved) is byte-identical to before this parameter existed.
 
     Decision order — each early branch yields exactly one `DevServerOutcome`
     and spawns nothing: falsy/unconfigured `base_url` or `start_cmd` ->
@@ -597,8 +606,11 @@ async def dev_server(
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         fh = open(out_dir / _DEV_SERVER_LOG, "wb")
-        process = spawn(argv, cwd=str(repo_path), stdout=fh, stderr=subprocess.STDOUT,
-                         **proc.hidden_console_kwargs(new_group=True))
+        spawn_kwargs = dict(cwd=str(repo_path), stdout=fh, stderr=subprocess.STDOUT,
+                             **proc.hidden_console_kwargs(new_group=True))
+        if extra_env:
+            spawn_kwargs["env"] = {**os.environ, **extra_env}
+        process = spawn(argv, **spawn_kwargs)
     except OSError as exc:
         if fh is not None:
             with contextlib.suppress(Exception):
@@ -653,6 +665,191 @@ async def dev_server(
         if fh is not None:
             with contextlib.suppress(Exception):
                 fh.close()
+
+
+def _pick_ephemeral_port() -> int:
+    """Bind to an OS-assigned loopback port, read it back, and release it.
+
+    Injectable as `pick_port=`. A TOCTOU race — something else grabs the
+    port between this call returning and the caller's `spawn` binding it —
+    is an accepted failure mode: it surfaces as an ordinary spawn/never-ready
+    failure (`mode="failed"`), the same shape as any other boot failure, not
+    a crash.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _hermetic_start_argv(port: int) -> list[str]:
+    """argv for `nh start` under THIS interpreter, isolated only by the
+    caller's env (`HOME`/`NO_HUMAN_HOME`) — never a new CLI surface.
+
+    Mirrors `repro_gate._pytest_python`'s frozen/non-frozen split: in a
+    PyInstaller build `sys.executable` IS the `nh` binary already (there is
+    no separate Python to hand a module path to), so it is invoked directly.
+    In a normal install `sys.executable` is the interpreter, and
+    `no_human.cli.commands` (the module backing the `nh`/`no-human` console
+    scripts, `pyproject.toml`'s `[project.scripts]`) has a
+    `if __name__ == "__main__"` guard, so `-m` reaches the exact same
+    `cli()` Click group a PATH `nh` would — preferred over a PATH lookup so
+    a customer install with no `nh` on PATH fails loudly into the skip path
+    instead of silently resolving to something else.
+    """
+    base = (
+        [sys.executable] if getattr(sys, "frozen", False)
+        else [sys.executable, "-m", "no_human.cli.commands"]
+    )
+    return base + [
+        "start", "--host", "127.0.0.1", "--port", str(port),
+        "--no-open", "--workers", "1",
+    ]
+
+
+_HERMETIC_API_LOG = "hermetic-api.log"
+_HERMETIC_READY_PATH = "/api/tasks"
+_HERMETIC_READY_TIMEOUT_S = 60
+
+
+@dataclass  # NOT frozen — teardown stamps detail onto the caller's object
+class HermeticBackend:
+    """What `hermetic_backend` decided and (if it spawned anything) what
+    happened.
+
+    `mode` is `"armed"` (a fresh, throwaway-HOME `nh start` answered before
+    `_HERMETIC_READY_TIMEOUT_S`) or `"failed"` (never got there — see
+    `cause`). `detail` is LOG-ONLY, same promise as `DevServerOutcome.detail`:
+    never rendered into a PR body, only an advisory.
+
+    `cause` is a fixed vocabulary, safe to render (unlike `detail`): ``""``
+    (armed), ``"port-unavailable"`` (the picked port could not be bound),
+    ``"home-seed-failed"`` (the throwaway HOME could not be created/seeded),
+    ``"spawn-failed"`` (the API server process never started),
+    ``"exited-early"`` (it started and exited before answering), or
+    ``"timeout"`` (it never answered before the deadline). Only meaningful
+    when `mode == "failed"`.
+    """
+
+    mode: str
+    home: str = ""
+    port: int = 0
+    api_target: str = ""
+    detail: str = ""
+    cause: str = ""
+
+
+@contextlib.asynccontextmanager
+async def hermetic_backend(
+    out_dir, *, spawn=subprocess.Popen, pick_port=_pick_ephemeral_port,
+    clock=time.monotonic, sleep=asyncio.sleep, reachable=_reachable,
+    kill=_kill_dev_server, home_root=None,
+):
+    """Boot an ISOLATED `nh start` under a throwaway HOME so a walk step that
+    clicks Save/Reset-to-defaults writes into a directory nobody will ever
+    read again — never the operator's real `~/.no_human/config.yaml`. This
+    is the fix for the bug this module exists to close: a walk's dev server
+    used to proxy `/api` straight at the operator's live `:8420` board.
+
+    Always yields exactly one `HermeticBackend`, never raises; every seam is
+    injectable so tests never spawn a real subprocess, hit the network, or
+    touch a real filesystem beyond `tmp_path`. `home_root` lets tests confine
+    the throwaway `mkdtemp` under `tmp_path`; `None` (production) uses the
+    OS default temp directory, same as `default_out_dir`.
+
+    On any failure — before or during boot — teardown still runs: kill the
+    process if one was spawned and is still alive, and always remove the
+    throwaway HOME. Nothing is left running or on disk outside `out_dir`.
+    """
+    home = None
+    process = None
+    fh = None
+    port = 0
+    try:
+        try:
+            port = pick_port()
+        except OSError as exc:
+            yield HermeticBackend(mode="failed",
+                                   detail=f"{type(exc).__name__}: {exc}",
+                                   cause="port-unavailable")
+            return
+
+        try:
+            home = Path(tempfile.mkdtemp(prefix="nh-walk-home-", dir=home_root))
+            config.ensure_private_dir(home / ".no_human")
+            config.atomic_write_0600(
+                home / ".no_human" / "config.yaml",
+                f"server:\n  host: 127.0.0.1\n  port: {port}\n",
+            )
+        except Exception as exc:
+            yield HermeticBackend(mode="failed", home=str(home or ""),
+                                   port=port,
+                                   detail=f"{type(exc).__name__}: {exc}",
+                                   cause="home-seed-failed")
+            return
+
+        api_target = f"http://127.0.0.1:{port}"
+        out_dir = Path(out_dir)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fh = open(out_dir / _HERMETIC_API_LOG, "wb")
+            process = spawn(
+                _hermetic_start_argv(port),
+                env={**os.environ, "HOME": str(home), "USERPROFILE": str(home),
+                     "NO_HUMAN_HOME": str(home / ".no_human")},
+                cwd=str(home), stdout=fh, stderr=subprocess.STDOUT,
+                **proc.hidden_console_kwargs(new_group=True),
+            )
+        except OSError as exc:
+            yield HermeticBackend(mode="failed", home=str(home), port=port,
+                                   api_target=api_target,
+                                   detail=f"{type(exc).__name__}: {exc}",
+                                   cause="spawn-failed")
+            return
+
+        probe_url = api_target + _HERMETIC_READY_PATH
+        outcome = HermeticBackend(mode="failed", home=str(home), port=port,
+                                   api_target=api_target)
+        started = clock()
+        try:
+            while clock() - started < _HERMETIC_READY_TIMEOUT_S:
+                rc = process.poll()
+                if rc is not None:
+                    outcome.cause = "exited-early"
+                    outcome.detail = f"exit code {rc}"
+                    break
+                try:
+                    ok = reachable(probe_url)
+                except Exception:
+                    ok = False
+                if ok:
+                    outcome.mode = "armed"
+                    break
+                await sleep(_READY_POLL_S)
+            else:
+                outcome.cause = "timeout"
+
+            try:
+                yield outcome
+            finally:
+                # `poll() is None` guards this so a process that exited early
+                # (or was already reaped) is never killed twice.
+                with contextlib.suppress(Exception):
+                    if process.poll() is None:
+                        kill(process)
+                with contextlib.suppress(Exception):
+                    if fh is not None:
+                        fh.flush()
+                with contextlib.suppress(Exception):
+                    log_bytes = (out_dir / _HERMETIC_API_LOG).read_bytes()[-2048:]
+                    outcome.detail = log_bytes.decode("utf-8", "replace").replace("\n", " ")
+        finally:
+            if fh is not None:
+                with contextlib.suppress(Exception):
+                    fh.close()
+    finally:
+        if home is not None:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(home, ignore_errors=True)
 
 
 def _png_size(data: bytes, fallback: dict) -> tuple[int, int]:

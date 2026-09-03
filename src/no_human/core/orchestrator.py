@@ -20391,13 +20391,54 @@ SIX of them read a checkpoint and TWO do not — but do
         except Exception:  # noqa: BLE001 — bad manifest: skip the boot, `run` reports it
             manifest_base_url = ""
         srv: "ui_evidence.DevServerOutcome | None" = None
-        cm = (
-            ui_evidence.dev_server(Path(repo.path), ui_conf or {}, manifest_base_url, out_dir)
-            if manifest_base_url else contextlib.nullcontext(None)
+        # A dev server never boots straight at the operator's live `:8420`
+        # board any more: when there IS a manifest base_url, arm a throwaway-
+        # HOME `nh start` first and only ever hand `dev_server` its
+        # `api_target` (never the real one). `hb is None` (no manifest
+        # base_url) reproduces today's plain `nullcontext` path unchanged.
+        hb_cm = (
+            ui_evidence.hermetic_backend(out_dir) if manifest_base_url
+            else contextlib.nullcontext(None)
         )
         try:
-            async with cm as srv:
-                result = await ui_evidence.run(Path(repo.path), out_dir)
+            async with hb_cm as hb:
+                if hb is not None and hb.mode == "failed":
+                    self._advisory(
+                        f"walk_skip::hermetic_backend_init_failed: {hb.detail}")
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return self._ui_evidence_skipped(
+                        f"the hermetic walk backend failed to start ({hb.cause})")
+                cm = (
+                    ui_evidence.dev_server(
+                        Path(repo.path), ui_conf or {}, manifest_base_url, out_dir,
+                        extra_env={"VITE_API_TARGET": hb.api_target} if hb else None)
+                    if manifest_base_url else contextlib.nullcontext(None)
+                )
+                async with cm as srv:
+                    if hb is not None and srv is not None and srv.mode == "pre-existing":
+                        # Already-running dev server proxies wherever IT was
+                        # configured — the harness cannot verify that target
+                        # is the hermetic one, so this is the exact live-
+                        # config blast radius the hermetic backend exists to
+                        # close. Skip rather than trust it.
+                        self._advisory(
+                            "walk_skip::hermetic_backend_not_bound: pre-existing "
+                            f"dev server at {manifest_base_url}")
+                        shutil.rmtree(out_dir, ignore_errors=True)
+                        # `manifest_base_url` is coder/manifest-controlled, same
+                        # as `server.base_url` in the sibling `pre-existing`
+                        # disclosure below — sanitize it the same way (strip
+                        # newlines, replace backticks, cap length) before it
+                        # reaches the PR body; `_ui_evidence_skipped` itself
+                        # does not sanitize its `reason` argument.
+                        safe_url = (manifest_base_url or "").strip().replace(
+                            "\n", " ").replace("`", "'")
+                        if len(safe_url) > 120:
+                            safe_url = safe_url[:117] + "..."
+                        return self._ui_evidence_skipped(
+                            f"a pre-existing dev server at {safe_url} "
+                            "could not be bound to the hermetic backend")
+                    result = await ui_evidence.run(Path(repo.path), out_dir)
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
             # promise; it fails the same way every other evidence gather here

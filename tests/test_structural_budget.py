@@ -335,9 +335,19 @@ FROZEN_FILE_LINES = {
     # _kill_dev_server test coverage). Measured with the scanner below after
     # rebasing onto the role-backend landing, never summed by hand.
     # 21136 -> 21147 (+11): the direct-unwind cancel-reason write (guard +
-    # reasoning comment) in _run_attempt. Measured on this tree with the
-    # scanner below.
-    "core/orchestrator.py": 21147,
+    # reasoning comment) in _run_attempt, landed on main (de401ec99) ahead of
+    # this branch's base.
+    #
+    # 21147 -> 21188 (+41, rebased onto the above): `_maybe_capture_ui_evidence`
+    # now arms `ui_evidence.hermetic_backend` (a throwaway-HOME `nh start`)
+    # before `dev_server`, and skips the walk with a disclosed
+    # `walk_skip::hermetic_backend_*` reason when it fails to arm or when a
+    # pre-existing dev server can't be bound to it — the fix for a walk being
+    # able to write into the operator's live `~/.no_human/config.yaml` via a
+    # dev server that proxied straight at the real `:8420` board. Measured on
+    # this rebased tree with the scanner below (`len(Path(...).read_text().
+    # splitlines())`), never summed by hand.
+    "core/orchestrator.py": 21188,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

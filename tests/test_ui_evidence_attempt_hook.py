@@ -217,6 +217,40 @@ def _wire_fake_dev_server(monkeypatch, *, spawn, reachable, kill=None, clock=Non
     monkeypatch.setattr(orch_mod.ui_evidence, "dev_server", fake)
 
 
+def _wire_fake_hermetic_backend(monkeypatch, *, spawn, reachable, pick_port=None,
+                                kill=None, clock=None, home_root=None):
+    """Patch `orch_mod.ui_evidence.hermetic_backend` to the REAL function with
+    only its spawn/reachable/pick_port/kill/clock seams overridden — same
+    shape as `_wire_fake_dev_server`: `_maybe_capture_ui_evidence` still
+    calls the real state machine (and its real `dev_server` afterwards) and
+    only the OS subprocess, ephemeral-port bind, and network probe
+    underneath `hermetic_backend` are faked."""
+    real_hermetic_backend = ui_evidence.hermetic_backend
+    fake = functools.partial(
+        real_hermetic_backend, spawn=spawn, reachable=reachable,
+        pick_port=pick_port or (lambda: 54321),
+        kill=kill or _kill_recorder([]), clock=clock or (lambda: 0.0),
+        sleep=_no_sleep, home_root=home_root,
+    )
+    monkeypatch.setattr(orch_mod.ui_evidence, "hermetic_backend", fake)
+
+
+def _wire_armed_hermetic_backend(monkeypatch, tmp_path):
+    """Every manifest with a `base_url` now arms a hermetic backend before
+    `dev_server` even runs (D2-hermetic) — a test whose point is `dev_
+    server`'s own behavior, not the hermetic backend's, wires this so that
+    backend arms instantly on its first readiness probe and never touches a
+    real subprocess/port/HOME. `home_root=tmp_path` confines the (faked, so
+    never actually created by a real `nh start`) throwaway HOME bookkeeping
+    to this test's own tmpdir, never the real machine."""
+    _wire_fake_hermetic_backend(
+        monkeypatch,
+        spawn=_spawn_recorder([], _FakeDevServerProc(pid=8888)),
+        reachable=lambda url: True,
+        home_root=tmp_path,
+    )
+
+
 async def test_ui_touching_diff_invokes_the_walk_and_embeds_the_pr_media(
         repo_env, tmp_path, store, monkeypatch):
     def mutate(cwd):
@@ -241,6 +275,7 @@ async def test_ui_touching_diff_invokes_the_walk_and_embeds_the_pr_media(
                         lambda self, remote="origin": "https://github.com/acme/widget.git")
     fake_open_pr, opens = _fake_open_pr()
     monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     cfg = _config(tmp_path)
     orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
@@ -464,6 +499,7 @@ async def test_booted_dev_server_is_disclosed_in_the_pr_body_and_stopped(
         reachable=reachable,
         kill=_kill_recorder(kill_calls),
     )
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     calls: list[dict] = []
     monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
@@ -507,9 +543,13 @@ async def test_booted_dev_server_is_disclosed_in_the_pr_body_and_stopped(
 
 async def test_pre_existing_dev_server_is_disclosed(
         repo_env, tmp_path, store, monkeypatch):
-    """When something already answers at the manifest's `base_url`, the
-    harness must never spawn or kill anything — it only discloses that it
-    walked against a pre-existing, unverified server."""
+    """D2-hermetic (2026-09-03): when something already answers at the
+    manifest's `base_url`, the harness cannot verify that pre-existing
+    server proxies at the hermetic backend rather than the operator's live
+    `:8420` board — the exact blast radius the hermetic backend exists to
+    close — so it must never spawn or kill anything AND must never run the
+    walk against it; it only discloses the skip. This REPLACES the pre-
+    hermetic walk-and-disclose behavior for this scenario (PLAN.md)."""
     base_url = "http://127.0.0.1:5299"
     start_cmd = "python -m http.server 5299"
 
@@ -531,6 +571,7 @@ async def test_pre_existing_dev_server_is_disclosed(
         reachable=lambda url: True,  # already up, at every URL asked about
         kill=_kill_recorder(kill_calls),
     )
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     calls: list[dict] = []
     monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
@@ -558,16 +599,16 @@ async def test_pre_existing_dev_server_is_disclosed(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
-    assert len(calls) == 1, f"expected exactly one ui_evidence.run() call, got {calls}"
+    assert calls == [], f"a pre-existing server that can't bind to the hermetic " \
+        f"backend must never be walked: {calls}"
     assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
     assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
 
     body = opens[-1]["body"]
     assert "## UI evidence" in body, body
     assert (
-        f"Dev server was already running at {base_url} before the walk; "
-        "the harness did not start it and did not verify which checkout "
-        "it serves." in body
+        f"Visual proof skipped: a pre-existing dev server at {base_url} "
+        "could not be bound to the hermetic backend" in body
     ), body
     assert "booted by the harness" not in body, body
 
@@ -578,10 +619,15 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     — `_base_url_problem` only checks scheme + loopback hostname, so a value
     carrying a backtick or an embedded newline in its path still passes
     validation (`urlsplit` ignores those characters for `.hostname`, but the
-    raw string keeps them). The pre-existing disclosure line must sanitize it
-    exactly like the sibling `booted` branch sanitizes `start_cmd`: strip
-    newlines, replace backticks, and cap the length — never inject the raw
-    manifest string into the PR body."""
+    raw string keeps them). D2-hermetic (2026-09-03): a pre-existing server
+    can no longer be walked at all (see
+    `test_pre_existing_dev_server_is_disclosed`) — this is now the
+    regression test for the `hermetic_backend_not_bound` skip line's own
+    sanitization, which must sanitize the coder-controlled `base_url`
+    exactly like the sibling `booted`/`boot-failed` disclosures sanitize
+    their own coder/manifest-controlled strings: strip newlines, replace
+    backticks, and cap the length — never inject the raw manifest string
+    into the PR body."""
     raw_base_url = "http://127.0.0.1:5299/evil`)\ninjected"
     start_cmd = "python -m http.server 5299"
 
@@ -603,6 +649,7 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
         reachable=lambda url: True,  # already up, at every URL asked about
         kill=_kill_recorder(kill_calls),
     )
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     calls: list[dict] = []
     monkeypatch.setattr(orch_mod.ui_evidence, "run", _fake_ui_evidence_run(calls))
@@ -631,6 +678,8 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert calls == [], f"a pre-existing server that can't bind to the hermetic " \
+        f"backend must never be walked: {calls}"
     assert spawn_calls == [], f"a pre-existing server must never be spawned over: {spawn_calls}"
     assert kill_calls == [], f"a pre-existing server must never be killed: {kill_calls}"
 
@@ -640,10 +689,9 @@ async def test_pre_existing_disclosure_sanitizes_a_coder_controlled_base_url(
     assert "`)\ninjected" not in body, body
     assert "evil`)" not in body, body
     assert (
-        "Dev server was already running at "
-        "http://127.0.0.1:5299/evil') injected before the walk; "
-        "the harness did not start it and did not verify which checkout "
-        "it serves." in body
+        "Visual proof skipped: a pre-existing dev server at "
+        "http://127.0.0.1:5299/evil') injected "
+        "could not be bound to the hermetic backend" in body
     ), body
 
 
@@ -690,6 +738,7 @@ async def test_boot_failed_skip_line_names_the_url_not_the_log(
         kill=_kill_recorder(kill_calls),
         clock=_StepClock([0.0, 999.0]),
     )
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -780,6 +829,7 @@ async def test_boot_failed_skip_line_says_failed_to_start_when_the_spawn_fails(
         reachable=lambda url: False,
         kill=_kill_recorder(kill_calls),
     )
+    _wire_armed_hermetic_backend(monkeypatch, tmp_path)
 
     calls: list[dict] = []
     monkeypatch.setattr(

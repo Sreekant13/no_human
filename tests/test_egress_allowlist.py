@@ -850,13 +850,22 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
 
     "testing/ui_evidence.py": {
         "exec:<dynamic>": Allowed(
-            "the repo's OWN dev server — `dev_server` spawns the profile's "
-            "`ui_evidence.start_cmd` in the attempt's worktree so the walk "
-            "has something to walk, and kills the process group afterwards",
-            _CFG + "ui_evidence.enabled — and, past that, only when the "
-            "repo's own profile sets a `start_cmd` (absent from "
+            "two spawns, both loopback-only: `dev_server` spawns the "
+            "profile's OWN `ui_evidence.start_cmd` in the attempt's "
+            "worktree so the walk has something to walk (kills the process "
+            "group afterwards); `hermetic_backend` separately spawns an "
+            "ISOLATED `nh start` (the existing command, no new CLI surface) "
+            "under a throwaway `HOME`/`NO_HUMAN_HOME` on an ephemeral port, "
+            "so a walk step that clicks Save/Reset-to-defaults can never "
+            "write into the operator's real `~/.no_human/config.yaml` — "
+            "torn down (killed, `HOME` rmtree'd) every time",
+            _CFG + "ui_evidence.enabled — and, past that, `dev_server` only "
+            "when the repo's own profile sets a `start_cmd` (absent from "
             "DEFAULT_CONFIG: it is a per-repo profile field, empty by "
-            "default) and the manifest base_url is loopback"),
+            "default) and the manifest base_url is loopback; "
+            "`hermetic_backend` runs whenever the manifest has a base_url at "
+            "all — it is the harness's own throwaway backend, not something "
+            "a profile configures"),
         "http:urllib.request": Allowed(
             "the attempt's OWN dev server — one GET of base_url as a readiness "
             "probe before the browser walk (`_reachable`)",
@@ -872,6 +881,15 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "can reference fonts, scripts or beacons on any host, and the "
             "browser fetches those like any browser would",
             _CFG + "ui_evidence.enabled"),
+        "sock:socket": Allowed(
+            "nothing external — `_pick_ephemeral_port` binds "
+            "`(\"127.0.0.1\", 0)`, reads back the OS-assigned port number, "
+            "and immediately closes the socket; it exists only so "
+            "`hermetic_backend` can hand its throwaway `nh start` a free "
+            "loopback port instead of a fixed one",
+            "loopback: the bind address is the literal string "
+            "\"127.0.0.1\" — not configurable, not derived from a "
+            "profile or base_url"),
     },
     "ci/jenkins_session.py": {
         "sdk:playwright": Allowed(
@@ -2042,16 +2060,18 @@ def test_loopback_entries_really_bind_loopback() -> None:
             if entry.gate.startswith("loopback:"):
                 checked += 1
                 assert "127.0.0.1" in (PKG / module).read_text(), (module, channel)
-    # 12 = the 10 that predate the UI evidence runner, + its readiness probe
+    # 13 = the 10 that predate the UI evidence runner, + its readiness probe
     # (one connection to a validated 127.0.0.1/localhost base_url, redirects
     # refused), + `cli/pool_probe.py`, which is `nh status`'s queue-health GET
     # split out of cli/commands.py — a move of an existing channel, not a new
-    # destination. The runner's BROWSER is deliberately NOT loopback: a page it
+    # destination, + `hermetic_backend`'s `_pick_ephemeral_port`, which binds
+    # the literal "127.0.0.1" to find a free port for its throwaway `nh
+    # start`. The runner's BROWSER is deliberately NOT loopback: a page it
     # loads can fetch from anywhere, so that channel is config-gated instead.
-    # + `api/local_boundary.py`, the Host/Origin boundary split out of
-    # api/app.py — the check that DEFINES loopback for the board, not a new
-    # destination.
-    assert checked == 13, f"expected 13 loopback channels, found {checked}"
+    # + `api/local_boundary.py` (the Host/Origin boundary split out of
+    # api/app.py) AND the hermetic walk backend's loopback channel — two
+    # independent +1s over the same base, merged: 14.
+    assert checked == 14, f"expected 14 loopback channels, found {checked}"
 
 
 def test_no_unused_local_classifications() -> None:
