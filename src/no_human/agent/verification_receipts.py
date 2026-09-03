@@ -758,7 +758,7 @@ KIND_LABELS: dict[str, str] = {
 }
 
 
-def fold_by_kind(rows: list[dict]) -> str:
+def fold_by_kind(rows: list[dict], *, anchors: dict[str, str] | None = None) -> str:
     """The PR body's verification digest (#23): one `<details>` per receipt
     kind, in `KINDS` order, unknown kinds last. The summary names the kind
     and the LAST command of that kind — the one that describes the tree that
@@ -770,6 +770,10 @@ def fold_by_kind(rows: list[dict]) -> str:
     The command is model-chosen text rendered inside an HTML `<summary>`, so
     it is HTML-escaped — `md_inline_code` neutralises markdown, not a
     `</summary>`. The excerpt goes through `md_fence` for the same reason.
+
+    *anchors* (kind → URL, from `core/evidence_ledger.py`) adds a
+    `full log` link to a kind's summary that opens the ledger's copy of the
+    log on that command's line. Absent or missing a kind: no link.
     """
     by_kind: dict[str, list[dict]] = {}
     for r in rows:
@@ -790,9 +794,11 @@ def fold_by_kind(rows: list[dict]) -> str:
                           f"characters of output in total_")
         else:
             inner = "_nothing was captured on stdout or stderr for this command._"
+        href = (anchors or {}).get(kind)
+        link = f' · <a href="{html.escape(href, quote=True)}">full log</a>' if href else ""
         folds.append(
             f"<details><summary><b>{KIND_LABELS.get(kind, 'Other')}</b>{runs} — "
-            f"<code>{cmd}</code></summary>\n\n{inner}\n\n</details>")
+            f"<code>{cmd}</code>{link}</summary>\n\n{inner}\n\n</details>")
     return "\n".join(folds)
 
 

@@ -26,7 +26,21 @@ table's cells so nothing is rendered twice; absent when no gate has a
 verdict.
 
 **Evidence** — one table of mechanical facts, gathered once from the
-attempt's gate outputs:
+attempt's gate outputs. On a GitHub remote each row whose gate produced a
+file ends with a `proof` link to the file behind it on the task's `nh-evidence/<task-id>` side branch — the
+**evidence ledger** (`core/evidence_ledger.py`): one file per row
+(`review.md`, `tests.md`, `verifiers.md`, `tamper.md`, `merge-policy.md`,
+plus `verification.md`, `assumptions.md` and a `README.md`), each opening
+with what it is (a harness-captured record, not model-authored), written
+from the same evidence object the table renders from, and committed and
+pushed before the body is built. Every link names the ledger COMMIT, never
+the branch, so what a body points at cannot be rewritten afterwards. A gate
+that produced nothing gets no file and no link (nor does a review whose
+rounds judged a different commit, or the CI row). The ledger is best-effort:
+on a non-GitHub remote, or when the push fails, the rows render exactly as
+they did without it. The same side branch carries the UI-evidence media,
+which stays where it was; the squash-land and the tamper guard ignore the
+directory as before.
 
 | Check | What the cell is |
 |---|---|
@@ -68,7 +82,9 @@ fold_by_kind`): the summary line names the kind and the LAST command of that
 kind, with the run count when there were several, so the section reads in as
 many lines as there were kinds; opening a fold shows that command's captured
 output, fenced. Earlier runs of a kind — a failing mid-work pytest — never
-reach the body. Under the folds, a short paragraph names where the full log lives:
+reach the body. When the ledger was delivered, each fold's summary also
+carries a `full log` link that opens the ledger's `verification.md` on that
+command's line. Under the folds, a short paragraph names where the full log lives:
 every command line a hook saw the coder's session submit to the shell and the
 text the harness returned (the model does not author an entry and cannot edit
 one) is posted, in full, as its own PR comment (below) — the copy every
