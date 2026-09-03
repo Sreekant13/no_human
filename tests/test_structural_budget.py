@@ -435,7 +435,13 @@ FROZEN_FILE_LINES = {
     # `merge_context` call clears the marker on fresh approval (+7/-4 per
     # `git diff --numstat 4db9fd316 c39dd98aa -- src/no_human/cli/commands.py`).
     # Measured on this tree with the scanner below.
-    "cli/commands.py": 8412,
+    # 8412 -> 8423 (+11): `_approve_go_single` echoes `result.gate_reason` on
+    # both the `failed` (+8) and `done` (+2) branches so a full-gate failure
+    # isn't mistaken for the cheaper focused one, and `approve()` resolves
+    # the attempt's tested commit via `latest_attempt_branch` and threads it
+    # into `land_task(..., tested_commit_sha=tested)` (+1 net: 2 added lines,
+    # 1 modified in place). Measured on this tree with the scanner below.
+    "cli/commands.py": 8423,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -618,7 +624,11 @@ FROZEN_FILE_LINES = {
     # 3544 -> 3546 (+2): telemetry.endpoint's DEFAULT_CONFIG comment
     # re-worded for PostHog-by-default routing (telemetry.py:_destination).
     # Measured on this tree.
-    "config.py": 3546,
+    # 3546 -> 3554 (+8): `approve_merge.full_test_timeout_seconds` (5400s) and
+    # its explanatory comment — the timeout for the merge-time FULL gate that
+    # runs when the squash tree diverges from the tested attempt's tree
+    # (vcs/approve_merge.py `_decide_gate`). Measured on this tree.
+    "config.py": 3554,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

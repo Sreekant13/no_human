@@ -919,6 +919,236 @@ def test_change_scoped_tests_run_against_worktree(land_env, tmp_path, monkeypatc
     assert recorded_pythonpath.endswith(f"{os.sep}src")
 
 
+# --------------------------------------------------------------------------- #
+# merge-time gate: focused vs. full, decided by tree comparison               #
+# --------------------------------------------------------------------------- #
+#
+# Every test below monkeypatches `approve_merge._run_pytest` — the sole seam
+# `land_task`'s step 6b shells out to pytest through — with a recorder, so no
+# real suite is ever invoked here. `test_change_scoped_tests_run_against_
+# worktree` above deliberately does NOT patch it (proving the full gate's
+# real subprocess still discovers and runs a change-scoped test file when it
+# falls back to "full"); everything below is about the GATE DECISION itself.
+
+
+def _patch_run_pytest(monkeypatch, *, returncode=0):
+    calls = []
+
+    def _fake(argv, *, cwd, timeout, env):
+        calls.append({"argv": list(argv), "cwd": cwd, "timeout": timeout})
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+    monkeypatch.setattr("no_human.vcs.approve_merge._run_pytest", _fake)
+    return calls
+
+
+def test_diverged_tree_runs_the_full_gate_before_push(land_env, monkeypatch):
+    """A conflict-round-style divergence: the recorded tested commit is the
+    tip the branch was cut from, but the squash result's tree (branch tip
+    + the squash-derived RELEASE_MANIFEST.txt) is not byte-identical to it
+    — this is exactly what happened on 201baa8: the focused gate ran on a
+    tree the full suite never actually saw."""
+    calls = _patch_run_pytest(monkeypatch, returncode=0)
+    base_sha = land_env.remote_main_sha()
+    branch, head_sha = land_env.cut_branch("no-human/t-diverged")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha=base_sha,
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "full"
+    assert "diverged" in result.gate_reason
+    assert base_sha[:12] in result.gate_reason
+    assert len(calls) == 1
+    assert calls[0]["argv"][:3] == [sys.executable, "-m", "pytest"]
+    # no explicit test paths -- pytest discovers the whole worktree itself
+    assert "-q" in calls[0]["argv"]
+    assert not any(a.endswith(".py") for a in calls[0]["argv"])
+
+
+def test_full_gate_failure_blocks_the_push(land_env, monkeypatch):
+    calls = _patch_run_pytest(monkeypatch, returncode=1)
+    before = land_env.remote_main_sha()
+    branch, head_sha = land_env.cut_branch("no-human/t-fullfail")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha="",
+    )
+    assert not result.ok
+    assert result.step == "tests"
+    assert result.gate == "full"
+    assert len(calls) == 1
+    assert land_env.remote_main_sha() == before, \
+        "a failed full gate must never push"
+
+
+def _pin_branch_head(land_env) -> str:
+    """Re-pin RELEASE_MANIFEST.txt at the branch's own HEAD and amend — what
+    a real coder attempt is required to do before pushing a new/changed
+    ship-classified file (the EXPORT GATE: re-pin via `export_guard.py
+    approve` in the same commit). `cut_branch` deliberately leaves this
+    UNDONE (most gate tests below want a divergent tree, exactly like a real
+    attempt that forgot to re-pin); the two "matching tree" tests need a
+    branch tip whose manifest is byte-identical to what the squash step's
+    own re-approve of the changed ship file would independently derive from
+    the SAME tip — running `approve` with no path args re-pins every shipped
+    file from its current on-disk content, so it reproduces that derivation
+    exactly regardless of whether `corrupt_manifest` wiped the manifest."""
+    clone = land_env.clone
+    subprocess.run([sys.executable, "scripts/export_guard.py", "approve"],
+                    cwd=clone, check=True, capture_output=True, text=True)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "--amend", "--no-edit", "-q")
+    _git(clone, "push", "-q", "-f", "origin", "HEAD")
+    return _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_matching_tree_keeps_the_focused_gate(land_env, monkeypatch):
+    calls = _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch(
+        "no-human/t-matching",
+        extra_files={"tests/test_feature.py": "def test_x():\n    assert True\n"},
+    )
+    head_sha = _pin_branch_head(land_env)
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha=head_sha,
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "focused"
+    assert "matches tested attempt" in result.gate_reason
+    assert head_sha[:12] in result.gate_reason
+    assert len(calls) == 1
+    assert calls[0]["argv"] == [sys.executable, "-m", "pytest", "-q", "tests/test_feature.py"]
+
+
+def test_moved_base_counts_as_divergence(land_env, monkeypatch):
+    """The attempt tested its branch against ONE base tip; a concurrent
+    push (another task landing, a human commit) moves the default branch
+    before this task's `nh approve` runs — the squash-result tree can no
+    longer match the tested one even with an otherwise-clean squash, so
+    this must fall back to the full gate exactly like an in-band conflict
+    round would."""
+    calls = _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch("no-human/t-movedbase")
+    land_env.advance_origin("moved-base-before-land")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha=head_sha,
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "full"
+    assert "diverged" in result.gate_reason
+    assert len(calls) == 1
+
+
+def test_unknown_tested_commit_runs_the_full_gate(land_env, monkeypatch):
+    calls = _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch("no-human/t-notested")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha="",
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "full"
+    assert "no recorded tested-attempt tree" in result.gate_reason
+    assert len(calls) == 1
+
+
+def test_unresolvable_tested_commit_runs_the_full_gate(land_env, monkeypatch):
+    calls = _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch("no-human/t-badsha")
+    bogus = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha=bogus,
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "full"
+    assert "does not resolve here" in result.gate_reason
+    assert bogus[:12] in result.gate_reason
+    assert len(calls) == 1
+
+
+def test_full_gate_exit_code_5_is_not_a_landing_failure(land_env, monkeypatch):
+    """rc=5 is pytest's own "no tests were collected" — a hermetic fixture
+    repo with nothing under `tests/` for the full run to discover must not
+    block a landing that would otherwise succeed; it's annotated onto the
+    gate reason instead."""
+    calls = _patch_run_pytest(monkeypatch, returncode=5)
+    branch, head_sha = land_env.cut_branch("no-human/t-nocollect")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha="",
+    )
+    assert result.ok, result.stderr
+    assert result.gate == "full"
+    assert "no tests collected" in result.gate_reason
+    assert len(calls) == 1
+
+
+def test_land_result_message_names_the_gate(land_env, monkeypatch):
+    _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch("no-human/t-message")
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config, tested_commit_sha=head_sha,
+    )
+    assert result.ok, result.stderr
+    assert result.gate_reason in result.message
+    assert "gate:" in result.message
+
+
+def test_cli_approve_prints_the_gate_that_ran(land_env, tmp_path, monkeypatch):
+    _patch_run_pytest(monkeypatch, returncode=0)
+    branch, head_sha = land_env.cut_branch("no-human/t-cligate")
+    head_sha = _pin_branch_head(land_env)
+    db = tmp_path / "t.db"
+    task_id = _seed_land_task(
+        db, TaskStatus.AWAITING_APPROVAL, repo_path=str(land_env.clone),
+        branch=branch, pr_url=land_env.pr_url,
+        review_history=[{"sha": head_sha, "passed": True}],
+        attempt_commit_sha=head_sha,
+    )
+    runner = _make_cli_runner(db, land_env.config, monkeypatch)
+    result = runner.invoke(cli, ["approve", task_id[:8]])
+    assert result.exit_code == 0, result.output
+    assert "gate: focused" in result.output, result.output
+    assert head_sha[:12] in result.output
+
+
+def test_cli_approve_passes_the_recorded_attempt_commit(land_env, tmp_path, monkeypatch):
+    branch, head_sha = land_env.cut_branch("no-human/t-clitested")
+    db = tmp_path / "t.db"
+    task_id = _seed_land_task(
+        db, TaskStatus.AWAITING_APPROVAL, repo_path=str(land_env.clone),
+        branch=branch, pr_url=land_env.pr_url,
+        review_history=[{"sha": head_sha, "passed": True}],
+        attempt_commit_sha=head_sha,
+    )
+    captured = {}
+
+    def _fake_land_task(*, repo_path, branch, pr_url, task_id, task_title,
+                          review_evidence, config, on_step=None, **kwargs):
+        captured.update(kwargs)
+        return LandResult(ok=True, step="close_pr", landed_sha="a" * 40,
+                           pr_url=pr_url, branch=branch, message="landed")
+
+    monkeypatch.setattr("no_human.vcs.approve_merge.land_task", _fake_land_task)
+    runner = _make_cli_runner(db, land_env.config, monkeypatch)
+    result = runner.invoke(cli, ["approve", task_id[:8]])
+    assert result.exit_code == 0, result.output
+    assert captured.get("tested_commit_sha") == head_sha
+
+
 def test_push_advances_remote_ref(land_env):
     branch, head_sha = land_env.cut_branch("no-human/t-push")
     result = land_task(
@@ -1245,7 +1475,15 @@ def _make_cli_runner(db_path, config_data, monkeypatch) -> CliRunner:
 
 def _seed_land_task(db_path, status, *, repo_path, branch=None, pr_url=None,
                     review_history=None, title="Fix the thing",
-                    task_id=None, base_branch=None) -> str:
+                    task_id=None, base_branch=None,
+                    attempt_branch=None, attempt_commit_sha=None) -> str:
+    """`attempt_branch`/`attempt_commit_sha` seed one `attempts` row (branch
+    defaults to `branch` when omitted) so `Store.latest_attempt_branch` — the
+    source `nh approve` reads `tested_commit_sha` from — has something to
+    return. Neither existed before this task; every existing caller omits
+    them, so `latest_attempt_branch` keeps returning `{"branch": "",
+    "commit_sha": ""}` for them exactly as it did before this pair of
+    keywords was added."""
     async def _go():
         async with Store(db_path) as s:
             t = Task.new(title, repo_path=repo_path)
@@ -1264,6 +1502,12 @@ def _seed_land_task(db_path, status, *, repo_path, branch=None, pr_url=None,
                 ctx["base_branch"] = base_branch
             if ctx:
                 await s.merge_context(t.id, ctx)
+            if attempt_commit_sha is not None:
+                attempt_id = await s.create_attempt(t.id, 1)
+                await s.update_attempt(
+                    attempt_id, branch_name=attempt_branch or branch or "",
+                    commit_sha=attempt_commit_sha,
+                )
             if status is not TaskStatus.PENDING:
                 await s.set_status(t, status, validate=False)
             return t.id

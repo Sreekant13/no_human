@@ -1552,6 +1552,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "approve_merge": {
         "enabled": True,
         "test_timeout_seconds": 1800,
+        # Timeout for the FULL suite, run instead of the focused (change-
+        # scoped) gate when the squash result's tree diverges from (or is
+        # unknown relative to) the attempt's recorded tested tree — conflict
+        # rounds/a moved base mean the attempt-time full-suite evidence no
+        # longer describes what's about to land (vcs/approve_merge.py
+        # `_decide_gate`). Longer than `test_timeout_seconds` because it's the
+        # whole suite, not a change-scoped slice.
+        "full_test_timeout_seconds": 5400,
     },
     "git": {
         "branch_prefix": "no-human/",

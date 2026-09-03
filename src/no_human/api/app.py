@@ -1692,11 +1692,12 @@ async def _merge_task_pr(
     if not passed:
         return "", {"step": "preconditions", "stderr": evidence}
 
+    tested = (await store.latest_attempt_branch(task.id)).get("commit_sha") or ""
     result = await asyncio.to_thread(
         land_task,
         repo_path=task.repo_path, branch=branch, pr_url=pr_url,
         task_id=task.id, task_title=task.title, review_evidence=evidence,
-        config=config.data, on_step=on_step,
+        config=config.data, on_step=on_step, tested_commit_sha=tested,
     )
     if result.skipped:
         return "", None

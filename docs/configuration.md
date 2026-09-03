@@ -30,6 +30,7 @@ changes in code and not here fails the suite.
 | `usage_ledger.retention_days` | `90` | Age past which `unattributed_usage` rows are rolled up (not deleted — totals stay exact, per-row `ts`/`task_id` detail is lost); `0` disables compaction |
 | `approve_merge.enabled` | `true` | Whether `nh approve` lands the PR itself — squash the branch into one commit, push the default branch, close the PR. `false` records the approval and leaves the merge to you; neither is a failure |
 | `approve_merge.test_timeout_seconds` | `1800` | Wall-clock seconds the change-scoped test run that gates a landing gets. Exceeding it fails the landing at the test step, so nothing is pushed |
+| `approve_merge.full_test_timeout_seconds` | `5400` | Wall-clock seconds the FULL suite gets when it runs instead of the change-scoped one — squash result's tree diverges from (or is unknown relative to) the attempt's recorded tested tree. Exceeding it fails the landing at the test step, so nothing is pushed |
 | `review.post_checklist_comment` | `true` | Post the independent reviewer's checklist (verdict, rounds, every finding with severity and `file:line`) as its own PR comment, once per commit. `false` skips posting — the checklist still lives in the DB and the PR body's one-row summary, just not as its own comment |
 
 Review depth scales with diff size: a gate review of a diff at or under
@@ -229,6 +230,16 @@ PR or no `gh` on PATH; none of those is a failure.
 landing. Both defaults are in the table at the top of this file, which is
 pinned to `DEFAULT_CONFIG` by the suite; stating a default here as well would
 put an unguarded second copy in the file.
+
+Landing runs one of two test gates, never both: FOCUSED (change-scoped) when
+the squash result's tree is byte-for-byte the tree the attempt's recorded
+full-suite evidence ran on, or FULL — bounded by
+`approve_merge.full_test_timeout_seconds` — when it differs, or the attempt's
+tested tree is unknown or unresolvable. Conflict-round merges and a moved
+default branch are the common way a landed tree diverges from what was
+actually tested; the full gate re-establishes that evidence on what is
+about to be pushed instead of trusting a claim about a tree that no longer
+exists. `nh approve`'s output states which gate ran and why.
 
 `git.approve_identity.name`/`.email` is the identity the ONE commit `nh
 approve` lands when it squash-merges a PR is attributed to — the human merge

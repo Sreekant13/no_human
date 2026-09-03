@@ -37,8 +37,17 @@ The eight-step procedure, proven by hand before this module existed:
                         resolved `user.name`/`user.email` for the repo
                         (repo-local overriding global); if neither resolves,
                         the run refuses at the `preconditions` step.
-  6. verify + tests   — `export_guard.py verify`, then the task's
-                        change-scoped tests, both run IN the worktree.
+  6. verify + tests   — `export_guard.py verify`, then the merge-time test
+                        gate, both run IN the worktree. The gate is
+                        FOCUSED (the task's change-scoped tests) when the
+                        squash result's tree matches the tree the attempt's
+                        recorded full suite ran on; it is the FULL suite
+                        when that tree diverged (a conflict-round or
+                        supervisor commit landed on the branch, or the base
+                        moved) or the tested tree is unknown/unresolvable —
+                        a conflict round changes the tree, and the attempt's
+                        full-suite evidence is only ever attached to the
+                        tree it actually ran on.
   7. push             — re-check the tip has not moved, then push the landed
                         commit straight onto the remote's default branch ref
                         (a non-force push, so a raced tip is refused by git
@@ -83,6 +92,7 @@ STEPS = (
 
 _STDERR_CAP = 4000
 _DEFAULT_TEST_TIMEOUT_S = 1800
+_DEFAULT_FULL_TEST_TIMEOUT_S = 5400
 _APPROVE_TIMEOUT_S = 120
 _VERIFY_TIMEOUT_S = 120
 _GH_TIMEOUT_S = 30
@@ -110,6 +120,14 @@ class LandResult:
     #: EXPORT_CLASSIFICATION.txt by merge arithmetic — the human who approved
     #: must be able to see that a hand-maintained file was touched.
     reconciled: str = ""
+    #: Which merge-time test gate ran — "focused" (change-scoped tests) or
+    #: "full" (the whole suite, because the squash tree diverged from the
+    #: tested attempt's tree, or that tree is unknown). "" when the tests
+    #: step never ran (an earlier step failed first).
+    gate: str = ""
+    #: Human-readable reason behind ``gate`` — also folded into ``message``
+    #: on success and into ``stderr`` on a tests-step failure.
+    gate_reason: str = ""
 
 
 def _cap(text: str) -> str:
@@ -525,6 +543,46 @@ def _map_change_scoped_tests(root: Path, changed_files: list[str]) -> list[str]:
     return sorted(dict.fromkeys(tests))
 
 
+def _run_pytest(argv: list[str], *, cwd: Path, timeout: float,
+                 env: dict) -> subprocess.CompletedProcess:
+    """The one place `nh approve`'s merge-time gate shells out to pytest —
+    a seam so tests can pin WHICH set was invoked (focused vs. full)
+    without ever running it for real."""
+    return _sh(argv, cwd=cwd, timeout=timeout, env=env)
+
+
+def _tree_of(worktree_path: Path, commitish: str) -> str:
+    """The tree object *commitish* points at, resolved IN *worktree_path* —
+    "" if it does not resolve there (unknown sha, pruned branch, empty
+    string). Comparing trees (not commits) is deliberate: a squash landing
+    exactly its tested content produces the identical tree even though its
+    commit sha differs (new parent, new message)."""
+    if not commitish:
+        return ""
+    proc = _sh(["git", "rev-parse", "--verify", "--quiet",
+                f"{commitish}^{{tree}}"], cwd=worktree_path)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _decide_gate(landed_tree: str, tested_commit_sha: str,
+                  tested_tree: str) -> tuple[str, str]:
+    """Which merge-time test gate to run, and why — conservative by default
+    (an unknown or unresolvable tested tree runs the FULL suite, never the
+    cheap path): trees compare equal only when the squash result is
+    byte-for-byte the tree the attempt's recorded full suite passed on."""
+    if not tested_commit_sha:
+        return "full", "full (no recorded tested-attempt tree)"
+    if not tested_tree:
+        return "full", (f"full (tested attempt {tested_commit_sha[:12]} does not "
+                         "resolve here)")
+    if not landed_tree:
+        return "full", "full (could not resolve the squash-result tree)"
+    if landed_tree == tested_tree:
+        return "focused", f"focused (tree matches tested attempt {tested_commit_sha[:12]})"
+    return "full", (f"full (tree diverged from tested attempt "
+                     f"{tested_commit_sha[:12]}: conflict rounds or a moved base)")
+
+
 def _close_pr(pr_url: str, cwd: Path) -> str:
     """Close *pr_url* without a comment. Idempotent, best-effort: any problem
     (gh/glab missing, network, already handled) returns a note but never
@@ -599,6 +657,7 @@ def land_task(
     review_evidence: str,
     config: dict,
     changed_test_paths: list[str] | None = None,
+    tested_commit_sha: str = "",
     remote: str = "origin",
     _before_push: Callable[[], None] | None = None,
     on_step: Callable[[str], None] | None = None,
@@ -609,7 +668,16 @@ def land_task(
     ``config`` is a plain nested dict (``Config.data`` in production) —
     reads ``config["git"]`` (``agent_identity_name``/``_email``,
     ``never_push_to``, ``approve_identity``) and ``config["approve_merge"]``
-    (``enabled``, ``test_timeout_seconds``).
+    (``enabled``, ``test_timeout_seconds``, ``full_test_timeout_seconds``).
+
+    ``tested_commit_sha`` is the commit the task's ATTEMPT recorded its
+    full-suite pass on (``store.latest_attempt_branch(task_id)["commit_sha"]``
+    at the caller). If the squash result's tree matches that commit's tree,
+    the merge-time gate stays the cheap change-scoped set; if it diverged
+    (a conflict-round or supervisor commit landed on the branch, or the
+    base moved since) — or *tested_commit_sha* is empty or does not resolve
+    — the gate runs the FULL suite instead, since the full-suite evidence
+    attached to the PR is only ever valid for the tree it actually ran on.
 
     ``_before_push`` is a test-only seam: a callable invoked immediately
     before the push-time tip re-check, so a test can simulate a concurrent
@@ -676,6 +744,8 @@ def land_task(
         return LandResult(ok=False, step="preconditions", branch=branch,
                            pr_url=pr_url, stderr=_cap(ident_err))
     test_timeout = approve_cfg.get("test_timeout_seconds", _DEFAULT_TEST_TIMEOUT_S)
+    full_test_timeout = approve_cfg.get(
+        "full_test_timeout_seconds", _DEFAULT_FULL_TEST_TIMEOUT_S)
 
     # -- step 2: fetch + resolve the CURRENT default-branch tip ------------ #
     _step(on_step, "fetch")
@@ -725,7 +795,9 @@ def land_task(
             resolved_branch=resolved_branch, default=default, tip_sha=tip_sha,
             task_id=task_id, task_title=task_title, review_evidence=review_evidence,
             op_name=op_name, op_email=op_email, test_timeout=test_timeout,
+            full_test_timeout=full_test_timeout,
             pr_url=pr_url, changed_test_paths=changed_test_paths,
+            tested_commit_sha=tested_commit_sha,
             _before_push=_before_push, on_step=on_step,
         )
     finally:
@@ -761,8 +833,9 @@ def _land_in_worktree(
     *, repo: GitRepo, worktree_path: Path, remote: str, branch: str,
     resolved_branch: str, default: str, tip_sha: str, task_id: str,
     task_title: str, review_evidence: str, op_name: str, op_email: str,
-    test_timeout: float, pr_url: str, changed_test_paths: list[str] | None,
-    _before_push: Callable[[], None] | None,
+    test_timeout: float, full_test_timeout: float, pr_url: str,
+    changed_test_paths: list[str] | None, tested_commit_sha: str = "",
+    _before_push: Callable[[], None] | None = None,
     on_step: Callable[[str], None] | None = None,
 ) -> LandResult:
     # -- step 3: squash --------------------------------------------------- #
@@ -922,29 +995,60 @@ def _land_in_worktree(
                                landed_sha=landed_sha,
                                stderr=_cap(verify_proc.stdout + "\n" + verify_proc.stderr))
 
-    # -- step 6b: change-scoped tests --------------------------------------#
+    # -- step 6b: merge-time test gate --------------------------------------#
+    # FOCUSED (change-scoped) when the squash result's tree matches the tree
+    # the attempt's recorded full suite ran on; FULL otherwise (conflict
+    # rounds / a moved base / an unknown tested tree) — see `_decide_gate`.
     _step(on_step, "tests")
-    test_paths = changed_test_paths
-    if test_paths is None:
-        squash_diff = _sh(["git", "diff", "--name-only", f"{tip_sha}..HEAD"],
-                           cwd=worktree_path)
-        changed_files = [p.strip() for p in squash_diff.stdout.splitlines() if p.strip()]
-        test_paths = _map_change_scoped_tests(worktree_path, changed_files)
-    if test_paths:
+    landed_tree = _tree_of(worktree_path, "HEAD")
+    tested_tree = _tree_of(worktree_path, tested_commit_sha)
+    gate, gate_reason = _decide_gate(landed_tree, tested_commit_sha, tested_tree)
+
+    if gate == "focused":
+        test_paths = changed_test_paths
+        if test_paths is None:
+            squash_diff = _sh(["git", "diff", "--name-only", f"{tip_sha}..HEAD"],
+                               cwd=worktree_path)
+            changed_files = [p.strip() for p in squash_diff.stdout.splitlines() if p.strip()]
+            test_paths = _map_change_scoped_tests(worktree_path, changed_files)
+        if test_paths:
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(worktree_path / "src")
+            argv = [sys.executable, "-m", "pytest", "-q", *test_paths]
+            try:
+                test_proc = _run_pytest(argv, cwd=worktree_path, timeout=test_timeout, env=env)
+            except subprocess.TimeoutExpired:
+                return LandResult(ok=False, step="tests", branch=branch, pr_url=pr_url,
+                                   landed_sha=landed_sha, gate=gate, gate_reason=gate_reason,
+                                   stderr=f"{gate_reason}\nchange-scoped tests timed out "
+                                          f"after {test_timeout}s")
+            if test_proc.returncode != 0:
+                return LandResult(ok=False, step="tests", branch=branch, pr_url=pr_url,
+                                   landed_sha=landed_sha, gate=gate, gate_reason=gate_reason,
+                                   stderr=_cap(f"{gate_reason}\n"
+                                               + test_proc.stdout + "\n" + test_proc.stderr))
+    else:
         env = dict(os.environ)
         env["PYTHONPATH"] = str(worktree_path / "src")
+        argv = [sys.executable, "-m", "pytest", "-q"]
+        if importlib.util.find_spec("xdist") is not None:
+            argv += ["-n", "4"]
         try:
-            test_proc = _sh([sys.executable, "-m", "pytest", "-q", *test_paths],
-                             cwd=worktree_path, timeout=test_timeout, env=env)
+            test_proc = _run_pytest(argv, cwd=worktree_path, timeout=full_test_timeout, env=env)
         except subprocess.TimeoutExpired:
             return LandResult(ok=False, step="tests", branch=branch, pr_url=pr_url,
-                               landed_sha=landed_sha,
-                               stderr=f"change-scoped tests timed out after "
-                                      f"{test_timeout}s")
-        if test_proc.returncode != 0:
+                               landed_sha=landed_sha, gate=gate, gate_reason=gate_reason,
+                               stderr=f"{gate_reason}\nfull suite timed out after "
+                                      f"{full_test_timeout}s")
+        if test_proc.returncode == 5:
+            # No tests collected — a repo with no suite must not be blocked
+            # from landing; annotate rather than fail.
+            gate_reason = f"{gate_reason} (no tests collected)"
+        elif test_proc.returncode != 0:
             return LandResult(ok=False, step="tests", branch=branch, pr_url=pr_url,
-                               landed_sha=landed_sha,
-                               stderr=_cap(test_proc.stdout + "\n" + test_proc.stderr))
+                               landed_sha=landed_sha, gate=gate, gate_reason=gate_reason,
+                               stderr=_cap(f"{gate_reason}\n"
+                                           + test_proc.stdout + "\n" + test_proc.stderr))
 
     # -- step 7: ff-merge + push, remote-ref verified ---------------------- #
     _step(on_step, "push")
@@ -992,9 +1096,9 @@ def _land_in_worktree(
     _step(on_step, "close_pr")
     close_cwd = repo.path if repo.path.exists() else Path(tempfile.gettempdir())
     close_note = _close_pr(pr_url, close_cwd)
-    msg = f"landed {landed_sha[:12]} onto {default}"
+    msg = f"landed {landed_sha[:12]} onto {default}; gate: {gate_reason}"
     if close_note:
         msg += f"; {close_note}"
     return LandResult(ok=True, step="close_pr", branch=branch, pr_url=pr_url,
-                      reconciled=reconciled_note,
+                      reconciled=reconciled_note, gate=gate, gate_reason=gate_reason,
                        landed_sha=landed_sha, message=msg)

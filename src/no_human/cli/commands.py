@@ -4934,6 +4934,14 @@ async def _approve_go_single(config, task_id, land_one):
             console.print(
                 f"[bold red]merge FAILED[/] at step {result.step!r}:\n{result.stderr}"
             )
+            if result.gate_reason:
+                # The reason already rides in `result.stderr` when the
+                # failure came from the test step itself, but a step-6a
+                # (export_guard verify) or push failure would not otherwise
+                # say which gate the run was headed for — echo it explicitly
+                # so a full-gate failure is never mistaken for the (cheaper,
+                # more common) focused one.
+                console.print(f"  gate: {result.gate_reason}")
             console.print(
                 "Approval recorded; task remains awaiting_approval. Fix the "
                 "issue and re-run `nh approve`."
@@ -4945,6 +4953,8 @@ async def _approve_go_single(config, task_id, land_one):
             f"[bold green]merged[/] {t.id[:8]} — landed "
             f"{result.landed_sha[:12]} onto the default branch. Task done."
         )
+        if result.gate_reason:
+            console.print(f"  gate: {result.gate_reason}")
 
 
 @cli.command("approve")
@@ -5092,10 +5102,11 @@ def approve(task_id, list_ready, assume_yes, landed_sha, justification, base_bra
             return {"tag": "precondition", "pr_url": pr_url, "branch": branch,
                     "evidence": evidence, "result": None}
 
+        tested = (await store.latest_attempt_branch(t.id)).get("commit_sha") or ""
         result = land_task(
             repo_path=t.repo_path, branch=branch, pr_url=pr_url,
             task_id=t.id, task_title=t.title, review_evidence=evidence,
-            config=config.data,
+            config=config.data, tested_commit_sha=tested,
         )
 
         if result.skipped:
