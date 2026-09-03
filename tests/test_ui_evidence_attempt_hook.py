@@ -154,9 +154,21 @@ class _FakeDevServerProc:
         return None
 
 
-def _spawn_recorder(calls, proc_obj):
+def _spawn_recorder(calls, proc_obj, log_bytes=None, written_log=None):
+    """`log_bytes`, when given, is written to `kwargs["stdout"]` — the real
+    file handle `dev_server` opened for the dev-server log — and flushed, so
+    a boot-failed test's log actually contains recognizable text on disk
+    instead of an empty file. `written_log`, when given, is a list this
+    appends the bytes read straight back off disk to (a positive control
+    that the write really landed, not just that `.write()` was called)."""
     def _spawn(argv, **kwargs):
         calls.append({"argv": argv, "kwargs": kwargs})
+        if log_bytes is not None:
+            fh = kwargs["stdout"]
+            fh.write(log_bytes)
+            fh.flush()
+            if written_log is not None:
+                written_log.append(Path(fh.name).read_bytes())
         return proc_obj
 
     return _spawn
@@ -657,13 +669,23 @@ async def test_boot_failed_skip_line_names_the_url_not_the_log(
 
     spawn_calls: list[dict] = []
     kill_calls: list[object] = []
+    written_log: list[bytes] = []
+    # A real dev-server log body, naming a filesystem path AND the log's own
+    # filename — the positive control for the two "not in body" assertions
+    # below: if `_maybe_capture_ui_evidence` ever rendered `srv.detail`
+    # instead of `srv.cause`, this text would leak into the PR body and
+    # those assertions would fail for real, not vacuously.
+    log_bytes = (
+        f"Traceback: EADDRINUSE while writing {tmp_path}/dev-server.log\n"
+    ).encode()
     # started=0.0, then the loop's first condition check reads 999.0 —
     # `999.0 - 0.0 < 5` is False, so the poll loop never runs at all and the
     # `else:` (timeout-exhausted) branch fires immediately: deterministic,
     # no real waiting.
     _wire_fake_dev_server(
         monkeypatch,
-        spawn=_spawn_recorder(spawn_calls, _FakeDevServerProc()),
+        spawn=_spawn_recorder(spawn_calls, _FakeDevServerProc(),
+                              log_bytes=log_bytes, written_log=written_log),
         reachable=lambda url: False,  # never already up, never answers
         kill=_kill_recorder(kill_calls),
         clock=_StepClock([0.0, 999.0]),
@@ -702,13 +724,104 @@ async def test_boot_failed_skip_line_names_the_url_not_the_log(
     assert len(spawn_calls) == 1, spawn_calls
     assert len(kill_calls) == 1, "a still-running process must be killed on teardown"
 
+    # The fake spawn's write must have actually landed on disk — otherwise
+    # the "not in body" assertions below would be vacuously true (the
+    # forbidden text was never anywhere to leak from in the first place).
+    assert written_log and written_log[0] == log_bytes, (
+        "the dev-server log write never reached disk — the positive "
+        f"control below cannot prove anything: {written_log}"
+    )
+
     body = opens[-1]["body"]
     assert "## UI evidence" in body, body
     assert (
         f"the dev server did not answer at {base_url} within "
         f"{ready_timeout_s}s (boot-failed)" in body
     ), body
-    # Never the dev-server log, never a filesystem path.
+    # Never the dev-server log, never a filesystem path — even though this
+    # attempt's real log on disk contains both (asserted above).
+    assert "dev-server.log" not in body, body
+    assert str(tmp_path) not in body, body
+    assert "page never loaded" not in body, body
+    assert "EADDRINUSE" not in body, body
+
+
+async def test_boot_failed_skip_line_says_failed_to_start_when_the_spawn_fails(
+        repo_env, tmp_path, store, monkeypatch):
+    """A dev server that never even becomes a polling process (here: `spawn`
+    itself raises `OSError`, e.g. the configured `start_cmd`'s binary is
+    missing) is a DIFFERENT boot failure than a timeout — the skip line must
+    say so, and must still never leak the log content, the command, or a
+    filesystem path."""
+    base_url = "http://127.0.0.1:5398"
+    start_cmd = "npm run dev"
+    ready_timeout_s = 5
+
+    def mutate(cwd):
+        (Path(cwd) / "web" / "App.jsx").write_text(
+            "export default function App() { return <div id=\"z\" />; }\n"
+        )
+        d = Path(cwd) / ".no_human"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ui_evidence.json").write_text(json.dumps(
+            {"base_url": base_url, "steps": [{"goto": "/"}, {"shot": "loaded"}]}
+        ))
+
+    spawn_calls: list[dict] = []
+    kill_calls: list[object] = []
+
+    def _spawn_raises(argv, **kwargs):
+        spawn_calls.append({"argv": argv, "kwargs": kwargs})
+        raise OSError("No such file or directory: 'npm'")
+
+    _wire_fake_dev_server(
+        monkeypatch,
+        spawn=_spawn_raises,
+        reachable=lambda url: False,
+        kill=_kill_recorder(kill_calls),
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        orch_mod.ui_evidence, "run",
+        _fake_ui_evidence_run_empty(calls, reason="page never loaded"))
+    monkeypatch.setattr(orch_mod.ui_evidence, "playwright_available", lambda: True)
+    monkeypatch.setattr(GitRepo, "remote_url",
+                        lambda self, remote="origin": "https://github.com/acme/widget.git")
+    fake_open_pr, opens = _fake_open_pr()
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    prof = _profile_with_ui_evidence(repo_env["work"], start_cmd=start_cmd,
+                                     base_url=base_url,
+                                     ready_timeout_s=ready_timeout_s)
+
+    async def fake_usable_profile(self, repo_path):
+        return prof
+
+    monkeypatch.setattr(Orchestrator, "_usable_profile", fake_usable_profile)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append)
+    t = Task.new("touch the UI, dev server binary is missing",
+                 repo_path=str(repo_env["work"]))
+    t.acceptance_criteria = ["the button renders"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert len(calls) == 1, f"the walk still runs even on a boot failure: {calls}"
+    assert len(spawn_calls) == 1, spawn_calls
+    assert kill_calls == [], "spawn never returned a process, so there is nothing to kill"
+
+    body = opens[-1]["body"]
+    assert "## UI evidence" in body, body
+    assert (
+        f"the dev server failed to start for {base_url} (boot-failed)" in body
+    ), body
+    assert "did not answer" not in body, body
+    assert "npm" not in body, body
     assert "dev-server.log" not in body, body
     assert str(tmp_path) not in body, body
     assert "page never loaded" not in body, body

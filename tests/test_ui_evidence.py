@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import struct
+import subprocess
 
 import pytest
 
@@ -1096,3 +1098,267 @@ async def test_ready_timeout_is_clamped(tmp_path, configured, expected):
         tmp_path, {"ready_timeout_s": configured}, "", tmp_path,
     ) as srv:
         assert srv.ready_timeout_s == expected
+
+
+# ──────────────────────────── _kill_dev_server ──────────────────────────── #
+#
+# `_kill_dev_server` is exercised directly here (not through `dev_server`):
+# it is the one seam every other test in this file injects around, so the
+# real SIGTERM->SIGKILL escalation and the never-raises promise were
+# otherwise dead code as far as this suite could tell. POSIX only — the
+# `os.name == "nt"` terminate branch is an explicit follow-up (see the
+# module's docstring / intake notes), not covered here.
+
+
+class _KillProc:
+    """Popen stand-in for `_kill_dev_server`: `wait` raises the scripted
+    exceptions in order, then returns 0. No real process, no real signal."""
+
+    def __init__(self, waits=(), pid=4242):
+        self.pid = pid
+        self._waits = list(waits)
+        self.wait_calls = []
+        self.terminate_calls = 0
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self._waits:
+            exc = self._waits.pop(0)
+            raise exc
+        return 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+
+_KILL_PGID = 9191
+
+
+def _patch_killpg(monkeypatch):
+    """Force the POSIX branch (deterministic even on a Windows runner) and
+    replace `os.getpgid`/`os.killpg` with recorders — `ui_evidence` does
+    `import os` at module scope, so patching the attributes on
+    `ui_evidence.os` is what the function under test actually sees."""
+    monkeypatch.setattr(ui_evidence.os, "name", "posix")
+    getpgid_calls = []
+    killpg_calls = []
+
+    def fake_getpgid(pid):
+        getpgid_calls.append(pid)
+        return _KILL_PGID
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+
+    monkeypatch.setattr(ui_evidence.os, "getpgid", fake_getpgid, raising=False)
+    monkeypatch.setattr(ui_evidence.os, "killpg", fake_killpg, raising=False)
+    return getpgid_calls, killpg_calls
+
+
+def test_kill_dev_server_escalates_sigterm_then_sigkill_on_posix(monkeypatch):
+    getpgid_calls, killpg_calls = _patch_killpg(monkeypatch)
+    proc = _KillProc(waits=[subprocess.TimeoutExpired("x", ui_evidence._KILL_GRACE_S)])
+
+    assert ui_evidence._kill_dev_server(proc) is None
+
+    assert killpg_calls == [
+        (_KILL_PGID, signal.SIGTERM),
+        (_KILL_PGID, signal.SIGKILL),
+    ]
+    assert getpgid_calls == [proc.pid, proc.pid]
+    assert proc.wait_calls == [ui_evidence._KILL_GRACE_S, ui_evidence._KILL_GRACE_S]
+
+
+def test_kill_dev_server_does_not_sigkill_a_process_that_exits_on_sigterm(monkeypatch):
+    getpgid_calls, killpg_calls = _patch_killpg(monkeypatch)
+    proc = _KillProc(waits=())  # `wait` returns 0 immediately: no escalation
+
+    ui_evidence._kill_dev_server(proc)
+
+    assert killpg_calls == [(_KILL_PGID, signal.SIGTERM)]
+    assert getpgid_calls == [proc.pid]
+    assert proc.wait_calls == [ui_evidence._KILL_GRACE_S]
+
+
+def test_kill_dev_server_never_raises_when_killpg_raises(monkeypatch):
+    monkeypatch.setattr(ui_evidence.os, "name", "posix")
+
+    def raising_killpg(pgid, sig):
+        raise RuntimeError("killpg blew up")
+
+    monkeypatch.setattr(ui_evidence.os, "getpgid", lambda pid: _KILL_PGID, raising=False)
+    monkeypatch.setattr(ui_evidence.os, "killpg", raising_killpg, raising=False)
+    proc = _KillProc(waits=())
+
+    assert ui_evidence._kill_dev_server(proc) is None
+    # `killpg` raising a non-suppressed-by-name exception aborts the
+    # function's `with contextlib.suppress(Exception):` body outright — the
+    # subsequent `wait` call is never reached, not merely swallowed.
+    assert proc.wait_calls == []
+
+
+# ─────────────────────── raising-kill teardown safety ───────────────────── #
+
+
+async def test_dev_server_teardown_survives_a_kill_that_raises(tmp_path):
+    proc_obj = FakeProc(poll_sequence=[None])  # still running at teardown time
+    spawn_calls = []
+
+    def spawn(argv, **kwargs):
+        spawn_calls.append((argv, kwargs))
+        kwargs["stdout"].write(b"server crashed: boom\n")
+        kwargs["stdout"].flush()
+        return proc_obj
+
+    def raising_kill(proc):
+        raise RuntimeError("kill blew up")
+
+    clock = FakeClock([0.0, 0.5, 2.0, 2.0])
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev", "ready_timeout_s": 1},
+        "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False, clock=clock, sleep=_no_sleep,
+        kill=raising_kill,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "timeout"
+    # The `async with` above must exit with no exception (asserted simply by
+    # reaching this line) — the raising kill is swallowed by `dev_server`'s
+    # own `contextlib.suppress(Exception)`, and teardown still ran the rest
+    # of its steps: the log tail was still read back into `srv.detail`.
+    assert len(spawn_calls) == 1
+    assert "server crashed: boom" in srv.detail
+
+
+async def test_dev_server_body_exception_wins_over_a_raising_kill(tmp_path):
+    proc_obj = FakeProc(poll_sequence=[None])
+    spawn = _spawn_factory(proc_obj)
+    reach_calls = {"n": 0}
+
+    def reachable(url):
+        reach_calls["n"] += 1
+        return reach_calls["n"] > 1  # False for pre-existing check, True in the loop
+
+    def raising_kill(proc):
+        raise RuntimeError("kill blew up")
+
+    clock = FakeClock([0.0, 0.1, 0.1])
+    with pytest.raises(ValueError, match="boom"):
+        async with ui_evidence.dev_server(
+            tmp_path, {"start_cmd": "npm run dev", "ready_timeout_s": 60},
+            "http://127.0.0.1:5173", tmp_path,
+            spawn=spawn, reachable=reachable, clock=clock, sleep=_no_sleep,
+            kill=raising_kill,
+        ) as srv:
+            assert srv.mode == "booted"
+            raise ValueError("boom")
+    # The kill's RuntimeError never surfaced or replaced the caller's
+    # ValueError — `pytest.raises` above already proved that; this is just
+    # documentation of what's being asserted.
+
+
+# ────────────────────────── truthful boot-failed cause ──────────────────── #
+
+
+async def test_dev_server_cause_is_timeout_when_it_never_answers(tmp_path):
+    proc_obj = FakeProc(poll_sequence=[None])  # never exits, never answers
+    spawn = _spawn_factory(proc_obj)
+    clock = FakeClock([0.0, 0.5, 2.0, 2.0])
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev", "ready_timeout_s": 1},
+        "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False, clock=clock, sleep=_no_sleep,
+        kill=lambda p: None,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "timeout"
+
+
+async def test_dev_server_cause_is_failed_to_start_for_non_loopback(tmp_path):
+    spawn = _spawn_factory()
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev"}, "http://example.com:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "failed-to-start"
+    assert spawn.calls == []
+
+
+async def test_dev_server_cause_is_failed_to_start_for_unparsable_start_cmd(tmp_path):
+    spawn = _spawn_factory()
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run 'dev"}, "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "failed-to-start"
+    assert spawn.calls == []
+
+
+async def test_dev_server_cause_is_failed_to_start_for_empty_argv(tmp_path, monkeypatch):
+    # No realistic post-`.strip()` non-empty `start_cmd` makes `shlex.split`
+    # return `[]` (it always yields at least one, possibly-empty, token) —
+    # this defensive branch is exercised by patching `shlex.split` directly.
+    monkeypatch.setattr(ui_evidence.shlex, "split", lambda s: [])
+    spawn = _spawn_factory()
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev"}, "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "failed-to-start"
+    assert spawn.calls == []
+
+
+async def test_dev_server_cause_is_failed_to_start_for_spawn_oserror(tmp_path):
+    spawn = _spawn_factory(raises=OSError("no such file"))
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev"}, "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "failed-to-start"
+
+
+async def test_dev_server_cause_is_failed_to_start_for_early_exit(tmp_path):
+    proc_obj = FakeProc(poll_sequence=[7])  # exited immediately, code 7
+    spawn = _spawn_factory(proc_obj)
+    clock = FakeClock([0.0, 0.1, 0.1])
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev", "ready_timeout_s": 60},
+        "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=lambda url: False, clock=clock, sleep=_no_sleep,
+        kill=lambda p: None,
+    ) as srv:
+        assert srv.mode == "boot-failed"
+        assert srv.cause == "failed-to-start"
+
+
+async def test_dev_server_cause_is_empty_when_booted_or_pre_existing(tmp_path):
+    proc_obj = FakeProc(poll_sequence=[None])
+    spawn = _spawn_factory(proc_obj)
+    reach_calls = {"n": 0}
+
+    def reachable(url):
+        reach_calls["n"] += 1
+        return reach_calls["n"] > 1  # False for pre-existing check, True in the loop
+
+    clock = FakeClock([0.0, 0.1, 0.2])
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev", "ready_timeout_s": 60},
+        "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn, reachable=reachable, clock=clock, sleep=_no_sleep,
+        kill=lambda p: None,
+    ) as srv:
+        assert srv.mode == "booted"
+        assert srv.cause == ""
+
+    spawn2 = _spawn_factory()
+    async with ui_evidence.dev_server(
+        tmp_path, {"start_cmd": "npm run dev"}, "http://127.0.0.1:5173", tmp_path,
+        spawn=spawn2, reachable=lambda url: True, kill=lambda p: None,
+    ) as srv2:
+        assert srv2.mode == "pre-existing"
+        assert srv2.cause == ""
+    assert spawn2.calls == []

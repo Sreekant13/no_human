@@ -474,6 +474,13 @@ class DevServerOutcome:
     (no `start_cmd`/`base_url` — the byte-identical-to-today path), or
     ``boot-failed`` (spawn/host/timeout/early-exit failure — see `detail`).
     `detail` is LOG-ONLY: never rendered into a PR body, only an advisory.
+
+    `cause` is a fixed vocabulary and therefore safe to render (unlike
+    `detail`): ``""`` (not a failure), ``"timeout"`` (spawned, never answered
+    before `ready_timeout_s`), or ``"failed-to-start"`` (never became a
+    polling server — non-loopback refusal, unparsable `start_cmd`, spawn
+    `OSError`, or early process exit). Only meaningful when `mode ==
+    "boot-failed"`.
     """
 
     mode: str
@@ -483,6 +490,7 @@ class DevServerOutcome:
     waited_s: float = 0.0
     exit_code: int | None = None
     detail: str = ""  # LOG-ONLY — never rendered into a PR body
+    cause: str = ""  # "" | "timeout" | "failed-to-start" — safe to render
 
 
 def _kill_dev_server(process) -> None:
@@ -550,7 +558,8 @@ async def dev_server(
     if host not in _LOCAL_HOSTS and f"[{host}]" not in _LOCAL_HOSTS:
         yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
                                 base_url=base_url, ready_timeout_s=timeout,
-                                detail="refused: non-loopback host")
+                                detail="refused: non-loopback host",
+                                cause="failed-to-start")
         return
 
     try:
@@ -572,12 +581,14 @@ async def dev_server(
     except ValueError as exc:
         yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
                                 base_url=base_url, ready_timeout_s=timeout,
-                                detail=f"unparsable start_cmd: {exc}")
+                                detail=f"unparsable start_cmd: {exc}",
+                                cause="failed-to-start")
         return
     if not argv:
         yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
                                 base_url=base_url, ready_timeout_s=timeout,
-                                detail="unparsable start_cmd")
+                                detail="unparsable start_cmd",
+                                cause="failed-to-start")
         return
 
     out_dir = Path(out_dir)
@@ -594,7 +605,8 @@ async def dev_server(
                 fh.close()
         yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
                                 base_url=base_url, ready_timeout_s=timeout,
-                                detail=f"{type(exc).__name__}: {exc}")
+                                detail=f"{type(exc).__name__}: {exc}",
+                                cause="failed-to-start")
         return
 
     probe_url = base_url + ready_path
@@ -606,6 +618,7 @@ async def dev_server(
             rc = process.poll()
             if rc is not None:
                 outcome.exit_code = rc
+                outcome.cause = "failed-to-start"
                 break
             try:
                 ok = reachable(probe_url)
@@ -617,6 +630,7 @@ async def dev_server(
             await sleep(_READY_POLL_S)
         else:
             outcome.exit_code = process.poll()
+            outcome.cause = "timeout"
         outcome.waited_s = clock() - started
 
         try:

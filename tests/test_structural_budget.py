@@ -321,7 +321,13 @@ FROZEN_FILE_LINES = {
     # 21065 -> 21123 (+58): the reviewer role-backend seam's disclosure and
     # construction wiring (6d part 1). Measured on the merge result with the
     # scanner below, never summed.
-    "core/orchestrator.py": 21123,
+    #
+    # 21123 -> 21134 (+11): `_maybe_capture_ui_evidence`'s boot-failed reason
+    # now branches on `srv.cause` to render a distinct failed-to-start
+    # sentence alongside the byte-unchanged timeout sentence (task:
+    # _kill_dev_server test coverage). Measured with the scanner below after
+    # rebasing onto the role-backend landing, never summed by hand.
+    "core/orchestrator.py": 21134,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

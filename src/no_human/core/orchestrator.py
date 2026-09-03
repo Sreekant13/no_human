@@ -20415,10 +20415,21 @@ SIX of them read a checkpoint and TWO do not — but do
             # out of this section. A `boot-failed` dev server names the URL
             # it never answered at instead — more useful than the walk's own
             # generic "not reachable" reason, and still sanitized the same way.
+            # `srv.cause` picks which of two sentences applies: `"timeout"`
+            # (spawned, polled, never answered — the original, byte-identical
+            # sentence) vs `"failed-to-start"` (never became a polling server
+            # at all — non-loopback refusal, unparsable start_cmd, or a spawn
+            # OSError). An empty/unknown `cause` falls back to the timeout
+            # sentence so an older/None-ish outcome still renders as before.
+            # `srv.detail` (the log tail) is still never rendered here.
             shutil.rmtree(out_dir, ignore_errors=True)
             if srv is not None and srv.mode == "boot-failed":
-                reason = (f"the dev server did not answer at {srv.base_url} "
-                          f"within {srv.ready_timeout_s}s ({srv.mode})")
+                if srv.cause == "failed-to-start":
+                    reason = (f"the dev server failed to start for {srv.base_url} "
+                              f"({srv.mode})")
+                else:
+                    reason = (f"the dev server did not answer at {srv.base_url} "
+                              f"within {srv.ready_timeout_s}s ({srv.mode})")
             else:
                 reason = (result.reason or result.verdict or "unknown")
             reason = reason.strip().replace("\n", " ").replace("`", "'")
