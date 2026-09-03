@@ -2,7 +2,8 @@
 
 A minimal Model Context Protocol server, run over stdio, that lets an MCP
 client (e.g. an editor's agent) create and check no_human tasks through the
-EXISTING local HTTP API at ``http://127.0.0.1:8420`` — this module never
+EXISTING local HTTP API at ``http://{server.host}:{server.port}``, which
+defaults to ``http://127.0.0.1:8420`` — this module never
 imports or touches the store, orchestrator, or API endpoints directly, only
 calls the HTTP surface they already expose. Exactly two tools: ``task_add``
 and ``task_status``. No auth (localhost-only, same trust domain as the web
@@ -34,6 +35,22 @@ _TIMEOUT = 10.0
 _TRANSPORT: httpx.BaseTransport | None = None
 
 mcp = FastMCP("no_human-mcp-bridge")
+
+
+def _resolve_base_url() -> str:
+    """Base URL of the local API, from ``server.host`` and ``server.port``.
+
+    Falls back to :data:`BASE_URL` when the config is missing or unreadable, so
+    a default install behaves exactly as before.
+    """
+    try:
+        from ..config import load_config
+        server = load_config(create_if_missing=False).data.get("server") or {}
+    except Exception:  # noqa: BLE001 — an unreadable config must not stop the bridge
+        return BASE_URL
+    host = server.get("host") or "127.0.0.1"
+    port = server.get("port") or 8420
+    return f"http://{host}:{port}"
 
 
 def _client() -> httpx.Client:
@@ -104,6 +121,8 @@ def _ensure_api_reachable() -> None:
 
 
 def main() -> None:
+    global BASE_URL
+    BASE_URL = _resolve_base_url()
     _ensure_api_reachable()
     mcp.run()
 

@@ -454,13 +454,16 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "/api/queue/health, server.host defaults to 127.0.0.1"),
     },
     "intake/mcp_bridge.py": {
-        "http:httpx": Allowed("no_human's own API", "loopback: 127.0.0.1:8420 "
-                              "(BASE_URL) — the MCP bridge calling our server"),
+        "http:httpx": Allowed("no_human's own API",
+                              "loopback: http://{server.host}:{server.port} "
+                              "(BASE_URL), server.host defaults to 127.0.0.1 "
+                              "— the MCP bridge calling our server"),
         "sdk:mcp": Allowed(
             "the MCP client that launched this bridge — FastMCP's default "
             "transport is stdio, so the 'connection' is the pipe your editor "
             "already opened",
-            "loopback: BASE_URL is 127.0.0.1:8420; the bridge dials nothing else"),
+            "loopback: BASE_URL is {server.host}:{server.port}, 127.0.0.1:8420 "
+            "by default; the bridge dials nothing else"),
     },
     "api/local_boundary.py": {
         "sock:fastapi": Allowed(

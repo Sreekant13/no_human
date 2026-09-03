@@ -151,3 +151,25 @@ def test_ensure_api_reachable_ok_when_api_up():
 
     _set_transport(handler)
     mcp_bridge._ensure_api_reachable()  # must not raise
+
+
+def test_base_url_follows_server_port_from_config(monkeypatch):
+    """An operator who moves the board must not be left dialling 8420."""
+    import no_human.config as config_module
+
+    class _Config:
+        data = {"server": {"host": "127.0.0.1", "port": 9999}}
+
+    monkeypatch.setattr(config_module, "load_config", lambda **kw: _Config())
+    assert mcp_bridge._resolve_base_url() == "http://127.0.0.1:9999"
+
+
+def test_base_url_falls_back_when_config_unreadable(monkeypatch):
+    """A missing or broken config leaves a default install working as before."""
+    import no_human.config as config_module
+
+    def _boom(**kw):
+        raise OSError("no config here")
+
+    monkeypatch.setattr(config_module, "load_config", _boom)
+    assert mcp_bridge._resolve_base_url() == "http://127.0.0.1:8420"
