@@ -11,6 +11,7 @@ import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { loadDraft, saveDraft, clearDraft, mergeWithSeed } from "./composerDraft.js";
 import { coderBackendCaption, effectiveCoderBackend } from "./coderBackendCaption.js";
+import { shortReason } from "./backendPanelView.js";
 import PathInput from "./PathInput.jsx";
 import QueueNotice from "./QueueNotice.jsx";
 
@@ -987,7 +988,7 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
               className="mt-2 px-5 font-ui text-sm"
               style={{ color: "var(--red)" }}
             >
-              {selectedBackendInfo.reason || `The '${backend}' coder backend is not available on this install.`}{" "}
+              {shortReason(selectedBackendInfo.reason) || `The '${backend}' coder backend is not available on this install.`}{" "}
               Pick a different backend.
             </p>
           )}

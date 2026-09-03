@@ -37,9 +37,21 @@ export function backendPanelView(payload) {
       label: titleCase(String(o.id || "")),
       disabled: !o.available,
       reason: o.available ? "" : o.reason || "",
+      short: o.available ? "" : shortReason(o.reason || ""),
       isCurrent: o.id === payload.current,
     })),
   };
+}
+
+// One line for the picker: the server's reason strings are written for a
+// terminal (multi-sentence, with a shell command). First sentence, leading
+// dash dropped, capped so it fits under the <select>. The full string stays
+// on the option's title attribute.
+export function shortReason(reason) {
+  const text = String(reason || "").trim().replace(/^[—–-]\s*/, "");
+  if (!text) return "";
+  const first = text.split(/\n|(?<=\.)\s/)[0].trim();
+  return first.length > 140 ? `${first.slice(0, 139).trimEnd()}…` : first;
 }
 
 // The backend whose config fields the row can set inline (a model id + a

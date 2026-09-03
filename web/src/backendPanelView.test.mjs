@@ -11,6 +11,7 @@ import {
   showLocalFields,
   submitBody,
   canSubmit,
+  shortReason,
 } from "./backendPanelView.js";
 
 // One fixture payload shared by every test below — the shape GET
@@ -251,4 +252,35 @@ test("MUTATION CONTROL: an isSubmittable that ignores availability would pass a 
   const p = payload();
   assert.equal(alwaysTrue(p, "local"), true, "the naive mutant wrongly allows 'local'");
   assert.equal(isSubmittable(p, "local"), false, "the real function correctly refuses it");
+});
+
+// ── shortReason ─────────────────────────────────────────────────────────
+
+const CODEX_UNAVAILABLE_REASON =
+  "— the coder backend is 'codex' (worker.backend, or a task's --backend) but no OPENAI_API_KEY was found, and llm.codex_auth_mode is 'api_key' (the default). The Codex backend runs on YOUR OWN OpenAI API key in this mode.\nAdd the key to ~/.no_human/.env (chmod 600):\n  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env";
+
+test("shortReason: first sentence only, leading dash stripped, one line, capped at 140 chars", () => {
+  const s = shortReason(CODEX_UNAVAILABLE_REASON);
+  assert.ok(!s.includes("\n"), s);
+  assert.ok(s.startsWith("the coder backend is 'codex'"), s);
+  assert.ok(s.length <= 140, String(s.length));
+  assert.equal(shortReason(LOCAL_UNAVAILABLE_REASON), LOCAL_UNAVAILABLE_REASON);
+  assert.equal(shortReason("First. Second."), "First.");
+  assert.equal(shortReason(""), "");
+  assert.equal(shortReason(undefined), "");
+});
+
+test("options carry a one-line short reason; available options carry an empty one", () => {
+  const view = backendPanelView(payload({
+    options: [
+      { id: "claude", available: true, reason: "" },
+      { id: "codex", available: false, reason: CODEX_UNAVAILABLE_REASON },
+      { id: "local", available: false, reason: LOCAL_UNAVAILABLE_REASON },
+    ],
+  }));
+  const byId = Object.fromEntries(view.options.map((o) => [o.id, o]));
+  assert.equal(byId.claude.short, "");
+  assert.equal(byId.codex.reason, CODEX_UNAVAILABLE_REASON); // full text still there for the tooltip
+  assert.equal(byId.codex.short, shortReason(CODEX_UNAVAILABLE_REASON));
+  assert.equal(byId.local.short, LOCAL_UNAVAILABLE_REASON);
 });

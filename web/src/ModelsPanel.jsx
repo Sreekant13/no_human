@@ -107,12 +107,19 @@ function CoderBackendRow() {
             const disabled = o.disabled && !configurable;
             return (
               <option key={o.id} value={o.id} disabled={disabled} title={o.reason || undefined}>
-                {o.label}{disabled ? ` — ${o.reason}` : ""}
+                {o.label}{disabled ? " (unavailable)" : ""}
               </option>
             );
           })}
         </select>
       </label>
+      {view.options
+        .filter((o) => o.disabled && !(lf && o.id === lf.backend) && o.short)
+        .map((o) => (
+          <div key={o.id} className="ntm-hint" title={o.reason}>
+            <span aria-hidden="true">ⓘ</span> {o.label}: {o.short}
+          </div>
+        ))}
       <span className="models-default">
         default: <code>{view.default}</code>
       </span>
