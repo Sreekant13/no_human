@@ -19548,10 +19548,10 @@ SIX of them read a checkpoint and TWO do not — but do
         # `<artifacts>/verification-attempt-<n>.md` (`_write_verification_
         # artifact`) and the PR comment `_post_verification_comment` posts.
         # Per-layer test results render ONCE, in the Evidence table above —
-        # this section never repeats them. It needs no `<details>` fold: it
-        # carries no raw command text, so there is nothing in it that
-        # benefits from being hidden. See `_verification_section` /
-        # `_verification_appendix`.
+        # this section never repeats them. Since #23 it folds the last
+        # command of each receipt kind, with its output, behind a
+        # `<details>` (`verification_receipts.fold_by_kind`). See
+        # `_verification_section` / `_verification_appendix`.
         #
         # The `## Stats` line (files/diffstat/turns) was REMOVED: the forge shows
         # the diffstat itself, and the turn count is internal noise. `repo`/`base`
@@ -19572,7 +19572,8 @@ SIX of them read a checkpoint and TWO do not — but do
             task, branch=branch, base=base, attempt_n=attempt_n)
 
         def _assemble(changes_text: str) -> str:
-            return (f"{ticket_line}{evidence_section}{criteria_block}"
+            headline = evidence.headline() if evidence_section else ""
+            return (f"{ticket_line}{headline}{evidence_section}{criteria_block}"
                     f"## Changes\n{changes_text}\n\n{assumptions}{superseded}"
                     f"{verification}{ui_evidence_section}{footer}")
 
@@ -20759,9 +20760,9 @@ SIX of them read a checkpoint and TWO do not — but do
         `docs/pr-body.md`'s "no PASS/FAIL badge" rationale, which now
         describes the artifact file).
 
-        UNLIKE `_verification_appendix`, this section is never folded behind
-        a `<details>` disclosure: it carries no raw command text, so nothing
-        in it benefits from being hidden.
+        #23: the last command of each receipt KIND, with its output, folds
+        behind a `<details>` per kind (`verification_receipts.fold_by_kind`);
+        the scannable text outside every fold still carries no receipt text.
 
         ``evidence.repro``, when given, is the single source for *receipts*
         — the explicit param stays for this file's own standalone unit
@@ -20794,19 +20795,18 @@ SIX of them read a checkpoint and TWO do not — but do
                 "every acceptance criterion as unverified and check it "
                 "yourself."
             ]
-        else:
+        else:  # #23: one fold per kind, then the pointer — see `fold_by_kind`
+            from ..agent.verification_receipts import fold_by_kind
             short_id = (task_id or "")[:8] or "<task-id>"
             where = (Orchestrator._display_path(artifact_path) if artifact_path
                      else "(not written this run)")
-            lines = [
-                f"Full verification log: {where} — `nh logs {short_id}`. "
-                f"{n} command{'' if n == 1 else 's'} recorded while working — "
-                f"the log's FINAL entries describe the tree that shipped; no "
-                f"in-progress command or its raw output reaches this body. "
-                f"See the **Evidence** table above for the orchestrator's own "
-                f"test run, by layer. No entry in the log asserts a pass or a "
-                f"fail: read the output there."
-            ]
+            lines = [fold_by_kind(rows), (
+                f"\n{n} command{'' if n == 1 else 's'} recorded while working. "
+                f"Full verification log: {where} — `nh logs {short_id}`; the "
+                f"same log, every command with its captured output, is posted "
+                f"as this PR's **How I verified this** comment when posting "
+                f"succeeds. Whether it passed is in the **Evidence** table "
+                f"above: no entry here asserts a pass or a fail.")]
 
         return header + "\n".join(lines) + "\n\n"
 

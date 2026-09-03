@@ -88,6 +88,7 @@ rendered limits list says so. Do not grow a verdict on top of it.
 from __future__ import annotations
 
 import base64
+import html
 import os
 import re
 import shlex
@@ -718,6 +719,17 @@ _INVISIBLE = re.compile(
     "]")
 
 
+def _one_line(text: str) -> str:
+    """*text* folded onto one line with invisible and direction-changing
+    characters dropped — the display form of a command, shared by
+    `md_inline_code` and `fold_by_kind` (a newline inside an HTML `<summary>`
+    ends the HTML block just as it would end a list item)."""
+    flat = (text or "")
+    for sep in ("\r", "\n", "\u2028", "\u2029"):
+        flat = flat.replace(sep, " ")
+    return _INVISIBLE.sub("", flat).strip()
+
+
 def md_inline_code(text: str) -> str:
     """Render *text* as a markdown code span that cannot escape its delimiters.
 
@@ -727,10 +739,7 @@ def md_inline_code(text: str) -> str:
     direction-changing characters are dropped so the span displays the sequence
     that actually ran; see `_INVISIBLE`.
     """
-    flat = (text or "")
-    for sep in ("\r", "\n", "\u2028", "\u2029"):
-        flat = flat.replace(sep, " ")
-    flat = _INVISIBLE.sub("", flat).strip()
+    flat = _one_line(text)
     if not flat:
         return "`` ``"
     longest = max((len(m) for m in re.findall(r"`+", flat)), default=0)
@@ -739,6 +748,52 @@ def md_inline_code(text: str) -> str:
     # which CommonMark strips back out.
     pad = " " if flat.startswith("`") or flat.endswith("`") else ""
     return f"{fence}{pad}{flat}{pad}{fence}"
+
+
+#: Reader-facing names for `KINDS` in the PR body's "How I verified this"
+#: fold summaries.
+KIND_LABELS: dict[str, str] = {
+    "test": "Tests", "e2e": "End-to-end", "http": "HTTP checks",
+    "typecheck": "Type check", "lint": "Lint", "build": "Build",
+}
+
+
+def fold_by_kind(rows: list[dict]) -> str:
+    """The PR body's verification digest (#23): one `<details>` per receipt
+    kind, in `KINDS` order, unknown kinds last. The summary names the kind
+    and the LAST command of that kind — the one that describes the tree that
+    shipped — with the run count when there were several; opening it shows
+    that command's captured output, fenced. Earlier runs of a kind (a failing
+    mid-work pytest, say) never reach the body: they are in the full log
+    only. Like the log, this asserts no pass or fail.
+
+    The command is model-chosen text rendered inside an HTML `<summary>`, so
+    it is HTML-escaped — `md_inline_code` neutralises markdown, not a
+    `</summary>`. The excerpt goes through `md_fence` for the same reason.
+    """
+    by_kind: dict[str, list[dict]] = {}
+    for r in rows:
+        by_kind.setdefault(str(r.get("kind")), []).append(r)
+    order = [k for k in KINDS if k in by_kind] + sorted(
+        k for k in by_kind if k not in KINDS)
+    folds: list[str] = []
+    for kind in order:
+        group = by_kind[kind]
+        last = group[-1]
+        runs = f" ({len(group)} runs, last shown)" if len(group) > 1 else ""
+        cmd = html.escape(_one_line(str(last.get("command") or "")), quote=False)
+        excerpt = str(last.get("output_excerpt") or "").strip()
+        if excerpt:
+            inner = md_fence(excerpt)
+            if last.get("truncated"):
+                inner += (f"\n_excerpt — {last.get('output_bytes', 0):,} "
+                          f"characters of output in total_")
+        else:
+            inner = "_nothing was captured on stdout or stderr for this command._"
+        folds.append(
+            f"<details><summary><b>{KIND_LABELS.get(kind, 'Other')}</b>{runs} — "
+            f"<code>{cmd}</code></summary>\n\n{inner}\n\n</details>")
+    return "\n".join(folds)
 
 
 def md_fence(text: str, *, info: str = "") -> str:

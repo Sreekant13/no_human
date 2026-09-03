@@ -6,16 +6,24 @@ demoted below the template's, and every model-written cell is neutralised
 before it is interpolated. The shape is deliberately short: a reviewer meets
 the gate results first, and most reference-grade detail is folded behind a
 `<details>` disclosure — still in the body, one click away, never dropped.
-The one exception is the raw command log ("How I verified this" below): it
-does not fold into the body at all any more — it moves to this attempt's own
-artifact file and a PR comment, and the body keeps only a pointer to it and
-the recorded-command count; each test layer's own final result still renders
-exactly once, in the **Evidence** table above.
+The raw command log ("How I verified this" below) is the one thing that
+lives mostly elsewhere: the body folds only the last command of each kind
+with its output, and the full log moves to this attempt's own artifact file
+and a PR comment; each test layer's own final result still renders exactly
+once, in the **Evidence** table above.
 
 ## What is in it, top to bottom
 
 **Ticket** — the tracker issue this PR answers, linked when intake recorded
 its URL, plain text otherwise. Absent when the task has no ticket.
+
+**Verdict line** — one quoted line, ahead of everything else the body
+renders from evidence: the independent reviewer's verdict and round count,
+the orchestrator's own test counts, and the merge-policy verdict when one was
+computed (`PrEvidence.headline()`). Every value is read from the same
+evidence object the table below renders from, worded differently from the
+table's cells so nothing is rendered twice; absent when no gate has a
+verdict.
 
 **Evidence** — one table of mechanical facts, gathered once from the
 attempt's gate outputs:
@@ -52,24 +60,30 @@ step answered on the requester's behalf, the assumptions it recorded, and the
 original wording of any criterion it sharpened. An unresolved blocker or an
 open question is printed *above* the fold, as a callout.
 
-**How I verified this** — a pointer, not a log (2026-08-31: the operator's
-"receipts out of the PR body" directive). The full command log — every
-command line a hook saw the coder's session submit to the shell and the text
-the harness returned; the model does not author an entry and cannot edit
-one — no longer lives in the body. It is written, in full, to this ATTEMPT's
-own artifact file (`~/.no_human/artifacts/<task-id>/verification-attempt-
-<n>.md` — attempt-scoped, so a later attempt's write can never overwrite the
-file an earlier, still-open PR body points a reader at) and posted, in full,
-as its own PR comment (below); the body carries one line naming that file —
-rendered `~`-relative, never as an absolute path that would leak the
-operator's local account name — plus `nh logs <task-id>`, which prints that
-same path and tails the file, and the recorded-command count. Per-layer test
-results are not repeated here: they render exactly once, in the **Evidence**
-table above. The log itself is still capped the same way it always was (40
-entries listed, 12 with output, 1,200 characters per excerpt, 200 receipts
-per attempt) and still says so when a cap bit, and it still ends with six
-sentences on what it cannot attest — the full list is below; only its
-LOCATION moved.
+**How I verified this** — a digest that expands, not a log (#23; before
+that, 2026-08-31's "receipts out of the PR body" directive made it a
+one-line pointer). One `<details>` fold per kind of check the receipts
+recorded (test, e2e, http, typecheck, lint, build — `verification_receipts.
+fold_by_kind`): the summary line names the kind and the LAST command of that
+kind, with the run count when there were several, so the section reads in as
+many lines as there were kinds; opening a fold shows that command's captured
+output, fenced. Earlier runs of a kind — a failing mid-work pytest — never
+reach the body. Under the folds, a short paragraph names where the full log lives:
+every command line a hook saw the coder's session submit to the shell and the
+text the harness returned (the model does not author an entry and cannot edit
+one) is posted, in full, as its own PR comment (below) — the copy every
+reader of the PR can open — and written to this ATTEMPT's own artifact file
+(`~/.no_human/artifacts/<task-id>/verification-attempt-<n>.md` — attempt-
+scoped, so a later attempt's write can never overwrite the file an earlier,
+still-open PR body points at), named `~`-relative, never as an absolute path
+that would leak the operator's local account name, plus `nh logs <task-id>`,
+which prints that same path and tails the file. Per-layer test results are
+not repeated here: they render exactly once, in the **Evidence** table
+above, and nothing in this section asserts a pass or a fail. The log itself
+is still capped the same way it always was (40 entries listed, 12 with
+output, 1,200 characters per excerpt, 200 receipts per attempt) and still
+says so when a cap bit, and it still ends with six sentences on what it
+cannot attest — the full list is below.
 
 **UI evidence** — present only on a task whose diff touched `web/`/`desktop/`
 (or a repo-declared `ui_evidence.ui_paths` glob) AND left a coder-authored
@@ -128,9 +142,8 @@ invites. So the log shows what ran and what came back, and the table
 above it carries the verdicts no_human *can* establish: the reviewer's and
 its own test run's. See `agent/verification_receipts.py`.
 
-This is now the artifact file's rationale, not the body's: the body never
-shows a command's raw output at all any more, so there is nothing in it a
-badge could be attached to. The reasoning still applies in full to the
+The reasoning applies wherever a command's output is shown: the per-kind
+folds in the body carry no badge for the same reason. It applies in full to the
 artifact file (`~/.no_human/artifacts/<task-id>/verification-attempt-<n>.md`)
 and to the PR comment, which carry the log this section describes.
 

@@ -3463,6 +3463,14 @@ class _Result:
     num_turns = 5
 
 
+def _scannable(text: str) -> str:
+    """*text* with every `<details>` fold removed — what a reader sees
+    without clicking. Since #23 the last command of each receipt kind and
+    its output sit INSIDE such a fold; the scannable body still carries no
+    receipt text."""
+    return re.sub(r"<details>.*?</details>", "", text, flags=re.DOTALL)
+
+
 def test_pr_body_embeds_the_short_verification_pointer(store, tmp_path):
     """D1.1: the body carries the heading and a pointer, never the raw
     command text — that moved to the artifact file / PR comment."""
@@ -3471,7 +3479,8 @@ def test_pr_body_embeds_the_short_verification_pointer(store, tmp_path):
                          receipts=_rows())
     assert "## How I verified this" in body
     assert "Full verification log:" in body
-    assert "uv run pytest -q" not in body
+    assert "uv run pytest -q" not in _scannable(body)
+    assert "<summary><b>Tests</b> — <code>uv run pytest -q</code></summary>" in body
 
 
 def test_pr_body_says_so_when_nothing_was_verified(store, tmp_path):
@@ -3547,9 +3556,9 @@ async def test_the_DRAFT_pr_body_the_reviewer_reads_carries_the_receipts(
         "the body the independent reviewer reads still declares the work "
         "unverified while receipts for it exist")
     assert "1 command recorded" in body, body[-2000:]
-    assert "uv run pytest -q" not in body, (
-        "the raw receipt reached the draft body — it belongs only in the "
-        "artifact file and the PR comment now")
+    assert "uv run pytest -q" not in _scannable(body), (
+        "the raw receipt reached the draft body's scannable text — it belongs "
+        "inside the per-kind fold, the artifact file and the PR comment")
     artifact_path = Orchestrator._verification_artifact_path(task.id, 1)
     assert Orchestrator._display_path(str(artifact_path)) in body, (
         "the pointer does not name the real artifact file (in its "

@@ -631,7 +631,7 @@ async def test_already_satisfied_rebuilds_the_pr_body_through_pr_body(
     assert edit_calls[0][4] == "--body", edit_calls[0][:5]
     body = edit_calls[0][5]
 
-    assert body.startswith("## Evidence"), body[:200]
+    assert body.startswith("> **Review passed** (1 round)\n\n## Evidence"), body[:200]
     assert "| Independent review | ✅ **PASSED**" in body, body
     assert "| Verifiers |" in body, body
     # test_evidence=None by design (this path runs no test command) — the
