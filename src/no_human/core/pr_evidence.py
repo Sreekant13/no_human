@@ -17,7 +17,7 @@ module guarantees is that the renderer has nowhere else to get the fact from.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from typing import Any
 
 
@@ -80,6 +80,11 @@ class PrEvidence:
     merge_policy: dict[str, Any] | None = None
     merge_policy_error: str | None = None
     reviewer_attribution: str = ""
+    #: #23 proof ledger: Evidence-table row name → URL of the ledger file
+    #: behind it, at the ledger commit (`core/evidence_ledger.py`). Empty
+    #: when no ledger was delivered (non-GitHub remote, delivery failure, the
+    #: pre-review draft body) — a row then renders exactly as before.
+    proof_urls: dict[str, str] = dc_field(default_factory=dict)
 
     def has(self, field: str) -> bool:
         return getattr(self, field, None) is not None
@@ -125,6 +130,19 @@ class PrEvidence:
         if not self.ci_state:
             return None
         return f"| CI | {self.ci_state} |"
+
+    def proof(self, key: str) -> str:
+        """` · [proof](url)` for the row *key* when the ledger holds its file,
+        else "" — appended inside the row's cell, never a cell of its own."""
+        url = self.proof_urls.get(key)
+        return f" · [proof]({url})" if url else ""
+
+    def log_anchors(self) -> dict[str, str]:
+        """kind → URL into the ledger's `verification.md` on that kind's last
+        command (`proof_urls` keys `verification:<kind>`), for the fold
+        summaries of "How I verified this"."""
+        pre = "verification:"
+        return {k[len(pre):]: u for k, u in self.proof_urls.items() if k.startswith(pre)}
 
     def headline(self) -> str:
         """#23: the facts a human reads first — the reviewer's verdict, the

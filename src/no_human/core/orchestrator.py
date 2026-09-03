@@ -6790,10 +6790,10 @@ class Orchestrator:
             # completed. Same object either way — never a second gather.
             policy_evidence = replace(policy_evidence, merge_policy=None,
                                        merge_policy_error=type(exc).__name__)
-        body = self._pr_body(task, commit, result, test_evidence=test_evidence,
-                             receipts=receipts,
-                             repo=repo, base=base, branch=branch,
-                             attempt_n=attempt_n, merge_policy=merge_policy_dict,
+        policy_evidence = self._deliver_evidence_ledger(  # #23 proof ledger
+            repo, task, policy_evidence, head_sha=head_sha, review_checklist_raw=review_checklist_raw)
+        body = self._pr_body(task, commit, result, test_evidence=test_evidence, receipts=receipts,
+                             repo=repo, base=base, branch=branch, attempt_n=attempt_n, merge_policy=merge_policy_dict,
                              evidence=policy_evidence,
                              verification_artifact_path=verification_artifact_path,
                              ui_evidence_section=ui_evidence_section)
@@ -19560,7 +19560,7 @@ SIX of them read a checkpoint and TWO do not — but do
         verification = self._verification_section(
             receipts, observable=observable,
             evidence=evidence, task_id=task.id,
-            artifact_path=verification_artifact_path,
+            artifact_path=verification_artifact_path, anchors=evidence.log_anchors(),
         )
         ticket_line = self._ticket_line(task)
         evidence_section = self._evidence_section(
@@ -19705,7 +19705,7 @@ SIX of them read a checkpoint and TWO do not — but do
             task, head_sha=head_sha, repo=repo, evidence=evidence)
         verifiers = self._verifiers_evidence_section(evidence)
         tamper = self._tamper_adjudication_section(task, evidence=evidence)
-        tests = self._test_evidence_section(evidence.tests)
+        tests = self._test_evidence_section(evidence.tests, proof=evidence.proof("tests"))
         ci = ""
         if evidence.ci_state:
             ci = f"| CI | {self._table_cell(str(evidence.ci_state), None)} |\n"
@@ -19788,7 +19788,8 @@ SIX of them read a checkpoint and TWO do not — but do
         safe = evidence.tamper if evidence is not None else Orchestrator._tamper_data(task)
         if not safe:
             return ""
-        return tamper_adjudication.pr_body_section(safe)
+        proof = evidence.proof("tamper") if evidence is not None else ""
+        return tamper_adjudication.pr_body_section(safe).replace(" |\n", f"{proof} |\n", 1)
 
     def _ticket_line(self, task: Task) -> str:
         """H9: name the tracker issue this PR answers, on line one.
@@ -20016,7 +20017,8 @@ SIX of them read a checkpoint and TWO do not — but do
         # this row, unlike `ci_state_pin`.
         glyph = "✅" if rv["verdict"] == "PASSED" else "❌"
         row = (f"| Independent review | {glyph} **{rv['verdict']}** — "
-               f"{n} round{'s' if n != 1 else ''} |\n")
+               f"{n} round{'s' if n != 1 else ''}"
+               f"{evidence.proof('review') if evidence is not None else ''} |\n")
         # Constraint §6d disclosure: an ADDITIONAL row, appended AFTER the
         # verdict row above rather than folded into it — `review_verdict_pin`
         # (`pr_evidence.py`) must stay an exact substring of the row above,
@@ -20080,7 +20082,7 @@ SIX of them read a checkpoint and TWO do not — but do
             glyph = "⚠️"
         else:
             glyph = "✅"
-        row = f"| Verifiers | {glyph} {Orchestrator._table_cell(pin, None)} |\n"
+        row = f"| Verifiers | {glyph} {Orchestrator._table_cell(pin, None)}{evidence.proof('verifiers')} |\n"
         # The items below render into a `<details>` list, not a table row —
         # a raw `|` there ends nothing, so these stay on `_inline_cell`.
         items: list[str] = []
@@ -20153,7 +20155,7 @@ SIX of them read a checkpoint and TWO do not — but do
         # own policy demands happens to pass.
         glyph = ("⚠️" if mp.get("policy_changed_in_diff")
                  else ("✅" if mp.get("ready") else "❌"))
-        row = f"| Merge policy | {glyph} {Orchestrator._table_cell(pin, None)} |\n"
+        row = f"| Merge policy | {glyph} {Orchestrator._table_cell(pin, None)}{evidence.proof('merge_policy')} |\n"
         # `warn` is a plain paragraph (not a table cell) and `items` render
         # into a `<details>` list — a raw `|` in either is literal and
         # harmless, so both stay on `_inline_cell`.
@@ -20525,76 +20527,31 @@ SIX of them read a checkpoint and TWO do not — but do
         unstages what it staged. A side branch never enters that squash at
         all, so it can never leak.
 
-        The working tree is left exactly as `repo.current_branch()` found
-        it: this checks out a NEW branch from the task branch's tip, commits
-        the evidence there, pushes, and checks back out to the original
-        branch in a `finally` — a later step in `_finalize` (the real push,
-        `open_pr`) must see the task branch, not this one.
+        Branch, commit, push and the checkout back to the task branch are
+        `core/evidence_ledger.py`'s `deliver` (#23), shared with the ledger.
         """
-        try:
-            original_branch = repo.current_branch()
-        except Exception as exc:  # noqa: BLE001
-            self._advisory(f"ui evidence not delivered: {exc}")
-            return ""
-
-        evidence_branch = f"nh-evidence/{task_id}"
-        dest_root = Path(repo.path) / ".nh-evidence" / task_id
-        committed_paths: list[str] = []
+        from . import evidence_ledger
+        evidence_branch = evidence_ledger.BRANCH.format(task_id=task_id)
+        files: dict[str, bytes] = {}
         delivered_names: list[dict] = []
         video_name: str | None = None
-        try:
-            repo.create_branch(evidence_branch, base=original_branch)
-            dest_root.mkdir(parents=True, exist_ok=True)
-            for shot in result.shots:
-                rel = shot.get("path") if isinstance(shot, dict) else None
-                if not rel:
-                    continue
-                src = out_dir / rel
-                if not src.is_file():
-                    continue
-                dst = dest_root / rel
-                dst.write_bytes(src.read_bytes())
-                committed_paths.append(str(dst))
+        for shot in result.shots:
+            rel = shot.get("path") if isinstance(shot, dict) else None
+            if rel and (out_dir / rel).is_file():
+                files[rel] = (out_dir / rel).read_bytes()
                 delivered_names.append({"name": shot.get("name", rel), "path": rel})
-            if result.video:
-                src = out_dir / result.video
-                if src.is_file():
-                    dst = dest_root / result.video
-                    dst.write_bytes(src.read_bytes())
-                    committed_paths.append(str(dst))
-                    video_name = result.video
-            if not committed_paths:
+        if result.video and (out_dir / result.video).is_file():
+            files[result.video] = (out_dir / result.video).read_bytes()
+            video_name = result.video
+        try:
+            if not evidence_ledger.deliver(
+                    repo, task_id, files, f"UI evidence for {task_id[:8]}",
+                    on_repair=lambda paths, note: self._advisory(
+                        f"ui evidence branch: manifest repaired for {paths} ({note})")):
                 return ""
-            # Through `commit_with_manifest_repair`, NEVER a raw
-            # `repo.commit_paths(...)`: `tests/test_checkpoint_commit_seam.py`
-            # statically enforces that every commit call in this file funnels
-            # through the one manifest-repair-aware seam (`_checkpoint_commit`
-            # for `[WIP-*]` checkpoints; this direct call for everything
-            # else), so a delivery that lands on an ALREADY-pinned path (e.g.
-            # a repo whose export guard classifies `.nh-evidence/**` as ship,
-            # unlike this product's own) survives the gate's retry instead of
-            # silently losing the commit to a raw refusal.
-            commit_with_manifest_repair(
-                repo, committed_paths, f"UI evidence for {task_id[:8]}",
-                on_repair=lambda paths, note: self._advisory(
-                    f"ui evidence branch: manifest repaired for {paths} ({note})"),
-            )
-            # `force_with_lease`, not a plain push: `evidence_branch` is
-            # recreated from the task branch's CURRENT tip every call
-            # (`create_branch` above is `checkout -B`, resetting the local
-            # ref), so a task's SECOND attempt produces unrelated history
-            # under the SAME branch name — a plain push is a non-fast-
-            # forward rejection every retry, silently losing evidence from
-            # attempt 2 onward. Safe to force unconditionally: this branch
-            # is written by nothing but this method, on every task, so there
-            # is never a human or another attempt's commit on it to lose.
-            repo.push(branch=evidence_branch, force_with_lease=True)
         except Exception as exc:  # noqa: BLE001 — advisory only
             self._advisory(f"ui evidence delivery failed: {exc}")
             return ""
-        finally:
-            with contextlib.suppress(Exception):
-                repo.checkout(original_branch)
 
         try:
             remote_url = repo.remote_url() or ""
@@ -20651,6 +20608,45 @@ SIX of them read a checkpoint and TWO do not — but do
     #: verification log today) live under, inside `NO_HUMAN_HOME` — never
     #: inside the target repo, so nothing here can be mistaken for a change
     #: the coder made or reach the export allowlist by accident.
+    def _deliver_evidence_ledger(
+        self, repo: "GitRepo | None", task: Task, evidence: PrEvidence, *,
+        head_sha: str, review_checklist_raw: "str | dict | None" = None,
+    ) -> PrEvidence:
+        """#23 proof ledger: one file per Evidence row on `nh-evidence/<task-id>`;
+        returns *evidence* with the rows' blob URLs (`proof_urls`) at the ledger
+        COMMIT. Best-effort: no repo/GitHub remote/push → *evidence* unchanged."""
+        from . import evidence_ledger
+        try:
+            owner_repo = self._github_owner_repo(repo.remote_url() or "") if repo is not None else None
+            if owner_repo is None:
+                return evidence
+            review_md = ""
+            if review_checklist_raw and not self._checklist_unreadable(review_checklist_raw):
+                review_md = self._review_checklist_comment(
+                    task, review_checklist_raw, head_sha=head_sha,
+                    rounds=int((evidence.review_verdict or {}).get("rounds") or 0))
+            log = self._verification_appendix(None, evidence=evidence, test_evidence=evidence.tests)
+            files = evidence_ledger.render_files(
+                evidence, task_id=task.id, head_sha=head_sha, verification_md=log,
+                review_md=review_md, assumptions_md=self._assumptions_section(task))
+            sha = evidence_ledger.deliver(
+                repo, task.id, {k: v.encode("utf-8") for k, v in files.items()},
+                f"Evidence ledger for {task.id[:8]}",
+                on_repair=lambda paths, note: self._advisory(
+                    f"evidence ledger: manifest repaired for {paths} ({note})"))
+            if not sha:
+                return evidence
+            rows = [r for r in ((evidence.repro or {}).get("receipts") or []) if isinstance(r, dict)]
+            urls = evidence_ledger.proof_urls(
+                *owner_repo, sha, task.id, files,
+                evidence_ledger.command_lines(files["verification.md"], rows))
+            self.emit("evidence_ledger", f"{len(files)} files at {sha[:7]}",
+                      branch=evidence_ledger.BRANCH.format(task_id=task.id))
+            return replace(evidence, proof_urls=urls)
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            self._advisory(f"evidence ledger not delivered: {exc}")
+            return evidence
+
     _ARTIFACTS_DIRNAME = "artifacts"
 
     @staticmethod
@@ -20732,6 +20728,7 @@ SIX of them read a checkpoint and TWO do not — but do
         receipts: list[dict] | None, *,
         observable: bool = True, evidence: PrEvidence | None = None,
         task_id: str = "", artifact_path: str = "",
+        anchors: dict[str, str] | None = None,
     ) -> str:
         """"How I verified this" — the SHORT, final-results-only form the PR
         body carries (D1.1, 2026-08-31: the operator's "receipts out of the
@@ -20800,7 +20797,7 @@ SIX of them read a checkpoint and TWO do not — but do
             short_id = (task_id or "")[:8] or "<task-id>"
             where = (Orchestrator._display_path(artifact_path) if artifact_path
                      else "(not written this run)")
-            lines = [fold_by_kind(rows), (
+            lines = [fold_by_kind(rows, anchors=anchors), (
                 f"\n{n} command{'' if n == 1 else 's'} recorded while working. "
                 f"Full verification log: {where} — `nh logs {short_id}`; the "
                 f"same log, every command with its captured output, is posted "
@@ -21076,7 +21073,7 @@ SIX of them read a checkpoint and TWO do not — but do
         return header + "\n".join(lines) + "\n"
 
     @staticmethod
-    def _test_evidence_section(test_evidence: dict | None) -> str:
+    def _test_evidence_section(test_evidence: dict | None, proof: str = "") -> str:
         """M-B: render runtime/integration test evidence for the PR body.
 
         Uses the per-layer summaries collected during the layered test run
@@ -21185,4 +21182,6 @@ SIX of them read a checkpoint and TWO do not — but do
                          "deleted or weakened tests")
         if not lines:
             return ""
+        if proof and lines[0].startswith("| Tests |"):  # #23: link the row to its ledger file
+            lines[0] = lines[0][:-2] + proof + " |"
         return "\n".join(lines) + "\n"
