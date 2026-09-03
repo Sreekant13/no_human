@@ -97,6 +97,26 @@ def ws_handshake_is_local(headers: Mapping[str, str],
         origin is None or origin_is_local(origin, allowed))
 
 
+# Content-Security-Policy for the board HTML document (applied to text/html
+# responses in the middleware below). The built index.html loads one same-origin
+# module and no inline script, so `script-src 'self'` is strict and
+# non-breaking: an injected <script> or inline handler cannot execute even if
+# markup slipped past react-markdown's escaping. Board XSS is same-origin and
+# would otherwise reach the whole API; this closes the script-execution half.
+# Inline STYLE is allowed (React style props / bundler CSS); object-src 'none',
+# base-uri 'self', frame-ancestors 'none' and form-action 'self' close the
+# plugin, base-tag, clickjacking and form-redirect vectors.
+_BOARD_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
+# Trusted Types is sent REPORT-ONLY: the board's own code uses no guarded DOM
+# sink, but bundled dependencies call innerHTML, so enforcing this could break
+# rendering until each is confirmed TrustedHTML-safe in a real browser.
+_BOARD_CSP_REPORT_ONLY = "require-trusted-types-for 'script'"
+
+
 async def local_boundary(request: Request, call_next):
     """One dispatch, two refusals: a cross-origin browser write (403), then a
     request whose ``Host`` is not an allowed host (400)."""
@@ -125,7 +145,13 @@ async def local_boundary(request: Request, call_next):
                 ),
             },
         )
-    return await call_next(request)
+    response = await call_next(request)
+    # CSP is defense-in-depth for the board document; applied to HTML only.
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers.setdefault("Content-Security-Policy", _BOARD_CSP)
+        response.headers.setdefault(
+            "Content-Security-Policy-Report-Only", _BOARD_CSP_REPORT_ONLY)
+    return response
 
 
 def install_local_boundary(app) -> None:
