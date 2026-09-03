@@ -3424,12 +3424,36 @@ class Orchestrator:
 
         The profile is a name, never a token (constraint §1). It is read from
         the process, not from config, so the stamp is what actually billed.
+
+        Constraint §6d: `models["reviewer"]` stays the model id ONLY — the
+        `attempts`/task-detail column shape and `core/cost.py`'s parsing of
+        it are out of scope and unchanged. A non-default reviewer backend is
+        disclosed ADDITIONALLY, appended to the human-readable `detail`
+        string and carried as its own `role_backends` event kwarg, read from
+        the SAME resolver `_reviewer_attribution`/`AdversarialReviewer.
+        from_config` use (`role_backend_settings.effective_role_backend`) —
+        never a second opinion of what actually got constructed.
         """
         detail = " · ".join(f"{r}={m}" for r, m in models.items())
         profile = active_auth_profile()
         if profile:
             detail = f"{detail} · auth={profile}"
-        self.emit("models", detail, models=models, auth_profile=profile)
+        from .role_backend_settings import effective_role_backend
+        reviewer_effective = effective_role_backend(self.config, "reviewer")
+        role_backends: dict[str, dict[str, str]] = {}
+        if not reviewer_effective["is_default"]:
+            role_backends["reviewer"] = {
+                "backend": reviewer_effective["backend"],
+                "model": reviewer_effective["model"],
+            }
+            detail = (
+                f"{detail} · reviewer-backend={reviewer_effective['backend']} "
+                "(chosen in Settings)"
+            )
+        self.emit(
+            "models", detail, models=models, auth_profile=profile,
+            **({"role_backends": role_backends} if role_backends else {}),
+        )
 
     @staticmethod
     def _plan_file(repo: GitRepo) -> Path:
@@ -19616,7 +19640,29 @@ SIX of them read a checkpoint and TWO do not — but do
             verifiers=((task.context or {}).get("verifier_results") or {}).get(head_sha),
             ci_state=(task.context or {}).get("ci_status"),
             merge_policy=merge_policy,
+            reviewer_attribution=self._reviewer_attribution(),
         )
+
+    def _reviewer_attribution(self) -> str:
+        """Constraint §6d's PR-body disclosure string: `""` when the reviewer
+        ran on the default (`CLAUDE_PINNED_ROLES`'s pin), or `"<backend>
+        \\`<model>\\`"` when an explicit `llm.role_backends.reviewer` Settings
+        choice built it instead. Reads `self.config` through the SAME
+        resolver `agent.backend.make_backend`/`review.reviewer.
+        AdversarialReviewer.from_config` consult (`role_backend_settings.
+        effective_role_backend`) — never a second opinion of what actually
+        got constructed.
+
+        Imported locally, not at module scope: `role_backend_settings`
+        imports `backend_settings`, which imports `runtime`, which imports
+        `Orchestrator` from this module — a module-level import here would
+        be a circular import at load time.
+        """
+        from .role_backend_settings import effective_role_backend
+        effective = effective_role_backend(self.config, "reviewer")
+        if effective["is_default"]:
+            return ""
+        return f"{effective['backend']} `{effective['model']}`"
 
     def _evidence_section(
         self, task: Task, *, test_evidence: dict | None = None,
@@ -19957,6 +20003,18 @@ SIX of them read a checkpoint and TWO do not — but do
         glyph = "✅" if rv["verdict"] == "PASSED" else "❌"
         row = (f"| Independent review | {glyph} **{rv['verdict']}** — "
                f"{n} round{'s' if n != 1 else ''} |\n")
+        # Constraint §6d disclosure: an ADDITIONAL row, appended AFTER the
+        # verdict row above rather than folded into it — `review_verdict_pin`
+        # (`pr_evidence.py`) must stay an exact substring of the row above,
+        # and this field is deliberately not part of that pin (see
+        # `PrEvidence.reviewer_attribution`'s docstring). "" (the default)
+        # renders nothing — a reader who never touched Settings sees no new
+        # row at all.
+        if evidence is not None and evidence.reviewer_attribution:
+            row += (
+                f"| Reviewer model | {evidence.reviewer_attribution} — "
+                "non-default, chosen in Settings |\n"
+            )
         addressed = rv.get("addressed") or []
         if not addressed:
             return row

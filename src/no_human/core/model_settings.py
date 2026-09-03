@@ -29,6 +29,13 @@ from .model_catalog import (
     options_for,
     validate,
 )
+from .role_backend_settings import (
+    ROLE_BACKEND_ROLES,
+    RoleBackendError,
+    apply_role_backend_change,
+    effective_role_backend,
+    validate_role_backend_entries,
+)
 
 __all__ = [
     "ALLOWED_KEYS",
@@ -54,7 +61,13 @@ ROLE_BY_KEY = {config_key: role for role, config_key in ROLES.items()}
 class ModelSettingsError(ValueError):
     """A model-settings write was refused. The message is always safe to
     show verbatim to an operator: never a stack trace, and any value it
-    quotes is exactly what the operator just typed into a model-id field."""
+    quotes is exactly what the operator just typed into a model-id field.
+
+    Also raised (re-wrapped from :class:`~.role_backend_settings.
+    RoleBackendError`) for a refused ``role_backends`` entry inside the same
+    PUT body — one exception type reaching ``/api/config/models``'s single
+    ``except`` clause, never a second error shape the endpoint has to learn.
+    """
 
 
 #: ``task_events`` has no task row for a config change — there is no task.
@@ -115,9 +128,31 @@ def models_payload(
     when a write has landed on disk that the running process has not picked
     up — the same shape of check ``/api/auth/status``'s
     ``_auth_status_payload`` already performs for the auth profile.
+
+    Constraint §6d: a role in :data:`role_backend_settings.ROLE_BACKEND_ROLES`
+    (today, ``"reviewer"`` only) additionally carries a ``"backend"`` block —
+    ``role_backend_settings.effective_role_backend``'s return value verbatim,
+    never re-derived — so the Settings picker can show "default
+    (claude-opus-4-8)" vs an explicit chosen backend/model. Every other role
+    is untouched: no ``"backend"`` key at all, the exact shape it had before
+    this constraint landed. ``restart_required`` folds in the same role's
+    on-disk-vs-running comparison, since a ``role_backends`` write takes
+    effect on the orchestrator's NEXT task exactly like a plain model write.
+
+    B6: that ``"backend"`` block is built from *on-disk* config, not
+    *running_cfg_data* — deliberately asymmetric with ``current`` above (the
+    five plain ``llm.*_model`` scalars, which DO still read the running
+    process, since those apply live). A role-backend write only takes full
+    effect on the orchestrator's next task, so echoing the still-running
+    value back right after a successful PUT would show the just-saved choice
+    as "default" and leave its Settings-pane clear control dead until a
+    restart, even though the write already landed on disk. Reading on-disk
+    means the very next GET (no restart) already reflects a save, and a
+    clear-to-default PUT is immediately visible as cleared too.
     """
     running = current_models(running_cfg_data)
-    on_disk = current_models(_config.load_config(config_path).data)
+    on_disk_cfg = _config.load_config(config_path).data
+    on_disk = current_models(on_disk_cfg)
 
     roles = [
         {
@@ -130,10 +165,20 @@ def models_payload(
             # other role carries "" — the A/B evidence only exists for this
             # role's tier decision (see model_catalog.py / config.py).
             "cost_note": REVIEWER_COST_NOTE if role == "reviewer" else "",
+            **(
+                {"backend": effective_role_backend(on_disk_cfg, role)}
+                if role in ROLE_BACKEND_ROLES
+                else {}
+            ),
         }
         for role, key in ROLES.items()
     ]
-    return {"roles": roles, "restart_required": on_disk != running}
+    restart_required = on_disk != running or any(
+        effective_role_backend(on_disk_cfg, role)
+        != effective_role_backend(running_cfg_data, role)
+        for role in ROLE_BACKEND_ROLES
+    )
+    return {"roles": roles, "restart_required": restart_required}
 
 
 def apply_model_changes(
@@ -147,19 +192,45 @@ def apply_model_changes(
 
     Returns ``(payload, changes)``: *payload* is the refreshed
     ``models_payload`` (reflecting the write, if one happened); *changes* is
-    ``{key: {"old": ..., "new": ...}}`` for every key whose value actually
-    changed (empty when the request was a no-op repeat — an idempotent PUT
-    writes nothing and emits nothing).
+    ``{key: {"old": ..., "new": ...}}`` for every ``llm.*_model`` key whose
+    value actually changed, PLUS — constraint §6d — a ``"role_backends"``
+    entry (``{role: {"old": ..., "new": ...}}``, `role_backend_settings.
+    apply_role_backend_change`'s own return shape verbatim) when the body
+    carried a ``role_backends`` key and it changed anything. Empty when the
+    request was a no-op repeat in every part — an idempotent PUT writes
+    nothing and emits nothing.
 
     Raises :class:`ModelSettingsError` on: a non-dict body, a non-string
     value, an unrecognised key, any ``model_catalog.validate`` refusal
     (vendor pin, unpriced id, reviewer==coder collision in either
     direction), or — checked strictly AFTER ``validate`` returns ``None`` —
     a non-Claude id for the coder role, which no backend reads from
-    ``llm.primary_model``.
+    ``llm.primary_model``. A refused ``role_backends`` entry raises the same
+    :class:`ModelSettingsError`, re-wrapped from `role_backend_settings.
+    RoleBackendError` — see that class's docstring — so this stays the ONE
+    exception type ``/api/config/models`` has to catch.
+
+    B5: the ENTIRE body — both the scalar keys above AND ``role_backends`` —
+    is validated before either half writes anything. `role_backends` is
+    checked (via `role_backend_settings.validate_role_backend_entries`, the
+    same refusals as `apply_role_backend_change`) right after the scalar
+    validation loop and before the scalar write, so a body carrying a valid
+    scalar change alongside a refused `role_backends` entry lands NEITHER —
+    the scalar half never gets a head start over the half that fails.
+    Belt-and-braces beyond that ordering: the two on-disk writes below are
+    also wrapped so that if the write step itself fails partway through
+    (rather than validation refusing first), the config file is restored to
+    its exact pre-request bytes rather than left half-applied.
     """
     if not isinstance(body, dict):
         raise ModelSettingsError("expected a JSON object of {config_key: model_id}")
+
+    # Popped BEFORE the unknown-key check below: "role_backends" is a real,
+    # documented key of this PUT body, just not one of the five ALLOWED_KEYS
+    # (those are `llm.*_model` scalars; this is a nested per-role mapping) —
+    # so it must never trip the "unrecognised config key" refusal.
+    body = dict(body)
+    role_backend_entries = body.pop("role_backends", None)
 
     stripped: dict[str, str] = {}
     for key, value in body.items():
@@ -174,7 +245,8 @@ def apply_model_changes(
             f"subset of {sorted(ALLOWED_KEYS)!r}"
         )
 
-    on_disk = current_models(_config.load_config(config_path).data)
+    on_disk_cfg = _config.load_config(config_path).data
+    on_disk = current_models(on_disk_cfg)
     # The full resolved five AFTER this write: on-disk values overlaid with
     # every submitted value — so a multi-key PUT (e.g. coder and reviewer
     # swapping models in one request) validates against where each key is
@@ -189,16 +261,56 @@ def apply_model_changes(
         if role == "coder" and not _is_claude_id(value):
             raise ModelSettingsError(CODER_BACKEND_REASON.format(model_id=value))
 
-    changes = {
+    # B5: validate the role_backends half of the body BEFORE either write
+    # below touches disk — delegated to the SAME validation the (future)
+    # standalone role-backend picker will use, never a second, divergent
+    # implementation of "is this backend/model choice allowed" folded in
+    # here. A refusal here must leave the scalar half above unwritten too,
+    # so this runs before the scalar write, not just before the
+    # role_backends write.
+    if role_backend_entries is not None:
+        try:
+            validate_role_backend_entries(role_backend_entries, on_disk_cfg=on_disk_cfg)
+        except RoleBackendError as exc:
+            raise ModelSettingsError(str(exc)) from exc
+
+    changes: dict[str, Any] = {
         key: {"old": on_disk[key], "new": value}
         for key, value in stripped.items()
         if value != on_disk[key]
     }
 
+    # Belt-and-braces beyond the validate-before-write ordering above: if the
+    # write step itself fails partway through (rather than validation
+    # refusing first — e.g. `set_role_backend`'s own splice/verify/restore
+    # raising after the scalar write already landed), restore the file to
+    # its exact pre-request bytes rather than leave it half-applied.
+    before_bytes = config_path.read_bytes() if config_path.exists() else None
+    try:
+        if changes:
+            _config.set_model_ids({key: c["new"] for key, c in changes.items()}, config_path)
+
+        if role_backend_entries is not None:
+            try:
+                role_backend_changes, _effective = apply_role_backend_change(
+                    role_backend_entries,
+                    running_cfg_data=running_cfg_data,
+                    config_path=config_path,
+                )
+            except RoleBackendError as exc:
+                raise ModelSettingsError(str(exc)) from exc
+            if role_backend_changes:
+                changes = {**changes, "role_backends": role_backend_changes}
+    except Exception:
+        if before_bytes is not None:
+            config_path.write_bytes(before_bytes)
+        elif config_path.exists():
+            config_path.unlink()
+        raise
+
     if not changes:
         return models_payload(running_cfg_data, config_path), {}
 
-    _config.set_model_ids({key: c["new"] for key, c in changes.items()}, config_path)
     return models_payload(running_cfg_data, config_path), changes
 
 

@@ -59,6 +59,16 @@ class PrEvidence:
       head — say nothing; ``(merge_policy=None, merge_policy_error="...")``
       means the compute was tried and failed — disclose it. A stamped
       ``merge_policy`` always wins over a stale error string.
+    * ``reviewer_attribution`` — constraint amendment §6d disclosure: ``""``
+      (never ``None`` — this field is a plain flag, not a "gate never ran"
+      slot like the others above) when the reviewer ran on the default
+      (`CLAUDE_PINNED_ROLES`'s pin, `claude-opus-4-8`), or ``"<backend>
+      `<model>`"`` when it ran on an explicit `llm.role_backends.reviewer`
+      Settings choice instead. Deliberately NOT a truth pin
+      (`truth_pins()`/`review_verdict_pin()` are unchanged by this field —
+      the evidence-based review verdict itself is backend-agnostic, per the
+      out-of-scope list): this is an honesty disclosure about WHICH backend
+      produced the verdict above, not a second verdict.
     """
 
     repro: dict[str, Any] | None = None
@@ -69,6 +79,7 @@ class PrEvidence:
     ci_state: Any = None
     merge_policy: dict[str, Any] | None = None
     merge_policy_error: str | None = None
+    reviewer_attribution: str = ""
 
     def has(self, field: str) -> bool:
         return getattr(self, field, None) is not None

@@ -2099,6 +2099,7 @@ class AdversarialReviewer:
         *,
         model: str = "claude-opus-5",
         backend: Any | None = None,
+        backend_name: str = "claude",
         on_event: Callable | None = None,
         timeout: int | None = None,
         code_review_timeout: int | None = None,
@@ -2114,6 +2115,14 @@ class AdversarialReviewer:
         # The model actually bound to this reviewer, read back from the backend
         # so an injected one reports itself rather than the default kwarg.
         self.model = getattr(self._backend, "model", model)
+        # Which backend NAME this reviewer runs on — "claude" for every
+        # existing call site (direct construction never sets this). Only
+        # `from_config` passes a resolved value, per constraint §6d's
+        # explicit-choice-overrides-the-default-pin seam
+        # (`agent.backend.resolve_backend_name`). Read by disclosure
+        # (task-detail models line, PR body) to say WHEN the reviewer ran on
+        # something other than the default.
+        self.backend_name = backend_name
         self._on_event = on_event
         # Wall-clock window per review session. None ⇒ the module default, so
         # every existing direct construction (tests, ad-hoc callers) behaves
@@ -2139,13 +2148,34 @@ class AdversarialReviewer:
         before: six call sites each spelled `model=config.review_model` and any
         knob added next was added to some of them. A raw dict rather than a
         ``Config`` because the eval harness holds `config.data`, not a Config.
+
+        Backend construction goes through `agent.backend.make_backend` (role=
+        "reviewer") rather than constructing `ClaudeBackend` directly — the
+        seam constraint §6d added: with no `llm.role_backends.reviewer` entry
+        this yields the exact same `ClaudeBackend(model=review_model,
+        readonly=True)` construction as before (byte-identical defaults —
+        see `make_backend`'s own docstring for that guarantee); an explicit
+        Settings choice builds the chosen backend instead. Only used when the
+        caller does not inject its own `backend=` (tests, ad-hoc callers keep
+        doing that unchanged). `backend_name` is resolved unconditionally
+        (even for an injected backend) so disclosure always reflects what
+        `llm.role_backends.reviewer` says, per `resolve_backend_name`.
         """
+        from ..agent.backend import make_backend, resolve_backend_name
         from ..config import code_review_timeout_seconds, review_timeout_seconds
 
         llm = data.get("llm") or {}
+        review_model = llm.get("review_model") or "claude-opus-4-8"
+        built_backend = backend if backend is not None else make_backend(
+            model=review_model,
+            config=data,
+            role="reviewer",
+            readonly=True,
+        )
         return cls(
-            model=llm.get("review_model") or "claude-opus-4-8",
-            backend=backend,
+            model=review_model,
+            backend=built_backend,
+            backend_name=resolve_backend_name(data, role="reviewer"),
             on_event=on_event,
             timeout=review_timeout_seconds(data),
             code_review_timeout=code_review_timeout_seconds(data),

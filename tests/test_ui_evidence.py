@@ -141,6 +141,14 @@ class FakePage:
     async def fill(self, sel, text):
         self.calls.append(("fill", sel, text))
         await self._maybe_sleep()
+        if self.fail_action == "fill":
+            raise RuntimeError("boom")
+
+    async def select_option(self, sel, value):
+        self.calls.append(("select_option", sel, value))
+        await self._maybe_sleep()
+        if self.fail_action == "select":
+            raise RuntimeError("boom")
 
     def locator(self, text_sel):
         self.calls.append(("locator", text_sel))
@@ -316,6 +324,22 @@ def test_manifest_problem_text_on_non_fill(tmp_path):
     assert problem is not None and "only valid on a" in problem
 
 
+def test_manifest_problem_select_without_text(tmp_path):
+    """`select` on a `<select>` needs the option value in `text`, same
+    contract as `fill` — a bare `{"select": "#picker"}` (no option chosen)
+    is rejected the same way a bare `fill` is."""
+    data = dict(VALID, steps=[{"select": "#picker"}])
+    write_manifest(tmp_path, data)
+    problem = ui_evidence.manifest_problem(tmp_path)
+    assert problem is not None and "select" in problem and "text" in problem
+
+
+def test_manifest_problem_select_with_text_valid(tmp_path):
+    data = dict(VALID, steps=[{"select": "#picker", "text": "codex"}])
+    write_manifest(tmp_path, data)
+    assert ui_evidence.manifest_problem(tmp_path) is None
+
+
 def test_manifest_problem_goto_protocol_relative_rejected(tmp_path):
     """The prior-attempt review finding: //evil.com/x must be rejected."""
     data = dict(VALID, steps=[{"goto": "//evil.com/x"}])
@@ -453,6 +477,22 @@ async def test_run_records_shots_with_png_dims(tmp_path, monkeypatch):
     assert shot["path"] == "loaded.png"
     assert (out_dir / "loaded.png").read_bytes() == PNG_1x1
     assert len(shot["sha256"]) == 64
+
+
+async def test_run_select_dispatches_via_select_option_not_fill(tmp_path, monkeypatch):
+    """A `<select>` picker (e.g. the §6d reviewer-backend-override dropdown)
+    rejects `page.fill()` — Playwright's `fill()` only targets
+    <input>/<textarea>/[contenteditable]. `select` must call
+    `page.select_option(selector, value)`, never `page.fill`."""
+    monkeypatch.setattr(ui_evidence, "_reachable", lambda url: True)
+    data = dict(VALID, steps=[{"goto": "/"}, {"select": "#picker", "text": "codex"}])
+    write_manifest(tmp_path, data)
+    out_dir = tmp_path / "evidence"
+    page = FakePage()
+    result = await ui_evidence.run(tmp_path, out_dir, launch=make_launch(page))
+    assert result.verdict == "ran"
+    assert ("select_option", "#picker", "codex") in page.calls
+    assert not any(call[0] == "fill" and call[1] == "#picker" for call in page.calls)
 
 
 async def test_run_press_dispatches_via_keyboard_not_page_press(tmp_path, monkeypatch):

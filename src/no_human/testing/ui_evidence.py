@@ -59,7 +59,7 @@ SCHEMA_HINT = (
     '{"base_url": "http://127.0.0.1:5173", "steps": [{"goto": "/"}, ...]}'
 )
 
-_ACTIONS = ("goto", "wait_for", "click", "fill", "shot", "assert_text", "press")
+_ACTIONS = ("goto", "wait_for", "click", "fill", "select", "shot", "assert_text", "press")
 _MAX_STEPS = 40
 _MAX_SHOTS = 12
 _DEFAULT_TIMEOUT_MS = 10_000
@@ -240,11 +240,14 @@ def _step_problem(raw_step, i: int, shot_names: set) -> tuple[Step | None, str |
         return None, f"step {i} ({action}) value must be a non-empty string"
 
     text = raw_step.get("text")
-    if action == "fill":
+    if action in ("fill", "select"):
         if not isinstance(text, str) or not text:
-            return None, f"step {i} (fill) requires a non-empty \"text\""
+            return None, f"step {i} ({action}) requires a non-empty \"text\""
     elif "text" in raw_step:
-        return None, f"step {i} ({action}) — \"text\" is only valid on a \"fill\" step"
+        return None, (
+            f"step {i} ({action}) — \"text\" is only valid on a \"fill\" or "
+            "\"select\" step"
+        )
 
     if action == "goto":
         problem = _goto_local_problem(value)
@@ -277,7 +280,7 @@ def _step_problem(raw_step, i: int, shot_names: set) -> tuple[Step | None, str |
     step = Step(
         action=action,
         value=value,
-        text=text if action == "fill" else None,
+        text=text if action in ("fill", "select") else None,
         timeout_ms=timeout_ms,
         index=i,
     )
@@ -720,6 +723,11 @@ async def _dispatch(page, step: Step, base_url: str, out_dir: Path, shots: list)
         await _maybe_await(page.click(value))
     elif action == "fill":
         await _maybe_await(page.fill(value, step.text))
+    elif action == "select":
+        # `<select>` elements reject `fill()` (Playwright: fill only works on
+        # <input>/<textarea>/[contenteditable]) — `select_option` is the
+        # dedicated primitive for choosing an option by its `value` attr.
+        await _maybe_await(page.select_option(value, step.text))
     elif action == "press":
         # Global key press — Playwright's `Page.press(selector, key)` takes a
         # selector as its FIRST positional argument, so calling it with only

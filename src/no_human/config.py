@@ -1383,6 +1383,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # the recall measurement in eval/ (control set now 10). The README's
         # published catch-rate was measured on 4.8 and is consistent again.
         "review_model": "claude-opus-4-8",
+        # Constraint amendment §6d (operator, commit 413d76f0d):
+        # CLAUDE_PINNED_ROLES is now a DEFAULT pin set, not absolute — an
+        # explicit per-role Settings choice overrides it. That choice lives at
+        # `llm.role_backends.<role>: {backend, model}`, today wired for
+        # "reviewer" only (see agent.backend.explicit_role_backend). The key
+        # is deliberately ABSENT here — it is never a default value, only
+        # something `set_role_backend` (this module, the one on-disk writer —
+        # reached only through `core.role_backend_settings.
+        # apply_role_backend_change`'s validation+availability-refusal layer,
+        # never called directly by a route) splices in when an operator makes
+        # an explicit choice in Settings. Its absence IS "use review_model
+        # above, on Claude".
         # Wall-clock seconds granted to ONE reviewer session before it is cut
         # off. These are the walls, not budgets: the reviewer is bounded by
         # turns as well, and a round that dies on the wall halves the next one.
@@ -2710,6 +2722,7 @@ def load_config(
         user_data = yaml.safe_load(config_path.read_text()) or {}
 
     _reject_api_key_in_config(user_data)
+    _reject_invalid_role_backends(user_data)
     if "tracker" in user_data:
         warnings.warn(
             "The 'tracker' config section is deprecated and ignored — the TRACKER "
@@ -3107,6 +3120,113 @@ def set_worker_backend(backend: str, config_path: Path = CONFIG_PATH) -> str:
     return backend
 
 
+def _role_backends_flow_mapping(role_backends: dict[str, dict[str, str]]) -> str:
+    """Serialize a ``{role: {backend, model}}`` mapping as a single-line YAML
+    flow mapping, for ``_splice_llm_scalar``.
+
+    Every token going in here has already been shape-validated (role against
+    ``_ROLE_BACKENDS_ROLE_WHITELIST``, backend against ``SUPPORTED_BACKENDS``,
+    model against ``_MODEL_ID_SHAPE_RE``) by ``set_role_backend``, so nothing
+    here can inject YAML structure. Sorted by role for a deterministic write.
+    """
+    if not role_backends:
+        return "{}"
+    parts = [
+        f"{role}: {{backend: {entry['backend']}, model: {entry['model']}}}"
+        for role, entry in sorted(role_backends.items())
+    ]
+    return "{" + ", ".join(parts) + "}"
+
+
+def set_role_backend(
+    role: str,
+    backend: str | None,
+    model: str | None,
+    config_path: Path = CONFIG_PATH,
+) -> dict[str, str] | None:
+    """Splice one role's entry into ``llm.role_backends``, one atomic write,
+    preserving comments — the *only* writer for this key (constraint §6d;
+    ``core.role_backend_settings.apply_role_backend_change`` is the only
+    caller; catalog/availability validation happens there, BEFORE this is
+    reached — this function's own job is purely the text splice, the
+    write-time safety net, and refusing an out-of-whitelist role / unsupported
+    backend / non-bare-shape model as a last-line guard).
+
+    A falsy ``backend`` AND ``model`` (both ``None``/blank) *clears* the role
+    — removes its entry from the mapping, leaving any sibling role untouched.
+    Otherwise both must be given and shape-valid.
+
+    Reads the CURRENT mapping first (so this is additive per role, never a
+    second writer for the whole key), re-emits the whole flow mapping via
+    ``_splice_llm_scalar``, and keeps the exact same discipline as
+    ``set_worker_backend``: write -> reject-duplicate-keys -> reload ->
+    compare resolved value -> restore original + ``AuthError`` on any
+    mismatch. Returns the resolved entry for *role* (``None`` if cleared).
+    """
+    from .agent.backend import SUPPORTED_BACKENDS  # local: see set_worker_backend
+
+    role = str(role or "").strip()
+    if role not in _ROLE_BACKENDS_ROLE_WHITELIST:
+        raise ValueError(
+            f"role {role!r} is not supported for role_backends; must be one "
+            f"of {sorted(_ROLE_BACKENDS_ROLE_WHITELIST)!r}"
+        )
+
+    clearing = not backend and not model
+    if not clearing:
+        backend = str(backend or "").strip().lower()
+        if backend not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"backend {backend!r} is not supported; must be one of "
+                f"{sorted(SUPPORTED_BACKENDS)!r}"
+            )
+        if not _BACKEND_NAME_SHAPE_RE.fullmatch(backend):
+            raise ValueError(
+                f"backend {backend!r} is not a bare name (letters, digits, "
+                "'.', '_', '-' only) — refusing to splice it into "
+                "config.yaml."
+            )
+        model = str(model or "").strip()
+        if not model or not _MODEL_ID_SHAPE_RE.fullmatch(model):
+            raise ValueError(
+                f"model {model!r} is not a bare model id (letters, digits, "
+                "'.', '_', '-' only) — refusing to splice it into "
+                "config.yaml."
+            )
+
+    cfg = load_config(config_path)  # materialize a default file if there is none
+    current = dict((cfg.data.get("llm") or {}).get("role_backends") or {})
+    if clearing:
+        current.pop(role, None)
+    else:
+        current[role] = {"backend": backend, "model": model}
+
+    original = config_path.read_text()
+    lines = original.splitlines()
+    _splice_llm_scalar(lines, "role_backends", _role_backends_flow_mapping(current))
+    _atomic_write_text(config_path, "\n".join(lines) + "\n")
+    _reject_duplicate_keys_after_write(config_path, original, "set role backend")
+
+    try:
+        resolved_cfg = load_config(config_path)
+    except Exception as exc:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set role backend for {role!r}: {config_path} failed "
+            f"to reload after the edit ({exc}). The file has been restored."
+        ) from exc
+
+    resolved = dict(resolved_cfg.data.get("llm", {}).get("role_backends") or {})
+    if resolved != current:
+        _atomic_write_text(config_path, original)
+        raise AuthError(
+            f"failed to set role backend for {role!r}: {config_path} "
+            f"resolved to {resolved!r} after the edit, not {current!r}. The "
+            "file has been restored."
+        )
+    return resolved.get(role)
+
+
 #: Upper bound on ``concurrency.max_workers`` a caller may WRITE. The scheduler
 #: clamps the effective pool further at runtime (``clamp_pool_width`` — CPU and
 #: isolation aware), so this is only a sanity rail against an absurd config
@@ -3320,6 +3440,90 @@ def _reject_api_key_in_config(data: dict[str, Any]) -> None:
                 walk(item)
 
     walk(data)
+
+
+#: Roles that may appear as a key in `llm.role_backends`. Constraint §6d wires
+#: the reviewer only; planner/supervisor/utility/intake are future entries —
+#: adding one here is a deliberate whitelist edit, not something a stray
+#: config value can smuggle in.
+_ROLE_BACKENDS_ROLE_WHITELIST = ("reviewer",)
+
+
+def _reject_invalid_role_backends(data: dict[str, Any]) -> None:
+    """Fail loudly if `llm.role_backends` is not exactly what the Settings
+    write path (`core.role_backend_settings.apply_role_backend_change` via
+    `set_role_backend`, the ONE writer) would have produced.
+
+    This is the load-time half of the single-write-path rule for §6d: a
+    config-file-injected entry (hand-edited, or dropped in by a task/env-var/
+    other code path) is rejected here with a clear, operator-facing error —
+    it never silently takes effect. `set_role_backend` validates before it
+    writes; this validates every time the file is read, so the two guards
+    together mean the only way `role_backends` ever holds a value is the
+    Settings endpoint.
+
+    A `backend: "claude"` entry is additionally required to name a model
+    `core.model_catalog.options_for(role)` actually offers that role — the
+    SAME catalog-membership rule `core.role_backend_settings.
+    validate_role_backend_entries` enforces at write time, checked again here
+    so a config-file-injected entry can't bypass it by claiming the Claude
+    backend for a model outside the catalog.
+    """
+    from .agent.backend import SUPPORTED_BACKENDS  # local: see set_worker_backend
+    from .core.model_catalog import options_for  # local: avoids an import cycle
+
+    role_backends = (data.get("llm") or {}).get("role_backends")
+    if role_backends is None:
+        return
+    if not isinstance(role_backends, dict):
+        raise ValueError(
+            f"llm.role_backends must be a mapping of role -> "
+            f"{{backend, model}}, got {type(role_backends).__name__}"
+        )
+    for role, entry in role_backends.items():
+        if role not in _ROLE_BACKENDS_ROLE_WHITELIST:
+            raise ValueError(
+                f"llm.role_backends has an unknown role {role!r}; only "
+                f"{sorted(_ROLE_BACKENDS_ROLE_WHITELIST)!r} may appear here"
+            )
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"llm.role_backends.{role} must be a mapping of "
+                f"{{backend, model}}, got {type(entry).__name__}"
+            )
+        extra = set(entry) - {"backend", "model"}
+        if extra:
+            raise ValueError(
+                f"llm.role_backends.{role} has unrecognised key(s) "
+                f"{sorted(extra)!r}; only 'backend' and 'model' are allowed"
+            )
+        backend = entry.get("backend")
+        if not isinstance(backend, str) or not backend.strip():
+            raise ValueError(
+                f"llm.role_backends.{role}.backend is required and must be a "
+                "non-blank string"
+            )
+        if backend not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"llm.role_backends.{role}.backend {backend!r} is not "
+                f"supported; must be one of {sorted(SUPPORTED_BACKENDS)!r}"
+            )
+        model = entry.get("model")
+        if not isinstance(model, str) or not model.strip() \
+                or not _MODEL_ID_SHAPE_RE.fullmatch(model):
+            raise ValueError(
+                f"llm.role_backends.{role}.model must be a bare model id "
+                "(letters, digits, '.', '_', '-' only), "
+                f"got {model!r}"
+            )
+        if backend == "claude":
+            offered = {opt.id for opt in options_for(role)}
+            if model not in offered:
+                raise ValueError(
+                    f"llm.role_backends.{role}.model {model!r} is not an "
+                    f"offered model for the {role} role; must be one of "
+                    f"{sorted(offered)!r}"
+                )
 
 
 def _reject_decomposition_enabled(data: dict[str, Any]) -> None:

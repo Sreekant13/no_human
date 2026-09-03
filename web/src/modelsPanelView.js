@@ -12,8 +12,15 @@ import { titleCase } from "./titleCase.js";
 //               "options":[{"id","price_class":{"label","input_rate",
 //                           "output_rate"},"is_default","note",
 //                           "requires_backend","disabled_reason"}],
-//               "cost_note"}],
+//               "cost_note",
+//               "backend"?:{"backend","model","is_default"}}],
 //    "restart_required": bool}
+//
+// Constraint §6d: a role in `role_backend_settings.ROLE_BACKEND_ROLES` (today
+// only "reviewer") additionally carries the optional "backend" block above —
+// the server's own effective-backend answer, copied verbatim onto the row as
+// `row.backend`; every other role's row has `backend: null`, exactly as it
+// had no such field before this constraint landed.
 
 // modelsPanelView(payload) -> {unavailable, showRestartBanner, rows}
 //
@@ -34,6 +41,13 @@ export function modelsPanelView(payload) {
     default: r.default,
     note: r.note || "",
     costNote: r.cost_note || "",
+    // Only the reviewer row (ROLE_BACKEND_ROLES) carries this from the
+    // server; every other role gets `null` — copied verbatim, never
+    // re-derived, so "default" vs "chosen" is always the server's own
+    // answer.
+    backend: r.backend
+      ? { backend: r.backend.backend, model: r.backend.model, isDefault: !!r.backend.is_default }
+      : null,
     options: (r.options || []).map((o) => ({
       id: o.id,
       priceLabel: o.price_class?.label ?? "",
@@ -53,15 +67,44 @@ export function modelsPanelView(payload) {
 // differs from the row's `current` value. `pending` is `{config_key:
 // model_id}` for every row the user has touched (Reset never needs this —
 // see resetBody below), keyed by `row.key` exactly as the payload spells it.
-export function pendingBody(payload, pending) {
+//
+// `pendingRoleBackend` (constraint §6d, optional — omit it and this behaves
+// exactly as before the amendment) is the reviewer backend picker's own
+// pending edit, independent of the five model-id dropdowns above:
+//   - `undefined` (the default when the argument is omitted): unedited —
+//     never adds a "role_backends" key, whatever the server's current
+//     reviewer backend is.
+//   - `null`: the operator explicitly picked "default" — sends
+//     `{role_backends: {reviewer: null}}` (clearing the entry) UNLESS the
+//     reviewer is already on the default, in which case nothing is sent.
+//   - `{backend, model}`: sends `{role_backends: {reviewer: {backend,
+//     model}}}` UNLESS it is identical to the server's current explicit
+//     choice already.
+export function pendingBody(payload, pending, pendingRoleBackend) {
   const roles = payload?.roles;
-  if (!Array.isArray(roles) || !pending) return {};
+  if (!Array.isArray(roles)) return {};
   const out = {};
-  for (const r of roles) {
-    const next = pending[r.key];
-    if (next === undefined) continue;
-    if (next === r.current) continue;
-    out[r.key] = next;
+  if (pending) {
+    for (const r of roles) {
+      const next = pending[r.key];
+      if (next === undefined) continue;
+      if (next === r.current) continue;
+      out[r.key] = next;
+    }
+  }
+  if (pendingRoleBackend !== undefined) {
+    const reviewer = roles.find((r) => r.role === "reviewer");
+    const current = reviewer && reviewer.backend ? reviewer.backend : null;
+    const currentlyDefault = !current || current.is_default;
+    if (pendingRoleBackend === null) {
+      if (!currentlyDefault) out.role_backends = { reviewer: null };
+    } else {
+      const same =
+        !currentlyDefault &&
+        current.backend === pendingRoleBackend.backend &&
+        current.model === pendingRoleBackend.model;
+      if (!same) out.role_backends = { reviewer: pendingRoleBackend };
+    }
   }
   return out;
 }
@@ -70,12 +113,21 @@ export function pendingBody(payload, pending) {
 // filtered to the ones that actually differ from `current` — an idempotent
 // PUT (Reset when everything is already at its default) sends an empty body,
 // which the server treats as a no-op write (no event, nothing on disk).
+//
+// Constraint §6d: also clears the reviewer's explicit backend, if any —
+// `{role_backends: {reviewer: null}}` — read straight off the payload's own
+// `roles[].backend.is_default`, the same "reset means the server's default"
+// rule the five model-id keys already follow above.
 export function resetBody(payload) {
   const roles = payload?.roles;
   if (!Array.isArray(roles)) return {};
   const out = {};
   for (const r of roles) {
     if (r.default !== r.current) out[r.key] = r.default;
+  }
+  const reviewer = roles.find((r) => r.role === "reviewer");
+  if (reviewer && reviewer.backend && reviewer.backend.is_default === false) {
+    out.role_backends = { reviewer: null };
   }
   return out;
 }

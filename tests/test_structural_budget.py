@@ -318,7 +318,10 @@ FROZEN_FILE_LINES = {
     # boots the repo's configured `start_cmd` and discloses which server it
     # walked). Measured on this merge result with the scanner below, never
     # summed by hand.
-    "core/orchestrator.py": 21065,
+    # 21065 -> 21123 (+58): the reviewer role-backend seam's disclosure and
+    # construction wiring (6d part 1). Measured on the merge result with the
+    # scanner below, never summed.
+    "core/orchestrator.py": 21123,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -557,7 +560,10 @@ FROZEN_FILE_LINES = {
     # config keys (second-tier resolution between `approve_identity` and the
     # repo's own git config, never a fallback to `agent_identity_*`) and
     # their explanatory comment. Re-anchored on rebase.
-    "config.py": 3340,
+    # 3340 -> 3544 (+204): the role_backends config surface (single-write-path
+    # validation, load-time catalog/availability alignment, set_role_backend).
+    # Measured on the merge result with the scanner below, never summed.
+    "config.py": 3544,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
@@ -566,7 +572,10 @@ FROZEN_FILE_LINES = {
     # path now takes the LAST well-formed REVIEW_JSON_START…END match instead
     # of the first (closing the forged-early-block preemption hole), and the
     # missing-END recovery path scans START occurrences last-first to match.
-    "review/reviewer.py": 2915,
+    # 2915 -> 2945 (+30): reviewer-backend construction honoring the explicit
+    # Settings choice (6d part 1). Measured on the merge result with the
+    # scanner below, never summed.
+    "review/reviewer.py": 2945,
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.
