@@ -106,8 +106,8 @@ modes the key lives only in this `.env` file, never in `config.yaml`.
 
 ```yaml
 server:
-  host: 127.0.0.1
-  port: 8420                      # nh dashboard / API bind
+  host: 127.0.0.1                 # requests must address this host or loopback;
+  port: 8420                      # any other Host header is refused (400) — docs/security.md §7
 
 llm:
   auth_mode: subscription         # subscription (default) | api_key — see auth modes below
@@ -341,6 +341,11 @@ ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
                                   # = escalate code PRs honestly instead
   enrich_job_url: https://build.example.com/<controller>/job/<folder>/.../<image-build-job>
   jenkins_controller: https://build.example.com/<controller>
+  jenkins_ca_bundle: /etc/ssl/internal-ca.pem   # PEM the CI-log fetch verifies the
+                                  # Jenkins TLS chain against; empty = system trust
+                                  # store. The console-log fetch sends its SSO
+                                  # credentials only to jenkins_controller and never
+                                  # disables verification.
   registry_prefix: registry.example.com/<org>/<image-path>
 ```
 

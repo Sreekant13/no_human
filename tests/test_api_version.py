@@ -30,7 +30,7 @@ async def client(store, tmp_path):
     app.state.store = store
     app.state.config = Config(data={}, path=tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 
@@ -76,7 +76,7 @@ async def test_version_needs_no_config_or_store(tmp_path):
     """Settings fetches this on open; it must not depend on request state that
     a partially-initialised app might not have."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.get("/api/version")
     assert r.status_code == 200
     assert r.json()["version"] == no_human.__version__

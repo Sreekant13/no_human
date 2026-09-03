@@ -2091,8 +2091,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # is readable by whoever installs it. An operator using this gate fills
         # these in via ~/.no_human/config.yaml on their own machine.
         "enabled": False,
-        # GitLab numeric project id of the pipeline project to trigger.
-        "project_id": None,
+        "project_id": None,  # GitLab numeric project id of the pipeline project to trigger
         "hostname": "",
         "ref": "main",
         # Repos governed by this gate, matched against the PR's repo name.
@@ -2124,6 +2123,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pr_build": True,
         "enrich_job_url": "",
         "jenkins_controller": "",
+        "jenkins_ca_bundle": "",  # PEM the CI-log fetch verifies against; "" = system store
         "registry_prefix": "",
     },
     "hooks": {

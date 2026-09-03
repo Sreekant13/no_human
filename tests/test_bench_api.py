@@ -46,7 +46,7 @@ async def client(tmp_path, monkeypatch):
     app.state.store = store
     app.state.config = load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         c.results = results        # type: ignore[attr-defined]
         yield c
     await store.close()

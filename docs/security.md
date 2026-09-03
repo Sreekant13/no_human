@@ -38,7 +38,12 @@ merge** button and `nh approve` are that action: they squash-land the PR as a
 local commit under the operator identity and push it (§7, `vcs/approve_merge.py`)
 — a human runs them, never the agent. `approval.auto_merge_on_approval` defaults
 to `false` and nothing in the code reads it: no state change, webhook or timer
-merges anything; only that human command does.
+merges anything; only that human command does. Every coder subprocess is
+stamped with an agent-session mark (`agent/session_mark.py`); the `nh` CLI, the
+board's gate-ending routes and `land_task` itself (`vcs/approve_merge.py`) each
+refuse a caller that carries it. The mark is an environment variable, so this
+is a tripwire against an agent that follows its instructions, not a lock
+against one that unsets it — §6 states that residual.
 
 ## 3. Deterministic VCS under a distinct identity
 
@@ -399,6 +404,63 @@ The CLI, the desktop app and the MCP bridge talk to no_human's **own** API on
 `cli/commands.py:print_no_task_matching:78`), and the transcript-research reader probes a language
 server on localhost (`history/extractor.py:65-72`). These never leave the
 machine, and `server.host` defaults to `127.0.0.1`.
+
+That API is unauthenticated, and a loopback address is not an authentication
+boundary on its own: a page the operator visits while the board is up can reach
+`127.0.0.1:8420` from the browser. `api/local_boundary.py` closes that in one
+place — every request must carry an allowed `Host` (else 400; the DNS-rebinding
+defence), a state-changing request whose `Origin` is present and not allowed is
+refused (403), the CORS grant is exact-host loopback only, and the `/ws`
+handshake repeats the `Host`/`Origin` gate because a WebSocket bypasses CORS.
+Allowed means loopback (`127.0.0.1`, `localhost`, `::1`) **plus the configured
+`server.host`**, because the `nh` CLI addresses the board by that configured
+value; a rebinding page cannot make its own domain equal it. A local non-browser
+client — the `nh` CLI, the MCP bridge — sends no `Origin` and is unaffected by
+the origin check: a same-user process is inside the trust boundary (an attacker
+with shell as the nh user is out of scope). **Consequence:** a board bound to
+`0.0.0.0` (`nh start --host 0.0.0.0`, the container image's default) still
+serves its CLI and a browser at `localhost`, but a browser addressing it by a
+LAN name or IP that is not `server.host` gets `400 bad_host`; set `server.host`
+to that name, or reach it through an SSH tunnel or a loopback port-forward. The
+one credential-carrying fetch that follows forge-supplied data, the Jenkins
+console-log excerpt, sends its SSO credentials only to a link under
+`ci_gate.jenkins_controller` (https, same host, port and path prefix) over
+verified TLS (`ci_gate.jenkins_ca_bundle` names an internal CA) — any other link
+gets no request at all.
+
+The coder subprocess (both backends) does **not** inherit the launcher's
+environment credentials. `agent/child_env.py` removes every environment
+variable whose NAME is credential-shaped — `*TOKEN*`, `*SECRET*`, `*PASSWORD*`,
+`*API_KEY*`, `*CREDENTIAL*`, `*WEBHOOK*`, any `*_KEY` (deliberately broad:
+`SORT_KEY`, `PARTITION_KEY`, `LICENSE_KEY` go too), credential-file pointers
+(`SSH_AUTH_SOCK`, `GOOGLE_APPLICATION_CREDENTIALS`, `NETRC`, `PGPASSFILE`,
+`KUBECONFIG`, `DOCKER_CONFIG`, `DOCKER_AUTH_CONFIG`), the named connection
+URLs (`DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `SENTRY_DSN`) plus **any**
+variable whose value is a URL with a password in it
+(`postgres://app:s3cret@host/db`, whatever its name), and the whole
+`AWS_*`/`GCP_*`/`AZURE_*` namespaces except `AWS_REGION`, `AWS_DEFAULT_REGION`,
+`AWS_PAGER`, `AWS_CA_BUNDLE` and `AWS_ENDPOINT_URL*`; `TOKENIZERS_PARALLELISM`
+is exempt from the `*TOKEN*` rule. Kept: the credential that pays for that
+child (`ANTHROPIC_*`/`CLAUDE_*` for Claude, `OPENAI_*` for Codex), the
+agent-session mark, and every `*_PROXY` variable even when its URL carries a
+password — the child is the process that reaches its model, and on a network
+that requires an authenticated proxy an empty `HTTPS_PROXY` would mean
+"connect directly" and cut every session off. A prompt injection in the child cannot read
+`GITHUB_TOKEN`, a cloud key or an integration token out of `env`. It is a
+name-shape rule plus one value rule, so a bare credential under an unusual
+name survives, and the Claude child sees the removed names as empty strings
+(the SDK merges over the parent environment) while the Codex child does not
+see them at all. The runtime's own `git push`/PR-open run in the parent and
+are unaffected.
+
+What this does **not** do: the child keeps `HOME` and the filesystem, so a
+keyring login, `~/.aws/credentials` or `~/.config/gh/hosts.yml` remain
+reachable — `gh` and `git` in the child still authenticate as the operator
+through them. `forbidden_paths` (§3) refuses the paths it lists; everything
+else on disk is the host's to deny (a container, a separate user). Inside the
+child, an ssh-agent-only key is unusable, `AWS_PROFILE` is gone, and a private
+registry token (`NPM_TOKEN`, `CARGO_REGISTRY_TOKEN`, ...) a task's own test
+suite needs must come from the machine, not from the launcher's shell.
 
 ### What you actually control
 

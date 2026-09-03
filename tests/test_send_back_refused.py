@@ -324,7 +324,7 @@ async def test_api_send_back_records_the_pending_marker(store, tmp_path):
     app.state.store = store
     app.state.config = load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as client:
         r = await client.post(
             f"/api/tasks/{t.id}/send-back",
             json={"message": "handle the empty-input edge case"},

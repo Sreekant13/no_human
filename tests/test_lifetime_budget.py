@@ -1884,7 +1884,7 @@ async def _detail(store, tmp_path, task_id):
     app.state.config = nh_config.load_config(tmp_path / "config.yaml")
     app.state.scheduler = None
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.get(f"/api/tasks/{task_id}")
     assert r.status_code == 200, r.text
     return r.json()

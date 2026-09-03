@@ -46,7 +46,7 @@ async def client(tmp_path, monkeypatch):
     transport = ASGITransport(app=app)
     # A real browser always sends Origin on these calls; the write route now
     # requires it, so the fixture mirrors the legitimate UI.
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
     await store.close()
@@ -345,8 +345,8 @@ async def test_an_implausibly_long_token_is_refused(client, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_cross_origin_write_is_refused(client, tmp_path):
-    """The server is unauthenticated and sets allow_origins=["*"], so any page
-    the operator visits could otherwise PUT the credential store."""
+    """The server is unauthenticated, so any page the operator visits could
+    otherwise PUT the credential store."""
     r = await client.put("/api/auth/token",
                          json={"profile": "personal", "token": TOKEN},
                          headers={"Origin": "https://evil.example"})
@@ -387,7 +387,7 @@ async def test_a_write_with_no_origin_is_refused(tmp_path, monkeypatch):
     import no_human.config as _cfg
     assert str(_cfg.ENV_PATH).startswith(str(tmp_path))
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.put("/api/auth/token",
                         json={"profile": "personal", "token": TOKEN})
     await store.close()
@@ -484,8 +484,8 @@ def test_repeated_writes_do_not_accumulate_blank_lines(tmp_path):
 async def test_the_integrations_route_writes_env_and_must_guard_its_origin(
         client, tmp_path):
     """`PUT /api/integrations/{name}/config` writes the SAME ~/.no_human/.env
-    the auth route guards. It had no origin check, and with
-    `allow_origins=["*"]` the preflight succeeds for any site — so a page the
+    the auth route guards. It had no origin check, and with the CORS grant
+    open to every origin at the time the preflight succeeded for any site — so a page the
     operator merely visits while `nh serve` is up could plant a credential.
     Demonstrated end to end before this guard existed: 200, value on disk.
     """

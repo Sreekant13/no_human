@@ -6,9 +6,43 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+### Security
+- The board API enforces a loopback boundary (`api/local_boundary.py`): a
+  request whose `Host` is not loopback is refused (400, DNS-rebinding defence),
+  a cross-origin browser write to any state-changing route is refused (403),
+  the CORS grant is exact-host loopback only, and the `/ws` handshake applies
+  the same `Host`/`Origin` gate. Allowed hosts are loopback plus the
+  configured `server.host`, which the `nh` CLI addresses the board by. At
+  v0.1.9 only 11 of the 50 mutating routes had an origin check and CORS
+  allowed every origin. The boundary is one middleware dispatch, on the order
+  of 100 µs per request.
+- `land_task` refuses in-process when the calling process carries the
+  agent-session mark, so a marked agent cannot land a PR by driving the
+  landing module directly.
+- The Jenkins console-log excerpt sends its SSO credentials only to the
+  configured `ci_gate.jenkins_controller`, over `https` with TLS verified
+  (`ci_gate.jenkins_ca_bundle` or the system store); it previously sent them
+  to whatever host a failing check's `targetUrl` named, with verification off.
+- Both coder backends strip the launcher's credential-shaped environment
+  variables from the child process (`agent/child_env.py`); see
+  docs/security.md §7 for what is removed and what that means inside the
+  child.
+
+### Added
+- `ci_gate.jenkins_ca_bundle`: PEM path the CI-log fetch verifies the Jenkins
+  TLS chain against (empty = system trust store).
+
 ### Changed
 - Development now happens directly in this repository: changes land here as
   commits and pull requests rather than arriving through a periodic export.
+- A board bound to a non-loopback interface (`nh start --host 0.0.0.0`) answers
+  `400 bad_host` to a browser that addresses it by a LAN name or IP other than
+  the configured `server.host`; set `server.host` to that name, or use an SSH
+  tunnel or loopback port-forward.
+- The CI-log excerpt logs a warning when SSO credentials are set but
+  `ci_gate.jenkins_controller` is empty or not an https URL, instead of
+  silently returning nothing; the fetch is scoped to the controller's host,
+  port and path, not its host alone.
 
 ## [0.1.9] — 2026-09-01
 

@@ -120,7 +120,7 @@ def _api_client(store: Store, tmp_path) -> AsyncClient:
     api_app.state.config = load_config(tmp_path / "api_config.yaml")
     api_app.state.scheduler = None
     transport = ASGITransport(app=api_app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(transport=transport, base_url="http://localhost")
 
 
 # --------------------------------------------------------------------------- #

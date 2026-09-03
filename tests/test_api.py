@@ -39,7 +39,7 @@ async def client(store, tmp_path):
     app.state.store = store
     app.state.config = load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
 
 
@@ -2581,8 +2581,10 @@ async def test_board_websocket_routes_and_sends_the_init_snapshot(store):
     assert ws_routes and ws_routes[0].endpoint is ws_board
     # 2. The coroutine itself, over the fixture store, no lifespan.
     t = await _seed_task(store, status=TaskStatus.PENDING, title="ws smoke")
+    # host: loopback — TestClient hardcodes the ws Host to "testserver", which
+    # the ws_board origin/host gate refuses; a real browser sends the true host.
     with TestClient(_ws_shim(store)) as tc:
-        with tc.websocket_connect("/ws") as ws:
+        with tc.websocket_connect("/ws", headers={"host": "localhost"}) as ws:
             msg = ws.receive_json()
             assert msg["type"] == "init"
             assert any(x["title"] == "ws smoke" for x in msg["tasks"])
@@ -2613,6 +2615,7 @@ async def test_board_websocket_disconnect_ends_the_poll_loop(store, monkeypatch)
 
     class _FakeWS:
         app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+        headers = {"host": "localhost"}   # loopback: pass the ws_board origin/host gate
 
         async def accept(self):
             return None
@@ -2663,6 +2666,7 @@ async def test_board_websocket_disconnect_deregisters_the_socket(store, monkeypa
 
     class _FakeWS:
         app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+        headers = {"host": "localhost"}   # loopback: pass the ws_board origin/host gate
         async def accept(self): return None
         async def send_text(self, _): return None
         async def receive(self):
@@ -2694,6 +2698,7 @@ async def test_board_websocket_pushes_a_sync_frame_on_change(store, monkeypatch)
 
     class _FakeWS:
         app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+        headers = {"host": "localhost"}   # loopback: pass the ws_board origin/host gate
         async def accept(self): return None
         async def send_text(self, text): sent.append(_json.loads(text))
         async def receive(self):

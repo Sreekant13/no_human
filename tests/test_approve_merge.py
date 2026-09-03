@@ -1427,7 +1427,7 @@ async def api_store_client(tmp_path):
     app.state.config = load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://test") as c:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as c:
             yield c, store
     finally:
         await store.close()

@@ -31,6 +31,7 @@ from no_human.agent.backend import (
     DEFAULT_CODER_COMPACT_WINDOW_TOKENS,
     make_backend,
 )
+from no_human.agent.child_env import scrub_foreign_secrets_into
 from no_human.agent.claude_backend import AgentEvent, ClaudeBackend
 from no_human.agent.session_mark import mark_env
 from no_human.cli.commands import cli
@@ -45,6 +46,16 @@ from no_human.notify.slack import SlackNotifier
 # include it alongside the compaction-window key(s) it actually pins.
 _MARK = mark_env("claude")
 
+
+def _expected_env(**deliberate):
+    """The exact `ClaudeAgentOptions.env` `_options` builds: the deliberate
+    keys, the mark, and — because `agent/child_env.py` overrides every
+    secret-shaped variable of the launcher's environment to "" — one empty
+    entry per such name in THIS process's env (so the assertion is exact in
+    any shell, not only a secret-free one)."""
+    return {**deliberate, **_MARK,
+            **{name: "" for name in scrub_foreign_secrets_into({})}}
+
 from .test_cli_commands import _make_runner, _seed_attempt, _seed_task
 from .test_e2e_orchestrator import _config, store  # noqa: F401
 
@@ -56,7 +67,7 @@ from .test_e2e_orchestrator import _config, store  # noqa: F401
 def test_compact_window_reaches_sdk_options(tmp_path):
     backend = ClaudeBackend(model="claude-sonnet-4-6", compact_window_tokens=140_000)
     opts = backend._options(tmp_path, max_turns=5)
-    assert opts.env == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "140000", **_MARK}
+    assert opts.env == _expected_env(CLAUDE_CODE_AUTO_COMPACT_WINDOW="140000")
 
 
 def test_no_window_means_no_env_override(tmp_path):
@@ -75,36 +86,30 @@ def test_only_the_coder_role_gets_the_window(tmp_path):
     cfg = {"bounds": {"coder_compact_window_tokens": 123456}}
 
     coder = make_backend(model="m", config=cfg, role="coder")
-    assert _window_env(coder, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456", **_MARK
-    }
+    assert _window_env(coder, tmp_path) == _expected_env(CLAUDE_CODE_AUTO_COMPACT_WINDOW="123456")
 
     reviewer = make_backend(model="m", config=cfg, role="reviewer")
-    assert _window_env(reviewer, tmp_path) == _MARK
+    assert _window_env(reviewer, tmp_path) == _expected_env()
 
     planner = make_backend(model="m", config=cfg, role="planner")
-    assert _window_env(planner, tmp_path) == _MARK
+    assert _window_env(planner, tmp_path) == _expected_env()
 
     readonly_coder = make_backend(model="m", config=cfg, role="coder", readonly=True)
-    assert _window_env(readonly_coder, tmp_path) == _MARK
+    assert _window_env(readonly_coder, tmp_path) == _expected_env()
 
 
 def test_default_window_applied_when_key_absent(tmp_path):
     backend = make_backend(model="m", config={}, role="coder")
-    assert _window_env(backend, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS),
-        **_MARK,
-    }
+    assert _window_env(backend, tmp_path) == _expected_env(
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS))
 
 
 @pytest.mark.parametrize("bad", ["abc", 0, -1])
 def test_invalid_window_does_not_reach_the_cli(tmp_path, bad):
     cfg = {"bounds": {"coder_compact_window_tokens": bad}}
     backend = make_backend(model="m", config=cfg, role="coder")
-    assert _window_env(backend, tmp_path) == {
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS),
-        **_MARK,
-    }
+    assert _window_env(backend, tmp_path) == _expected_env(
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(DEFAULT_CODER_COMPACT_WINDOW_TOKENS))
 
 
 # --------------------------------------------------------------------------- #

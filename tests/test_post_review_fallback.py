@@ -21,7 +21,7 @@ async def store(tmp_path):
 @pytest_asyncio.fixture
 async def client(store):
     app.state.store = store
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as c:
         yield c
 
 

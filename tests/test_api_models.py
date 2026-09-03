@@ -70,7 +70,7 @@ async def client(store, tmp_path, monkeypatch):
     # A real browser always sends Origin on a write; the PUT route requires
     # it (writing=True), so the fixture mirrors the legitimate Settings UI
     # for every test — GET tests simply never rely on it.
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
 
@@ -256,7 +256,7 @@ async def test_put_requires_local_origin(store, tmp_path, monkeypatch):
     app.state.store = store
     app.state.config = nh_config.load_config(tmp_path / "config.yaml")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         r = await c.put("/api/config/models", json={"utility_model": "claude-opus-5"})
     assert r.status_code == 403
 
@@ -377,7 +377,7 @@ async def test_put_preserves_hand_written_comments_and_unrelated_sections(
     app.state.store = store
     app.state.config = nh_config.load_config(path)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         r = await c.put("/api/config/models", json={"utility_model": "claude-opus-5"})
     assert r.status_code == 200

@@ -38,7 +38,7 @@ async def client(tmp_path, monkeypatch):
     transport = ASGITransport(app=app)
     # A real browser always sends Origin; the endpoint mutates the filesystem,
     # so like the credential routes it refuses a cross-origin caller.
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
     await store.close()

@@ -684,26 +684,73 @@ async def default_ci_log_excerpt(link: str) -> str:
     `<build>/consoleText` answers HTTP Basic with the credentials from
     ~/.no_human/.env even where the browser URL redirects to SSO — the API path
     and the human path authenticate differently, which is the whole reason this
-    reaches for Basic. Where the TLS chain is an internal CA, verification is
-    disabled for that host: the excerpt feeds a prompt, it is not an integrity
-    boundary. Best-effort by
-    design: "" simply means the feedback carries only the check name + link.
+    reaches for Basic. `link` arrives from forge-supplied PR check data (a
+    check's `targetUrl`/`detailsUrl` points wherever the forge says), so both
+    the credentials AND the request are scoped to the configured Jenkins
+    controller (`ci_gate.jenkins_controller`, an https URL, compared as a
+    scheme+host+port+path prefix): a link outside that controller gets no
+    request at all — `/consoleText` is a Jenkins endpoint, and firing at an
+    arbitrary host, port or path would leak credentials or make a request on
+    the forge's behalf. TLS is always verified — against
+    `ci_gate.jenkins_ca_bundle` (a PEM path) when set, else the system trust
+    store. Best-effort by design: "" simply means the feedback carries only the
+    check name + link.
     """
     if "/display/redirect" in link:
         link = link.split("/display/redirect")[0]
-    if not link.startswith("http"):
+    from urllib.parse import unquote, urlparse
+
+    from ..config import load_config, load_env_var
+
+    # load_config reads YAML from disk: off the event loop, like the other
+    # blocking work in this process (api/app.py uses asyncio.to_thread too).
+    ci_gate = (await asyncio.to_thread(load_config)).data.get("ci_gate") or {}
+    controller = urlparse((ci_gate.get("jenkins_controller") or "").strip())
+    # Credentials and the fetch go ONLY to the configured Jenkins controller,
+    # compared as an https scheme+host+port+path prefix. The diagnostics fire
+    # only when SSO credentials exist: without them there is no excerpt to lose.
+    if controller.scheme != "https" or not controller.hostname:
+        if load_env_var("SSO_USERNAME"):
+            log.warning(
+                "SSO credentials are set but ci_gate.jenkins_controller is %s; the CI log "
+                "excerpt is disabled until it is the controller's https URL",
+                "empty" if not controller.geturl() else f"not an https URL ({controller.geturl()!r})")
+        return ""
+    prefix = (f"https://{controller.hostname.lower()}:{controller.port or 443}"
+              f"{controller.path.rstrip('/')}/")
+    lk = urlparse(link)
+    if lk.scheme != "https" or not lk.hostname:
+        log.debug("CI log excerpt skipped: %r is not an https link", link)
+        return ""
+    # httpx applies RFC 3986 dot-segment removal AFTER this compare, so
+    # `/ctrl/../other` would pass a raw prefix test and be sent to `/other`;
+    # a percent-encoded `%2e%2e` or `..%2f` is the same segment once the
+    # server decodes it, and `..;x` is the same segment once a servlet
+    # container strips the path parameter. A Jenkins build URL never contains
+    # a dot segment or an encoded separator: refuse any, rather than normalise
+    # and trust the normaliser. (A single-encoded `%2F` inside a segment is
+    # refused too — Jenkins double-encodes those itself, so the common
+    # multibranch URL still passes.)
+    if any(seg.split(";", 1)[0] in (".", "..") or "/" in seg or "\\" in seg
+           for seg in map(unquote, lk.path.split("/"))):
+        log.debug("CI log excerpt skipped: %r contains a dot segment or an encoded separator", link)
+        return ""
+    if not f"https://{lk.hostname.lower()}:{lk.port or 443}{lk.path}".startswith(prefix):
+        log.debug("CI log excerpt skipped: %s is outside the configured Jenkins controller", link)
         return ""
     # The credentials live in ~/.no_human/.env; the server process does not
     # export them, so reading os.environ alone would always come up empty.
-    from ..config import load_env_var
-
     user = load_env_var("SSO_USERNAME")
     password = load_env_var("SSO_PASSWORD")
     if not (user and password):
         return ""
+    # An internal Jenkins CA is a trust anchor to supply, never a reason to stop
+    # verifying: a PEM path verifies against that CA, its absence against the
+    # system store.
+    verify = (ci_gate.get("jenkins_ca_bundle") or "").strip() or True
     import httpx
     try:
-        async with httpx.AsyncClient(verify=False, timeout=25, auth=(user, password)) as client:
+        async with httpx.AsyncClient(verify=verify, timeout=25, auth=(user, password)) as client:
             resp = await client.get(link.rstrip("/") + "/consoleText")
             if resp.status_code != 200:
                 return ""

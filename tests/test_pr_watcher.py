@@ -1023,3 +1023,182 @@ async def test_default_ci_annotations_hits_the_check_runs_rest_path_with_hostnam
     assert check_runs_call[-1] == "repos/dev/x/commits/deadbeef/check-runs"
     annotations_call = next(c for c in api_calls if c[-1].endswith("/annotations"))
     assert annotations_call[-1] == "repos/dev/x/check-runs/999/annotations"
+
+
+# --------------------------------------------------------------------------- #
+# CI log excerpt: SSO credentials and the fetch are scoped to the configured   #
+# Jenkins controller over verified TLS                                         #
+#                                                                              #
+# `link` is forge-supplied PR check data (a check's targetUrl points wherever  #
+# the forge says), so `default_ci_log_excerpt` sends the SSO Basic-auth        #
+# credentials — and makes any request at all — ONLY to the configured Jenkins  #
+# controller, over TLS it always verifies (a CA bundle when set, else the      #
+# system store), and only over https.                                          #
+# --------------------------------------------------------------------------- #
+
+class _FakeCfg:
+    def __init__(self, controller="", ca_bundle=""):
+        self.data = {"ci_gate": {
+            "jenkins_controller": controller, "jenkins_ca_bundle": ca_bundle}}
+
+
+def _patch_ci_log(monkeypatch, *, controller="", ca_bundle="",
+                  sso=("u", "p"), body="ERROR: boom\nmore\n"):
+    """Wire `default_ci_log_excerpt`'s config + env + httpx seams and record
+    whether an AsyncClient was constructed and with what verify/auth."""
+    import httpx
+
+    from no_human import config
+
+    rec: dict = {"constructed": False}
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: _FakeCfg(controller, ca_bundle))
+    monkeypatch.setattr(
+        config, "load_env_var",
+        lambda name, *a, **k: {"SSO_USERNAME": sso[0], "SSO_PASSWORD": sso[1]}.get(name)
+        if sso else None,
+    )
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            rec["constructed"] = True
+            rec["verify"] = kwargs.get("verify")
+            rec["auth"] = kwargs.get("auth")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            rec["url"] = url
+            return httpx.Response(200, text=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    return rec
+
+
+async def test_ci_log_excerpt_sends_nothing_to_a_foreign_host(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example")
+    out = await default_ci_log_excerpt("https://evil.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False  # no request, so no Authorization header
+
+
+async def test_ci_log_excerpt_refuses_cleartext_http(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example")
+    out = await default_ci_log_excerpt("http://jenkins.internal.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False
+
+
+async def test_ci_log_excerpt_returns_empty_when_no_controller_configured(monkeypatch, caplog):
+    """SSO credentials set but no `ci_gate.jenkins_controller`: no request, and
+    the operator is told why the excerpt is missing (the silent "" was a
+    support round-trip); without SSO credentials there is nothing to warn about."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="")
+    with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+        out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
+    assert out == ""
+    assert rec["constructed"] is False
+    assert "ci_gate.jenkins_controller is empty" in caplog.text
+
+    caplog.clear()
+    _patch_ci_log(monkeypatch, controller="", sso=None)
+    with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+        assert await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42") == ""
+    assert "jenkins_controller" not in caplog.text
+
+
+async def test_ci_log_excerpt_fetches_matching_host_with_auth_and_ca_bundle(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(
+        monkeypatch, controller="https://jenkins.internal.example",
+        ca_bundle="/etc/ssl/internal-ca.pem")
+    out = await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42/")
+    assert "ERROR: boom" in out
+    assert rec["auth"] == ("u", "p")
+    assert rec["verify"] == "/etc/ssl/internal-ca.pem"
+    assert rec["url"] == "https://jenkins.internal.example/job/x/42/consoleText"
+
+
+async def test_ci_log_excerpt_verifies_against_system_store_without_a_bundle(monkeypatch):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    rec = _patch_ci_log(monkeypatch, controller="https://jenkins.internal.example", ca_bundle="")
+    await default_ci_log_excerpt("https://jenkins.internal.example/job/x/42")
+    assert rec["verify"] is True  # never verify=False
+
+
+async def test_ci_log_excerpt_scopes_to_the_controller_path_and_port(monkeypatch):
+    """`jenkins_controller` is a URL with a controller path; the same host on
+    another path or port is NOT the controller and gets no request."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/other/job/x/42",
+                 "https://build.example.com/ctrl2/job/x/42",
+                 "https://build.example.com:8443/ctrl/job/x/42",
+                 "https://build.example.com/job/x/42"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com:443/ctrl/job/x/42/")
+    assert rec["url"] == "https://build.example.com:443/ctrl/job/x/42/consoleText"
+
+
+async def test_ci_log_excerpt_warns_when_the_controller_is_not_an_https_url(monkeypatch, caplog):
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    for ctrl in ("http://build.example.com/ctrl", "build.example.com"):
+        caplog.clear()
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        with caplog.at_level("WARNING", logger="no_human.pr_watcher"):
+            assert await default_ci_log_excerpt("https://build.example.com/ctrl/job/x/42") == ""
+        assert rec["constructed"] is False
+        assert "not an https URL" in caplog.text and ctrl in caplog.text, ctrl
+
+
+async def test_ci_log_excerpt_refuses_dot_segments_in_the_link(monkeypatch):
+    """httpx applies RFC 3986 dot-segment removal AFTER our prefix compare, so
+    `/ctrl/../other` would pass a raw startswith and be sent to `/other`: a
+    link containing any `.`/`..` segment, encoded or not, gets no request."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/ctrl/../secrets/job/1",
+                 "https://build.example.com/ctrl/a/../../other/job/1",
+                 "https://build.example.com/ctrl/%2e%2e/evil/job/1",
+                 "https://build.example.com/ctrl/%2E%2E/evil/job/1",
+                 "https://build.example.com/ctrl/./job/1",
+                 "https://build.example.com/ctrl/..%2fevil/job/1"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    # positive control: a dot INSIDE a segment is an ordinary name
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com/ctrl/job/x.y/42")
+
+
+async def test_ci_log_excerpt_refuses_path_parameter_dot_segments(monkeypatch):
+    """`..;x` is a dot segment once a servlet container strips the path
+    parameter; the guard refuses it without relying on server ordering."""
+    from no_human.vcs.pr_watcher import default_ci_log_excerpt
+
+    ctrl = "https://build.example.com/ctrl"
+    for link in ("https://build.example.com/ctrl/..;/evil/job/1",
+                 "https://build.example.com/ctrl/%2e%2e;x/evil/job/1",
+                 "https://build.example.com/ctrl/.;/job/1"):
+        rec = _patch_ci_log(monkeypatch, controller=ctrl)
+        assert await default_ci_log_excerpt(link) == "", link
+        assert rec["constructed"] is False, link
+    rec = _patch_ci_log(monkeypatch, controller=ctrl)  # a `;` inside an ordinary name is fine
+    assert "ERROR: boom" in await default_ci_log_excerpt("https://build.example.com/ctrl/job/a;b/42")

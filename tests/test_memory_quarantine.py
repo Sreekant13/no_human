@@ -257,7 +257,7 @@ async def test_quarantined_rows_absent_from_list_memories_and_api(tmp_path):
         app.state.store = store
         app.state.config = load_config(tmp_path / "config.yaml")
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             r = await client.get("/api/rules")
             assert rule_id not in {m["id"] for m in r.json()}
             r = await client.get("/api/skills")
@@ -577,7 +577,7 @@ async def test_quarantine_counts_endpoint(tmp_path):
         app.state.store = store
         app.state.config = load_config(tmp_path / "config.yaml")
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             r = await client.get("/api/memories/quarantine")
             assert r.status_code == 200
             body = r.json()
@@ -610,7 +610,7 @@ async def test_quarantine_counts_total_spans_all_types(tmp_path):
         app.state.store = store
         app.state.config = load_config(tmp_path / "config.yaml")
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             r = await client.get("/api/memories/quarantine")
             assert r.status_code == 200
             body = r.json()

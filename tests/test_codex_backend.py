@@ -2600,3 +2600,41 @@ def test_rewriting_the_same_key_is_byte_identical_and_a_rotation_replaces_it(
     cx.materialise_api_key_auth("sk-two", home, base=nh_root)
     assert json.loads(cred.read_text())["OPENAI_API_KEY"] == "sk-two"
     assert oct(cred.stat().st_mode)[-3:] == "600", "the rotation lost the mode"
+
+
+def test_codex_child_env_drops_the_launchers_ambient_secrets_api_key_mode(monkeypatch):
+    """The Codex child env is a FULL copy of the launcher's environment, so the
+    same secret-shaped names the Claude child never sees (agent/child_env.py)
+    are deleted here — while the OpenAI key this mode bills on, the mark and
+    the operational vars survive."""
+    from no_human.agent.session_mark import NO_HUMAN_AGENT_SESSION
+
+    _stub_cli(monkeypatch)
+    env = cx.CodexBackend(env={
+        **FAKE_ENV,
+        "GITHUB_TOKEN": "ghp_not_real", "AWS_SECRET_ACCESS_KEY": "aws_not_real",
+        "AWS_PROFILE": "work", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "JIRA_API_TOKEN": "jira_not_real", "HOME": "/home/x",
+    })._child_env()
+    for gone in ("GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
+                 "SSH_AUTH_SOCK", "JIRA_API_TOKEN"):
+        assert gone not in env, gone
+    assert env["OPENAI_API_KEY"] == "not-a-real-key"
+    assert env["PATH"] == FAKE_ENV["PATH"]
+    assert env["HOME"] == "/home/x"
+    assert env[NO_HUMAN_AGENT_SESSION] == "1"
+
+
+def test_codex_child_env_drops_the_launchers_ambient_secrets_subscription_mode(monkeypatch):
+    from no_human.agent.session_mark import mark_env
+
+    monkeypatch.setattr(cx, "codex_login_status",
+                        lambda cli_path=None: cx.CodexSessionStatus(True, "chatgpt"))
+    env = cx.CodexBackend(auth_mode="subscription", env={
+        "PATH": "/bin", "GITHUB_TOKEN": "ghp_not_real", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "OPENAI_API_KEY": "not-a-real-key",
+    })._child_env()
+    assert "GITHUB_TOKEN" not in env
+    assert "SSH_AUTH_SOCK" not in env
+    assert "OPENAI_API_KEY" not in env  # subscription mode holds no OpenAI credential
+    assert env == {"PATH": "/bin", **mark_env("codex")}

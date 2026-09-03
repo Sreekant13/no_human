@@ -218,7 +218,7 @@ async def client(store, tmp_path):
     # This route writes ~/.no_human/.env, so it requires a local Origin like
     # the auth route does. Its only caller is the browser (web/src/api.js),
     # which always sends one — the fixture mirrors that legitimate client.
-    async with AsyncClient(transport=transport, base_url="http://test",
+    async with AsyncClient(transport=transport, base_url="http://localhost",
                            headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
 
