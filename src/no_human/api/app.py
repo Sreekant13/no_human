@@ -2031,8 +2031,7 @@ async def cancel_task(
     prior_blocker = task.blocker if isinstance(task.blocker, dict) else None
     reason = (body.reason if body else None) or ""
     reason = reason.strip()[:500] or "Cancelled from board"
-    task.context = await store.merge_context(
-        task.id, {"cancel_reason": reason})
+    task.context = await store.record_cancel_reason(task.id, reason)
     # Nothing can honour a pending board Pause after the kill below — withdraw
     # it, as `nh task cancel` does (cli/commands.py).
     await store.clear_cancel_request(task.id)

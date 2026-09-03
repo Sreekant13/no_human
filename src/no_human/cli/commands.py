@@ -2063,8 +2063,7 @@ def task_cancel(task_id, reason):
                 # records an assertion: honestly, with a human event, and
                 # without pretending automated evidence produced it.
                 from ..blockers import human_event
-                t.context = await store.merge_context(
-                    t.id, {"cancel_reason": reason})
+                t.context = await store.record_cancel_reason(t.id, reason)
                 await store.save_events(t.id, [{
                     **human_event(
                         "cancel", prior_status=TaskStatus.FAILED,
@@ -2111,8 +2110,7 @@ def task_cancel(task_id, reason):
             from ..blockers import human_event
             prior_status = t.status
             prior_blocker = t.blocker if isinstance(t.blocker, dict) else None
-            t.context = await store.merge_context(
-                t.id, {"cancel_reason": reason})
+            t.context = await store.record_cancel_reason(t.id, reason)
             await store.clear_cancel_request(t.id)
             await store.set_status(
                 t, TaskStatus.FAILED, validate=False, human_override=True,

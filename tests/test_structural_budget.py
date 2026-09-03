@@ -88,7 +88,12 @@ FROZEN_FUNCTION_LINES = {
     # anchored comment) and passes `cap=self.bounds.max_turns_per_attempt`,
     # and `_abort_kind(exc)` replaces the inline ternary in the merged
     # abort handler. Measured on this tree with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2156,
+    # 2156 -> 2167 (+11): the cancel-reason discriminator is recorded on the
+    # direct-unwind path too (record_cancel_reason guarded by
+    # SERVER_STOP_REASON, with its reasoning comment), so the property holds
+    # for callers with no HTTP handler in the loop. Measured on this tree
+    # with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2167,
     "core/orchestrator.py:Orchestrator._drive": 760,
     # 449 -> 457 (+8): D3.1 (2026-08-31, auto-activation pipeline) adds the
     # one call (plus its explanatory comment) that hands `paused`/
@@ -169,7 +174,9 @@ FROZEN_FUNCTION_LINES = {
 FROZEN_FUNCTION_CC = {
     # 250 -> 251 (+1): P2's `kind = "stuck" if ... else "non-converging"`
     # dispatch (an IfExp) in the merged StuckAbort/ConvergenceAbort handler.
-    "core/orchestrator.py:Orchestrator._run_attempt": 251,
+    # 251 -> 252 (+1): the `if reason != SERVER_STOP_REASON` guard on the
+    # direct-unwind cancel-reason write. Measured on this tree.
+    "core/orchestrator.py:Orchestrator._run_attempt": 252,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -327,7 +334,10 @@ FROZEN_FILE_LINES = {
     # sentence alongside the byte-unchanged timeout sentence (task:
     # _kill_dev_server test coverage). Measured with the scanner below after
     # rebasing onto the role-backend landing, never summed by hand.
-    "core/orchestrator.py": 21136,
+    # 21136 -> 21147 (+11): the direct-unwind cancel-reason write (guard +
+    # reasoning comment) in _run_attempt. Measured on this tree with the
+    # scanner below.
+    "core/orchestrator.py": 21147,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -542,7 +552,10 @@ FROZEN_FILE_LINES = {
     # `Store.landed_reconcilable_terminal_tasks`, the TERMINAL-row twin of
     # `Store.reconcile_landed_orphan` above. Measured on this tree with the
     # scanner below.
-    "core/db.py": 4945,
+    # 4945 -> 4991 (+46): Store.record_cancel_reason (validated cancel-reason
+    # write with the json_patch carry-forward) and its docstring. Measured on
+    # this tree with the scanner below.
+    "core/db.py": 4991,
     # +71: set_local_backend_fields — the config-write helper for the Settings
     # pane's local coder-backend fields (llm.local_model / llm.local_base_url).
     # +75: Codex account config helpers.

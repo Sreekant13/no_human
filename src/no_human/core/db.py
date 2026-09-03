@@ -1906,6 +1906,18 @@ class Store:
         callers keep reasoning about reality. Every other column still
         writes normally, so e.g. the Jira poller can keep updating context
         write-back markers on an already-DONE row.
+
+        A human's terminal cancel marker (``context.cancel_reason``) gets the
+        same stale-handle protection as status: the CASE below carries the
+        LIVE row's ``$.cancel_reason`` forward over whatever the in-memory
+        `task` copy had, so a still-running attempt's next `update_task(task)`
+        — snapshotted before the cancel landed — cannot silently erase it
+        (that race was the actual loss the cancel_session_not_found path hit:
+        no live backend task to interrupt, so the attempt kept running and its
+        next write-back stomped the field back to absent). The only sanctioned
+        way to clear it is an explicit `merge_context({"cancel_reason": None})`
+        (used by retry), which this does not affect since it targets a
+        different UPDATE.
         """
         task.updated_at = _now()
         row = task.to_row()
@@ -1916,7 +1928,16 @@ class Store:
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
                  kind=:kind, parent_id=:parent_id, follows_id=:follows_id,
                  blocker=:blocker, wake_check_at=:wake_check_at,
-                 priority=:priority, context=:context, plan=:plan, config=:config,
+                 priority=:priority,
+                 context = json_patch(
+                     :context,
+                     CASE WHEN json_extract(COALESCE(context, '{}'), '$.cancel_reason')
+                               IS NOT NULL
+                          THEN json_object(
+                              'cancel_reason',
+                              json_extract(COALESCE(context, '{}'), '$.cancel_reason'))
+                          ELSE '{}' END),
+                 plan=:plan, config=:config,
                  updated_at=:updated_at
                WHERE id=:id""",
             row,
@@ -1937,6 +1958,13 @@ class Store:
         result = await self._fetchone(
             "SELECT status FROM tasks WHERE id = ?", (task.id,)
         )
+        # A second read-back, same critical section, same uncommitted
+        # transaction as the one above — kept as its own statement (rather
+        # than folded into the query above) so that query's exact SQL text
+        # stays the one `tests/test_db_concurrency.py` parks writers on.
+        ctx_result = await self._fetchone(
+            "SELECT context FROM tasks WHERE id = ?", (task.id,)
+        )
         await self.db.commit()
         if result is not None and result["status"] != row["status"]:
             log.info(
@@ -1944,6 +1972,8 @@ class Store:
                 row["status"], result["status"], task.id,
             )
             task.status = TaskStatus(result["status"])
+        if ctx_result is not None:
+            task.context = json.loads(ctx_result["context"]) if ctx_result["context"] else {}
         return task
 
     @serialized_write
@@ -1972,6 +2002,23 @@ class Store:
         row = await self._fetchone(
             "SELECT context FROM tasks WHERE id = ?", (task_id,))
         return json.loads(row[0]) if row and row[0] else {}
+
+    async def record_cancel_reason(self, task_id: str, reason: str) -> dict:
+        """Write the one discriminator every reader filters cancels on.
+
+        Every cancel path — the API handler, the CLI's own re-label branch,
+        and the orchestrator's hard-cancel unwind — must call this, not
+        `merge_context` directly, regardless of which status it cancels from
+        or whether a live in-process session was found to interrupt. One
+        write, one field (`context.cancel_reason`), one reader
+        (`db.py`'s CAS predicate, `metrics.py`'s failure query,
+        `api/models.py`'s `cancelled` flag): a cancel that only appends an
+        event and skips this write is indistinguishable from a genuine
+        failure everywhere that matters. The event-stream write (`human_cancel`,
+        `cancel_stopped_session`/`cancel_session_not_found`) is additive and
+        unaffected by this method — it stays exactly where it is.
+        """
+        return await self.merge_context(task_id, {"cancel_reason": reason})
 
     _MERGE_CLAIM_STALE_S = 1800  # a crashed server must not wedge the button forever
 

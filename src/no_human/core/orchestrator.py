@@ -5042,6 +5042,17 @@ class Orchestrator:
                                 commit_exc)
             await self._record_wip_checkpoint(
                 task, wip_sha, repo, stopped_because="cancelled")
+            # This is the path `request_task_cancel` reaches with no HTTP
+            # handler in the loop (a caller driving the orchestrator directly,
+            # or the cancel_session_not_found race where the attempt keeps
+            # running past the API's own write and a stale `update_task`
+            # would otherwise stomp it) — record the discriminator here too,
+            # so the property holds regardless of which caller triggered the
+            # unwind. SERVER_STOP_REASON is a shutdown/pause signal, not a
+            # human cancel (see `_honor_cancel` above); never mark those.
+            if reason != SERVER_STOP_REASON:
+                task.context = await self.store.record_cancel_reason(
+                    task.id, reason)
             detail = f"cancelled: {reason}"
             u = self._attempt_usage
             await self.store.update_attempt(
