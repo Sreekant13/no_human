@@ -106,7 +106,7 @@ from ..review.verifiers import (
 )
 from ..testing import ownership, runner, ui_evidence
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
-from ..testing.repro_gate import run_repro_gate
+from ..testing.repro_gate import declared_test_files, run_repro_gate
 from .prompt_blocks import (
     EXPORT_CLASSIFICATION_FILE,
     DistillationError,
@@ -278,6 +278,28 @@ def repro_send_back_message(detail: str) -> str:
         f"{REPRO_MANIFEST} "
         '({"tests": ["path::test_name"]}) naming the '
         f"test(s), and make them prove the bug.\n{detail}"
+    )
+
+
+def declared_files_send_back_message(missing: list[str]) -> str:
+    """The instruction for the ONE bounded round bought when the coder ended
+    an attempt with `REPRO_MANIFEST` declaring test file(s) that are not in
+    the attempt's own committed tree (`Orchestrator._declared_files_preflight`).
+
+    Module-level and pure, same idiom as `repro_send_back_message`: this is
+    read by an already-blocked coder on every retry, so it must name the
+    exact paths rather than a generic "some files are missing".
+    """
+    paths = ", ".join(missing)
+    return (
+        f"{REPRO_MANIFEST} declares the following test file(s), but they are "
+        f"absent from this attempt's committed tree: {paths}. "
+        "Create any that do not yet exist, and COMMIT them — use a "
+        "file-writing tool (Write/Edit), not a Bash heredoc or redirect, so "
+        "the change is captured and committed. "
+        "Removing or editing the declaration in "
+        f"{REPRO_MANIFEST} to make this pass is tampering and is not an "
+        "option — the missing file(s) must actually be committed."
     )
 
 
@@ -1103,6 +1125,12 @@ _MECHANICAL_FEEDBACK_SOURCES = frozenset({"pr_conflict"})
 # SAME branch, when the gate WAIVED for lack of one — not a review round, so
 # it gets a small budget of its own rather than the attempt's full turn cap.
 _REPRO_CORRECTIVE_TURNS = 15
+
+# One bounded round to COMMIT declared repro test file(s) that the manifest
+# names but the attempt's committed tree lacks — "commit the files you
+# already declared", not a fresh coder pass, so it gets its own small budget
+# rather than `_REPRO_CORRECTIVE_TURNS`'s.
+_DECLARED_FILES_ROUND_TURNS = 10
 
 # Appended to `repro_send_back_message(detail)` for the corrective round
 # ONLY — the diff under review is already committed and tamper-clean (or the
@@ -8085,6 +8113,68 @@ class Orchestrator:
                     task, budget_blocker, repo=repo, branch=branch)
         return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
+    async def _declared_files_preflight(
+        self, task: Task, repo: GitRepo, *, attempt_id: str,
+        branch: str | None, attempt_n: int, tamper_before: str,
+    ) -> "TaskOutcome | None":
+        """An attempt can end with `REPRO_MANIFEST` declaring test file(s)
+        that were never committed — the gate then fails a full round later on
+        "declared test file(s) missing from the attempt tree", after the
+        attempt already believed itself done. This buys ONE bounded round to
+        commit exactly those files, on the SAME branch, BEFORE the gate ever
+        runs — so the coder gets one immediate corrective turn instead of
+        losing the whole attempt to a mechanically-detectable omission.
+
+        Zero LLM spend for the check itself: `declared_test_files` reads the
+        manifest off disk, `_paths_at_head` is one `git ls-tree`.
+
+        Returns None when there is nothing to fix (no manifest, or every
+        declared file is already at HEAD — the byte-identical path to before
+        this method existed) or when a second pre-flight fire on a
+        re-entered attempt should fall straight through to the gate. Returns
+        the `TaskOutcome` that ends the attempt only when the corrective
+        round itself ends it (a commit refusal or a tamper fire) — a file
+        still missing after the round is NOT ended here; it is left to
+        `run_repro_gate`'s own missing-file check, which stays the backstop.
+        """
+        declared = declared_test_files(repo.path)
+        if not declared:
+            return None
+        present = self._paths_at_head(repo, declared)
+        missing = [f for f in declared if f not in present]
+        if not missing:
+            return None
+        corrected = self.__dict__.setdefault("_declared_files_corrected", set())
+        if attempt_id in corrected:
+            return None
+        corrected.add(attempt_id)
+        self.emit(
+            "declared_files_uncommitted",
+            f"{len(missing)} declared repro test file(s) are not in the "
+            f"attempt's committed tree: {missing}",
+            missing=list(missing),
+        )
+        outcome = await self._repro_corrective_round(
+            task, repo, "", attempt_id=attempt_id, branch=branch,
+            attempt_n=attempt_n, tamper_before=tamper_before,
+            instruction=declared_files_send_back_message(missing),
+            why="declared repro test file(s) not committed — one bounded "
+                "round to commit them",
+            turns=_DECLARED_FILES_ROUND_TURNS,
+        )
+        if outcome is not None:
+            return outcome
+        still_present = self._paths_at_head(repo, declared)
+        still_missing = [f for f in declared if f not in still_present]
+        if still_missing:
+            self.emit(
+                "declared_files_uncommitted",
+                f"{len(still_missing)} declared repro test file(s) still "
+                f"not in the attempt's committed tree: {still_missing}",
+                missing=list(still_missing), still_missing=True,
+            )
+        return None
+
     async def _repro_gate_step(
         self, task: Task, repo: GitRepo, *, base: str | None, attempt_id: str,
         attempt_n: int, branch: str | None, tamper_before: str,
@@ -8114,6 +8204,15 @@ class Orchestrator:
           so the failure reason describes what actually happened last.
           Keyed on `attempt_id` (`_repro_corrected`) so a re-entered attempt
           cannot buy a second round.
+
+        Before either verdict can even be read, `_declared_files_preflight`
+        runs (for `enforced` attempts only): if the manifest declares test
+        file(s) that are absent from the attempt's own committed tree, it
+        buys ONE bounded round to commit them — a mechanically-detectable
+        omission that used to burn a whole attempt on this gate's own
+        "declared test file(s) missing from the attempt tree" failure. That
+        missing-file check in `run_repro_gate` is unchanged and stays the
+        backstop for anything the pre-flight round does not resolve.
 
         Returns None to let the pipeline continue to the draft PR / reviewer,
         or the `TaskOutcome` that ends the attempt.
@@ -8189,6 +8288,13 @@ class Orchestrator:
                 attempt_id, status="failed", failure_reason=fail_detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=fail_detail)
 
+        if enforced:
+            pre = await self._declared_files_preflight(
+                task, repo, attempt_id=attempt_id, branch=branch,
+                attempt_n=attempt_n, tamper_before=tamper_before)
+            if pre is not None:
+                return pre
+
         repro = await _run_gate()
         if not enforced or repro is None or repro.verdict not in ("fail", "waived"):
             return None
@@ -8217,6 +8323,8 @@ class Orchestrator:
     async def _repro_corrective_round(
         self, task: Task, repo: GitRepo, detail: str, *, attempt_id: str,
         branch: str | None, attempt_n: int, tamper_before: str,
+        instruction: str | None = None, why: str | None = None,
+        turns: int = _REPRO_CORRECTIVE_TURNS,
     ) -> "TaskOutcome | None":
         """ONE bounded coder round to write the MISSING repro manifest, on
         the SAME branch/worktree the attempt already committed to — not a
@@ -8226,6 +8334,13 @@ class Orchestrator:
         `_REPRO_CORRECTIVE_TURNS` (15) the turn budget — small on purpose:
         this is "write one JSON manifest and the test(s) it names", not a
         second implementation pass.
+
+        `instruction`/`why`/`turns` are optional overrides — default to
+        today's exact behaviour (`repro_send_back_message(detail)`, the
+        literal "repro gate waived — …" emit text, and
+        `_REPRO_CORRECTIVE_TURNS`) — so `_declared_files_preflight` can reuse
+        this same method for a differently-worded, differently-budgeted round
+        without touching the `waived` path at all.
 
         Returns None to let the caller re-run the gate, or the `TaskOutcome`
         that ends the attempt (a commit refusal, or a tamper fire on the
@@ -8258,8 +8373,8 @@ class Orchestrator:
         """
         self.emit(
             "repro_corrective_round",
-            "repro gate waived — one bounded round to write "
-            f"{REPRO_MANIFEST} before failing the attempt",
+            why or ("repro gate waived — one bounded round to write "
+                     f"{REPRO_MANIFEST} before failing the attempt"),
         )
         usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
         bounds = self.config.get("bounds") or {}
@@ -8277,9 +8392,10 @@ class Orchestrator:
         try:
             result = await asyncio.wait_for(
                 self.backend.run(
-                    repro_send_back_message(detail) + _REPRO_ROUND_SCOPE_NOTE,
+                    (instruction or repro_send_back_message(detail))
+                    + _REPRO_ROUND_SCOPE_NOTE,
                     cwd=repo.path,
-                    max_turns=_REPRO_CORRECTIVE_TURNS, effort="high",
+                    max_turns=turns, effort="high",
                     on_event=self._agent_sink,
                 ),
                 timeout=timeout_s,

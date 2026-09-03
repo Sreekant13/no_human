@@ -289,18 +289,36 @@ FROZEN_FILE_LINES = {
     # `_warn_profile_divergence` from `_usable_profile`) and this branch's
     # disclosure work above, plus the review-round comment completion (+2).
     # Measured on the merge result with the scanner below, never summed.
-    # 20673 -> 20899 (+226): mechanical PR-body fallback for a
-    # classifier-rejected coder final message — `_mechanical_changes_summary`,
-    # `_render_mechanical`, `_trim_mechanical`, and the new constants
-    # (`_MECHANICAL_LABEL`, `_MECH_MAX_COMMITS`/`_MECH_MAX_FILES`,
-    # `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus threading
-    # `repo`/`base`/`mechanical` through `_summary_section` and `_pr_body`.
-    # Measured on this tree with the scanner below.
-    # 20899 -> 20949 (+50): the ui_evidence dev-server boot wiring in
-    # _maybe_capture_ui_evidence/_deliver_ui_evidence (the harness now boots
-    # the repo's configured start_cmd and disclosed which server it walked).
-    # Measured on the merge result with the scanner below, never summed.
-    "core/orchestrator.py": 20949,
+    # 20673 -> 20789 (+116): the declared-repro-files-committed
+    # preflight — `_declared_files_preflight`, `_DECLARED_FILES_ROUND_TURNS`,
+    # `declared_files_send_back_message`, and the `_repro_gate_step` /
+    # `_repro_corrective_round` wiring for it, plus the three
+    # reviewer-worktree-returncode-audit comment blocks rebased in from
+    # origin/main's own history. Measured on this rebased tree with the
+    # scanner below (the scanner's own `len(Path(...).read_text().
+    # splitlines())` metric — confirmed by reading `scan_source()`'s
+    # implementation, which returns `len(text.splitlines())`, not `wc -l`).
+    #
+    # 20789 + main's independent 20673 -> 20899 (+226, mechanical PR-body
+    # fallback for a classifier-rejected coder final message —
+    # `_mechanical_changes_summary`, `_render_mechanical`, `_trim_mechanical`,
+    # and the new constants (`_MECHANICAL_LABEL`, `_MECH_MAX_COMMITS`/
+    # `_MECH_MAX_FILES`, `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus
+    # threading `repo`/`base`/`mechanical` through `_summary_section` and
+    # `_pr_body`) merge to 21015, the exact sum of both deltas (116 + 226 =
+    # 342, 20673 + 342 = 21015) — confirmed via
+    # `len(Path("src/no_human/core/orchestrator.py").read_text().
+    # splitlines())`, the scanner's own metric, which (unlike `wc -l`) also
+    # counts main's `_LINE_BREAKS` regex's three literal Unicode
+    # line-separator characters (NEL/LS/PS) as line breaks.
+    #
+    # 21015 -> 21065 (+50): a second independent main landing on top of
+    # this merge — the ui_evidence dev-server boot wiring in
+    # `_maybe_capture_ui_evidence`/`_deliver_ui_evidence` (the harness now
+    # boots the repo's configured `start_cmd` and discloses which server it
+    # walked). Measured on this merge result with the scanner below, never
+    # summed by hand.
+    "core/orchestrator.py": 21065,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
