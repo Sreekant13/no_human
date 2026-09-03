@@ -376,7 +376,7 @@ _CSP = (
     "default-src 'self'; script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
     "font-src 'self'; connect-src 'self' ws: wss:; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'"
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 
 # The two PostHog hosts the browser needs when (and ONLY when) the operator
