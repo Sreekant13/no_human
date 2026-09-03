@@ -461,6 +461,24 @@ class Comparison:
     rate_b: float = 0.0
     specs_a: int = 0
     specs_b: int = 0
+    # Measured specs each run scored against a pin re-derived by date from a
+    # rewritten history (`bench_task.build_bench_tasks`), not the pin the
+    # original task actually saw. Read straight off each run's own aggregate
+    # (`pin_rederived_spec_count`) — never recomputed from the paired rows —
+    # so a run missing the field (predates it) reports 0 here rather than
+    # raising. That default-0 is ambiguous with a genuine zero, which is
+    # exactly what `rederived_recorded_a/b` below disambiguates — the CLI
+    # (`_compare_side`) reads BOTH fields to print "0 re-derived pin(s)" vs
+    # "unrecorded" for a reader.
+    rederived_a: int = 0
+    rederived_b: int = 0
+    # Whether each run's aggregate carried the re-derived-pin field AT ALL —
+    # set from key PRESENCE in `compare_runs`, not from the count being
+    # nonzero, so a run that legitimately re-derived zero pins still reports
+    # `True` here and only a run whose results file predates the field at
+    # all reports `False`.
+    rederived_recorded_a: bool = True
+    rederived_recorded_b: bool = True
     # 2x2 paired table. `both_pass`/`both_fail` are concordant; b and c are the
     # only cells McNemar looks at, and the only cells a change can move.
     both_pass: int = 0
@@ -575,6 +593,16 @@ def compare_runs(run_a: dict[str, Any], run_b: dict[str, Any]) -> Comparison:
         only_in_b=sorted(set(vb) - set(va)),
         unmeasured_a=sorted(unmeasured_a),
         unmeasured_b=sorted(unmeasured_b),
+        rederived_a=int((run_a.get("aggregate") or {})
+                        .get("pin_rederived_spec_count") or 0),
+        rederived_b=int((run_b.get("aggregate") or {})
+                        .get("pin_rederived_spec_count") or 0),
+        # Presence, not the count being nonzero — a results file that
+        # genuinely re-derived 0 pins still recorded the field.
+        rederived_recorded_a=("pin_rederived_spec_count" in (run_a.get("aggregate") or {})
+                              or "pin_rederived_specs" in (run_a.get("aggregate") or {})),
+        rederived_recorded_b=("pin_rederived_spec_count" in (run_b.get("aggregate") or {})
+                              or "pin_rederived_specs" in (run_b.get("aggregate") or {})),
     )
 
     cost_deltas: list[CostDelta] = []

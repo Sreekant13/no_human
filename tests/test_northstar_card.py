@@ -10,6 +10,7 @@ from no_human.eval.northstar_card import (
     cost_ratio_basis,
     corpus_shortfall,
     northstar_gate,
+    pin_rederivation_note,
     render_northstar_md,
     unmeasured_specs,
 )
@@ -344,6 +345,102 @@ def test_an_old_card_without_the_field_says_not_recorded(tmp_path):
     assert loaded.unscoreable_recorded is False
     md = render_northstar_md(loaded)
     line = next(ln for ln in md.splitlines() if "unscoreable" in ln.lower())
+    assert "not recorded" in line, line
+
+
+# ------------------------------ pin re-derivation ---------------------------- #
+# History rewrites make a spec's recorded pin unreachable; `nh bench build`
+# repairs it by re-deriving a pin from the spec's own recorded start date
+# (bench_task.build_bench_tasks) rather than dropping or guessing. These tests
+# pin the disclosure side: the count must survive save/load, render
+# unconditionally (including the 0 case, as a positive control against a
+# missing line), and read "not recorded" — never a confident 0 — for a
+# results file that predates the field.
+
+def test_aggregate_reports_pin_rederived_rows_and_specs():
+    rederived = _score(task_id="rewritten-history", satisfied=False)
+    rederived.pin_rederived = True
+    clean = _score(task_id="clean", satisfied=True)
+    card = NorthStarCard(scores=[rederived, clean], created_at="2026-08-23")
+    assert card.pin_rederived_specs == 1
+    assert card.pin_rederived_spec_count == 1
+    agg = card.as_dict()["aggregate"]
+    assert agg["pin_rederived_specs"] == 1
+    assert agg["pin_rederived_spec_count"] == 1
+
+
+def test_pin_rederivation_note_at_zero_is_a_positive_control():
+    """Same rationale as the unscoreable line: a missing line and a measured
+    zero must not look the same — the line always renders, 0 included, and
+    says every measured spec ran against the pin the original task saw."""
+    card = NorthStarCard(scores=[_score(satisfied=True)], created_at="2026-08-23")
+    note = pin_rederivation_note(card)
+    assert "**0**" in note, note
+    assert "the original task actually saw" in note, note
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines() if "re-derived pin" in ln.lower())
+    assert "**0**" in line, line
+
+
+def test_report_line_carries_the_rederived_count():
+    a = _score(task_id="ns-1", satisfied=False)
+    a.pin_rederived = True
+    b = _score(task_id="ns-2", satisfied=True)
+    b.pin_rederived = True
+    c = _score(task_id="ns-3", satisfied=True)
+    card = NorthStarCard(scores=[a, b, c], created_at="2026-08-23")
+    note = pin_rederivation_note(card)
+    assert "**2**" in note, note
+    assert "of 3" in note, note
+    assert "PARTIALLY" in note, note
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines() if "re-derived pin" in ln.lower())
+    assert "**2**" in line, line
+
+
+def test_card_save_load_round_trips_pin_rederived(tmp_path):
+    s = _score(task_id="ns-1", satisfied=False)
+    s.pin_rederived = True
+    card = NorthStarCard(scores=[s], created_at="2026-08-23", label="rt")
+    p = tmp_path / "latest.json"
+    card.save(p)
+    loaded = NorthStarCard.load(p)
+    assert loaded is not None
+    assert loaded.scores[0].pin_rederived is True
+    assert loaded.pin_rederived_recorded is True
+    assert loaded.pin_rederived_spec_count == 1
+
+
+def test_an_old_card_without_the_pin_rederived_field_says_not_recorded(tmp_path):
+    """A results file written before this field existed has no
+    `pin_rederived`/`pin_rederived_specs` keys anywhere — `load()` must still
+    succeed, and the rendered line must say so honestly rather than print a
+    confident 0 that looks like a measured zero."""
+    old = {
+        "created_at": "2026-01-01", "label": "pre-field",
+        "scores": [{
+            "task_id": "ns-1", "title": "t", "outcome_status": "done",
+            "goal_satisfied": False, "escalated_honestly": False,
+            "mergeable": True, "nh_tokens": 500, "nh_cache_tokens": 100,
+            "nh_turns": 5, "nh_wall_clock_s": 60.0, "orig_tokens": 1000,
+            "orig_wall_clock_s": 600.0, "orig_corrections": 3,
+            "subset": "core",
+            # deliberately no "pin_rederived" key
+        }],
+        "aggregate": {
+            # deliberately no "pin_rederived_specs"/"pin_rederived_spec_count" keys
+        },
+    }
+    p = tmp_path / "old_latest.json"
+    p.write_text(__import__("json").dumps(old))
+    loaded = NorthStarCard.load(p)
+    assert loaded is not None
+    assert loaded.scores[0].pin_rederived is False
+    assert loaded.pin_rederived_recorded is False
+    note = pin_rederivation_note(loaded)
+    assert "not recorded" in note, note
+    md = render_northstar_md(loaded)
+    line = next(ln for ln in md.splitlines() if "re-derived pin" in ln.lower())
     assert "not recorded" in line, line
 
 

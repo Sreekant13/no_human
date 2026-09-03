@@ -35,7 +35,8 @@ from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
 from ..notify.slack import SlackNotifier
-from .bench_task import BenchTask, redact_local_path, spec_project_name
+from .bench_task import (BenchTask, redact_local_path, spec_pin_rederived,
+                         spec_project_name)
 from .sandbox_selftest import wrong_tree_imports
 
 BackendFactory = Callable[[BenchTask], Any]
@@ -290,6 +291,13 @@ class BenchScore:
     # answered" OR "no judge ran"; it never influences goal_satisfied, which
     # stays fail-closed exactly as before this field existed.
     unscoreable: bool = False
+    # The spec's pin was re-derived by date from a rewritten history — this
+    # replay ran against today's ancestor of the recorded start, not the
+    # tree the original task actually saw. Read-only here: set from the
+    # spec at construction, never written back to it — no spec is ever
+    # mutated at run time (`bench_task.build_bench_tasks` is the only
+    # writer).
+    pin_rederived: bool = False
 
     @property
     def token_ratio(self) -> float | None:
@@ -417,6 +425,7 @@ class BenchScore:
             "nh_role_tokens": self.nh_role_tokens,
             "nh_role_models": self.nh_role_models,
             "unscoreable": self.unscoreable,
+            "pin_rederived": self.pin_rederived,
         }
 
 
@@ -869,6 +878,7 @@ class NorthStarRunner:
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
             project=spec_project_name(spec),
+            pin_rederived=spec_pin_rederived(spec),
             # REDACTED. The run-time reasons below name the repo path, which
             # after the repo-map translation is the operator's real local
             # checkout — and this note is rendered into the tracked report.
@@ -956,6 +966,7 @@ class NorthStarRunner:
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
             project=spec_project_name(spec),
+            pin_rederived=spec_pin_rederived(spec),
             # Set unconditionally (they're the run's cost either way, same
             # `attempts`/`nh_tokens` this call already computed); the report
             # decides whether to SHOW them by filtering on escalated_honestly.

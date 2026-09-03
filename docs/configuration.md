@@ -20,7 +20,7 @@ changes in code and not here fails the suite.
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `concurrency.stop_grace_s` | `60` | Seconds a stopping server (`nh stop`, SIGTERM) waits for running attempts to checkpoint (`[WIP-PARTIAL]` commit + `resume_from`) and unwind before exiting anyway. `nh stop --timeout` defaults to this plus 15 |
-| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK), `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`) or `local` (the Claude Agent SDK pointed at an Anthropic-compatible server on loopback/RFC1918). Only the coder moves — reviewer, planner, supervisor, utility and intake stay on Claude. One task can override it: `nh task add --backend codex` (or `backend` on `POST /api/tasks`). See [BACKENDS.md](BACKENDS.md) |
+| `worker.backend` | `claude` | Which coding backend the IMPLEMENTER runs on: `claude` (the Claude Agent SDK), `codex` (the OpenAI Codex CLI, on your own `OPENAI_API_KEY`) or `local` (the Claude Agent SDK pointed at an Anthropic-compatible server on loopback/RFC1918). By default only the coder moves — planner, supervisor, utility and intake stay on Claude unconditionally; the reviewer stays on Claude too unless an explicit `llm.role_backends.reviewer` Settings choice overrides it (constraint §6d, below). One task can override the coder: `nh task add --backend codex` (or `backend` on `POST /api/tasks`). See [BACKENDS.md](BACKENDS.md) |
 | `worker.abort_non_converging` | `true` | Turn-cap convergence early-abort: fail an attempt that keeps calling tools (varied reads/greps, never a repeat) but has made no file edit and run no test for `worker.convergence_window_turns` turns, once past `worker.convergence_check_after_turns`. Checkpointed `[WIP-PARTIAL]`, exactly like a hard doom-loop abort — the bounded loop retries with fresh context; `false` restores pre-P2 behaviour, where only `bounds.max_turns_per_attempt` and the hard stuck tiers can end an attempt |
 | `worker.convergence_check_after_turns` | `80` | Turns before the convergence check applies at all — below this, exploring with no edit yet is normal |
 | `worker.convergence_window_turns` | `40` | Turns since the last file edit or test run that count as stalled, once past `convergence_check_after_turns` |
@@ -517,6 +517,29 @@ value per changed key. **It does not reload the running server's config** —
 that is exactly what `restart_required` on the next `GET` is for; a change
 here takes effect on restart.
 
+**`llm.role_backends`** (constraint §6d) is a separate, additive key on the
+same body: `{"role_backends": {"reviewer": {"backend": ..., "model": ...} |
+null}}`. Today only `"reviewer"` is accepted — every other role stays pinned
+to Claude with no override front door. This does not replace `llm.
+review_model`: `review_model` still names the model id in the vendor-pinned
+default case; `role_backends.reviewer`, when present, is what actually
+constructs the reviewer's backend, and `GET /api/models`'s reviewer row
+carries an extra `backend` block (`{backend, model, is_default}`) alongside
+the plain five-role shape so a caller can tell which is in effect. Writing it
+goes through the exact same validation the plain five keys get (unpriced
+Claude ids refused, unsupported/unavailable backends refused with the
+credential each backend's normal construction path requires — Codex's
+`llm.codex_auth_mode`, local's loopback/RFC1918 check) plus one more: an
+unknown role name in `role_backends` is a `422`, never silently ignored. A
+non-default reviewer choice is disclosed, never silent: the `models` event
+carries a `role_backends.reviewer` `{backend, model}` kwarg which
+`web/src/summaries.js` renders as its own, un-clipped "Reviewer backend"
+digest fact on the task detail (the models line itself is clipped at 110
+chars — a four-role production string is already past that, so an appended
+suffix there could never render) — and the PR body's evidence table gets an
+additional `| Reviewer model | ... |` row — the existing
+`| Independent review | ... |` verdict row is untouched either way.
+
 **`nh config models`** (no args) prints the same five roles/current
 values/options `GET /api/models` returns, from a freshly loaded config file
 rather than a running server's state (there may be no server running).
@@ -532,9 +555,13 @@ endpoints — it adds no new server behavior. It renders one row per role in
 the order `GET /api/models` returns them, each row's `<select>` built
 entirely from that role's `options`: an option the server marked
 `requires_backend` is rendered `disabled`, with the server's
-`disabled_reason` as the option's title (the coder role is the only one that
-can have such an option today — the other four roles are pinned to Claude
-ids, so there is nothing on their menu to disable). A role whose `note` is
+`disabled_reason` as the option's title (the coder role is the only one with
+such a menu rendered today — part 3 ships the reviewer's picker). Planner,
+supervisor and utility model ids stay pinned to Claude with no override
+front door; the reviewer's *backend* may already be overridden via
+`llm.role_backends.reviewer` (disclosed on the task detail and in the PR
+body), even though its Settings-pane picker is not live in this slice. A
+role whose `note` is
 non-empty (every pinned role) shows it under the row; the reviewer row alone
 may also carry a `cost_note` — the same evidence sentence documented next to
 `review_model`'s default, describing the operator's A/B revert — and no
@@ -730,6 +757,21 @@ ui_evidence:
   start_cmd: npm run dev
   base_url: http://localhost:5173
 ```
+
+`start_cmd` is no longer just documentation: at attempt time, once tests pass
+and a coder-written walk manifest is present, the harness itself boots
+`start_cmd` in the attempt's worktree — but only if nothing already answers
+at the *manifest's* `base_url` (loopback hosts only: `127.0.0.1`, `localhost`
+or `::1` — never a remote host). It polls `base_url` + `ready_path` until
+something answers or `ready_timeout_s` elapses (clamped to `[1, 300]`
+regardless of the configured value), then runs the walk, then stops the
+process it started — whether the walk finished cleanly or raised. If a
+server was already answering at that URL, the harness never starts or stops
+anything; it just walks against whatever is already running. Either way the
+PR body says which happened: "Dev server booted by the harness for this
+walk (`{start_cmd}`), stopped afterwards." or "Dev server was already
+running at {base_url} before the walk; the harness did not start it and did
+not verify which checkout it serves."
 
 Nothing wrote this before no-human-67: a repo could have Playwright installed
 and the kill switch on, and the walk still had no `start_cmd`/`base_url` to

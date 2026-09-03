@@ -106,7 +106,7 @@ from ..review.verifiers import (
 )
 from ..testing import ownership, runner, ui_evidence
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
-from ..testing.repro_gate import run_repro_gate
+from ..testing.repro_gate import declared_test_files, run_repro_gate
 from .prompt_blocks import (
     EXPORT_CLASSIFICATION_FILE,
     DistillationError,
@@ -278,6 +278,28 @@ def repro_send_back_message(detail: str) -> str:
         f"{REPRO_MANIFEST} "
         '({"tests": ["path::test_name"]}) naming the '
         f"test(s), and make them prove the bug.\n{detail}"
+    )
+
+
+def declared_files_send_back_message(missing: list[str]) -> str:
+    """The instruction for the ONE bounded round bought when the coder ended
+    an attempt with `REPRO_MANIFEST` declaring test file(s) that are not in
+    the attempt's own committed tree (`Orchestrator._declared_files_preflight`).
+
+    Module-level and pure, same idiom as `repro_send_back_message`: this is
+    read by an already-blocked coder on every retry, so it must name the
+    exact paths rather than a generic "some files are missing".
+    """
+    paths = ", ".join(missing)
+    return (
+        f"{REPRO_MANIFEST} declares the following test file(s), but they are "
+        f"absent from this attempt's committed tree: {paths}. "
+        "Create any that do not yet exist, and COMMIT them — use a "
+        "file-writing tool (Write/Edit), not a Bash heredoc or redirect, so "
+        "the change is captured and committed. "
+        "Removing or editing the declaration in "
+        f"{REPRO_MANIFEST} to make this pass is tampering and is not an "
+        "option — the missing file(s) must actually be committed."
     )
 
 
@@ -1103,6 +1125,12 @@ _MECHANICAL_FEEDBACK_SOURCES = frozenset({"pr_conflict"})
 # SAME branch, when the gate WAIVED for lack of one — not a review round, so
 # it gets a small budget of its own rather than the attempt's full turn cap.
 _REPRO_CORRECTIVE_TURNS = 15
+
+# One bounded round to COMMIT declared repro test file(s) that the manifest
+# names but the attempt's committed tree lacks — "commit the files you
+# already declared", not a fresh coder pass, so it gets its own small budget
+# rather than `_REPRO_CORRECTIVE_TURNS`'s.
+_DECLARED_FILES_ROUND_TURNS = 10
 
 # Appended to `repro_send_back_message(detail)` for the corrective round
 # ONLY — the diff under review is already committed and tamper-clean (or the
@@ -3396,12 +3424,38 @@ class Orchestrator:
 
         The profile is a name, never a token (constraint §1). It is read from
         the process, not from config, so the stamp is what actually billed.
+
+        Constraint §6d: `models["reviewer"]` stays the model id ONLY — the
+        `attempts`/task-detail column shape and `core/cost.py`'s parsing of
+        it are out of scope and unchanged. A non-default reviewer backend is
+        disclosed ONLY as its own `role_backends` event kwarg — NOT appended
+        to `detail` anymore: the board clips that line at 110 chars and the
+        four-role production base string is already 113, so an appended
+        suffix could never render. `web/src/summaries.js` reads
+        `role_backends.reviewer` and renders it as its own un-clipped
+        "Reviewer backend" digest fact.
         """
         detail = " · ".join(f"{r}={m}" for r, m in models.items())
         profile = active_auth_profile()
         if profile:
             detail = f"{detail} · auth={profile}"
-        self.emit("models", detail, models=models, auth_profile=profile)
+        from .role_backend_settings import effective_role_backend
+        reviewer_effective = effective_role_backend(self.config, "reviewer")
+        role_backends: dict[str, dict[str, str]] = {}
+        if not reviewer_effective["is_default"]:
+            # The resolver says WHETHER the reviewer is non-default; the
+            # constructed reviewer object (when one exists) says WHAT
+            # actually got built, so an injected/stubbed reviewer's real
+            # backend wins over a second-guess of the config.
+            constructed = getattr(self.reviewer, "backend_name", None)
+            role_backends["reviewer"] = {
+                "backend": constructed or reviewer_effective["backend"],
+                "model": reviewer_effective["model"],
+            }
+        self.emit(
+            "models", detail, models=models, auth_profile=profile,
+            **({"role_backends": role_backends} if role_backends else {}),
+        )
 
     @staticmethod
     def _plan_file(repo: GitRepo) -> Path:
@@ -8085,6 +8139,68 @@ class Orchestrator:
                     task, budget_blocker, repo=repo, branch=branch)
         return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
+    async def _declared_files_preflight(
+        self, task: Task, repo: GitRepo, *, attempt_id: str,
+        branch: str | None, attempt_n: int, tamper_before: str,
+    ) -> "TaskOutcome | None":
+        """An attempt can end with `REPRO_MANIFEST` declaring test file(s)
+        that were never committed — the gate then fails a full round later on
+        "declared test file(s) missing from the attempt tree", after the
+        attempt already believed itself done. This buys ONE bounded round to
+        commit exactly those files, on the SAME branch, BEFORE the gate ever
+        runs — so the coder gets one immediate corrective turn instead of
+        losing the whole attempt to a mechanically-detectable omission.
+
+        Zero LLM spend for the check itself: `declared_test_files` reads the
+        manifest off disk, `_paths_at_head` is one `git ls-tree`.
+
+        Returns None when there is nothing to fix (no manifest, or every
+        declared file is already at HEAD — the byte-identical path to before
+        this method existed) or when a second pre-flight fire on a
+        re-entered attempt should fall straight through to the gate. Returns
+        the `TaskOutcome` that ends the attempt only when the corrective
+        round itself ends it (a commit refusal or a tamper fire) — a file
+        still missing after the round is NOT ended here; it is left to
+        `run_repro_gate`'s own missing-file check, which stays the backstop.
+        """
+        declared = declared_test_files(repo.path)
+        if not declared:
+            return None
+        present = self._paths_at_head(repo, declared)
+        missing = [f for f in declared if f not in present]
+        if not missing:
+            return None
+        corrected = self.__dict__.setdefault("_declared_files_corrected", set())
+        if attempt_id in corrected:
+            return None
+        corrected.add(attempt_id)
+        self.emit(
+            "declared_files_uncommitted",
+            f"{len(missing)} declared repro test file(s) are not in the "
+            f"attempt's committed tree: {missing}",
+            missing=list(missing),
+        )
+        outcome = await self._repro_corrective_round(
+            task, repo, "", attempt_id=attempt_id, branch=branch,
+            attempt_n=attempt_n, tamper_before=tamper_before,
+            instruction=declared_files_send_back_message(missing),
+            why="declared repro test file(s) not committed — one bounded "
+                "round to commit them",
+            turns=_DECLARED_FILES_ROUND_TURNS,
+        )
+        if outcome is not None:
+            return outcome
+        still_present = self._paths_at_head(repo, declared)
+        still_missing = [f for f in declared if f not in still_present]
+        if still_missing:
+            self.emit(
+                "declared_files_uncommitted",
+                f"{len(still_missing)} declared repro test file(s) still "
+                f"not in the attempt's committed tree: {still_missing}",
+                missing=list(still_missing), still_missing=True,
+            )
+        return None
+
     async def _repro_gate_step(
         self, task: Task, repo: GitRepo, *, base: str | None, attempt_id: str,
         attempt_n: int, branch: str | None, tamper_before: str,
@@ -8114,6 +8230,15 @@ class Orchestrator:
           so the failure reason describes what actually happened last.
           Keyed on `attempt_id` (`_repro_corrected`) so a re-entered attempt
           cannot buy a second round.
+
+        Before either verdict can even be read, `_declared_files_preflight`
+        runs (for `enforced` attempts only): if the manifest declares test
+        file(s) that are absent from the attempt's own committed tree, it
+        buys ONE bounded round to commit them — a mechanically-detectable
+        omission that used to burn a whole attempt on this gate's own
+        "declared test file(s) missing from the attempt tree" failure. That
+        missing-file check in `run_repro_gate` is unchanged and stays the
+        backstop for anything the pre-flight round does not resolve.
 
         Returns None to let the pipeline continue to the draft PR / reviewer,
         or the `TaskOutcome` that ends the attempt.
@@ -8189,6 +8314,13 @@ class Orchestrator:
                 attempt_id, status="failed", failure_reason=fail_detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=fail_detail)
 
+        if enforced:
+            pre = await self._declared_files_preflight(
+                task, repo, attempt_id=attempt_id, branch=branch,
+                attempt_n=attempt_n, tamper_before=tamper_before)
+            if pre is not None:
+                return pre
+
         repro = await _run_gate()
         if not enforced or repro is None or repro.verdict not in ("fail", "waived"):
             return None
@@ -8217,6 +8349,8 @@ class Orchestrator:
     async def _repro_corrective_round(
         self, task: Task, repo: GitRepo, detail: str, *, attempt_id: str,
         branch: str | None, attempt_n: int, tamper_before: str,
+        instruction: str | None = None, why: str | None = None,
+        turns: int = _REPRO_CORRECTIVE_TURNS,
     ) -> "TaskOutcome | None":
         """ONE bounded coder round to write the MISSING repro manifest, on
         the SAME branch/worktree the attempt already committed to — not a
@@ -8226,6 +8360,13 @@ class Orchestrator:
         `_REPRO_CORRECTIVE_TURNS` (15) the turn budget — small on purpose:
         this is "write one JSON manifest and the test(s) it names", not a
         second implementation pass.
+
+        `instruction`/`why`/`turns` are optional overrides — default to
+        today's exact behaviour (`repro_send_back_message(detail)`, the
+        literal "repro gate waived — …" emit text, and
+        `_REPRO_CORRECTIVE_TURNS`) — so `_declared_files_preflight` can reuse
+        this same method for a differently-worded, differently-budgeted round
+        without touching the `waived` path at all.
 
         Returns None to let the caller re-run the gate, or the `TaskOutcome`
         that ends the attempt (a commit refusal, or a tamper fire on the
@@ -8258,8 +8399,8 @@ class Orchestrator:
         """
         self.emit(
             "repro_corrective_round",
-            "repro gate waived — one bounded round to write "
-            f"{REPRO_MANIFEST} before failing the attempt",
+            why or ("repro gate waived — one bounded round to write "
+                     f"{REPRO_MANIFEST} before failing the attempt"),
         )
         usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
         bounds = self.config.get("bounds") or {}
@@ -8277,9 +8418,10 @@ class Orchestrator:
         try:
             result = await asyncio.wait_for(
                 self.backend.run(
-                    repro_send_back_message(detail) + _REPRO_ROUND_SCOPE_NOTE,
+                    (instruction or repro_send_back_message(detail))
+                    + _REPRO_ROUND_SCOPE_NOTE,
                     cwd=repo.path,
-                    max_turns=_REPRO_CORRECTIVE_TURNS, effort="high",
+                    max_turns=turns, effort="high",
                     on_event=self._agent_sink,
                 ),
                 timeout=timeout_s,
@@ -19500,7 +19642,29 @@ SIX of them read a checkpoint and TWO do not — but do
             verifiers=((task.context or {}).get("verifier_results") or {}).get(head_sha),
             ci_state=(task.context or {}).get("ci_status"),
             merge_policy=merge_policy,
+            reviewer_attribution=self._reviewer_attribution(),
         )
+
+    def _reviewer_attribution(self) -> str:
+        """Constraint §6d's PR-body disclosure string: `""` when the reviewer
+        ran on the default (`CLAUDE_PINNED_ROLES`'s pin), or `"<backend>
+        \\`<model>\\`"` when an explicit `llm.role_backends.reviewer` Settings
+        choice built it instead. Reads `self.config` through the SAME
+        resolver `agent.backend.make_backend`/`review.reviewer.
+        AdversarialReviewer.from_config` consult (`role_backend_settings.
+        effective_role_backend`) — never a second opinion of what actually
+        got constructed.
+
+        Imported locally, not at module scope: `role_backend_settings`
+        imports `backend_settings`, which imports `runtime`, which imports
+        `Orchestrator` from this module — a module-level import here would
+        be a circular import at load time.
+        """
+        from .role_backend_settings import effective_role_backend
+        effective = effective_role_backend(self.config, "reviewer")
+        if effective["is_default"]:
+            return ""
+        return f"{effective['backend']} `{effective['model']}`"
 
     def _evidence_section(
         self, task: Task, *, test_evidence: dict | None = None,
@@ -19841,6 +20005,18 @@ SIX of them read a checkpoint and TWO do not — but do
         glyph = "✅" if rv["verdict"] == "PASSED" else "❌"
         row = (f"| Independent review | {glyph} **{rv['verdict']}** — "
                f"{n} round{'s' if n != 1 else ''} |\n")
+        # Constraint §6d disclosure: an ADDITIONAL row, appended AFTER the
+        # verdict row above rather than folded into it — `review_verdict_pin`
+        # (`pr_evidence.py`) must stay an exact substring of the row above,
+        # and this field is deliberately not part of that pin (see
+        # `PrEvidence.reviewer_attribution`'s docstring). "" (the default)
+        # renders nothing — a reader who never touched Settings sees no new
+        # row at all.
+        if evidence is not None and evidence.reviewer_attribution:
+            row += (
+                f"| Reviewer model | {evidence.reviewer_attribution} — "
+                "non-default, chosen in Settings |\n"
+            )
         addressed = rv.get("addressed") or []
         if not addressed:
             return row
@@ -20193,8 +20369,24 @@ SIX of them read a checkpoint and TWO do not — but do
                 "the coder wrote no `.no_human/ui_evidence.json` walk manifest")
 
         out_dir = ui_evidence.default_out_dir(task.id)
+        # Boot the repo's configured dev server (`ui_conf["start_cmd"]`) when
+        # nothing already answers at the MANIFEST's `base_url` — never the
+        # profile's — and tear it down before this method returns, so the
+        # server is guaranteed dead before the PR body is produced. A bad/
+        # unreadable manifest reads the same as "unconfigured": `run` below
+        # still reports its own `not_run` for that; this just skips the boot.
         try:
-            result = await ui_evidence.run(Path(repo.path), out_dir)
+            manifest_base_url = ui_evidence.read_manifest(Path(repo.path)).base_url
+        except Exception:  # noqa: BLE001 — bad manifest: skip the boot, `run` reports it
+            manifest_base_url = ""
+        srv: "ui_evidence.DevServerOutcome | None" = None
+        cm = (
+            ui_evidence.dev_server(Path(repo.path), ui_conf or {}, manifest_base_url, out_dir)
+            if manifest_base_url else contextlib.nullcontext(None)
+        )
+        try:
+            async with cm as srv:
+                result = await ui_evidence.run(Path(repo.path), out_dir)
         except Exception as exc:  # noqa: BLE001 — `ui_evidence.run` documents
             # "never raises", but this call site does not re-derive that
             # promise; it fails the same way every other evidence gather here
@@ -20207,6 +20399,11 @@ SIX of them read a checkpoint and TWO do not — but do
             shutil.rmtree(out_dir, ignore_errors=True)
             return self._ui_evidence_skipped(f"the walk errored ({type(exc).__name__})")
 
+        if srv is not None and (srv.detail or srv.mode == "boot-failed"):
+            # Advisory only — `srv.detail` (log tail) never reaches the PR
+            # body, only `nh logs` via `self._advisory`.
+            self._advisory(f"ui evidence dev server ({srv.mode}): {srv.detail}")
+
         if not result.shots:
             # `not_run` (no reachable dev server, bad manifest) or a `failed`
             # walk that broke before its first shot — nothing to embed. This
@@ -20217,26 +20414,51 @@ SIX of them read a checkpoint and TWO do not — but do
             # `result.reason` (falling back to `result.verdict`) is
             # driver/coder-supplied text: newline-stripped, backticks
             # stripped, and truncated so it cannot forge Markdown or break
-            # out of this section.
+            # out of this section. A `boot-failed` dev server names the URL
+            # it never answered at instead — more useful than the walk's own
+            # generic "not reachable" reason, and still sanitized the same way.
+            # `srv.cause` picks which of two sentences applies: `"timeout"`
+            # (spawned, polled, never answered — the original, byte-identical
+            # sentence) vs `"failed-to-start"` (never became a polling server
+            # at all — non-loopback refusal, unparsable start_cmd, or a spawn
+            # OSError). An empty/unknown `cause` falls back to the timeout
+            # sentence so an older/None-ish outcome still renders as before.
+            # `srv.detail` (the log tail) is still never rendered here.
             shutil.rmtree(out_dir, ignore_errors=True)
-            reason = (result.reason or result.verdict or "unknown").strip()
-            reason = reason.replace("\n", " ").replace("`", "'")
+            if srv is not None and srv.mode == "boot-failed":
+                if srv.cause == "failed-to-start":
+                    reason = (f"the dev server failed to start for {srv.base_url} "
+                              f"({srv.mode})")
+                else:
+                    reason = (f"the dev server did not answer at {srv.base_url} "
+                              f"within {srv.ready_timeout_s}s ({srv.mode})")
+            else:
+                reason = (result.reason or result.verdict or "unknown")
+            reason = reason.strip().replace("\n", " ").replace("`", "'")
             if len(reason) > 120:
                 reason = reason[:117] + "..."
             return self._ui_evidence_skipped(f"the walk captured no shots ({reason})")
 
         try:
-            return self._deliver_ui_evidence(repo, task.id, out_dir, result)
+            return self._deliver_ui_evidence(repo, task.id, out_dir, result, server=srv)
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
 
     def _deliver_ui_evidence(
         self, repo: "GitRepo", task_id: str, out_dir: Path,
         result: "ui_evidence.UiEvidenceResult",
+        *, server: "ui_evidence.DevServerOutcome | None" = None,
     ) -> str:
         """Commit the captured shots + video to a SIDE branch
         (`nh-evidence/<task_id>`), push it, and return the rendered media
         section — "" on any delivery failure.
+
+        `server` (keyword-only, default `None` so every pre-existing 4-arg
+        call site keeps working byte-for-byte) is the `dev_server` outcome
+        for this walk, if any: when its mode is `booted` or `pre-existing`
+        one extra disclosure sentence is appended naming which case
+        occurred — `unconfigured`/`boot-failed`/`None` add nothing, so the
+        body stays byte-identical to before this parameter existed.
 
         NOT a commit on the task branch itself. D1.2's own decision-gate
         test (`tests/test_approve_merge.py::
@@ -20344,6 +20566,21 @@ SIX of them read a checkpoint and TWO do not — but do
             "branch — proof of what the page rendered at each step, "
             "nothing more.\n",
         ]
+        if server is not None and server.mode == "booted":
+            cmd = (server.start_cmd or "").strip().replace("\n", " ").replace("`", "'")
+            if len(cmd) > 120:
+                cmd = cmd[:117] + "..."
+            lines.append(
+                f"Dev server booted by the harness for this walk (`{cmd}`), "
+                "stopped afterwards.\n")
+        elif server is not None and server.mode == "pre-existing":
+            url = (server.base_url or "").strip().replace("\n", " ").replace("`", "'")
+            if len(url) > 120:
+                url = url[:117] + "..."
+            lines.append(
+                f"Dev server was already running at {url} before "
+                "the walk; the harness did not start it and did not verify "
+                "which checkout it serves.\n")
         shown = delivered_names[: self._UI_EVIDENCE_MAX_EMBEDDED_SHOTS]
         for shot in shown:
             lines.append(f"![{shot['name']}]({_raw_url(shot['path'])})")

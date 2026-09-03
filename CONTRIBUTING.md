@@ -385,7 +385,16 @@ containing the version of `CLA.md` you agree to and the date. The template is in
 The `CLA ledger` job in CI asks GitHub who authored the commits in your PR and
 fails if any of them has no such file. It checks only that the file exists — it
 cannot verify a signature and does not try to. The maintainer's own commits and
-bot accounts are skipped.
+bot accounts are skipped. When it would fail, the `CLA nudge` workflow
+(`scripts/cla_nudge.sh`) comments on the PR with the exact file to add, filled
+in for your handle, and updates that comment on every push; it never signs
+anything for you.
+
+The maintainer lands an external pull request by hand, as one squashed commit
+that keeps **you as the author** (the maintainer is the committer). The ledger
+entry is what admits an author other than the maintainer into `main`'s history;
+`CLA.md` §3 leaves crediting to the maintainer's discretion, and this is how it
+is exercised.
 
 ## Trademark
 

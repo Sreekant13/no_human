@@ -133,6 +133,15 @@ def _test_files(tests: list[str]) -> list[str]:
     return list(seen)
 
 
+def declared_test_files(repo_path: Path) -> list[str]:
+    """The FILE paths the manifest declares (node ids stripped), order kept.
+
+    The one seam callers outside the gate use to ask what was declared — the
+    gate's own missing-file check (:func:`run_repro_gate`) is unchanged and
+    remains the backstop."""
+    return _test_files(read_manifest(repo_path))
+
+
 def _pytest_python(repo_path: Path) -> str | None:
     """The interpreter to run the repro tests with, or None if none is usable.
 

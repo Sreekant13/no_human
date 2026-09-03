@@ -237,7 +237,7 @@ class BackendUnavailable(RuntimeError):
     """A backend was selected that this install cannot run."""
 
 
-#: Roles that are PINNED to Claude regardless of ``worker.backend``, and why.
+#: Roles that are PINNED to Claude by DEFAULT, and why.
 #:
 #: This project's non-negotiable constraints fix the review gate as "an
 #: independent fresh-context Agent SDK reviewer (claude-opus-5)", and fix all
@@ -247,6 +247,14 @@ class BackendUnavailable(RuntimeError):
 #: review gate, the planner, the supervisor or the utility tier off Claude, and
 #: a config key that silently did so would be a constraint change wearing the
 #: costume of a feature. So the switch reaches exactly one role: the coder.
+#:
+#: Constraint amendment §6d (operator, commit 413d76f0d) changed
+#: this from an absolute pin to a DEFAULT pin set: an explicit, per-role
+#: Settings choice (``llm.role_backends.<role>``, see
+#: :func:`explicit_role_backend`) now overrides it for that role. Today only
+#: "reviewer" is wired through that seam (`core.role_backend_settings.
+#: ROLE_BACKEND_ROLES`); every other role here still resolves to Claude
+#: unconditionally, same as before.
 #:
 #: This is a denylist of roles rather than an allowlist of one because the
 #: default for an unrecognised role must be the SAFE side (stay on Claude), and
@@ -262,14 +270,50 @@ CLAUDE_PINNED_ROLES = ("reviewer", "planner", "supervisor", "utility", "intake")
 SUPPORTED_BACKENDS: tuple[str, ...] = ("claude", "codex", "local")
 
 
+def explicit_role_backend(config: dict[str, Any] | None, role: str) -> dict[str, str] | None:
+    """The explicit ``llm.role_backends[role]`` entry, if one is present and
+    well-shaped — ``None`` otherwise (absent, blank, or malformed).
+
+    This is the ONLY place ``make_backend``/``resolve_backend_name`` consult
+    for an override of :data:`CLAUDE_PINNED_ROLES`'s default. It reads
+    exactly one thing: the config mapping passed in. It never consults
+    environment variables or per-task config (``task.config``) — a per-role
+    backend choice is a Settings-only, config-file-only concept (constraint
+    §6d's single-write-path rule; see ``config.set_role_backend`` and
+    ``config._reject_invalid_role_backends``, which together mean any entry
+    reaching a REAL loaded config already went through the one writer). A
+    malformed entry (should not happen for a config that went through
+    ``load_config``, but this function is also handed raw dicts in tests)
+    fails SAFE to ``None`` — i.e. the role's default — rather than raising:
+    this is a read, not the validation gate.
+    """
+    role_backends = ((config or {}).get("llm") or {}).get("role_backends")
+    if not isinstance(role_backends, dict):
+        return None
+    entry = role_backends.get(role)
+    if not isinstance(entry, dict):
+        return None
+    backend = entry.get("backend")
+    model = entry.get("model")
+    if not isinstance(backend, str) or not backend.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return {"backend": backend.strip().lower(), "model": model.strip()}
+
+
 def resolve_backend_name(config: dict[str, Any] | None, *, role: str = "coder") -> str:
     """Which backend name *role* should use, given a config mapping.
 
-    Only ``role="coder"`` consults ``worker.backend``; everything else resolves
-    to ``"claude"``. See :data:`CLAUDE_PINNED_ROLES`.
+    ``role="coder"`` consults ``worker.backend``. Every other role resolves to
+    ``"claude"`` UNLESS an explicit :func:`explicit_role_backend` entry exists
+    for it (§6d) — the same lookup :func:`make_backend` uses, so this stays a
+    read-only preview of what ``make_backend`` would build, never a second
+    opinion. See :data:`CLAUDE_PINNED_ROLES`.
     """
     if role != "coder":
-        return "claude"
+        entry = explicit_role_backend(config, role)
+        return entry["backend"] if entry else "claude"
     return str(((config or {}).get("worker") or {}).get("backend") or "claude")
 
 
@@ -465,6 +509,27 @@ def _codex_network_access(cfg: dict) -> bool:
         f"llm.codex_network_access must be a boolean, got {type(raw).__name__}")
 
 
+#: Which ``llm.*`` config key each non-Claude backend reads its model id
+#: from — used by :func:`make_backend`'s explicit-role-backend seam to steer
+#: a chosen model into the SAME lookup the codex/local branches already
+#: perform (``cfg.get("codex_model")`` / ``cfg_llm.get("local_model")``),
+#: rather than teaching either branch a second way to receive a model id.
+#: ``"claude"`` needs no entry — that branch reads the ``model`` parameter
+#: directly.
+_MODEL_KEY_BY_BACKEND = {"codex": "codex_model", "local": "local_model"}
+
+
+def _with_llm_override(config: dict[str, Any] | None, key: str, value: str) -> dict[str, Any]:
+    """A shallow copy of *config* with ``llm[key] = value`` — never mutates
+    the caller's config (or its nested ``llm`` dict). Both layers are copied
+    because ``config or {}`` may hand back a fresh empty dict already, but a
+    real config's ``llm`` sub-dict is shared state the caller (and every
+    other in-flight backend construction) still holds a reference to."""
+    base = dict(config or {})
+    base["llm"] = {**(base.get("llm") or {}), key: value}
+    return base
+
+
 def make_backend(
     *,
     model: str,
@@ -494,11 +559,27 @@ def make_backend(
     directly, with identical arguments. An operator who changes nothing sees
     no behavioural difference.
     """
+    entry = None
     if role != "coder":
         # The pin is the FACTORY's, not the caller's: an explicit `backend=`
-        # for a reviewer/planner/supervisor/utility role is ignored, so no
-        # call site can put the review on the model that wrote the code.
-        backend = None
+        # for a reviewer/planner/supervisor/utility role is ignored — the
+        # ONLY override the factory honors for a non-coder role is an
+        # explicit Settings choice (§6d, `llm.role_backends`), never a
+        # caller-supplied kwarg, so no call site can put the review on the
+        # model that wrote the code just by passing `backend=`.
+        entry = explicit_role_backend(config, role)
+        backend = entry["backend"] if entry else None
+    if entry:
+        chosen = entry["model"]
+        if entry["backend"] in ("claude", "", "claude-agent-sdk"):
+            # The claude branch below reads the `model` parameter directly,
+            # not `config` — so the override is a local reassignment, not a
+            # config copy.
+            model = chosen
+        else:
+            override_key = _MODEL_KEY_BY_BACKEND.get(entry["backend"])
+            if override_key is not None:
+                config = _with_llm_override(config, override_key, chosen)
     name = (backend or resolve_backend_name(config, role=role)).strip().lower()
 
     if name in ("claude", "", "claude-agent-sdk"):
@@ -566,9 +647,13 @@ def make_backend(
 
         model_id = str(cfg_llm.get("local_model") or "").strip()
         if not model_id:
-            raise BackendUnavailable(
+            role_desc = (
                 "the coder backend is 'local' (worker.backend, or this task's "
-                "--backend) but llm.local_model is not set. "
+                "--backend)" if role == "coder" else
+                f"the {role} backend is 'local' (llm.role_backends.{role})"
+            )
+            raise BackendUnavailable(
+                f"{role_desc} but llm.local_model is not set. "
                 "Set it in config.yaml:\n"
                 "  llm:\n"
                 "    local_model: <the model id the local server exposes>"
@@ -689,4 +774,5 @@ __all__ = [
     "local_run_without_subscription",
     "make_backend",
     "resolve_backend_name",
+    "explicit_role_backend",
 ]

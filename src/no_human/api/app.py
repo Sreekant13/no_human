@@ -3250,6 +3250,12 @@ def _format_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # node with the model that actually ran it.
             if kind == "models" and isinstance(e.get("models"), dict):
                 entry["models"] = e["models"]
+            # Constraint §6d part 2: a non-default reviewer backend is
+            # disclosed as its own `role_backends` kwarg (never appended to
+            # the clipped `text`) — whitelist it through like `models` above,
+            # or `web/src/summaries.js`'s `nonDefaultReviewer` never sees it.
+            if kind == "models" and isinstance(e.get("role_backends"), dict):
+                entry["role_backends"] = e["role_backends"]
             # The substance of a supervisor decision lives in `message`, not
             # `text` — dropping it made the Supervisor look like it only ever
             # said "continue"/"correct" while its corrections carried real,
@@ -3440,6 +3446,10 @@ async def task_events_stream(task_id: str, request: Request):
                               "text": text, "source": source}
                 if kind == "models" and isinstance(e.get("models"), dict):
                     frame_data["models"] = e["models"]
+                # Mirror the _format_events whitelist so a live-streamed
+                # reviewer disclosure matches the replayed log (§6d part 2).
+                if kind == "models" and isinstance(e.get("role_backends"), dict):
+                    frame_data["role_backends"] = e["role_backends"]
                 if isinstance(e.get("message"), str) and e["message"]:
                     frame_data["message"] = e["message"]
                 for key in _VERDICT_META:
@@ -4475,20 +4485,20 @@ async def api_get_models(request: Request) -> dict[str, Any]:
 async def api_set_config_models(request: Request) -> dict[str, Any]:
     """Change up to all five ``llm.*_model`` keys in one write.
 
-    The body is parsed BY HAND (not a pydantic model) so a malformed request
-    gets one short operator-facing sentence, not pydantic's auto-generated
-    error tree; that sentence may quote the offending key or value back to
-    the caller (the endpoint is origin-gated). Validation
-    and the write itself run through ``model_settings.apply_model_changes`` —
-    the exact function ``nh config models set`` calls too, so the API and the
-    CLI can never enforce different rules or drift in what they write.
+    The body is parsed BY HAND (not pydantic) so a malformed request gets one
+    short, operator-facing sentence — not pydantic's auto-generated error
+    tree — that may quote the bad key/value back to the caller (origin-
+    gated). Validation and the write both run through the exact function
+    ``model_settings.apply_model_changes`` that ``nh config models set``
+    calls, so the API and CLI can never drift.
 
-    Deliberately does NOT reload ``request.app.state.config`` — unlike the
-    integrations/telemetry PUTs above, a model change only takes effect on
-    the NEXT task (the orchestrator reads ``self.config`` per task, not per
-    request), so reloading here would make ``restart_required`` lie the
-    moment this handler returns even though nothing running has actually
-    picked the new value up yet.
+    Deliberately does NOT reload ``request.app.state.config`` (a model change
+    only takes effect next task) — reloading would make ``restart_required`` lie.
+
+    Constraint amendment §6d: the body may ALSO carry a ``role_backends`` key
+    (``{role: {"backend", "model"} | null}``, today ``"reviewer"`` only) —
+    ``apply_model_changes`` delegates it to ``role_backend_settings`` and
+    re-wraps any refusal as the same ``ModelSettingsError`` caught below.
     """
     from ..config import CONFIG_PATH, AuthError
     from ..core import model_settings

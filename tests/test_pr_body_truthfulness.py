@@ -360,6 +360,39 @@ def test_a_task_with_no_review_at_all_renders_no_section(store, tmp_path):
     assert Orchestrator._review_evidence_section(Task.new("t", repo_path="/r")) == ""
 
 
+# ──────── constraint §6d: the PR-body reviewer-backend disclosure row ─────── #
+
+
+def test_default_reviewer_adds_no_extra_row():
+    from no_human.core.pr_evidence import PrEvidence
+    evidence = PrEvidence(
+        review_verdict={"rounds": 2, "verdict": "PASSED", "addressed": [], "unmatched": False},
+        reviewer_attribution="",
+    )
+    section = Orchestrator._review_evidence_section(
+        Task.new("t", repo_path="/r"), evidence=evidence,
+    )
+    assert "| Independent review | ✅ **PASSED** — 2 rounds |" in section
+    assert "Reviewer model" not in section
+
+
+def test_non_default_reviewer_adds_the_disclosure_row_after_the_verdict_row():
+    from no_human.core.pr_evidence import PrEvidence
+    evidence = PrEvidence(
+        review_verdict={"rounds": 1, "verdict": "PASSED", "addressed": [], "unmatched": False},
+        reviewer_attribution="codex `gpt-5-codex`",
+    )
+    section = Orchestrator._review_evidence_section(
+        Task.new("t", repo_path="/r"), evidence=evidence,
+    )
+    verdict_row = "| Independent review | ✅ **PASSED** — 1 round |\n"
+    assert verdict_row in section
+    assert evidence.review_verdict_pin() in verdict_row  # untouched exact-substring pin
+    disclosure_row = "| Reviewer model | codex `gpt-5-codex` — non-default, chosen in Settings |\n"
+    assert disclosure_row in section
+    assert section.index(verdict_row) < section.index(disclosure_row)
+
+
 # ──────────────── C5: abandoned drafts look exactly like the live one ─────── #
 
 class _Forge:

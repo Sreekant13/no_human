@@ -131,7 +131,13 @@ FROZEN_FUNCTION_LINES = {
     # smaller before this landed; measured cc is 58, still under the 60
     # function-cc ceiling so no new `FROZEN_FUNCTION_CC` entry is needed.
     # Measured on this tree with the scanner below.
-    "cli/commands.py:bench_run": 398,
+    # 398 -> 400 (+2): pin-rederivation follow-up (no-human/89acc73f-2) adds
+    # one `console.print(escape(pin_rederivation_note(card)))` call after the
+    # publish summary, surfacing the recorded-branch/HEAD-fallback disclosure
+    # in the terminal, not just the markdown report. Already present on this
+    # branch before the quota-halt bump above; never previously reflected in
+    # the ratchet. Measured on the merge result with the scanner below.
+    "cli/commands.py:bench_run": 400,
     # Grew to 304 (> 300) when D3.1 (2026-08-31, auto-activation pipeline)
     # threaded `learning.auto_manage`/`learning.auto_activate_daily_cap`
     # through `nh serve`'s `HarvestJob` construction — the kill switch's own
@@ -142,7 +148,12 @@ FROZEN_FUNCTION_LINES = {
     # an inline enable+glob gate + the ui_evidence_block call. Reviewed on
     # its merits (the block is inert until a profile opts in); frozen here.
     "core/orchestrator.py:Orchestrator._build_implement_prompt": 371,
-    "eval/northstar_card.py:render_northstar_md": 332,
+    # 332 -> 333 (+1): pin-rederivation follow-up adds one
+    # `pin_rederivation_note(card),` line to the markdown body list so the
+    # published report carries the same recorded-branch/HEAD-fallback
+    # disclosure as the terminal (see the `bench_run` note above). Measured
+    # on the merge result with the scanner below.
+    "eval/northstar_card.py:render_northstar_md": 333,
     "core/orchestrator.py:Orchestrator._reformat_summary_markdown": 327,
     "core/orchestrator.py:Orchestrator._generate_plan": 322,
     "core/orchestrator.py:Orchestrator._scan_leaf_blocks": 319,
@@ -278,14 +289,45 @@ FROZEN_FILE_LINES = {
     # `_warn_profile_divergence` from `_usable_profile`) and this branch's
     # disclosure work above, plus the review-round comment completion (+2).
     # Measured on the merge result with the scanner below, never summed.
-    # 20673 -> 20899 (+226): mechanical PR-body fallback for a
-    # classifier-rejected coder final message — `_mechanical_changes_summary`,
-    # `_render_mechanical`, `_trim_mechanical`, and the new constants
-    # (`_MECHANICAL_LABEL`, `_MECH_MAX_COMMITS`/`_MECH_MAX_FILES`,
-    # `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus threading
-    # `repo`/`base`/`mechanical` through `_summary_section` and `_pr_body`.
-    # Measured on this tree with the scanner below.
-    "core/orchestrator.py": 20899,
+    # 20673 -> 20789 (+116): the declared-repro-files-committed
+    # preflight — `_declared_files_preflight`, `_DECLARED_FILES_ROUND_TURNS`,
+    # `declared_files_send_back_message`, and the `_repro_gate_step` /
+    # `_repro_corrective_round` wiring for it, plus the three
+    # reviewer-worktree-returncode-audit comment blocks rebased in from
+    # origin/main's own history. Measured on this rebased tree with the
+    # scanner below (the scanner's own `len(Path(...).read_text().
+    # splitlines())` metric — confirmed by reading `scan_source()`'s
+    # implementation, which returns `len(text.splitlines())`, not `wc -l`).
+    #
+    # 20789 + main's independent 20673 -> 20899 (+226, mechanical PR-body
+    # fallback for a classifier-rejected coder final message —
+    # `_mechanical_changes_summary`, `_render_mechanical`, `_trim_mechanical`,
+    # and the new constants (`_MECHANICAL_LABEL`, `_MECH_MAX_COMMITS`/
+    # `_MECH_MAX_FILES`, `_DERIVED_LEDGER_BASENAMES`, `_ABS_PATH_RE`), plus
+    # threading `repo`/`base`/`mechanical` through `_summary_section` and
+    # `_pr_body`) merge to 21015, the exact sum of both deltas (116 + 226 =
+    # 342, 20673 + 342 = 21015) — confirmed via
+    # `len(Path("src/no_human/core/orchestrator.py").read_text().
+    # splitlines())`, the scanner's own metric, which (unlike `wc -l`) also
+    # counts main's `_LINE_BREAKS` regex's three literal Unicode
+    # line-separator characters (NEL/LS/PS) as line breaks.
+    #
+    # 21015 -> 21065 (+50): a second independent main landing on top of
+    # this merge — the ui_evidence dev-server boot wiring in
+    # `_maybe_capture_ui_evidence`/`_deliver_ui_evidence` (the harness now
+    # boots the repo's configured `start_cmd` and discloses which server it
+    # walked). Measured on this merge result with the scanner below, never
+    # summed by hand.
+    # 21065 -> 21123 (+58): the reviewer role-backend seam's disclosure and
+    # construction wiring (6d part 1). Measured on the merge result with the
+    # scanner below, never summed.
+    #
+    # 21123 -> 21134 (+11): `_maybe_capture_ui_evidence`'s boot-failed reason
+    # now branches on `srv.cause` to render a distinct failed-to-start
+    # sentence alongside the byte-unchanged timeout sentence (task:
+    # _kill_dev_server test coverage). Measured with the scanner below after
+    # rebasing onto the role-backend landing, never summed by hand.
+    "core/orchestrator.py": 21136,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -345,7 +387,21 @@ FROZEN_FILE_LINES = {
     # 8356 -> 8377 (+21): quota-saturation mid-run halt (`bench_run` growth
     # above) plus the `quota_halt` import block. Measured on this tree with
     # the scanner below.
-    "cli/commands.py": 8377,
+    # 8377 -> 8411 (+34): pin-rederivation follow-up (no-human/89acc73f-2).
+    # `bench_build` reloads the freshly-written specs and prints the
+    # repaired/not-re-derivable disclosure counts instead of a bare "N specs
+    # written" (+17, incl. the AST-guard docstring explaining the int(...)
+    # wrapping); `bench_run` and `bench_report` each gain one
+    # `console.print(escape(pin_rederivation_note(card)))` call plus its
+    # import (+4); `_compare_side` gains the `recorded` parameter, its
+    # disambiguating branch, and an expanded docstring (+16); the two
+    # `bench_compare` call sites thread `cmp.rederived_recorded_a/b` (net
+    # +0, existing lines widened); `bench_report`'s import line wraps to two
+    # lines for `pin_rederivation_note` (+1); net -4 from removed/collapsed
+    # lines the disclosure and docstring rewrites replaced. Measured on this
+    # tree with the scanner below (43 added - 9 removed per
+    # `git diff --numstat 8356553f6 -- src/no_human/cli/commands.py`).
+    "cli/commands.py": 8411,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -419,7 +475,11 @@ FROZEN_FILE_LINES = {
     # so the composer's coder-backend disclosure caption can gate on the
     # EFFECTIVE backend, not just the picker. Measured directly against the
     # rebased tree (`wc -l src/no_human/api/app.py`).
-    "api/app.py": 5904,
+    # 5904 -> 5914 (+10): whitelist `role_backends` through `_format_events`
+    # and `task_events_stream` (§6d part 2) — the non-default reviewer
+    # disclosure kwarg was dropped before reaching the board otherwise.
+    # Measured directly (`wc -l src/no_human/api/app.py`).
+    "api/app.py": 5914,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -510,7 +570,10 @@ FROZEN_FILE_LINES = {
     # config keys (second-tier resolution between `approve_identity` and the
     # repo's own git config, never a fallback to `agent_identity_*`) and
     # their explanatory comment. Re-anchored on rebase.
-    "config.py": 3340,
+    # 3340 -> 3544 (+204): the role_backends config surface (single-write-path
+    # validation, load-time catalog/availability alignment, set_role_backend).
+    # Measured on the merge result with the scanner below, never summed.
+    "config.py": 3544,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the
@@ -519,7 +582,10 @@ FROZEN_FILE_LINES = {
     # path now takes the LAST well-formed REVIEW_JSON_START…END match instead
     # of the first (closing the forged-early-block preemption hole), and the
     # missing-END recovery path scans START occurrences last-first to match.
-    "review/reviewer.py": 2915,
+    # 2915 -> 2945 (+30): reviewer-backend construction honoring the explicit
+    # Settings choice (6d part 1). Measured on the merge result with the
+    # scanner below, never summed.
+    "review/reviewer.py": 2945,
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.

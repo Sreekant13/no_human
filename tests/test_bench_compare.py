@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 import pytest
 from click.testing import CliRunner
@@ -733,6 +734,90 @@ def test_bench_compare_says_so_when_no_run_carries_cost_data(tmp_path):
     res = CliRunner().invoke(cli, ["bench", "compare", str(path_a), str(path_b)])
     assert res.exit_code == 0, res.output
     assert "no spec on either side" in res.output
+
+
+def test_compare_sides_carry_each_runs_rederived_count():
+    """`rederived_a`/`rederived_b` are read straight off each run's OWN
+    aggregate (`pin_rederived_spec_count`) — never recomputed from the paired
+    rows — so a baseline cut before the history rewrite (0 re-derived) can be
+    compared against a change run measured entirely on re-derived pins (56)
+    without either side's number drifting from what that run's own report
+    would say."""
+    a = _run("base", [_row("s1", ok=True), _row("s2", ok=False)])
+    a["aggregate"] = {"pin_rederived_spec_count": 0}
+    b = _run("change", [_row("s1", ok=True), _row("s2", ok=True)])
+    b["aggregate"] = {"pin_rederived_spec_count": 56}
+
+    cmp = compare_runs(a, b)
+
+    assert cmp.rederived_a == 0
+    assert cmp.rederived_b == 56
+
+
+def test_compare_sides_default_rederived_to_zero_when_unrecorded():
+    """A run whose aggregate predates `pin_rederived_spec_count` must not
+    raise — it reports 0 here, same as a run that measured zero re-derived
+    specs. But the 0 alone is ambiguous with a genuine zero, so
+    `rederived_recorded_a/b` (set from key PRESENCE in `compare_runs`, not
+    from the count) distinguishes "0" from "never recorded" right on this
+    dataclass — `_compare_side` reads both fields directly."""
+    a = _run("base", [_row("s1", ok=True)])
+    b = _run("change", [_row("s1", ok=True)])
+
+    cmp = compare_runs(a, b)
+
+    assert cmp.rederived_a == 0
+    assert cmp.rederived_b == 0
+    assert cmp.rederived_recorded_a is False
+    assert cmp.rederived_recorded_b is False
+
+
+def test_compare_sides_mark_a_recorded_zero_as_recorded():
+    """A run that genuinely re-derived zero pins (the field IS present, just
+    0) must report `recorded is True` — only an aggregate missing the field
+    entirely reports `False`."""
+    a = _run("base", [_row("s1", ok=True)])
+    a["aggregate"] = {"pin_rederived_spec_count": 0}
+    b = _run("change", [_row("s1", ok=True)])
+    b["aggregate"] = {"pin_rederived_spec_count": 0}
+
+    cmp = compare_runs(a, b)
+
+    assert cmp.rederived_recorded_a is True
+    assert cmp.rederived_recorded_b is True
+
+
+def test_compare_prints_unrecorded_when_the_run_predates_the_field(tmp_path):
+    a = _run("base", [_row("s1", ok=True)])
+    b = _run("change", [_row("s1", ok=True)])
+    b["aggregate"] = {"pin_rederived_spec_count": 3}
+    path_a = tmp_path / "run_a.json"
+    path_b = tmp_path / "run_b.json"
+    path_a.write_text(json.dumps(a))
+    path_b.write_text(json.dumps(b))
+
+    res = CliRunner().invoke(cli, ["bench", "compare", str(path_a), str(path_b)])
+    assert res.exit_code == 0, res.output
+    assert "unrecorded" in res.output
+    assert not re.search(r"0\s+re-derived pin\(s\)", res.output)
+
+
+def test_bench_compare_prints_each_runs_rederived_pin_count(tmp_path):
+    a = _run("base", [_row("s1", ok=True), _row("s2", ok=False)])
+    a["aggregate"] = {"pin_rederived_spec_count": 0}
+    b = _run("change", [_row("s1", ok=False), _row("s2", ok=True)])
+    b["aggregate"] = {"pin_rederived_spec_count": 56}
+    path_a = tmp_path / "run_a.json"
+    path_b = tmp_path / "run_b.json"
+    path_a.write_text(json.dumps(a))
+    path_b.write_text(json.dumps(b))
+
+    res = CliRunner().invoke(cli, ["bench", "compare", str(path_a), str(path_b)])
+    assert res.exit_code == 0, res.output
+    # Rich wraps at terminal width, so the count and its label can land on
+    # either side of a line break — match across whitespace, not substring.
+    assert re.search(r"0\s+re-derived pin\(s\)", res.output)
+    assert re.search(r"56\s+re-derived pin\(s\)", res.output)
 
 
 def test_cli_cost_option_defaults_match_the_eval_module_constants():

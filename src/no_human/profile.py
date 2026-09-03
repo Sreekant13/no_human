@@ -71,21 +71,32 @@ class ProjectProfile:
     default_budget_unit: str = ""
     # UI evidence (no-human-67): opt-in browser-walk verification. Off by
     # default (`enabled: False`) so an unconfigured repo's attempts are
-    # byte-identical to before this field existed. Read today by
+    # byte-identical to before this field existed. Read by
     # `core/prompt_blocks.py`'s `ui_evidence_block` (the coder prompt block)
-    # and by `testing/ui_evidence.py`'s manifest runner (`MANIFEST`/`run`);
-    # the attempt-time invocation of that runner is not wired yet — it
-    # lands in part 2. Keys:
+    # and, at attempt time, by `Orchestrator._maybe_capture_ui_evidence`,
+    # which wraps `testing/ui_evidence.py`'s manifest runner (`run`) in
+    # `ui_evidence.dev_server` (D2, 2026-09-02). Keys:
     #   enabled: bool           - opt-in switch.
-    #   start_cmd: str           - argv (shlex-split) to boot the app.
+    #   start_cmd: str           - argv (shlex-split), run in the attempt's
+    #                              worktree by `dev_server` when nothing
+    #                              already answers at the *manifest's*
+    #                              `base_url` (the file the coder writes at
+    #                              `.no_human/ui_evidence.json`, not this
+    #                              profile field — the two may differ); the
+    #                              process is killed when the walk ends,
+    #                              whether it exits normally or raises. A
+    #                              server already answering there is left
+    #                              running untouched and is never killed.
     #   base_url: str            - http(s)://127.0.0.1|localhost:<port>, the
-    #                              only hosts the orchestrator will start a
+    #                              only hosts `dev_server` will start a
     #                              subprocess and poll for (never a remote
     #                              host — this runs inside the attempt's own
     #                              worktree, on the attempt's own machine).
     #   ready_path: str          - path polled for readiness (default '/').
     #   ready_timeout_s: int     - seconds to wait for `base_url+ready_path`
-    #                              before giving up (default 60).
+    #                              before giving up (default 60); clamped to
+    #                              [1, 300] regardless of the configured
+    #                              value.
     #   ui_paths: list[str]      - globs (fnmatch, matched like
     #                              `test_commands`) deciding whether an
     #                              attempt's declared plan files are "UI

@@ -81,7 +81,10 @@ def build_orchestrator(config, store: Store, *, event_sink: Any = None,
         forbidden_paths=config["safety"]["forbidden_paths"],
         never_push_to=config["git"]["never_push_to"],
     )
-    review_backend = None  # reviewer defaults to ClaudeBackend(readonly=True)
+    # reviewer: AdversarialReviewer.from_config builds through
+    # make_backend(role="reviewer") — default Claude claude-opus-4-8 readonly,
+    # or the explicit llm.role_backends.reviewer choice.
+    review_backend = None
     # Fan-out over every configured notify-OUT channel (Slack + Teams). One
     # source of truth for which channels are live: notify.build_notifier.
     notifier = build_notifier(config.data)

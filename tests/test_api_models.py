@@ -442,6 +442,272 @@ async def test_api_key_guard_runs_on_written_file(client, tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_put_persists_correct_kind_for_role_backends_only_event(client, store):
+    r = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    assert r.status_code == 200
+    events = await store.list_events("__config__")
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["source"] == "human"
+    assert ev["kind"] == "human_config_models_set"
+    assert ev["changes"] == {
+        "role_backends": {
+            "reviewer": {
+                "old": None,
+                "new": {"backend": "claude", "model": "claude-sonnet-5"},
+            }
+        }
+    }
+
+
+# --------------------------------------------------------------------------- #
+# PUT /api/config/models — role_backends (constraint amendment §6d)          #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_get_models_reviewer_row_carries_default_backend_block(client):
+    """The reviewer row (only) carries `effective_role_backend`'s default
+    shape verbatim on a fresh install — every other role has no `backend`
+    key at all."""
+    r = await client.get("/api/models")
+    body = r.json()
+    rows = {row["role"]: row for row in body["roles"]}
+    assert rows["reviewer"]["backend"] == {
+        "backend": "claude", "model": "claude-opus-4-8", "is_default": True,
+    }
+    for role, row in rows.items():
+        if role != "reviewer":
+            assert "backend" not in row
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_unknown_role_is_422(client):
+    r = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"planner": {"backend": "claude", "model": "claude-opus-5"}}},
+    )
+    assert r.status_code == 422
+    assert "planner" in r.text
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_takes_effect_end_to_end_and_discloses_via_get(
+        client, tmp_path):
+    r = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    assert r.status_code == 200
+    on_disk = nh_config.load_config(tmp_path / "config.yaml")
+    assert on_disk.data["llm"]["role_backends"] == {
+        "reviewer": {"backend": "claude", "model": "claude-sonnet-5"}
+    }
+    # restart_required now also folds in the role_backends divergence — the
+    # running process is still bound to the OLD (default) reviewer entry.
+    r2 = await client.get("/api/models")
+    body2 = r2.json()
+    assert body2["restart_required"] is True
+    rows = {row["role"]: row for row in body2["roles"]}
+    # B6: the `backend` block reports the SAVED (on-disk) choice, not the
+    # still-running process's default — otherwise the Settings pane would
+    # show the just-saved override as "default" and its clear control would
+    # stay dead until a restart, even though the write already landed.
+    assert rows["reviewer"]["backend"]["is_default"] is False
+    assert rows["reviewer"]["backend"]["backend"] == "claude"
+    assert rows["reviewer"]["backend"]["model"] == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_idempotent_no_op_emits_no_event(client, store, tmp_path):
+    r1 = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    assert r1.status_code == 200
+    r2 = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    assert r2.status_code == 200
+    events = await store.list_events("__config__")
+    assert len(events) == 1  # only the first write emitted an event
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_null_clears_back_to_default(client, tmp_path):
+    await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    r = await client.put("/api/config/models", json={"role_backends": {"reviewer": None}})
+    assert r.status_code == 200
+    on_disk = nh_config.load_config(tmp_path / "config.yaml")
+    assert on_disk.data["llm"].get("role_backends") in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_alongside_a_plain_model_key_in_one_request(
+        client, tmp_path):
+    """A single PUT may carry both a plain `llm.*_model` key and a
+    `role_backends` entry — the two write paths are independent but must
+    both land from one request."""
+    r = await client.put(
+        "/api/config/models",
+        json={
+            "utility_model": "claude-opus-5",
+            "role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}},
+        },
+    )
+    assert r.status_code == 200
+    on_disk = nh_config.load_config(tmp_path / "config.yaml")
+    assert on_disk.data["llm"]["utility_model"] == "claude-opus-5"
+    assert on_disk.data["llm"]["role_backends"] == {
+        "reviewer": {"backend": "claude", "model": "claude-sonnet-5"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_refusal_does_not_write_to_disk(client, tmp_path):
+    before = (tmp_path / "config.yaml").read_text()
+    r = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "gemini", "model": "x"}}},
+    )
+    assert r.status_code == 422
+    after = (tmp_path / "config.yaml").read_text()
+    assert before == after
+
+
+@pytest.mark.asyncio
+async def test_put_claude_backend_with_a_non_catalog_model_is_422(client, tmp_path):
+    """B7: `backend: "claude"` is checked against the catalog regardless of
+    whether the model string is even Claude-shaped — `gpt-5-codex` is not,
+    so the old `_is_claude_id(model)`-gated check would have waved this
+    through; the refusal must name the model, and nothing may land on disk."""
+    before = (tmp_path / "config.yaml").read_text()
+    r = await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "gpt-5-codex"}}},
+    )
+    assert r.status_code == 422
+    assert "gpt-5-codex" in r.text
+    after = (tmp_path / "config.yaml").read_text()
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_a_refused_put_writes_nothing_at_all(client, tmp_path):
+    """B5: a request that carries BOTH a valid scalar change and a refused
+    role_backends entry must leave every config scalar byte-identical — the
+    whole body is validated before either write, so the scalar half never
+    lands ahead of the role_backends refusal."""
+    before = (tmp_path / "config.yaml").read_text()
+    r = await client.put(
+        "/api/config/models",
+        json={
+            "utility_model": "claude-opus-5",
+            "role_backends": {"reviewer": {"backend": "gemini", "model": "x"}},
+        },
+    )
+    assert r.status_code == 422
+    after = (tmp_path / "config.yaml").read_text()
+    assert after == before
+    on_disk = nh_config.load_config(tmp_path / "config.yaml")
+    assert on_disk.data["llm"]["utility_model"] == "claude-haiku-4-5"  # unchanged default
+
+
+@pytest.mark.asyncio
+async def test_a_refused_put_with_an_unknown_role_writes_no_scalar(client, tmp_path):
+    """Same B5 guarantee, exercised via the unknown-role refusal path (a
+    different `RoleBackendError` raised earlier in
+    `validate_role_backend_entries`) rather than the unsupported-backend one
+    above — both must refuse before touching disk."""
+    before = (tmp_path / "config.yaml").read_text()
+    r = await client.put(
+        "/api/config/models",
+        json={
+            "utility_model": "claude-opus-5",
+            "role_backends": {"planner": {"backend": "claude", "model": "claude-opus-5"}},
+        },
+    )
+    assert r.status_code == 422
+    after = (tmp_path / "config.yaml").read_text()
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_put_role_backends_null_clears_in_session_without_a_restart(client, tmp_path):
+    """B6, the clear direction: after saving a non-default reviewer choice
+    and then clearing it back to null, the VERY NEXT GET (same process, no
+    restart) must already report `is_default: True` — the payload reads the
+    on-disk file, which the clear PUT already rewrote, not the still-running
+    process's stale in-memory config.
+
+    A PUT never reloads `app.state.config` (an unrelated, deliberate rule —
+    see `test_put_does_not_reload_running_app_state_config`), so the running
+    process's in-memory copy is realistically stale relative to whatever the
+    file on disk says. Force that staleness explicitly here: after the clear
+    PUT rewrites the file back to default, poke the in-memory config back to
+    the non-default entry the PUT just erased. A payload built from
+    `running_cfg_data` (the B6 bug) would echo this stale non-default entry
+    back as `is_default: False`; only a payload that reads the file the
+    clear PUT actually wrote reports `True` regardless of what is sitting in
+    memory. Without this poke, the running config's untouched default state
+    happens to already match the correct post-clear answer, so the assertion
+    below would pass even against the bug — this line is what makes the test
+    discriminate it."""
+    await client.put(
+        "/api/config/models",
+        json={"role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}}},
+    )
+    r = await client.put("/api/config/models", json={"role_backends": {"reviewer": None}})
+    assert r.status_code == 200
+
+    app.state.config.data.setdefault("llm", {})["role_backends"] = {
+        "reviewer": {"backend": "claude", "model": "claude-sonnet-5"}
+    }
+
+    r2 = await client.get("/api/models")
+    body2 = r2.json()
+    rows = {row["role"]: row for row in body2["roles"]}
+    assert rows["reviewer"]["backend"] == {
+        "backend": "claude", "model": "claude-opus-4-8", "is_default": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_failed_role_backend_write_rolls_back_the_scalar_write(
+        client, tmp_path, monkeypatch):
+    """B5's defensive half: even though `validate_role_backend_entries` runs
+    the ENTIRE body's validation before either write, `apply_model_changes`
+    still wraps both writes in a byte-level rollback for the rarer case of a
+    failure inside the write step itself (e.g. `set_role_backend`'s own
+    splice/verify/restore raising after the scalar write already landed).
+    Simulate that by making the on-disk writer itself blow up, and confirm
+    the scalar half that already landed is rolled back to the pre-request
+    bytes rather than left half-applied."""
+    def _boom(*a, **k):
+        raise RuntimeError("simulated: set_role_backend's own write failed")
+
+    monkeypatch.setattr(nh_config, "set_role_backend", _boom)
+    before = (tmp_path / "config.yaml").read_text()
+    with pytest.raises(RuntimeError):
+        await client.put(
+            "/api/config/models",
+            json={
+                "utility_model": "claude-opus-5",
+                "role_backends": {"reviewer": {"backend": "claude", "model": "claude-sonnet-5"}},
+            },
+        )
+    after = (tmp_path / "config.yaml").read_text()
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_put_multi_key_swap_validates_against_the_resolved_after_state(
         client, tmp_path):
     """`apply_model_changes` validates each changed key against

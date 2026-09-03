@@ -1188,6 +1188,26 @@ def test_format_events_carries_the_per_role_model_map():
     assert "models" not in out[1], "only the models event carries the map"
 
 
+def test_format_events_carries_the_role_backends_disclosure():
+    """§6d part 2: a non-default reviewer backend is disclosed as its own
+    `role_backends` event kwarg, never appended to the (110-char-clipped)
+    `text` — the formatter used to whitelist only `models`/`message`/
+    `_VERDICT_META`, so this kwarg was silently dropped before it ever
+    reached `web/src/summaries.js`'s `nonDefaultReviewer`."""
+    from no_human.api.app import _format_events
+
+    out = _format_events([
+        {"ts": 1, "source": "orchestrator", "kind": "models",
+         "text": "coder=claude-sonnet-5 · reviewer=claude-opus-4-8",
+         "models": {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"},
+         "role_backends": {"reviewer": {"backend": "codex", "model": "gpt-5-codex"}}},
+        {"ts": 2, "source": "orchestrator", "kind": "state", "text": "implementing"},
+    ])
+    assert out[0]["role_backends"] == {
+        "reviewer": {"backend": "codex", "model": "gpt-5-codex"}}
+    assert "role_backends" not in out[1]
+
+
 async def test_task_events_are_not_truncated_by_the_in_memory_buffer(store):
     """The scheduler buffer is a deque(maxlen=200). Serving it alone dropped the
     Planner's events from a 321-event run and the Planner vanished from the
@@ -3458,6 +3478,56 @@ async def test_the_live_stream_serves_the_same_verdict_as_the_replay(store):
     for noisy in ("tool_use", "thinking", "usage"):
         assert ("reviewer", noisy) not in kinds, (
             f"reviewer SDK {noisy} events leaked into the live stream")
+
+
+async def test_the_live_stream_also_carries_the_role_backends_disclosure(store):
+    """DoD mirrors test_the_live_stream_serves_the_same_verdict_as_the_replay:
+    fixing only the replay whitelist (_format_events) and not the live SSE
+    whitelist (task_events_stream) leaves the disclosure invisible on a task
+    a human is actually watching run."""
+    from types import SimpleNamespace
+    from no_human.api.app import _format_events, task_events_stream
+    from no_human.core.task import Task
+
+    t = Task.new("reviewer backend visibility", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    models_event = [{
+        "ts": 1, "source": "orchestrator", "kind": "models",
+        "text": "coder=claude-sonnet-5 · reviewer=claude-opus-4-8",
+        "models": {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"},
+        "role_backends": {"reviewer": {"backend": "codex", "model": "gpt-5-codex"}},
+    }]
+
+    class FakeSched:
+        inflight = set()             # not running -> the stream closes on idle
+        _event_log = {t.id: None}
+        _event_notify = {}
+        def task_events(self, tid):
+            return models_event
+
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(scheduler=FakeSched(), store=store)),
+        headers={},
+    )
+    resp = await task_events_stream(t.id, req)
+    body = ""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, str) else chunk.decode()
+        if '"done"' in body:
+            break
+
+    streamed = [json.loads(line[len("data: "):])
+                for line in body.splitlines() if line.startswith("data: ")]
+    (live,) = [e for e in streamed if e.get("kind") == "models"]
+    assert live["role_backends"] == {
+        "reviewer": {"backend": "codex", "model": "gpt-5-codex"}}
+
+    (replayed,) = [e for e in _format_events(models_event) if e["kind"] == "models"]
+    assert live["role_backends"] == replayed["role_backends"], (
+        "the live stream and the replayed log disagree about the reviewer "
+        "backend disclosure — one of the two whitelists was fixed and the "
+        "other was not")
 
 
 def test_both_surfaces_carry_the_meta_the_board_reads_the_verdict_from():

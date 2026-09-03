@@ -1161,15 +1161,18 @@ def ui_evidence_block(profile: Any) -> str:
     prompt prefix alongside ``build_profile_block``.
 
     The promise this text makes to the coder — that the harness runs the
-    walk after tests pass — is true as of D1.2 (2026-08-31):
+    walk after tests pass — is true as of D2 (2026-09-02):
     `Orchestrator._maybe_capture_ui_evidence` runs `testing/ui_evidence.py`'s
     `run()` from `_finalize`, once tests have passed, gated on the diff (not
     the plan this block itself gates on — see that method's docstring for
-    why the two checks differ) actually touching UI paths. What it captures
-    is delivered on a side branch (`nh-evidence/<task-id>`, never the task
-    branch itself — a squash-land would carry an unclassified directory
-    committed there straight into main) and, on a GitHub remote, embedded
-    directly in the PR body as images plus a video link.
+    why the two checks differ) actually touching UI paths, wrapped in
+    `ui_evidence.dev_server` — which boots `ui_evidence["start_cmd"]` itself
+    when nothing already answers at the manifest's `base_url`, and tears it
+    down when the walk ends. What it captures is delivered on a side branch
+    (`nh-evidence/<task-id>`, never the task branch itself — a squash-land
+    would carry an unclassified directory committed there straight into
+    main) and, on a GitHub remote, embedded directly in the PR body as
+    images plus a video link.
     """
     if not profile:
         return ""
@@ -1178,6 +1181,20 @@ def ui_evidence_block(profile: Any) -> str:
         return ""
     base_url = str(ui.get("base_url", ""))
     ready_path = str(ui.get("ready_path", "/"))
+    start_cmd = str(ui.get("start_cmd", ""))
+    if start_cmd:
+        dev_server_sentence = (
+            f"The harness boots your dev server itself (`{start_cmd}`) "
+            f"unless one already answers at {base_url}{ready_path}, and "
+            "stops it when the walk ends — you must still write the "
+            "manifest file or no walk runs."
+        )
+    else:
+        dev_server_sentence = (
+            "The harness does NOT start your dev server for you — leave it "
+            f"running at {base_url} when your tests finish, or the walk "
+            "reports NOT RUN and nothing is attached."
+        )
     return (
         "UI EVIDENCE — this attempt touches UI code. After your tests pass, "
         "the harness probes "
@@ -1186,10 +1203,8 @@ def ui_evidence_block(profile: Any) -> str:
         '`.no_human/ui_evidence.json` (never committed) as {"base_url": '
         '"...", "steps": [...]}, where each step is one of '
         "goto/wait_for/click/fill/press/assert_text/shot (in order); use "
-        "`shot` at any point worth capturing. The harness does NOT start "
-        "your dev server for you — leave it running at that base_url when "
-        "your tests finish, or the walk reports NOT RUN and nothing is "
-        "attached. When it runs, it records whatever the page actually "
+        f"`shot` at any point worth capturing. {dev_server_sentence} "
+        "When it runs, it records whatever the page actually "
         "shows (screenshots, a video, console errors) — proving nothing "
         "beyond what each screenshot shows — and delivers them on a "
         "separate branch, embedded directly in the PR body. Skipping the "

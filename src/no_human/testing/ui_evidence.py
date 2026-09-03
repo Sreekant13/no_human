@@ -40,7 +40,10 @@ import inspect
 import json
 import os
 import re
+import shlex
+import signal
 import struct
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -49,12 +52,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
+from .. import proc
+
 MANIFEST = ".no_human/ui_evidence.json"
 SCHEMA_HINT = (
     '{"base_url": "http://127.0.0.1:5173", "steps": [{"goto": "/"}, ...]}'
 )
 
-_ACTIONS = ("goto", "wait_for", "click", "fill", "shot", "assert_text", "press")
+_ACTIONS = ("goto", "wait_for", "click", "fill", "select", "shot", "assert_text", "press")
 _MAX_STEPS = 40
 _MAX_SHOTS = 12
 _DEFAULT_TIMEOUT_MS = 10_000
@@ -235,11 +240,14 @@ def _step_problem(raw_step, i: int, shot_names: set) -> tuple[Step | None, str |
         return None, f"step {i} ({action}) value must be a non-empty string"
 
     text = raw_step.get("text")
-    if action == "fill":
+    if action in ("fill", "select"):
         if not isinstance(text, str) or not text:
-            return None, f"step {i} (fill) requires a non-empty \"text\""
+            return None, f"step {i} ({action}) requires a non-empty \"text\""
     elif "text" in raw_step:
-        return None, f"step {i} ({action}) — \"text\" is only valid on a \"fill\" step"
+        return None, (
+            f"step {i} ({action}) — \"text\" is only valid on a \"fill\" or "
+            "\"select\" step"
+        )
 
     if action == "goto":
         problem = _goto_local_problem(value)
@@ -272,7 +280,7 @@ def _step_problem(raw_step, i: int, shot_names: set) -> tuple[Step | None, str |
     step = Step(
         action=action,
         value=value,
-        text=text if action == "fill" else None,
+        text=text if action in ("fill", "select") else None,
         timeout_ms=timeout_ms,
         index=i,
     )
@@ -450,6 +458,203 @@ def _reachable(base_url: str) -> bool:
         return False
 
 
+_READY_POLL_S = 0.5
+_READY_TIMEOUT_MIN, _READY_TIMEOUT_MAX = 1, 300
+_KILL_GRACE_S = 5.0
+_DEV_SERVER_LOG = "dev-server.log"
+
+
+@dataclass  # NOT frozen — teardown stamps exit_code/detail onto the caller's object
+class DevServerOutcome:
+    """What `dev_server` decided and (if it spawned anything) what happened.
+
+    `mode` is one of ``pre-existing`` (something already answered at
+    `base_url` — never killed, replaced, or checkout-verified), ``booted``
+    (the harness spawned `start_cmd` and it became reachable), ``unconfigured``
+    (no `start_cmd`/`base_url` — the byte-identical-to-today path), or
+    ``boot-failed`` (spawn/host/timeout/early-exit failure — see `detail`).
+    `detail` is LOG-ONLY: never rendered into a PR body, only an advisory.
+
+    `cause` is a fixed vocabulary and therefore safe to render (unlike
+    `detail`): ``""`` (not a failure), ``"timeout"`` (spawned, never answered
+    before `ready_timeout_s`), or ``"failed-to-start"`` (never became a
+    polling server — non-loopback refusal, unparsable `start_cmd`, spawn
+    `OSError`, or early process exit). Only meaningful when `mode ==
+    "boot-failed"`.
+    """
+
+    mode: str
+    start_cmd: str = ""
+    base_url: str = ""  # the manifest's, for the caller's disclosure
+    ready_timeout_s: int = 0  # clamped, for the caller's skip line
+    waited_s: float = 0.0
+    exit_code: int | None = None
+    detail: str = ""  # LOG-ONLY — never rendered into a PR body
+    cause: str = ""  # "" | "timeout" | "failed-to-start" — safe to render
+
+
+def _kill_dev_server(process) -> None:
+    """Stop a booted dev server. SIGTERM-first (not `runner._kill_process_tree`'s
+    shape) so the server can release its port; escalates to SIGKILL only if it
+    ignores the grace period. Never raises."""
+    with contextlib.suppress(Exception):
+        if os.name == "nt":
+            process.terminate()
+            with contextlib.suppress(Exception):
+                process.wait(timeout=_KILL_GRACE_S)
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        try:
+            process.wait(timeout=_KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.wait(timeout=_KILL_GRACE_S)
+
+
+@contextlib.asynccontextmanager
+async def dev_server(
+    repo_path, ui_conf, base_url, out_dir, *,
+    spawn=subprocess.Popen, clock=time.monotonic,
+    sleep=asyncio.sleep, reachable=_reachable,
+    kill=_kill_dev_server,
+):
+    """Boot the repo's configured dev server if nothing already answers at
+    `base_url`, poll for readiness, and tear it down (kill the process group)
+    on exit — normal or exceptional. `base_url` must be the MANIFEST's (the
+    URL the walk will actually hit), never the profile's — `ui_conf["base_url"]`
+    is never read here, only `start_cmd`/`ready_path`/`ready_timeout_s`.
+
+    `out_dir` is a required positional: the orchestrator owns its lifecycle
+    and already `rmtree`s it after the attempt. Every seam is injectable so
+    tests never spawn a real subprocess, hit the network, or open a browser.
+
+    Decision order — each early branch yields exactly one `DevServerOutcome`
+    and spawns nothing: falsy/unconfigured `base_url` or `start_cmd` ->
+    `unconfigured`; something already reachable at `base_url` -> `pre-existing`
+    (never killed/replaced); a non-loopback `base_url` host -> `boot-failed`
+    (refused); otherwise spawn `start_cmd` and poll `base_url + ready_path`
+    until reachable, the process exits early, or `ready_timeout_s` elapses.
+    """
+    ui_conf = ui_conf or {}
+    start_cmd = str(ui_conf.get("start_cmd") or "").strip()
+    ready_path = str(ui_conf.get("ready_path") or "/")
+    try:
+        # `.get(..., 60)` (not `or 60`) so an explicit 0 clamps to the floor
+        # instead of falling back to the default — 0 is falsy but valid input.
+        timeout = int(ui_conf.get("ready_timeout_s", 60))
+    except (TypeError, ValueError):
+        timeout = 60
+    timeout = min(max(timeout, _READY_TIMEOUT_MIN), _READY_TIMEOUT_MAX)
+
+    if not base_url:
+        yield DevServerOutcome(mode="unconfigured", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout)
+        return
+
+    host = urlsplit(base_url).hostname or ""
+    if host not in _LOCAL_HOSTS and f"[{host}]" not in _LOCAL_HOSTS:
+        yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout,
+                                detail="refused: non-loopback host",
+                                cause="failed-to-start")
+        return
+
+    try:
+        already_up = reachable(base_url)
+    except Exception:
+        already_up = False
+    if already_up:
+        yield DevServerOutcome(mode="pre-existing", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout)
+        return
+
+    if not start_cmd:
+        yield DevServerOutcome(mode="unconfigured", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout)
+        return
+
+    try:
+        argv = shlex.split(start_cmd)
+    except ValueError as exc:
+        yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout,
+                                detail=f"unparsable start_cmd: {exc}",
+                                cause="failed-to-start")
+        return
+    if not argv:
+        yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout,
+                                detail="unparsable start_cmd",
+                                cause="failed-to-start")
+        return
+
+    out_dir = Path(out_dir)
+    process = None
+    fh = None
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fh = open(out_dir / _DEV_SERVER_LOG, "wb")
+        process = spawn(argv, cwd=str(repo_path), stdout=fh, stderr=subprocess.STDOUT,
+                         **proc.hidden_console_kwargs(new_group=True))
+    except OSError as exc:
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+        yield DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout,
+                                detail=f"{type(exc).__name__}: {exc}",
+                                cause="failed-to-start")
+        return
+
+    probe_url = base_url + ready_path
+    outcome = DevServerOutcome(mode="boot-failed", start_cmd=start_cmd,
+                                base_url=base_url, ready_timeout_s=timeout)
+    started = clock()
+    try:
+        while clock() - started < timeout:
+            rc = process.poll()
+            if rc is not None:
+                outcome.exit_code = rc
+                outcome.cause = "failed-to-start"
+                break
+            try:
+                ok = reachable(probe_url)
+            except Exception:
+                ok = False
+            if ok:
+                outcome.mode = "booted"
+                break
+            await sleep(_READY_POLL_S)
+        else:
+            outcome.exit_code = process.poll()
+            outcome.cause = "timeout"
+        outcome.waited_s = clock() - started
+
+        try:
+            yield outcome
+        finally:
+            # `poll() is None` guards this so a process that exited early (or
+            # was already reaped) is never killed twice.
+            with contextlib.suppress(Exception):
+                if process.poll() is None:
+                    kill(process)
+            with contextlib.suppress(Exception):
+                outcome.exit_code = process.poll()
+            with contextlib.suppress(Exception):
+                if fh is not None:
+                    fh.flush()
+            with contextlib.suppress(Exception):
+                log_bytes = (out_dir / _DEV_SERVER_LOG).read_bytes()[-2048:]
+                outcome.detail = log_bytes.decode("utf-8", "replace").replace("\n", " ")
+    finally:
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+
+
 def _png_size(data: bytes, fallback: dict) -> tuple[int, int]:
     if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
         try:
@@ -532,6 +737,11 @@ async def _dispatch(page, step: Step, base_url: str, out_dir: Path, shots: list)
         await _maybe_await(page.click(value))
     elif action == "fill":
         await _maybe_await(page.fill(value, step.text))
+    elif action == "select":
+        # `<select>` elements reject `fill()` (Playwright: fill only works on
+        # <input>/<textarea>/[contenteditable]) — `select_option` is the
+        # dedicated primitive for choosing an option by its `value` attr.
+        await _maybe_await(page.select_option(value, step.text))
     elif action == "press":
         # Global key press — Playwright's `Page.press(selector, key)` takes a
         # selector as its FIRST positional argument, so calling it with only

@@ -176,3 +176,29 @@ def test_part2_wires_the_attempt_time_walk():
     assert hasattr(Orchestrator, "_maybe_capture_ui_evidence")
     assert hasattr(Orchestrator, "_deliver_ui_evidence")
     assert hasattr(orchestrator_module, "ui_evidence")
+    assert hasattr(orchestrator_module.ui_evidence, "dev_server")
+
+
+def test_block_says_the_harness_boots_the_dev_server():
+    """D2 (2026-09-02): with ``start_cmd`` configured, the block must tell the
+    coder the harness boots the dev server itself (and stops it afterwards)
+    instead of the old unconditional "does NOT start your dev server"
+    sentence — the coder no longer needs to leave a server running by hand.
+    Both sentences that must survive verbatim regardless of wording (the
+    "proving nothing" caveat and the "never blocks the attempt" caveat) must
+    still be present."""
+    orch = _prompt_orchestrator()
+    orch._active_profile = _profile(
+        enabled=True, start_cmd="npm run dev", base_url="http://127.0.0.1:5173",
+        ready_path="/",
+    )
+    prompt = _prompt(orch, plan=_PLAN_WITH_UI_FILE)
+    assert _MARKER in prompt
+    assert (
+        "The harness boots your dev server itself (`npm run dev`) "
+        "unless one already answers at http://127.0.0.1:5173/, and "
+        "stops it when the walk ends"
+    ) in prompt
+    assert "does NOT start your dev server" not in prompt
+    assert "proving nothing beyond what each screenshot shows" in prompt
+    assert "either way this never blocks the attempt" in prompt
