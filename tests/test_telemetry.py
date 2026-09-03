@@ -32,7 +32,7 @@ _CSP_TODAY = (
     "default-src 'self'; script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
     "font-src 'self'; connect-src 'self' ws: wss:; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'"
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 
 _ENABLED = {
@@ -210,7 +210,7 @@ def test_csp_enabled_adds_exactly_the_two_posthog_hosts():
         "font-src 'self'; "
         "connect-src 'self' ws: wss: "
         "https://us.i.posthog.com https://us-assets.i.posthog.com; "
-        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
     )
 
 
