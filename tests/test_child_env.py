@@ -76,7 +76,8 @@ def test_gh_token_and_dotenv_exported_credentials_are_scrubbed():
     config.load_env_var exports from .env into os.environ (an SSO password, a
     Jenkins/JIRA API token) are PASSWORD/TOKEN-shaped — so each is a foreign
     secret the child never sees, in both child-env shapes. Operational vars and
-    the child's own billing credential are untouched."""
+    each child's OWN billing credential are untouched; the other child's is not
+    (the Codex shape drops CLAUDE_CODE_OAUTH_TOKEN)."""
     dotenv = {
         "GH_TOKEN": "gho_real",                 # the gh-CLI spelling of the token
         "SSO_PASSWORD": "hunter2",              # ~/.no_human/.env, exported by load_env_var
@@ -93,13 +94,16 @@ def test_gh_token_and_dotenv_exported_credentials_are_scrubbed():
         assert env[name] == "" and name in blanked, name
     assert "PATH" not in env and "HOME" not in env
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env  # kept; child inherits the real value
-    # Full-copy (Codex/subprocess) shape: each foreign secret is deleted outright.
-    full = dict(dotenv)
-    dropped = drop_foreign_secrets(full, keep=CLAUDE_CHILD_KEEP)
-    for name in secrets:
+    # Full-copy (Codex/subprocess) shape, with the keep-list codex_backend
+    # really passes (the default, CODEX_CHILD_KEEP): each foreign secret is
+    # deleted outright - and so is the Claude credential, which the Codex
+    # child must never carry; the Codex child's own OPENAI_* survives.
+    full = {**dotenv, "OPENAI_API_KEY": "sk_codex"}
+    dropped = drop_foreign_secrets(full)
+    for name in secrets + ("CLAUDE_CODE_OAUTH_TOKEN",):
         assert name not in full and name in dropped, name
     assert full["PATH"] == "/usr/bin:/bin"
-    assert full["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth_keep"
+    assert full["OPENAI_API_KEY"] == "sk_codex"
 
 
 def test_additive_scrub_defaults_to_the_process_environment(monkeypatch):
