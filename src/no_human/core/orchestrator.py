@@ -104,7 +104,7 @@ from ..review.verifiers import (
     summary_line as verifiers_summary_line,
     to_checklist_item as verifier_to_checklist_item,
 )
-from ..testing import ownership, runner, ui_evidence
+from ..testing import ownership, runner, structural_budget, ui_evidence
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import declared_test_files, run_repro_gate
 from .prompt_blocks import (
@@ -300,6 +300,41 @@ def declared_files_send_back_message(missing: list[str]) -> str:
         "Removing or editing the declaration in "
         f"{REPRO_MANIFEST} to make this pass is tampering and is not an "
         "option — the missing file(s) must actually be committed."
+    )
+
+
+def structural_budget_send_back_message(paths: list[str], failure_text: str) -> str:
+    """The instruction for the ONE bounded round bought when this attempt's
+    diff trips the target repo's own `tests/test_structural_budget.py`
+    (`Orchestrator._structural_budget_preflight`) — any of its three failure
+    modes: a frozen entry GREW past its budget, a NEW offender crossed a
+    `MAX_*` limit the guard has never frozen before, or a frozen entry is
+    now STALE (its measured value no longer matches what is frozen, or the
+    entry no longer corresponds to anything real).
+
+    Module-level and pure, same idiom as `repro_send_back_message` and
+    `declared_files_send_back_message`: it embeds the guard's OWN failure
+    text (which already names which of the three modes fired, with the
+    exact measured numbers) so the coder never has to re-derive it, and it
+    is explicit about the only fixes in scope — re-anchoring a grown
+    entry's frozen value, adding a new frozen entry for a new offender (or
+    shrinking it back under the limit instead), or deleting a stale entry —
+    versus everything that would be tampering with the ratchet itself.
+    """
+    named = ", ".join(paths) if paths else structural_budget.GUARD_RELPATH
+    return (
+        f"{structural_budget.GUARD_RELPATH} blocked this attempt: a "
+        f"structural-budget check failed for {named}.\n{failure_text}\n"
+        "Fix ONLY what the guard's failure text above names: re-anchor a "
+        "grown frozen entry to its new, measured value; add a new frozen "
+        "entry for an offender the guard has never frozen before (or "
+        "shrink it back under the limit instead); or delete a frozen entry "
+        "that no longer matches reality — each with a short comment noting "
+        "why. Do not touch MAX_FUNCTION_LINES, MAX_FUNCTION_CC, "
+        "MAX_FILE_LINES, offenders(), scan_tree(), any assertion in that "
+        "file, or any other frozen entry your diff did not itself change — "
+        "widening the budget for anything you did not change, or editing "
+        "the guard's assertions, is tampering and is not an option."
     )
 
 
@@ -1131,6 +1166,11 @@ _REPRO_CORRECTIVE_TURNS = 15
 # already declared", not a fresh coder pass, so it gets its own small budget
 # rather than `_REPRO_CORRECTIVE_TURNS`'s.
 _DECLARED_FILES_ROUND_TURNS = 10
+
+# One bounded round to re-anchor a FROZEN structural-budget entry this
+# attempt's own diff grew — a one-line constant bump plus a comment, not a
+# fresh coder pass, so it gets the smallest budget of the three.
+_STRUCTURAL_BUDGET_ROUND_TURNS = 6
 
 # Appended to `repro_send_back_message(detail)` for the corrective round
 # ONLY — the diff under review is already committed and tamper-clean (or the
@@ -5889,6 +5929,25 @@ class Orchestrator:
         if repro_outcome is not None:
             return repro_outcome
 
+        # Structural-budget preflight — same shape as the repro gate above:
+        # deterministic, zero LLM spend unless this diff actually grew a
+        # frozen entry, and buys one bounded corrective round on THIS branch
+        # BEFORE review so the re-anchor lands in the SAME attempt instead of
+        # costing a whole extra one (`_structural_budget_preflight`).
+        try:
+            budget_outcome = await self._structural_budget_preflight(
+                task, repo, base=base, attempt_id=attempt_id,
+                branch=branch, attempt_n=attempt_n, tamper_before=tamper_before,
+            )
+        except CancelRequested as exc:
+            return await self._honor_cancel(
+                task, repo, branch, str(exc), attempt_id=attempt_id)
+        except (BudgetAbort, StuckAbort, ConvergenceAbort) as exc:
+            return await self._abort_during_repro_corrective(
+                task, repo, attempt_id, exc, branch=branch)
+        if budget_outcome is not None:
+            return budget_outcome
+
         # 🔴 0a / PR-021 — OPEN THE DRAFT PR BEFORE THE GATE RUNS.
         #
         # `_run_review` used to be the only thing between the diff and `_finalize`,
@@ -8230,6 +8289,106 @@ class Orchestrator:
             )
         return None
 
+    async def _structural_budget_preflight(
+        self, task: Task, repo: GitRepo, *, base: str | None, attempt_id: str,
+        branch: str | None, attempt_n: int, tamper_before: str,
+    ) -> "TaskOutcome | None":
+        """A diff that trips the target repo's own
+        `tests/test_structural_budget.py` still passes review — the
+        reviewer is not this gate — and only fails later, in TESTING's
+        full-suite run. That is a whole extra attempt spent discovering what
+        is mechanically a one-line budget fix (three tasks, 2026-09-03:
+        bf645f3a, c5ae50d8, c5b24230, all a GROWN frozen entry — the same
+        blind spot also covers a brand-new offender the guard has never
+        frozen before, and a frozen entry that has gone STALE). This buys
+        ONE bounded round to fix exactly what the guard's own failure names,
+        on the SAME branch, BEFORE review — so the coder gets the guard's
+        own failure text inside the same attempt instead of losing a whole
+        attempt to it.
+
+        Zero LLM spend for the check itself when it does not fire:
+        `structural_budget.frozen_paths`/`scanned_root` are each one
+        `ast.parse` of the guard file, `touched_frozen`/`touches_scanned_root`
+        one set-or-prefix comparison against this attempt's changed files —
+        all fail-open to nothing (`structural_budget.py`'s own doctrine), so
+        a repo without the guard, or a diff that never comes near it, pays
+        for none of this. `touched_frozen` alone only catches a GROWN
+        entry — it is blind to a brand-new offender (in no `FROZEN_*` dict
+        yet) and to a stale entry whose own path may not be among the
+        changed files at all — so `touches_scanned_root` also fires this
+        whenever the diff changes ANY `.py` file under the guard's own
+        scanned root, letting the guard's own full test file (not just the
+        growth node id) catch all three modes. Only once either signal is
+        non-empty does this run the guard's own tests, to confirm they
+        actually fail before spending a round on it.
+
+        Returns None when there is nothing to fix, or when a second
+        pre-flight fire on a re-entered attempt should fall straight through
+        to review. Returns the `TaskOutcome` that ends the attempt only when
+        the corrective round itself ends it (a commit refusal or a tamper
+        fire) — this gate never fails an attempt on its own verdict; a
+        budget still red after the round is left to TESTING's own run of
+        the full suite, which stays the backstop.
+        """
+        paths = structural_budget.frozen_paths(repo.path)
+        root = structural_budget.scanned_root(repo.path)
+        if not paths and root is None:
+            return None
+        changed = repo.changed_files(self._review_base(repo, base))
+        touched = structural_budget.touched_frozen(paths, changed)
+        scanned_touched = structural_budget.touches_scanned_root(root, changed)
+        if not touched and not scanned_touched:
+            return None
+        base_cmd, test_cwd = await self._resolve_test_target(repo)
+        cmd = structural_budget.bounded_guard_command(
+            base_cmd or runner.detect_command(repo.path)
+        )
+        if not cmd:
+            return None
+        corrected = self.__dict__.setdefault("_structural_budget_corrected", set())
+        if attempt_id in corrected:
+            return None
+        corrected.add(attempt_id)
+        result, _ = await self._run_tests_once(repo, cmd, cwd=test_cwd)
+        if not result.ran or result.ok:
+            return None
+        fail_tail = (getattr(result, "output", "") or "")[-1200:]
+        notify_paths = touched or scanned_touched
+        self.emit(
+            "structural_budget_grown",
+            f"structural-budget check failed ({len(notify_paths)} "
+            f"path(s)): {notify_paths}",
+            paths=list(notify_paths),
+        )
+        outcome = await self._repro_corrective_round(
+            task, repo, "", attempt_id=attempt_id, branch=branch,
+            attempt_n=attempt_n, tamper_before=tamper_before,
+            instruction=structural_budget_send_back_message(
+                notify_paths, fail_tail
+            ),
+            why="a structural-budget check failed — one bounded round to "
+                "fix it before review",
+            turns=_STRUCTURAL_BUDGET_ROUND_TURNS,
+            event_kind="structural_budget_corrective_round",
+            cause="structural_budget",
+        )
+        if outcome is not None:
+            return outcome
+        # The round just rewrote the guard file, possibly leaving a stale
+        # compile of it cached from the run above (`invalidate_guard_cache`'s
+        # docstring has the mechanism) — bust it before re-reading, so this
+        # re-run and every later one (the full-suite run moments later in
+        # `_run_review`/TESTING) see the round's actual content.
+        structural_budget.invalidate_guard_cache(repo.path)
+        result2, _ = await self._run_tests_once(repo, cmd, cwd=test_cwd)
+        if result2.ran and not result2.ok:
+            self.emit(
+                "structural_budget_grown",
+                f"still red after the round: {notify_paths}",
+                paths=list(notify_paths), still_failing=True,
+            )
+        return None
+
     async def _repro_gate_step(
         self, task: Task, repo: GitRepo, *, base: str | None, attempt_id: str,
         attempt_n: int, branch: str | None, tamper_before: str,
@@ -8380,6 +8539,8 @@ class Orchestrator:
         branch: str | None, attempt_n: int, tamper_before: str,
         instruction: str | None = None, why: str | None = None,
         turns: int = _REPRO_CORRECTIVE_TURNS,
+        event_kind: str = "repro_corrective_round",
+        cause: str | None = None,
     ) -> "TaskOutcome | None":
         """ONE bounded coder round to write the MISSING repro manifest, on
         the SAME branch/worktree the attempt already committed to — not a
@@ -8396,6 +8557,17 @@ class Orchestrator:
         `_REPRO_CORRECTIVE_TURNS`) — so `_declared_files_preflight` can reuse
         this same method for a differently-worded, differently-budgeted round
         without touching the `waived` path at all.
+
+        `event_kind`/`cause` are likewise optional overrides, defaulting to
+        `"repro_corrective_round"`/`None` so the repro-waived and
+        declared-files callers keep emitting the exact event they always
+        have. `_structural_budget_preflight` passes
+        `event_kind="structural_budget_corrective_round",
+        cause="structural_budget"` — a budget-cause round is not a repro
+        gate waiver, and `_recall_failures`/telemetry attribute a past
+        failure by its event *kind* string, so a distinct kind (not a nested
+        field alone) is what actually reaches that recall path; `cause` rides
+        along as data for a consumer that groups by cause instead.
 
         Returns None to let the caller re-run the gate, or the `TaskOutcome`
         that ends the attempt (a commit refusal, or a tamper fire on the
@@ -8427,9 +8599,10 @@ class Orchestrator:
         to bill.
         """
         self.emit(
-            "repro_corrective_round",
+            event_kind,
             why or ("repro gate waived — one bounded round to write "
                      f"{REPRO_MANIFEST} before failing the attempt"),
+            **({"cause": cause} if cause else {}),
         )
         usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
         bounds = self.config.get("bounds") or {}
@@ -8525,10 +8698,11 @@ class Orchestrator:
         out_of_scope = _repro_round_out_of_scope(changed)
         if out_of_scope:
             self.emit(
-                "repro_corrective_round",
+                event_kind,
                 "out of scope — discarded, not committed: "
                 + ", ".join(out_of_scope[:10]),
                 out_of_scope=list(out_of_scope),
+                **({"cause": cause} if cause else {}),
             )
             self._revert_worktree_writes(repo, before)
             # The revert above is git-status-driven and therefore blind to

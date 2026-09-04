@@ -2477,7 +2477,7 @@ def test_every_line_citation_currently_resolves_exactly():
 
 def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     """The plain-text traceback in KNOWN_ISSUES.md names `db.py:2296` inside
-    `update_attempt` and `orchestrator.py:4643` inside `_run_attempt` — not
+    `update_attempt` and `orchestrator.py:4683` inside `_run_attempt` — not
     backtick-wrapped, so the generic citation table above cannot see them.
     Checked directly against the AST so a refactor that moves either call is
     caught rather than silently believed.
@@ -2543,13 +2543,40 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     added 18 lines above `_run_attempt`'s `update_attempt` call inside
     `_drive`, earlier in orchestrator.py, moving the citation from 4625
     to 4643; re-verified against the code, not carried forward blind.
+
+    Re-anchored again 2026-09-03 (fourth): the structural-budget preflight
+    (`structural_budget_send_back_message`, `_structural_budget_preflight`,
+    and its call site between the repro gate and the draft-PR open — one
+    bounded corrective round when a diff grows a frozen
+    `tests/test_structural_budget.py` entry, so the re-anchor lands before
+    review instead of costing a whole extra attempt) added 34 lines above
+    `_run_attempt`'s `update_attempt(attempt_id, branch_name=branch)` call
+    in orchestrator.py, moving the citation from 4625 to 4659; re-verified
+    against the code, not carried forward blind. db.py:2296 is untouched by
+    this change.
+
+    Re-anchored again 2026-09-04 (fifth): the follow-up widening of the
+    structural-budget preflight (`scanned_root`/`touches_scanned_root`
+    alongside `frozen_paths`/`touched_frozen` so a brand-new offender or a
+    stale frozen entry also buys a corrective round, plus the generalized
+    `structural_budget_send_back_message` naming whichever paths triggered
+    it) added 22 lines above `_run_attempt`'s
+    `update_attempt(attempt_id, branch_name=branch)` call in
+    orchestrator.py, moving the citation from 4659 to 4681; re-verified
+    against the code, not carried forward blind. db.py:2296 is untouched by
+    this change.
+
+    Re-anchored again 2026-09-04 (re-home merge): both the intake-eval
+    hoisted path (+18) and the structural-budget preflight chain (+34, +22)
+    now live on one tree; the call measures at 4683 here — re-verified
+    against the code, not carried forward blind.
     """
     assert "db.py:2296" in known_issues_doc, (
         "the traceback no longer cites db.py:2296 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:4643" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:4643 — this test is "
+    assert "orchestrator.py:4683" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:4683 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -2568,13 +2595,13 @@ def test_known_issues_traceback_cites_the_functions_it_names(known_issues_doc):
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
-    assert 1 <= 4643 <= len(orch_lines), "orchestrator.py is now shorter than line 4643"
-    assert "self.store.update_attempt(" in orch_lines[4642], (
-        f"orchestrator.py:4643 is now {orch_lines[4642]!r}, not the "
+    assert 1 <= 4683 <= len(orch_lines), "orchestrator.py is now shorter than line 4683"
+    assert "self.store.update_attempt(" in orch_lines[4682], (
+        f"orchestrator.py:4683 is now {orch_lines[4682]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (
-        "line 4643 is no longer inside _run_attempt's body"
+        "line 4683 is no longer inside _run_attempt's body"
     )
 
 

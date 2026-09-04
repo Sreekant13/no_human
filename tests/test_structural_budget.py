@@ -93,7 +93,13 @@ FROZEN_FUNCTION_LINES = {
     # SERVER_STOP_REASON, with its reasoning comment), so the property holds
     # for callers with no HTTP handler in the loop. Measured on this tree
     # with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2167,
+    # 2167 -> 2186 (+19): the structural-budget preflight call site — a
+    # try/except around `_structural_budget_preflight` (mirroring the
+    # repro-gate call site immediately above it) plus its explanatory
+    # comment, so a frozen-file growth buys its corrective round in the
+    # SAME attempt instead of costing a whole extra one. Measured on this
+    # tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2186,
     # 760 -> 778 (+18): dispatch-time intake-eval hoisted path — the `elif
     # ctx.get("eval_result")` branch that acts on a grill/wizard-stored
     # verdict (idempotency marker, cost/residual-gap comments) added inside
@@ -201,7 +207,11 @@ FROZEN_FUNCTION_CC = {
     # dispatch (an IfExp) in the merged StuckAbort/ConvergenceAbort handler.
     # 251 -> 252 (+1): the `if reason != SERVER_STOP_REASON` guard on the
     # direct-unwind cancel-reason write. Measured on this tree.
-    "core/orchestrator.py:Orchestrator._run_attempt": 252,
+    # 252 -> 255 (+3): the structural-budget preflight call site's two
+    # `except` clauses plus the `if budget_outcome is not None` guard —
+    # same try/except shape as the repro-gate call site above it. Measured
+    # on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 255,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -403,7 +413,41 @@ FROZEN_FILE_LINES = {
     # (new `result` param, `AgentResult`/`_infra_sdk_failure` classification)
     # and its two call sites in `_run_review`. Measured with the scanner
     # below on this tree.
-    "core/orchestrator.py": 21305,
+    #
+    # 21191 -> 21323 (+132, rebased onto the above): the structural-budget
+    # preflight — the `structural_budget` import, module-level
+    # `structural_budget_send_back_message`, the
+    # `_STRUCTURAL_BUDGET_ROUND_TURNS` constant, the
+    # `_structural_budget_preflight` method, and its call site in
+    # `_run_attempt` — so a diff that grows a frozen entry gets the guard's
+    # own failure fed back and re-anchored inside the SAME attempt instead
+    # of costing a whole extra one. Measured on this rebased tree with the
+    # scanner below (`len(Path(...).read_text().splitlines())`), never
+    # summed by hand.
+    # 21323 -> 21329 (+6): the fix for the stale-.pyc race this same
+    # preflight's corrective round could hit against its own guard file —
+    # `structural_budget.invalidate_guard_cache` call site in
+    # `_structural_budget_preflight`, right after the round returns and
+    # before the post-round bounded re-run. Measured on this tree with the
+    # scanner below.
+    # 21329 -> 21398 (+69): the widened preflight — computing `scanned_root`/
+    # `touches_scanned_root` alongside `frozen_paths`/`touched_frozen` so a
+    # brand-new offender or a stale (shrunk/vanished) frozen entry also buys
+    # a corrective round, switching the bounded re-run from
+    # `bounded_growth_command` to `bounded_guard_command` (the whole guard
+    # file, not just the growth node id), the generalized
+    # `structural_budget_send_back_message` (now naming whichever paths
+    # triggered it, not only a touched-frozen path), and the
+    # `event_kind="structural_budget_corrective_round"` /
+    # `cause="structural_budget"` overrides on the `_repro_corrective_round`
+    # call so this preflight's corrective rounds are distinguishable from the
+    # repro gate's own in telemetry. Measured on this tree with the scanner
+    # below.
+    # Re-home merge 2026-09-04: all of the above now live on ONE tree
+    # (build_cmd +7, intake-eval +77, verifier-wall +30, preflight
+    # chain +132/+6/+69 rebased together). Measured on this merged
+    # tree with the scanner below, never summed by hand.
+    "core/orchestrator.py": 21479,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
