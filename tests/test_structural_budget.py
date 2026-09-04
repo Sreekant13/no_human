@@ -798,7 +798,11 @@ FROZEN_FILE_LINES = {
     # backend-config validation so an unrunnable LOCAL config is rejected
     # before a task dies attempt 1 on BackendUnavailable. Measured on this
     # merged tree with the scanner below.
-    "api/app.py": 6126,
+    # 6126 -> 6131 (+5): `metrics` (GET /api/metrics) now imports and calls
+    # `verification_receipt_rate` and merges its result into
+    # `data["verification_receipts"]` (verification-receipt aggregate, task
+    # 33e958ed, re-home). Measured on this merged tree with the scanner below.
+    "api/app.py": 6131,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -987,7 +991,12 @@ FROZEN_FILE_LINES = {
     # check that idles (returns `[]`) and emits `setup_required`/
     # `setup_complete` instead of crash-looping when no credential is on
     # file. Measured on this tree with the scanner below.
-    "core/scheduler.py": 3002,
+    # 3002 -> 3037 (+35): worker-death instrumentation in `_run`'s pool-crash
+    # handler — an all-time `_worker_deaths_total` counter (surfaced via
+    # `health_snapshot`'s `worker_deaths_total`), plus `exit_code`/
+    # `termination_reason`/capped `stderr_excerpt` on the durable
+    # `task_crashed` event. Measured on this tree with the scanner below.
+    "core/scheduler.py": 3037,
 }
 
 
