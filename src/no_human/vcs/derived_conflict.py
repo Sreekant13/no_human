@@ -60,6 +60,18 @@ from .approve_merge import (
     _ship_classified_paths,
     reconcile_merge_count_drift,
 )
+from .budget_conflict import (
+    BUDGET_TEST_PATH,
+    _HUNK_BASE,
+    _HUNK_END,
+    _HUNK_SEP,
+    _HUNK_START,
+    hunks_numeric_only,
+    measure,
+    parse_conflict_hunks,
+    resolve_hunks,
+    run_budget_test,
+)
 from .git import GitError, GitRepo, ProtectedBranch
 from .manifest_repair import _PRUNED_RE
 from .pr_watcher import (
@@ -286,11 +298,11 @@ async def classification_count_only(repo_path: str, base_tip_sha: str,
 
 #: Conflict-marker prefixes git writes into a merged blob. `|||||||` appears
 #: only under `merge.conflictStyle = diff3`/`zdiff3`, so both the 2- and
-#: 3-section shapes have to parse.
-_HUNK_START = "<<<<<<<"
-_HUNK_BASE = "|||||||"
-_HUNK_SEP = "======="
-_HUNK_END = ">>>>>>>"
+#: 3-section shapes have to parse. Hosted in `.budget_conflict` (imported
+#: above) since that module needs the same markers/parser for
+#: `tests/test_structural_budget.py`'s FROZEN_* hunks and this module already
+#: needs `.budget_conflict`'s own symbols — importing them FROM there avoids
+#: a circular import either way.
 
 
 def conflict_hunks_count_only(merged_text: str) -> bool:
@@ -313,44 +325,24 @@ def conflict_hunks_count_only(merged_text: str) -> bool:
     section (one side deleted the rule — a decision); any non-rule line inside
     a hunk (a conflicting comment or blank is a hand edit); and any pair of
     sections that are not equal under `_normalized_classification_lines`.
+
+    The structural parse (marker-outside-hunk, nested/unterminated hunks,
+    wrong section count, empty sections) is `.budget_conflict.
+    parse_conflict_hunks`'s job — shared with the structural-budget hunk
+    check so both refuse identically on a shape neither can parse. Only the
+    classification-specific rule-line/normalized-equality checks live here.
     """
-    lines = merged_text.splitlines()
-    hunks = 0
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i]
-        if not line.startswith(_HUNK_START):
-            if line.startswith((_HUNK_BASE, _HUNK_SEP, _HUNK_END)):
-                return False  # a marker outside a hunk — unparseable
-            i += 1
-            continue
-        sections: list[list[str]] = [[]]
-        i += 1
-        closed = False
-        while i < n:
-            cur = lines[i]
-            if cur.startswith(_HUNK_START):
-                return False  # nested start — unparseable
-            i += 1
-            if cur.startswith((_HUNK_BASE, _HUNK_SEP)):
-                sections.append([])
-                continue
-            if cur.startswith(_HUNK_END):
-                closed = True
-                break
-            sections[-1].append(cur)
-        if not closed or len(sections) not in (2, 3):
-            return False
-        if any(not section for section in sections):
-            return False
+    hunks = parse_conflict_hunks(merged_text)
+    if not hunks:
+        return False
+    for sections in hunks:
         if any(not _RULE_LINE_RE.match(ln) for section in sections for ln in section):
             return False
         normalized = [_normalized_classification_lines("\n".join(section))
                       for section in sections]
         if any(other != normalized[0] for other in normalized[1:]):
             return False
-        hunks += 1
-    return hunks > 0
+    return True
 
 
 def take_ours_in_conflict_hunks(merged_text: str) -> str | None:
@@ -424,44 +416,111 @@ async def classification_conflict_hunks_count_only(
     return conflict_hunks_count_only(text)
 
 
+async def budget_conflict_hunks_numeric_only(
+        repo_path: str, base_tip_sha: str, branch: str) -> bool:
+    """`hunks_numeric_only` (`.budget_conflict`) applied to
+    `tests/test_structural_budget.py` as the REAL three-way merge of
+    `base_tip_sha` into `branch` leaves it — the structural-budget mirror of
+    `classification_conflict_hunks_count_only`.
+
+    Unlike the classification file, there is no companion "branch declared
+    nothing but digits" check here: the resolution never trusts either
+    side's number in the first place, it re-measures the MERGED tree with the
+    scanner and writes that value (`budget_conflict.measure`/`resolve_hunks`,
+    proved by `run_budget_test`), so there is no analogous arithmetic to
+    protect the way `classification_count_only` protects the classification
+    file's additive win-count. This one check — the conflicting hunks
+    themselves are nothing but frozen entries differing only in their digits
+    — is the whole shape test.
+
+    Fails closed (`False`) when the merge cannot be computed, when the
+    budget file is not among the conflicted paths after all, or when the
+    blob cannot be read.
+    """
+    result = await merge_tree_conflicts(repo_path, branch, base_tip_sha)
+    if result is None:
+        return False
+    merged_tree, conflicted = result
+    if BUDGET_TEST_PATH not in conflicted:
+        return False
+    rc, text = await _git_rc(repo_path, "show",
+                             f"{merged_tree}:{BUDGET_TEST_PATH}")
+    if rc != 0 or not text:
+        return False
+    return hunks_numeric_only(text)
+
+
 async def mechanically_resolvable(repo_path: str, paths: set[str] | None,
                                   base_tip_sha: str,
                                   branch: str) -> frozenset[str] | None:
     """The eligible-for-mechanical-resolution artefact set for THIS conflict,
-    or `None` when no mechanical resolution applies. `DERIVED_ARTEFACTS` for
-    the existing manifest-only case — decided by `all_derived` alone, no new
-    git calls, exactly the same hot path as before this function existed.
-    `DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}` when the conflict is confined
-    to the classification file (alone, or together with the manifest) AND
-    BOTH count-only checks pass: `classification_count_only` (the BRANCH's
-    own edit against the merge-base is nothing but digits) and
-    `classification_conflict_hunks_count_only` (the hunks git actually
-    conflicts on are nothing but digits either). The pair is the whole test:
-    the first alone would let a main-side decision that landed inside the
-    conflicting hunk be resolved by `--ours`, and the second alone would let
-    a branch-side decision that merged cleanly through. `None` on anything
-    else, including `paths` itself being `None`/empty (could not enumerate) —
-    fail closed, the caller must never resolve a conflict it could not
-    confirm is one of these two shapes."""
+    or `None` when no mechanical resolution applies.
+
+    `DERIVED_ARTEFACTS` for the existing manifest-only case — decided by
+    `all_derived` alone, no new git calls, exactly the same hot path as
+    before this function existed.
+
+    Beyond that, the eligible superset is `DERIVED_ARTEFACTS |
+    {CLASSIFICATION_NAME} | {BUDGET_TEST_PATH}`; `paths` must be a subset of
+    it or this refuses immediately (`None`) — any OTHER conflicting path
+    (source code, docs, anything a coder actually authors) means a hand
+    decision is in the conflict and this never applies, no matter what else
+    is also conflicting.
+
+    Within that subset, `CLASSIFICATION_NAME` and `BUDGET_TEST_PATH` are each
+    admitted to the RETURNED set only if present in `paths` AND their own
+    shape check passes — the two are independent, so a conflict naming both
+    requires both checks to pass, and a conflict naming only one never runs
+    the other's check:
+
+      * `CLASSIFICATION_NAME`: `classification_count_only` (the BRANCH's own
+        edit against the merge-base is nothing but digits) AND
+        `classification_conflict_hunks_count_only` (the hunks git actually
+        conflicts on are nothing but digits either). The pair is the whole
+        test: the first alone would let a main-side decision that landed
+        inside the conflicting hunk be resolved by `--ours`, and the second
+        alone would let a branch-side decision that merged cleanly through.
+
+      * `BUDGET_TEST_PATH`: `budget_conflict_hunks_numeric_only` alone (see
+        its own docstring for why no second check is needed here).
+
+    The returned set always includes `DERIVED_ARTEFACTS` regardless of
+    whether the manifest itself is among `paths` — regenerating the derived
+    artefacts is always part of mechanical resolution, conflicting or not —
+    matching this function's behaviour before either extension existed.
+
+    `None` on anything else, including `paths` itself being `None`/empty
+    (could not enumerate) — fail closed, the caller must never resolve a
+    conflict it could not confirm is one of these shapes.
+    """
     if not paths:
         return None
     if all_derived(paths):
         return DERIVED_ARTEFACTS
-    eligible = DERIVED_ARTEFACTS | {CLASSIFICATION_NAME}
-    if paths <= eligible and CLASSIFICATION_NAME in paths:
-        if (await classification_count_only(repo_path, base_tip_sha, branch)
+    eligible = DERIVED_ARTEFACTS | {CLASSIFICATION_NAME} | {BUDGET_TEST_PATH}
+    if not paths <= eligible:
+        return None
+    result = set(DERIVED_ARTEFACTS)
+    if CLASSIFICATION_NAME in paths:
+        if not (await classification_count_only(repo_path, base_tip_sha, branch)
                 and await classification_conflict_hunks_count_only(
                     repo_path, base_tip_sha, branch)):
-            return eligible
-    return None
+            return None
+        result.add(CLASSIFICATION_NAME)
+    if BUDGET_TEST_PATH in paths:
+        if not await budget_conflict_hunks_numeric_only(
+                repo_path, base_tip_sha, branch):
+            return None
+        result.add(BUDGET_TEST_PATH)
+    return frozenset(result)
 
 
 @dataclass
 class DerivedResolution:
     """Result of `resolve_derived_conflict`. `step` names where it stopped —
-    one of "worktree", "merge", "regenerate", "verify", "commit", "push", or
-    "ok" — so an escalation can name the failing step, never just "it
-    failed"."""
+    one of "worktree", "merge", "budget", "regenerate", "verify", "commit",
+    "push", or "ok" — so an escalation can name the failing step, never just
+    "it failed"."""
 
     ok: bool
     step: str
@@ -476,6 +535,12 @@ class DerivedResolution:
     #: path that stopped shipping on one side of the merge) — the human gate
     #: must see that too, so the caller puts it in the event.
     pruned: list[str] = field(default_factory=list)
+    #: Non-empty when a `tests/test_structural_budget.py` FROZEN_* entry was
+    #: re-anchored to the merged tree's OWN measurement (never either side's
+    #: number) — one `"<dict>:<key> -> <value>"` note per entry, joined; the
+    #: human gate must see what was re-measured, so the caller puts it in the
+    #: event.
+    budget: str = ""
 
 
 def _run_export_guard(worktree_path: Path, subargs: list[str], *,
@@ -737,6 +802,72 @@ def _inventory_resolve_tail(*, repo: GitRepo, worktree_path: Path, remote: str,
                f"pushed {merge_sha[:8]}")
 
 
+def _take_budget_hunks(worktree_path: Path, branch_tip_sha: str,
+                       ) -> tuple[DerivedResolution | None, list[str]]:
+    """Resolve the conflicted `tests/test_structural_budget.py` in
+    `worktree_path` by rewriting every numeric-only FROZEN_* hunk to the
+    value the scanner measures on the MERGED tree — never either side's own
+    number — and staging it.
+
+    Returns `(None, notes)` on success — one note per rewritten entry,
+    `"<dict>:<key> -> <value>"`, threaded back so the caller's event can name
+    what was re-anchored — or `(failed_resolution, [])` (the caller aborts
+    the merge and returns `failed_resolution`) when the conflicted file
+    cannot be read, does not parse as conflict markers, is not numeric-only
+    on the REAL worktree merge (the fail-closed re-check, in case the base
+    moved between enumeration and now), the scanner cannot be loaded/run
+    against the merged tree, or a conflicting entry's dict is no longer
+    something the scanner measures as offending (it no longer applies —
+    never guess, refuse).
+    """
+    path = worktree_path / BUDGET_TEST_PATH
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return DerivedResolution(
+            ok=False, step="budget",
+            detail=_cap(f"cannot read the conflicted {BUDGET_TEST_PATH}: {exc}")
+        ), []
+    if not hunks_numeric_only(text):
+        return DerivedResolution(
+            ok=False, step="budget",
+            detail=_cap(f"{BUDGET_TEST_PATH} conflict is not numeric-only in "
+                        "the worktree merge (the base moved?) — a hand "
+                        "decision, not a re-measurement")
+        ), []
+    # "ours" (the branch tip, pre-merge) is what `load_scanner` falls back to
+    # reading the scanner's own code from when
+    # `src/no_human/testing/structural_budget.py` does not exist yet (the
+    # scanner still lives inside the test file itself) — read it via
+    # `git show` rather than the worktree path, which is about to be
+    # overwritten below.
+    ours_proc = _sh(["git", "show", f"{branch_tip_sha}:{BUDGET_TEST_PATH}"],
+                    cwd=worktree_path)
+    ours_blob_text = ours_proc.stdout if ours_proc.returncode == 0 else ""
+    measured = measure(str(worktree_path), ours_blob_text)
+    if measured is None:
+        return DerivedResolution(
+            ok=False, step="budget",
+            detail=_cap(f"could not run the {BUDGET_TEST_PATH} scanner "
+                        "against the merged tree")
+        ), []
+    resolved = resolve_hunks(text, measured)
+    if resolved is None:
+        return DerivedResolution(
+            ok=False, step="budget",
+            detail=_cap(f"could not resolve every conflicting entry in "
+                        f"{BUDGET_TEST_PATH} against the merged tree's "
+                        "measurement (an entry that no longer offends, or "
+                        "an unparseable marker)")
+        ), []
+    resolved_text, notes = resolved
+    path.write_text(resolved_text, encoding="utf-8")
+    add = _sh(["git", "add", "--", BUDGET_TEST_PATH], cwd=worktree_path)
+    if add.returncode != 0:
+        return DerivedResolution(ok=False, step="budget", detail=_cap(add.stderr)), []
+    return None, notes
+
+
 def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                          branch: str, base_tip_sha: str,
                          eligible: frozenset[str] = DERIVED_ARTEFACTS,
@@ -768,13 +899,24 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     # only the CONFLICTING HUNKS may be taken — the rest of the merged text
     # carries the rule lines main gained since the fork, which `--ours` would
     # discard (see `take_ours_in_conflict_hunks`). The win-count that survives
-    # gets repaired by merge arithmetic further down, never guessed here. --
+    # gets repaired by merge arithmetic further down, never guessed here. The
+    # structural-budget file is never taken from either side at all — its
+    # conflicting hunks are rewritten to the merged tree's OWN measurement
+    # (see `_take_budget_hunks`). --
+    budget_notes: list[str] = []
     for path in sorted(unmerged & eligible):
         if path == CLASSIFICATION_NAME:
             failed = _take_classification_hunks(worktree_path)
             if failed is not None:
                 _sh(["git", "merge", "--abort"], cwd=worktree_path)
                 return failed
+            continue
+        if path == BUDGET_TEST_PATH:
+            failed, notes = _take_budget_hunks(worktree_path, branch_tip_sha)
+            if failed is not None:
+                _sh(["git", "merge", "--abort"], cwd=worktree_path)
+                return failed
+            budget_notes = notes
             continue
         co = _sh(["git", "checkout", "--ours", "--", path], cwd=worktree_path)
         if co.returncode != 0:
@@ -813,6 +955,14 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
         if p.strip() and p.strip() not in eligible
     })
     shipped_changed = _ship_classified_paths(worktree_path, changed)
+    # The structural-budget file was rewritten in place above, not diffed —
+    # `changed` (base_tip_sha..branch_tip_sha) never names it (the branch's
+    # own edit is already superseded by the merged-tree measurement), so its
+    # re-pin has to be added explicitly whenever a hunk in it was resolved.
+    if budget_notes:
+        shipped_changed = list(dict.fromkeys(
+            [*shipped_changed,
+             *_ship_classified_paths(worktree_path, [BUDGET_TEST_PATH])]))
     unpinned = sorted(set(changed) - set(shipped_changed))
     reconciled = ""
     pruned_paths: list[str] = []
@@ -896,6 +1046,8 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     names_to_add = set(DERIVED_ARTEFACTS)
     if CLASSIFICATION_NAME in eligible:
         names_to_add.add(CLASSIFICATION_NAME)
+    if BUDGET_TEST_PATH in eligible:
+        names_to_add.add(BUDGET_TEST_PATH)
     for name in sorted(names_to_add):
         if (worktree_path / name).exists():
             add = _sh(["git", "add", "--", name], cwd=worktree_path)
@@ -913,6 +1065,17 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     # else: `git merge` above already auto-committed (no conflicts, nothing
     # left to stage) — HEAD is already the merge commit.
     merge_sha = _sh(["git", "rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+
+    # -- step 6.5: prove a structural-budget re-anchor is actually correct - #
+    # Never trust the arithmetic alone: run the very test the ratchet is
+    # gated on, in the committed merged tree, before this is ever pushed.
+    if budget_notes:
+        proof_ok, proof_output = run_budget_test(str(worktree_path))
+        if not proof_ok:
+            return DerivedResolution(
+                ok=False, step="budget", unpinned=unpinned,
+                detail=_cap("structural budget re-anchor did not pass its own "
+                            f"test:\n{proof_output}"))
 
     # -- step 7: verify BEFORE any push ------------------------------------ #
     verify_proc = _run_export_guard(worktree_path, ["verify"], timeout=_VERIFY_TIMEOUT_S)
@@ -1014,9 +1177,10 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
     _sh(["git", "update-ref", f"refs/heads/{branch}", merge_sha, branch_tip_sha],
         cwd=repo.path)
 
+    budget_note = "; ".join(budget_notes)
     return DerivedResolution(
         ok=True, step="ok", pushed_sha=merge_sha, unpinned=unpinned,
-        reconciled=reconciled, pruned=pruned_paths,
+        reconciled=reconciled, pruned=pruned_paths, budget=budget_note,
         detail=f"regenerated derived artefact(s) from the merged tree, "
                f"pushed {merge_sha[:8]}"
                + (f"; unpinned (drop-classified): {', '.join(unpinned)}"
@@ -1024,5 +1188,7 @@ def _resolve_in_worktree(*, repo: GitRepo, worktree_path: Path, remote: str,
                + (f"; {CLASSIFICATION_NAME} count reconciled by merge "
                   f"arithmetic: {reconciled}" if reconciled else "")
                + (f"; pruned stale pin(s): {', '.join(pruned_paths)}"
-                  if pruned_paths else ""),
+                  if pruned_paths else "")
+               + (f"; structural budget re-anchored: {budget_note}"
+                  if budget_note else ""),
     )

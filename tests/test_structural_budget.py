@@ -116,7 +116,13 @@ FROZEN_FUNCTION_LINES = {
     # `pr_conflict_local_clean` event instead of deferring/escalating at a
     # bound; the docstring also gained a paragraph explaining why the local
     # merge is authoritative. Measured on this merge.
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 441,
+    # 441 -> 453 (+12): mechanical resolution extended to cover
+    # `tests/test_structural_budget.py` FROZEN_* numeric-only conflicts
+    # (alongside the pre-existing RELEASE_MANIFEST.txt/
+    # EXPORT_CLASSIFICATION.txt paths) -- the `BUDGET_TEST_PATH` import, the
+    # widened `eligible` fallback set, and the `pr_conflict_resolved` event's
+    # budget note. Measured on this tree with the scanner below.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 453,
     # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
     # write wired into `_finalize` (review findings #1/#7). Measured on the
     # D1.1 squash-merge result.
@@ -178,6 +184,15 @@ FROZEN_FUNCTION_LINES = {
     # was reviewed on its merits; frozen here as its landing baseline.
     "blockers/landed_override.py:approve_landed_override": 315,
     "core/metrics.py:compute_metrics": 334,  # +21: PR #869 cost_usd_total server-side pricing
+    # NEW (324, > 300): mechanical resolution extended to cover
+    # `tests/test_structural_budget.py` FROZEN_* numeric-only conflicts --
+    # the new budget-hunk branch in the worktree merge-step loop, the
+    # ship-classified-paths extension, the names-to-add extension, the
+    # re-anchor proof-test call, and the extended final-return detail
+    # string; re-homed onto the tree where the inventory-backend dispatch
+    # (97a9fd79b) also lives in this function. Measured on this merged tree
+    # with the scanner below.
+    "vcs/derived_conflict.py:_resolve_in_worktree": 324,
 }
 
 # 5 functions with estimated cyclomatic complexity > 60.
@@ -698,7 +713,10 @@ FROZEN_FILE_LINES = {
     # the FROZEN_FUNCTION_LINES entry above — the whole-file delta equals the
     # function's delta since no other function in the file changed. Measured
     # on this merge.
-    "blockers/wake.py": 2740,
+    # 2740 -> 2752 (+12): mechanical resolution extended to cover structural
+    # budget conflicts, same cause as the FROZEN_FUNCTION_LINES entry above.
+    # Measured on this tree with the scanner below.
+    "blockers/wake.py": 2752,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies
