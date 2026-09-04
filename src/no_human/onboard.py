@@ -141,6 +141,46 @@ class ProveOutcome:
         verdict = "PROVEN" if self.ok else "FAILED"
         return f"[{verdict}] {self.kind}: {self.command}  (from {self.source}, exit {self.exit_code})"
 
+    def failure_tail(self, max_lines: int = 12, max_width: int = 200) -> str:
+        """The tail of this command's own output, for a FAILED candidate.
+
+        Empty for anything that passed, and empty when the command said nothing,
+        so a clean prove run reads exactly as it does today. Refusing to confirm
+        an unproven command is right; refusing without a diagnostic is where the
+        reader stops, unable to tell a missing dependency from an import error
+        from a genuinely failing test (KI-4 in docs/KNOWN_ISSUES.md).
+
+        Only ``output`` is ever rendered, which is the command's own stdout and
+        stderr. The proving subprocess inherits the process environment, which by
+        then holds the values loaded from ``~/.no_human/.env``, and nothing
+        derived from that environment is printed here.
+
+        Bounded on both axes: the last ``max_lines`` lines, each clipped to
+        ``max_width``, so neither a 10,000-line pytest failure nor a single
+        enormous line can flood the terminal. Whatever is dropped is announced
+        rather than silently cut.
+        """
+        if self.ok:
+            return ""
+        lines = self.output.strip().splitlines()
+        if not lines:
+            return ""
+
+        elided = len(lines) - max_lines
+        shown = lines[-max_lines:] if elided > 0 else lines
+        rendered = []
+        if elided > 0:
+            rendered.append(f"      [dim]... {elided} earlier line(s) not shown[/]")
+        for line in shown:
+            clipped = line[:max_width]
+            if len(line) > max_width:
+                clipped += f"... (+{len(line) - max_width} chars)"
+            # `[` opens a Rich markup tag, and this is the command's output, not
+            # ours: an unescaped `[foo]` in a traceback would be swallowed or
+            # would raise on an unclosed tag.
+            rendered.append(f"      [dim]{clipped.replace('[', chr(92) + '[')}[/]")
+        return "\n" + "\n".join(rendered)
+
 
 @dataclass
 class OnboardResult:
