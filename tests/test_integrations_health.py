@@ -369,14 +369,6 @@ async def test_with_health_probes_starts_after_boot_and_stops_before_return(monk
 # --------------------------------------------------------------------------- #
 
 @pytest_asyncio.fixture
-async def store(tmp_path):
-    from no_human.core.db import Store
-    s = await Store(tmp_path / "test.db").connect()
-    yield s
-    await s.close()
-
-
-@pytest_asyncio.fixture
 async def client(store, tmp_path):
     from no_human.api.app import app
     from no_human.config import load_config
