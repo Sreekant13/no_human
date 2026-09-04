@@ -806,7 +806,12 @@ FROZEN_FILE_LINES = {
     # `verification_receipt_rate` and merges its result into
     # `data["verification_receipts"]` (verification-receipt aggregate, task
     # 33e958ed, re-home). Measured on this merged tree with the scanner below.
-    "api/app.py": 6131,
+    # 6131 -> 6138 (+7): `_workers_payload` gains `cpu_count`/`hardware_ceiling`
+    # (this machine's detected cores and the derived pool ceiling) so the
+    # stranded Settings Workers panel UI can state where the limit comes
+    # from, instead of re-deriving it client-side (task 5caad018, re-home).
+    # Measured on this merged tree with the scanner below.
+    "api/app.py": 6138,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

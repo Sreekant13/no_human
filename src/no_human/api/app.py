@@ -4856,8 +4856,12 @@ def _workers_payload(file_data: dict, running_data: dict) -> dict[str, Any]:
     (``resolve_max_workers`` is read once at server start, so a fresh write
     only takes effect on the next ``nh serve``) — the same file-vs-process
     signal ``/api/config/models`` and ``/api/coder-backend`` report.
+
+    ``cpu_count``/``hardware_ceiling`` name *this machine's* detected cores
+    and the derived pool ceiling, so the Settings UI can say where the limit
+    comes from without re-deriving it.
     """
-    from ..core.scheduler import resolve_max_workers
+    from ..core.scheduler import pool_width_ceiling, resolve_max_workers
     from ..config import _MAX_WORKERS_WRITE_CEILING
 
     fconc = (file_data.get("concurrency") or {})
@@ -4869,6 +4873,7 @@ def _workers_payload(file_data: dict, running_data: dict) -> dict[str, Any]:
         file_mw != int(rconc.get("max_workers", 2) or 2)
         or file_en != bool(rconc.get("enabled", False))
     )
+    cpus = os.cpu_count() or 4
     return {
         "max_workers": file_mw,
         "enabled": file_en,
@@ -4876,6 +4881,8 @@ def _workers_payload(file_data: dict, running_data: dict) -> dict[str, Any]:
         "warning": warning,
         "max_allowed": _MAX_WORKERS_WRITE_CEILING,
         "restart_required": restart,
+        "cpu_count": cpus,
+        "hardware_ceiling": pool_width_ceiling(cpus),
     }
 
 
