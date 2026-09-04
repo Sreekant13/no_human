@@ -203,6 +203,23 @@ def load_unpinnable(root: Path, builder_root: Path | None = None
     return Unpinnable(verdicts)
 
 
+def _previous_rows(manifest_path: Path) -> dict[str, str]:
+    """The rows the manifest holds now, or empty when it cannot be read.
+
+    `--write` is the documented way out of a manifest left mid-merge, so it has
+    to survive reading a file that does not parse — conflict markers and all.
+    `parse_manifest` raises `SystemExit` on the first bad row, which is correct
+    for the check side and fatal for this one, so a failure here costs only the
+    comparison note below and never the regeneration itself.
+    """
+    if not manifest_path.exists():
+        return {}
+    try:
+        return parse_manifest(manifest_path.read_text(encoding="utf-8"))
+    except (SystemExit, OSError, UnicodeDecodeError):
+        return {}
+
+
 def _warn_if_nearly_every_row_changed(previous: dict[str, str],
                                       rows: dict[str, str]) -> None:
     """Say so when a regeneration rewrites most of the manifest.
@@ -228,8 +245,7 @@ def write_manifest(root: Path) -> int:
     tracked = [rel for rel in tracked_files(root) if rel != MANIFEST_NAME]
     unpinnable = load_unpinnable(root)
     manifest_path = root / MANIFEST_NAME
-    previous = (parse_manifest(manifest_path.read_text(encoding="utf-8"))
-                if manifest_path.exists() else {})
+    previous = _previous_rows(manifest_path)
 
     if unpinnable is not None:
         refused = [(rel, why) for rel in tracked

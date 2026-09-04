@@ -509,3 +509,41 @@ def test_write_is_quiet_when_only_a_little_changed(tmp_path):
     proc = run("--root", str(repo), "--write")
     assert proc.returncode == 0
     assert "existing row(s) changed" not in proc.stderr
+
+
+def test_write_recovers_a_manifest_left_mid_merge(tmp_path):
+    """`--write` is how a conflicted manifest gets cleared, and the manifest
+    conflicts on nearly every merge because it is generated. So the write side
+    has to survive READING a file that does not parse; `parse_manifest` raising
+    on the first bad row is right for the check side and fatal for this one."""
+    repo = make_repo(tmp_path)
+    (repo / "RELEASE_MANIFEST.txt").write_text(
+        "# pins\n"
+        "<<<<<<< HEAD\n"
+        + "a" * 64 + "  README.md\n"
+        "=======\n"
+        + "b" * 64 + "  README.md\n"
+        ">>>>>>> origin/main\n"
+    )
+
+    proc = run("--root", str(repo), "--write")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    written = (repo / "RELEASE_MANIFEST.txt").read_text()
+    assert "<<<<<<<" not in written
+    assert ">>>>>>>" not in written
+    assert "=======" not in written
+
+    # Recovery means the checker accepts the result, not merely that the write
+    # did not crash.
+    assert run("--root", str(repo)).returncode == 0
+
+
+def test_an_unreadable_previous_manifest_costs_only_the_note(tmp_path):
+    """The comparison is a convenience. Losing it must never cost the write."""
+    repo = make_repo(tmp_path)
+    (repo / "RELEASE_MANIFEST.txt").write_text("# pins\nnot a manifest row at all\n")
+
+    proc = run("--root", str(repo), "--write")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "existing row(s) changed" not in proc.stderr
