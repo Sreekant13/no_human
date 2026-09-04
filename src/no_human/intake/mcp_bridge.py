@@ -27,7 +27,7 @@ import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-from ..config import AuthError, ConfigError, load_config
+from ..config import load_config
 
 log = logging.getLogger(__name__)
 
@@ -42,12 +42,15 @@ _TIMEOUT = 10.0
 
 # What load_config raises on a config it cannot read or parse, plus the shape
 # errors a file that parses into something other than a mapping would raise.
+# Deliberately NOT AuthError or ConfigError: those are the product refusing a
+# config it read fine (an ANTHROPIC_API_KEY in the file, decomposition turned
+# on). Catching them would warn and then dial the DEFAULT port while the
+# config named another — so they propagate and the bridge refuses to start,
+# the same as every other entry point.
 _CONFIG_ERRORS = (
     OSError,
     yaml.YAMLError,
     ValueError,
-    AuthError,
-    ConfigError,
     AttributeError,
     TypeError,
 )
@@ -64,7 +67,8 @@ def _base_url() -> str:
     """Base URL of the local API, from ``server.host`` and ``server.port``.
 
     Resolved once per process. Falls back to :data:`BASE_URL` when the config is
-    missing, unreadable, or not shaped as expected, and warns when it does, so
+    missing, unreadable, or not shaped as expected (never when the product
+    refuses it — see ``_CONFIG_ERRORS``), and warns when it does, so
     that an ignored config is visible instead of surfacing later as an
     unexplained "API unreachable at 8420". The warning goes to stderr, which is
     safe for a stdio MCP server; anything on stdout would corrupt the protocol.

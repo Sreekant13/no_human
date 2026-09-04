@@ -2,6 +2,7 @@
 against a stubbed HTTP layer (httpx.MockTransport, no real server), and the
 unreachable-API startup refusal. Never talks to a real network."""
 
+import functools
 import json
 import logging
 
@@ -215,3 +216,33 @@ def test_reachability_check_dials_the_configured_port(monkeypatch):
     mcp_bridge.main()
 
     assert seen == ["http://127.0.0.1:9999/api/tasks"]
+
+
+def test_base_url_reads_host_and_port_from_a_real_config_file(tmp_path, monkeypatch):
+    """The real `load_config` path, not a stub: the file is parsed, merged onto
+    the defaults, and a non-default HOST is honoured as well as the port."""
+    import no_human.config as config
+
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  host: 192.168.1.20\n  port: 9001\n")
+    monkeypatch.setattr(
+        mcp_bridge, "load_config", functools.partial(config.load_config, path)
+    )
+    assert mcp_bridge._base_url() == "http://192.168.1.20:9001"
+
+
+def test_a_config_the_product_refuses_stops_the_bridge(tmp_path, monkeypatch):
+    """An ANTHROPIC_API_KEY inside config.yaml is refused by every other entry
+    point. The bridge must refuse too — not warn and dial the default port
+    while the file says 9001."""
+    import no_human.config as config
+
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "server:\n  port: 9001\nllm:\n  ANTHROPIC_API_KEY: not-a-real-key\n"
+    )
+    monkeypatch.setattr(
+        mcp_bridge, "load_config", functools.partial(config.load_config, path)
+    )
+    with pytest.raises(config.AuthError):
+        mcp_bridge._base_url()
