@@ -511,7 +511,13 @@ FROZEN_FILE_LINES = {
     # Supervised-land merge 2026-09-04: lifetime-cap (+62) and default-walk
     # (+70) now on one tree. Measured on this merged tree with the scanner
     # below, never summed by hand.
-    "core/orchestrator.py": 21634,
+    # 21502 -> 21503 (+1): the reviewer-worktree non-benign-config-key naming
+    # task threads `nonbenign_config_keys=list(getattr(delta, "nonbenign_keys",
+    # []))` into the `reviewer_wrote` event emit — one kwarg. Measured with
+    # the scanner below (`len(Path(...).read_text().splitlines())`).
+    # Supervised-land merge 2026-09-04: default-walk chain + the reviewer
+    # config-key naming (+1) on one tree. Measured on this merged tree.
+    "core/orchestrator.py": 21635,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

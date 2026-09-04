@@ -17401,6 +17401,7 @@ class Orchestrator:
             added=delta.added,
             modified=delta.modified,
             deleted=delta.deleted,
+            nonbenign_config_keys=list(getattr(delta, "nonbenign_keys", [])),
             baseline_commit=before.head,
         )
 
