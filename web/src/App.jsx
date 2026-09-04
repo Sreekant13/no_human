@@ -28,6 +28,7 @@ import { ledgerSummary } from "./nightLedger.js";
 import { fmtCost } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
+import useIsPhone from "./useIsPhone.js";
 import { createReconnector } from "./wsReconnect.js";
 import { connectionBanner } from "./connectionBanner.js";
 import { drainChip, formatPausedUntil } from "./drainChip.js";
@@ -875,6 +876,9 @@ export default function App() {
   //     strictly weaker condition than the badge's.
   const [aiConfigDone, setAiConfigDone] = useState(() => isAiConfigDone());
   const [popupDismissed, setPopupDismissed] = useState(() => isPopupDismissed());
+  // Phone width renders the nudge as a flow child of .nh-main instead of the
+  // sidebar foot — see useIsPhone.js.
+  const isPhone = useIsPhone();
   const openSettings = (tab = null) => {
     if (tab !== null) setSettingsTab(tab);
     setSettingsOpen(true);
@@ -1223,6 +1227,41 @@ export default function App() {
   // "Working (N)" figure agrees with the board instead of its own count.
   const sidebarCounts = deriveCounts(tasks);
   const banner = connectionBanner(wsPhase);
+  // One-time nudge from the "!" — shown after onboarding until Settings
+  // opens on ANY pane or the popup is dismissed (`popupDismissed`, a
+  // strictly weaker condition than the badge's own `aiConfigDone` above —
+  // the badge needs the Second-brain pane specifically; this popup does
+  // not). Not while onboarding is still checking (null) or in progress
+  // (false). Built once here so exactly one instance ever renders — desktop
+  // hosts it as a flow sibling in .nh-sidebar-foot (so it can never
+  // absolutely-overlap the Finish-setup row below it); phone hosts it inside
+  // .nh-main instead, since the sidebar foot sits outside the mobile nav's
+  // viewport there (see useIsPhone.js).
+  const showAiNudge = !popupDismissed && onboarded === true && !settingsOpen;
+  const aiConfigNudge = showAiNudge ? (
+    <div
+      className={`nh-aiconfig-nudge${isPhone ? " nh-aiconfig-nudge-mobile" : ""}`}
+      role="dialog"
+      aria-label="Complete AI configuration"
+    >
+      <button
+        type="button"
+        className="nh-aiconfig-nudge-x"
+        aria-label="Dismiss"
+        onClick={dismissAiConfig}
+      >×</button>
+      <div className="nh-aiconfig-nudge-title">Complete AI configuration</div>
+      <div className="nh-aiconfig-nudge-body">
+        Review your rules, pick the model for each role, and seed your
+        second brain — all in Settings.
+      </div>
+      <button
+        type="button"
+        className="btn btn-approve nh-aiconfig-nudge-cta"
+        onClick={() => openSettings("learnings")}
+      >Open Settings</button>
+    </div>
+  ) : null;
   return (
     <div className="nh-shell nh-shell-cc">
       {banner && (
@@ -1388,35 +1427,12 @@ export default function App() {
             onClick={() => setPage("about")}
             title="What no_human is, docs, and contact"
           />
-          {/* One-time nudge from the "!" — shown after onboarding until
-              Settings opens on ANY pane or the popup is dismissed
-              (`popupDismissed`, a strictly weaker condition than the
-              badge's own `aiConfigDone` below — the badge needs the
-              Second-brain pane specifically; this popup does not). Not
-              while onboarding is still checking (null) or in progress
-              (false). Rendered as a flow sibling here (not inside
-              .nh-settings-navwrap) so it can never absolutely-overlap the
-              Finish-setup row below it. */}
-          {!popupDismissed && onboarded === true && !settingsOpen && (
-            <div className="nh-aiconfig-nudge" role="dialog" aria-label="Complete AI configuration">
-              <button
-                type="button"
-                className="nh-aiconfig-nudge-x"
-                aria-label="Dismiss"
-                onClick={dismissAiConfig}
-              >×</button>
-              <div className="nh-aiconfig-nudge-title">Complete AI configuration</div>
-              <div className="nh-aiconfig-nudge-body">
-                Review your rules, pick the model for each role, and seed your
-                second brain — all in Settings.
-              </div>
-              <button
-                type="button"
-                className="btn btn-approve nh-aiconfig-nudge-cta"
-                onClick={() => openSettings("learnings")}
-              >Open Settings</button>
-            </div>
-          )}
+          {/* One-time nudge from the "!" (built above, near `banner`) — a flow
+              sibling here (not inside .nh-settings-navwrap) so it can never
+              absolutely-overlap the Finish-setup row below it. Desktop only:
+              at phone width it renders inside .nh-main instead, since the
+              sidebar foot sits outside the mobile nav's viewport there. */}
+          {!isPhone && aiConfigNudge}
           {/* The minimal path's leftover steps, as a compact affordance directly
               above Settings — not the old board-body card (real-user feedback:
               it "took half the screen" and every row deep-linked to the wrong
@@ -1464,6 +1480,11 @@ export default function App() {
             : page === "about" ? "About no_human"
             : "Settings"}
         </h1>
+        {/* Phone-only host for the AI-config nudge (built above, near
+            `banner`) — the sidebar foot it uses on desktop sits outside the
+            mobile nav's viewport, so at phone width it renders in flow here
+            instead, above the board on every page. */}
+        {isPhone && aiConfigNudge}
         {page === "board" && (
           <div className="nh-main-bar">
             <OverviewStrip tasks={tasks} />
