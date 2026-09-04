@@ -811,7 +811,12 @@ FROZEN_FILE_LINES = {
     # stranded Settings Workers panel UI can state where the limit comes
     # from, instead of re-deriving it client-side (task 5caad018, re-home).
     # Measured on this merged tree with the scanner below.
-    "api/app.py": 6138,
+    # 6138 -> 6140 (+2): `discover_repositories`'s docstring corrected to
+    # describe the typed-`root` containment fix (scanned wherever it resolves;
+    # configured `extra_scan_roots` stay home-contained) — comment only, no
+    # behaviour change (task bf0cfd72, re-home). Measured on this merged tree
+    # with the scanner below.
+    "api/app.py": 6140,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
