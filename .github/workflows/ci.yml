@@ -681,7 +681,11 @@ jobs:
           $argv = @(
             'run', 'pytest', '-q', '--tb=short',
             'tests/test_windows_portability.py',
-            'tests/test_windows_credential_file.py'
+            'tests/test_windows_credential_file.py',
+            # The manifest is written through Python's text layer, so only this
+            # job can catch a regression to CRLF rows. On linux it passes for
+            # free and proves nothing.
+            'tests/test_check_release_manifest.py'
           ) + $skip
           uv @argv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

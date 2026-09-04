@@ -44,6 +44,21 @@ uv sync --frozen
 uv run nh --help
 ```
 
+On Windows, set the clone to leave line endings alone before you build anything:
+
+```bash
+git config core.autocrlf false
+git config core.eol lf
+```
+
+Git for Windows defaults to `core.autocrlf=true`, which checks every file out
+with CRLF. `RELEASE_MANIFEST.txt` pins each file by the hash of its bytes, so a
+CRLF checkout makes every row disagree and a regeneration rewrites the whole
+file rather than the handful of rows you changed. If you have already cloned,
+commit or stash anything you care about first, then
+`git rm --cached -r . && git reset --hard` re-checks the tree out after the
+config change. That `reset --hard` discards uncommitted work.
+
 `uv sync --frozen` installs from the committed [`uv.lock`](uv.lock) without
 re-resolving. `uv.lock`, `web/package-lock.json`, and
 `desktop/package-lock.json` are all tracked. If you change a dependency, commit
