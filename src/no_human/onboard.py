@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from rich.markup import escape
+
 from .profile import ProjectProfile
 from .testing import runner
 
@@ -151,9 +153,9 @@ class ProveOutcome:
         from a genuinely failing test (KI-4 in docs/KNOWN_ISSUES.md).
 
         Only ``output`` is ever rendered, which is the command's own stdout and
-        stderr. The proving subprocess inherits the process environment, which by
-        then holds the values loaded from ``~/.no_human/.env``, and nothing
-        derived from that environment is printed here.
+        stderr, and it goes through ``_redact`` first. Nothing derived from the
+        environment is printed, but a proved command can print a credential of
+        its own, so the tail is masked the same way a verification receipt is.
 
         Bounded on both axes: the last ``max_lines`` lines, each clipped to
         ``max_width``, so neither a 10,000-line pytest failure nor a single
@@ -162,7 +164,9 @@ class ProveOutcome:
         """
         if self.ok:
             return ""
-        lines = self.output.strip().splitlines()
+        from .agent.verification_receipts import _redact
+
+        lines = _redact(self.output).strip().splitlines()
         if not lines:
             return ""
 
@@ -177,8 +181,11 @@ class ProveOutcome:
                 clipped += f"... (+{len(line) - max_width} chars)"
             # `[` opens a Rich markup tag, and this is the command's output, not
             # ours: an unescaped `[foo]` in a traceback would be swallowed or
-            # would raise on an unclosed tag.
-            rendered.append(f"      [dim]{clipped.replace('[', chr(92) + '[')}[/]")
+            # would raise on an unclosed tag. Rich's own escape is used rather
+            # than replacing `[`, because a line already ending in a backslash
+            # (a Windows path at the end of a traceback) would otherwise escape
+            # the closing tag and print it literally.
+            rendered.append(f"      [dim]{escape(clipped)}[/]")
         return "\n" + "\n".join(rendered)
 
 

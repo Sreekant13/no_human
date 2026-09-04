@@ -2,10 +2,12 @@
 REAL end-to-end proving on two different ecosystems (Python+pytest and Node)
 with no code path differing between them — the Phase-4 DoD."""
 
+import io
 import json
 import shutil
 
 import pytest
+from rich.console import Console
 
 from no_human.onboard import (
     AgentDeriver,
@@ -262,6 +264,31 @@ def test_command_output_cannot_inject_console_markup():
     tail = _failed("got [red]unclosed and [/] stray").failure_tail()
     assert r"\[red]" in tail
     assert r"\[/]" in tail
+
+
+def test_a_line_ending_in_a_backslash_keeps_its_closing_tag():
+    """A Windows path at the end of a traceback line ends in a backslash. Escaping
+    only `[` would let that backslash escape our own closing tag, so the line lost
+    its last character and printed a literal `[/]`."""
+    tail = _failed("cannot open C:\\Users\\dev\\").failure_tail()
+    assert tail.rstrip().endswith("[/]")
+
+    console = Console(file=io.StringIO(), width=200, force_terminal=False)
+    console.print(tail.strip())
+    rendered = console.file.getvalue()
+    assert "[/]" not in rendered
+    assert rendered.rstrip().endswith("\\")
+
+
+def test_a_credential_in_the_command_output_is_masked(monkeypatch):
+    """A proved command can print a credential of its own. `output` is the
+    command's, not the environment's, but it still must not reach a terminal."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-super-secret-value")
+    tail = _failed(
+        "config dump: ANTHROPIC_API_KEY=sk-ant-super-secret-value\nfailed"
+    ).failure_tail()
+    assert "sk-ant-super-secret-value" not in tail
+    assert "failed" in tail
 
 
 def test_nothing_from_the_environment_is_rendered(monkeypatch):
