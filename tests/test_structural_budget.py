@@ -131,7 +131,13 @@ FROZEN_FUNCTION_LINES = {
     # the FROZEN_FILE_LINES note below records. Re-anchored to the current
     # baseline so the full suite is green again; growth from here fails.
     "agent/claude_backend.py:ClaudeBackend.stream": 407,
-    "core/orchestrator.py:Orchestrator._run_review": 386,
+    # 386 -> 394 (+8): verifier-wall-park bugfix (tasks 279c03c5/c5b24230/
+    # 7da7c7ce) — `_raise_if_verifier_wall` (renamed from
+    # `_raise_if_verifier_quota_wall`) now also classifies a returned
+    # errored `AgentResult` via `_quota_signal`/`_infra_sdk_failure`, so
+    # `_run_review` gained the `result.is_error` check and passes `result`
+    # through on both `_judge_call` branches. Measured on this tree.
+    "core/orchestrator.py:Orchestrator._run_review": 394,
     # 377 -> 398 (+21): quota-saturation mid-run halt. `bench_run` now builds
     # a `QuotaHaltDetector`, threads `halt.observe(score)`/`halt.scored(...)`
     # through the per-spec checkpoint save inside `_run_spec`, and prints the
@@ -187,7 +193,10 @@ FROZEN_FUNCTION_CC = {
     # grew the conflict watcher; pre-existing red on main at 03b262d23,
     # repaired (measured) on this merge.
     "blockers/wake.py:WakeWatcher._check_pr_conflict": 74,
-    "core/orchestrator.py:Orchestrator._run_review": 73,
+    # 73 -> 74 (+1): same verifier-wall-park cause as the LINES entry above
+    # — the added `result.is_error` branch is one more `If`. Measured on
+    # this tree.
+    "core/orchestrator.py:Orchestrator._run_review": 74,
     # Crossed 60 (to 67) with the UI-evidence gate landed by task 389210fa.
     "core/orchestrator.py:Orchestrator._build_implement_prompt": 67,
 }
@@ -372,7 +381,14 @@ FROZEN_FILE_LINES = {
     # `len(Path(...).read_text().splitlines())` metric (which, unlike
     # `wc -l`, also counts the file's 3 pre-existing Unicode line-break
     # characters inside `_LINE_BREAKS`'s regex), never summed by hand.
-    "core/orchestrator.py": 21275,
+    #
+    # 21275 -> 21305 (+30): verifier-wall-park bugfix (task 57f38618,
+    # re-homed from the pre-cutover world) — `api_wall_reason` import, the
+    # `_raise_if_verifier_quota_wall` -> `_raise_if_verifier_wall` widening
+    # (new `result` param, `AgentResult`/`_infra_sdk_failure` classification)
+    # and its two call sites in `_run_review`. Measured with the scanner
+    # below on this tree.
+    "core/orchestrator.py": 21305,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

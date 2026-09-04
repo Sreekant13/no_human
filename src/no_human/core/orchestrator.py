@@ -142,8 +142,8 @@ from ..vcs.task_pr import resolve_task_pr
 from . import merge_policy
 from . import plan_gate
 from .bounds import (
-    Bounds, ConvergenceTracker, QuotaExhausted, StuckDetector, error_signature,
-    quota_reason, quota_signal,
+    Bounds, ConvergenceTracker, QuotaExhausted, StuckDetector, api_wall_reason,
+    error_signature, quota_reason, quota_signal,
 )
 from ..blockers.taxonomy import carried_checkpoint, carry_human_hold, resume_checkpoint
 from .complexity import is_trivial as _is_trivial
@@ -11657,19 +11657,40 @@ class Orchestrator:
             self._opened_draft_this_attempt = not pre_existing
         return url
 
-    async def _raise_if_verifier_quota_wall(self, attempt_id: str, reason: str | None) -> None:
-        """Route a bare verifier-call failure through the same classifier the
-        coder path uses (`quota_signal`): a genuine quota wall never had a
-        chance, so retrying wastes time and escalating misreports it as a
-        NOVEL_UNKNOWN infra incident (INCIDENT 2026-08-20). Close THIS
-        attempt row before the park, else `lifetime_usage_by_class` charges
-        a lifetime attempt for a round that never got a verdict."""
-        reason = reason or ""
-        if not quota_signal(reason):
+    async def _raise_if_verifier_wall(
+        self, attempt_id: str, reason: str | None, result=None,
+    ) -> None:
+        """Route a verifier-call failure through the same classifiers the
+        coder path uses: a genuine quota wall or an API wall (outage/529/5xx)
+        never had a chance, so retrying wastes time and escalating misreports
+        it as a NOVEL_UNKNOWN infra incident (INCIDENT 2026-08-20, and its
+        2026-09-03 sibling — a walled verifier reaching no verdict as an
+        `AgentResult`, not just a bare timeout). Close THIS attempt row
+        before the park, else `lifetime_usage_by_class` charges a lifetime
+        attempt for a round that never got a verdict.
+
+        `result`, when given, is the (possibly errored) `AgentResult` the
+        judge call returned — `reason` alone is what a bare timeout (`result
+        is None`) carries."""
+        text = reason or ""
+        if result is not None and getattr(result, "is_error", False):
+            text = f"{text}\n{result.final_text or ''}"
+        infra = False
+        if quota_signal(text):
+            wall = quota_reason(text)
+        elif result is not None and (r := _infra_sdk_failure(result)) is not None:
+            wall = r
+            infra = True
+        elif (r := api_wall_reason(text)) is not None:
+            wall = r
+            infra = True
+        else:
             return
-        wall_reason = quota_reason(reason)
-        await self.store.update_attempt(attempt_id, status="failed", failure_reason=f"quota: {wall_reason}", infra_failure=1)
-        raise QuotaExhausted(wall_reason)
+        await self.store.update_attempt(
+            attempt_id, status="failed",
+            failure_reason=f"{'infra' if infra else 'quota'}: {wall}",
+            infra_failure=1)
+        raise QuotaExhausted(wall, infra=infra)
 
     async def _run_review(
         self, task: Task, repo: GitRepo, attempt_id: str, base: str | None = None,
@@ -11853,9 +11874,18 @@ class Orchestrator:
                     prompt, repo.path, max_turns=1, timeout=timeout, on_event=None)
                 if result is None:
                     # Ordinarily infra (fall through to no_verdict) unless it's
-                    # actually a quota wall (see the helper's docstring).
-                    await self._raise_if_verifier_quota_wall(attempt_id, reason)
+                    # actually a quota/API wall (see the helper's docstring).
+                    await self._raise_if_verifier_wall(attempt_id, reason)
                     return "", 0  # parse_result → no_verdict → one bounded retry
+                if getattr(result, "is_error", False):
+                    # A result CAME BACK but errored (2026-09-03 shape): the
+                    # backend does not always raise on a dead session, it can
+                    # hand the failure back as a normal result whose
+                    # `final_text` is empty — which used to fall straight
+                    # through to `no_verdict` below and, after the bounded
+                    # retry, escalate as NOVEL_UNKNOWN instead of parking on
+                    # the wall that actually killed it.
+                    await self._raise_if_verifier_wall(attempt_id, reason, result)
                 verifier_tok["total"] += result.tokens_used or 0
                 verifier_tok["cache_read"] += result.cache_read_tokens or 0
                 verifier_tok["cache_creation"] += result.cache_creation_tokens or 0
