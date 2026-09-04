@@ -624,7 +624,20 @@ FROZEN_FILE_LINES = {
     # branch (`_act_on_stored_eval`) reachable for grill/wizard tasks.
     # Measured directly (`wc -l src/no_human/api/app.py`), rebased onto the
     # feasibility-hint-calibration change above.
-    "api/app.py": 5928,
+    #
+    # 5914 -> 5919 (+5): _start_telemetry in lifespan (startup instance_id
+    # mint via telemetry.ensure_instance_id). Measured via
+    # `wc -l src/no_human/api/app.py`.
+    # 5919 -> 5974 (+55): /api/worker/status event-loop stall fix — the
+    # inline `await asyncio.to_thread(_loaded_code_stale)` git measurement
+    # on the request path is replaced by a `_stale_cache` snapshot read
+    # (`_stale_note_cached`) plus a periodic `_refresh_stale_note`
+    # background task started/cancelled in `lifespan`. Measured via
+    # `wc -l src/no_human/api/app.py`.
+    # Re-home merge 2026-09-04: the feasibility-hint + grill-eval carry
+    # changes and the /api/worker/status stall fix now live on ONE tree.
+    # Measured on this merged tree, never summed by hand.
+    "api/app.py": 5983,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.

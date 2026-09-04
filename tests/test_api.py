@@ -1,6 +1,7 @@
 """FastAPI board endpoint tests (Phase 4 DoD)."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
@@ -2329,7 +2330,14 @@ async def test_worker_status_surfaces_the_loaded_code(client):
 
 async def test_advancing_head_after_startup_flips_the_stale_flag(
         client, tmp_path, monkeypatch):
-    """A cached current answer must not survive a checkout HEAD advance."""
+    """A cached current answer must not survive a checkout HEAD advance.
+
+    The handler itself no longer measures HEAD (that would be the request-
+    path git call this fix removes) — it only reads `_stale_cache`. So this
+    drives the same measurement the background refresher performs each tick
+    (`await asyncio.to_thread(api._loaded_code_stale)`) explicitly, then
+    checks the handler serves what that measurement produced.
+    """
     build_info = importlib.import_module("no_human.core.build_info")
     api = importlib.import_module("no_human.api.app")
     repo = tmp_path / "repo"
@@ -2353,6 +2361,9 @@ async def test_advancing_head_after_startup_flips_the_stale_flag(
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "advance HEAD")
     new = _git(repo, "rev-parse", "HEAD")
+
+    # One refresher tick: re-measures HEAD, re-keys `_stale_cache`.
+    await asyncio.to_thread(api._loaded_code_stale)
 
     stale = (await client.get("/api/worker/status")).json()["loaded_code_stale"]
     assert stale is not None

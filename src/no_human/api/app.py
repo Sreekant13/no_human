@@ -133,6 +133,13 @@ async def lifespan(app: FastAPI):
     _startup_stale = await asyncio.to_thread(staleness_note, code)
     if _startup_stale:
         log.warning("%s", _startup_stale)
+    # Seed `_stale_cache` here too, off the loop, so the first `/api/worker/
+    # status` poll is not silent (a cold `_stale_cache` reads as "current" —
+    # see `_loaded_code_stale`'s docstring). This is the SAME git call
+    # `staleness_note` above just made; `_loaded_code_stale` re-measures HEAD
+    # rather than reusing `_startup_stale` because HEAD (and thus the cache
+    # key) can already differ by the time this line runs.
+    await asyncio.to_thread(_loaded_code_stale)
     # `nh start` may already have connected a shared Store to hand to its
     # Jira/Linear intake pollers (started before uvicorn's ASGI lifespan
     # fires) — reuse it instead of opening a SECOND aiosqlite connection to
@@ -332,7 +339,19 @@ async def lifespan(app: FastAPI):
     log.info("embedded worker started: %d worker(s), poll=%ds",
              max_workers, int(poll_interval))
 
+    # Keeps `_stale_cache` warm without a request ever paying for the git
+    # calls: `/api/worker/status` used to run `_loaded_code_stale` itself
+    # (one `rev-parse`, and a `merge-base` too once behind) on every request
+    # that won its single-flight lock, which is where the 5-14s stalls this
+    # task fixes came from. This loop is the only remaining caller.
+    stale_refresh_task = asyncio.create_task(_refresh_stale_note())
+    app.state.stale_refresh_task = stale_refresh_task
+
     yield
+
+    stale_refresh_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await stale_refresh_task
 
     if worker_task and stop_event:
         stop_event.set()
@@ -3595,6 +3614,38 @@ def _loaded_code_stale() -> str | None:
         _stale_inflight.release()
 
 
+def _stale_note_cached() -> str | None:
+    """The only thing the `/api/worker/status` request path may call for this
+    field: no subprocess, no thread hop, no lock acquisition. `_loaded_code_
+    stale` used to run on every request that won its single-flight lock — a
+    `rev-parse` (and a `merge-base` too, once behind) inline on the event
+    loop's executor, on the order of 5-14s under load (2026-09-03 samples:
+    5.5s, 13.9s). A background refresher (`_refresh_stale_note`) is now the
+    only caller of `_loaded_code_stale`; this just reads its last answer."""
+    cached = _stale_cache          # read once; a refresh may swap it
+    return cached[1] if cached is not None else None
+
+
+_STALE_REFRESH_S = 30.0
+
+
+async def _refresh_stale_note() -> None:
+    """Background twin of the old per-request measurement.
+
+    Runs every `_STALE_REFRESH_S`, off the request path entirely, so
+    `loaded_code_stale` is at most that far behind rather than exactly as
+    fresh — and exactly as expensive — as the last poll. Sleeps FIRST:
+    `lifespan` already seeds `_stale_cache` once at startup, so refreshing
+    immediately here would be a redundant git call at boot.
+    """
+    while True:
+        await asyncio.sleep(_STALE_REFRESH_S)
+        try:
+            await asyncio.to_thread(_loaded_code_stale)
+        except Exception:  # noqa: BLE001 — advisory telemetry must never die
+            log.debug("staleness refresh failed", exc_info=True)
+
+
 @app.get("/api/worker/status")
 async def worker_status(request: Request) -> dict[str, Any]:
     """Is the embedded worker running, how many tasks in-flight — and if none,
@@ -3626,10 +3677,14 @@ async def worker_status(request: Request) -> dict[str, Any]:
 
     `loaded_code` / `loaded_code_stale` answer a different question on the same
     poll: WHICH code is running. The server never reloads, so a merged fix is
-    not live until it restarts; the stale flag re-measures the checkout HEAD on
-    each read that wins its single-flight lock and flips on the first such
-    read after that HEAD moves; a read that loses the lock, or whose HEAD
-    lookup fails, serves the last known answer rather than silence.
+    not live until it restarts. This flag is refreshed by a background task
+    (`_refresh_stale_note`) at most `_STALE_REFRESH_S` behind, never by this
+    request: measuring it inline used to mean an occasional request paid for
+    a `git rev-parse` (and a `merge-base` too, once behind) synchronously —
+    5-14s under load on 2026-09-03, on a process with four workers busy — for
+    an advisory value nobody gates on. A read before the first background
+    refresh serves `None`, the same first-cold-miss silence a lock loser
+    already served.
     """
     sched = getattr(request.app.state, "scheduler", None)
     watcher_error = getattr(request.app.state, "watcher_error", None)
@@ -3641,7 +3696,7 @@ async def worker_status(request: Request) -> dict[str, Any]:
         "watcher_error": watcher_error,
         "worker_error": worker_error,
         "loaded_code": getattr(request.app.state, "loaded_code", None),
-        "loaded_code_stale": await asyncio.to_thread(_loaded_code_stale),
+        "loaded_code_stale": _stale_note_cached(),
     }
     if sched is None:
         return {"running": False, "inflight": 0, "max_workers": 0, **common,
