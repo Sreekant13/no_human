@@ -141,7 +141,11 @@ FROZEN_FUNCTION_LINES = {
     # EXPORT_CLASSIFICATION.txt paths) -- the `BUDGET_TEST_PATH` import, the
     # widened `eligible` fallback set, and the `pr_conflict_resolved` event's
     # budget note. Measured on this tree with the scanner below.
-    "blockers/wake.py:WakeWatcher._check_pr_conflict": 453,
+    # 453 -> 458 (+5): the failed-DerivedResolution escalation now surfaces
+    # `result.detail` (capped, whitespace-collapsed) in the event text and
+    # `question`, and prefixes `step=` onto the stored `evidence` -- step
+    # alone was not root-causeable. Measured on this tree.
+    "blockers/wake.py:WakeWatcher._check_pr_conflict": 458,
     # 418 -> 424 (+6): D1.1 fix round — attempt-scoped verification-artifact
     # write wired into `_finalize` (review findings #1/#7). Measured on the
     # D1.1 squash-merge result.
@@ -202,7 +206,7 @@ FROZEN_FUNCTION_LINES = {
     # (task bf413cc6): two new refusal guards + the DONE branch. The growth
     # was reviewed on its merits; frozen here as its landing baseline.
     "blockers/landed_override.py:approve_landed_override": 315,
-    "core/metrics.py:compute_metrics": 334,  # +21: PR #869 cost_usd_total server-side pricing
+    "core/metrics.py:compute_metrics": 346,  # +12: tokens_total (SCRUM re-home) sibling of cost_usd_total
     # NEW (324, > 300): mechanical resolution extended to cover
     # `tests/test_structural_budget.py` FROZEN_* numeric-only conflicts --
     # the new budget-hunk branch in the worktree merge-step loop, the
@@ -798,7 +802,16 @@ FROZEN_FILE_LINES = {
     # backend-config validation so an unrunnable LOCAL config is rejected
     # before a task dies attempt 1 on BackendUnavailable. Measured on this
     # merged tree with the scanner below.
-    "api/app.py": 6126,
+    # 6126 -> 6131 (+5): `metrics` (GET /api/metrics) now imports and calls
+    # `verification_receipt_rate` and merges its result into
+    # `data["verification_receipts"]` (verification-receipt aggregate, task
+    # 33e958ed, re-home). Measured on this merged tree with the scanner below.
+    # 6131 -> 6138 (+7): `_workers_payload` gains `cpu_count`/`hardware_ceiling`
+    # (this machine's detected cores and the derived pool ceiling) so the
+    # stranded Settings Workers panel UI can state where the limit comes
+    # from, instead of re-deriving it client-side (task 5caad018, re-home).
+    # Measured on this merged tree with the scanner below.
+    "api/app.py": 6138,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -950,7 +963,10 @@ FROZEN_FILE_LINES = {
     # 2740 -> 2752 (+12): mechanical resolution extended to cover structural
     # budget conflicts, same cause as the FROZEN_FUNCTION_LINES entry above.
     # Measured on this tree with the scanner below.
-    "blockers/wake.py": 2752,
+    # 2752 -> 2757 (+5): same cause as the FROZEN_FUNCTION_LINES entry above
+    # -- the whole-file delta equals the function's delta. Measured on this
+    # tree.
+    "blockers/wake.py": 2757,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies

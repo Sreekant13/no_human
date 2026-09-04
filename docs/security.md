@@ -400,10 +400,18 @@ config key that turns it on and the default that keeps it off.
   `notifications.teams_webhook_url` both default to **`null`**; with a URL set,
   a task-status line (and, for Teams, a card linking to your board) is POSTed to
   it (`notify/slack.py:53`, `notify/teams.py:205`).
-- **Integration health checks.** `nh integrations` / the board's integrations
-  page authenticate against whichever of Jira, Linear, CircleCI and the Teams
-  webhook you have configured, to show a live status
-  (`integrations/__init__.py:_probe_github_ambient:512`, `:_probe_github_ambient:546`). Nothing configured → nothing sent.
+- **Integration health checks.** The board's integrations page authenticates
+  against whichever of Jira, Linear, monday, CircleCI, GitHub, GitLab and
+  Jenkins you have configured, to show a live status
+  (`integrations/__init__.py:test_integration:1591`). Slack and Teams are views
+  and send nothing: a webhook cannot be probed without posting a message into
+  someone's channel, so it is verified by the notifier at run time instead
+  (`:VIEW_ONLY_CHECKS:1588`). A **configured** GitHub is
+  checked like the rest: the token is sent to `api.github.com`, or to your GHES
+  host, to authenticate and to read the configured repo
+  (`:_check_github:1462`). Only an **unconfigured** GitHub is presence-only,
+  with no network round-trip (`:_probe_github_ambient:515`,
+  `:_probe_github_ambient:549`). Nothing configured → nothing sent.
 - **Team brain control plane.** `team_brain.enabled` defaults to **`false`** and
   `team_brain.control_plane_url` to **`""`**; when set, the client exchanges
   task patterns with that URL over `https` (loopback excepted)
