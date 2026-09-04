@@ -617,7 +617,12 @@ FROZEN_FILE_LINES = {
     # commit that lives only on the task branch gets landed through the
     # normal PR/squash path rather than silently completing unmerged.
     # Measured via `wc -l src/no_human/cli/commands.py`.
-    "cli/commands.py": 8495,
+    # 8423 -> 8427 (+4): the `bench` click group now self-marks every
+    # `nh bench …` subprocess with `os.environ.setdefault("NH_ENV", "bench")`
+    # (a comment + the setdefault call) so telemetry.environment() tags
+    # bench-fleet events "bench" instead of counting them as real installs.
+    # Measured on this tree with the scanner below.
+    "cli/commands.py": 8499,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
