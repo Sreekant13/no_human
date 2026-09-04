@@ -94,7 +94,11 @@ FROZEN_FUNCTION_LINES = {
     # for callers with no HTTP handler in the loop. Measured on this tree
     # with the scanner below.
     "core/orchestrator.py:Orchestrator._run_attempt": 2167,
-    "core/orchestrator.py:Orchestrator._drive": 760,
+    # 760 -> 778 (+18): dispatch-time intake-eval hoisted path — the `elif
+    # ctx.get("eval_result")` branch that acts on a grill/wizard-stored
+    # verdict (idempotency marker, cost/residual-gap comments) added inside
+    # `_drive`. Measured on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._drive": 778,
     # 449 -> 457 (+8): D3.1 (2026-08-31, auto-activation pipeline) adds the
     # one call (plus its explanatory comment) that hands `paused`/
     # `activated_at`/`learning_events` schema work to a new sibling method,
@@ -359,7 +363,16 @@ FROZEN_FILE_LINES = {
     # a `ui_evidence.build_cmd` failure/timeout names the build instead of
     # falling through to the generic dev-server sentence. Measured with the
     # scanner below, never summed by hand.
-    "core/orchestrator.py": 21198,
+    #
+    # 21198 -> 21275 (+77): dispatch-time intake-eval hoisted path for
+    # grill/wizard-sourced tasks — the `elif ctx.get("eval_result")` branch
+    # plus `_act_on_stored_eval`/`_write_eval_ctx` helpers and the
+    # `_act_on_eval` merge-not-clobber rewrite, rebased onto the
+    # `build_cmd` change above. Measured with the scanner's own
+    # `len(Path(...).read_text().splitlines())` metric (which, unlike
+    # `wc -l`, also counts the file's 3 pre-existing Unicode line-break
+    # characters inside `_LINE_BREAKS`'s regex), never summed by hand.
+    "core/orchestrator.py": 21275,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
@@ -529,7 +542,14 @@ FROZEN_FILE_LINES = {
     # persists the hint's `signals`/`hint_reasons` alongside band/tier/offer
     # so the pre-flight card can surface hint-only families. Measured
     # directly (`wc -l src/no_human/api/app.py`).
-    "api/app.py": 5919,
+    # 5919 -> 5928 (+9): grill-sourced tasks are annotated but never enriched
+    # — `create_task` now carries the grill's intake-eval verdict
+    # (`body.eval_result`) onto the created task's context, the missing
+    # production path that makes the orchestrator's stored-verdict dispatch
+    # branch (`_act_on_stored_eval`) reachable for grill/wizard tasks.
+    # Measured directly (`wc -l src/no_human/api/app.py`), rebased onto the
+    # feasibility-hint-calibration change above.
+    "api/app.py": 5928,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
