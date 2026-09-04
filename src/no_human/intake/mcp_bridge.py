@@ -62,7 +62,7 @@ _TRANSPORT: httpx.BaseTransport | None = None
 mcp = FastMCP("no_human-mcp-bridge")
 
 
-@functools.lru_cache(maxsize=1)
+@functools.cache
 def _base_url() -> str:
     """Base URL of the local API, from ``server.host`` and ``server.port``.
 
