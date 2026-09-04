@@ -1956,6 +1956,8 @@ CITATION_TABLE = (
      "httpx.post(self.webhook_url"),
     ("security.md", "integrations/__init__.py:test_integration:1591",
      "integrations/__init__.py", "async def test_integration"),
+    ("security.md", ":VIEW_ONLY_CHECKS:1588", "integrations/__init__.py",
+     "VIEW_ONLY_CHECKS = frozenset"),
     ("security.md", ":_check_github:1462", "integrations/__init__.py",
      "async def _check_github"),
     ("security.md", ":_probe_github_ambient:515", "integrations/__init__.py",
