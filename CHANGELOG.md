@@ -6,7 +6,7 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-09-04
+## [0.2.0] — 2026-09-05
 
 First release developed entirely in the open on the public repository, including
 the first external-contributor PRs.
@@ -74,6 +74,9 @@ the first external-contributor PRs.
   with uv caching so the packaging gate stops timing out.
 
 ### Fixed
+- Integration health: an enabled-but-unconfigured target (e.g. Microsoft Teams
+  on a fresh install) reports neutral, not a red "Failing" chip; a configured
+  target that genuinely fails still reports the failure.
 - `nh start` no longer refuses to boot without a credential — a new user can
   reach the onboarding that sets the credential up; on a source checkout it
   rebuilds (or warns on) a stale `web/dist` so the current UI is served.
