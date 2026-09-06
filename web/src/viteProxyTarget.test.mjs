@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 // D2-hermetic: `ui_evidence` walks used to boot the dev server against
@@ -14,10 +14,15 @@ import { dirname, join } from "node:path";
 // its only imports ("vite", "@vitejs/plugin-react") are real devDependencies.
 
 const CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "vite.config.js");
+// Imported as a file:// URL, never as a bare path: on Windows an absolute
+// path starts "E:\\...", and the ESM loader reads the drive letter as a URL
+// scheme (ERR_UNSUPPORTED_ESM_URL_SCHEME). A POSIX path happens to work
+// because it starts with "/", which is why CI has never seen this.
+const CONFIG_URL = pathToFileURL(CONFIG_PATH).href;
 
 test("defaults to 127.0.0.1:8420 when VITE_API_TARGET is unset", async () => {
   delete process.env.VITE_API_TARGET;
-  const mod = await import(`${CONFIG_PATH}?case=default`);
+  const mod = await import(`${CONFIG_URL}?case=default`);
   const { proxy } = mod.default.server;
   assert.equal(proxy["/api"], "http://127.0.0.1:8420");
   assert.equal(proxy["/ws"].target, "ws://127.0.0.1:8420");
@@ -30,7 +35,7 @@ test("VITE_API_TARGET overrides both the http and ws proxy targets", async () =>
     // Node's ESM loader caches a module per exact specifier string; a
     // cache-busting query re-evaluates vite.config.js under the new env var
     // instead of returning the previous test's already-imported module.
-    const mod = await import(`${CONFIG_PATH}?case=override`);
+    const mod = await import(`${CONFIG_URL}?case=override`);
     const { proxy } = mod.default.server;
     assert.equal(proxy["/api"], "http://127.0.0.1:39111");
     assert.equal(proxy["/ws"].target, "ws://127.0.0.1:39111");
@@ -42,7 +47,7 @@ test("VITE_API_TARGET overrides both the http and ws proxy targets", async () =>
 
 test("the build block is untouched", async () => {
   delete process.env.VITE_API_TARGET;
-  const mod = await import(`${CONFIG_PATH}?case=build`);
+  const mod = await import(`${CONFIG_URL}?case=build`);
   const { build } = mod.default;
   assert.equal(build.outDir, "dist");
   assert.equal(build.assetsDir, "assets");

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -28,20 +28,23 @@ async function loadBoardMarkdown() {
   // (never tracked) and is removed afterwards.
   const src = readFileSync(MARKDOWN_JSX, "utf8");
   const out = await transformWithEsbuild(src, MARKDOWN_JSX, { loader: "jsx", jsx: "automatic", format: "esm" });
-  // relative imports are relative to Markdown.jsx, not to the cache directory
   // relative imports are relative to Markdown.jsx, not to the cache directory;
   // a side-effect import of a build-time asset (css/svg/png...) is vite's
   // business, not the renderer's, and node cannot load it - dropped here
   const code = out.code
     .replace(/^\s*import\s+(["'])[^"']+\.(css|scss|less|svg|png|jpe?g|gif|webp|ico)\1;?\s*$/gm, "")
     .replace(/(from\s+|import\s+)(["'])(\.\.?\/[^"']+)\2/g,
-      (_, kw, q, rel) => `${kw}${q}${join(here, rel)}${q}`);
+      // pathToFileURL, not the raw path: this string is written into generated
+      // ESM as an import specifier, so on Windows it would both carry a drive
+      // letter the loader rejects and have its backslashes eaten as escapes
+      // inside the emitted string literal.
+      (_, kw, q, rel) => `${kw}${q}${pathToFileURL(join(here, rel)).href}${q}`);
   const dir = join(here, "..", "node_modules", ".cache");
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `markdownSafety-${process.pid}.mjs`);
   writeFileSync(file, code);
   try {
-    return (await import(`${file}?t=${Date.now()}`)).default;
+    return (await import(`${pathToFileURL(file).href}?t=${Date.now()}`)).default;
   } finally {
     unlinkSync(file);
   }
