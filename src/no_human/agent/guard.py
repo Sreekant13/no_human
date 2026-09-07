@@ -603,13 +603,13 @@ _PY_EXE_RE = re.compile(r"^(?:python|pypy)[0-9.]*$")
 #: argv[0] names this guard treats as package-manager invocations — passed to
 #: `_strip_wrappers` so `env -i pip install …` / `sudo -H <primary>/.venv/`
 #: `bin/pip install …` still recover the real command despite a wrapper flag
-#: (`-i`, `-H`) that helper does not parse (pip is neither `git` nor a shell
-#: runner, the two families it already knows how to re-find).
+#: (`-i`, `-H`) that helper does not parse. Matched through
+#: `venv_install_guard._basename`, so v1 and v2 agree on `pip.exe` (issue #107).
 _PKG_MANAGER_NAMES = frozenset({"pip", "pip3", "uv", "poetry", "pipenv", "conda", "mamba"})
 
 
 def _is_pkg_manager_name(name: str) -> bool:
-    return name in _PKG_MANAGER_NAMES or bool(_PY_EXE_RE.match(name))
+    return (n := venv_install_guard._basename(name)) in _PKG_MANAGER_NAMES or bool(_PY_EXE_RE.match(n))
 
 
 #: Cap on how many `<interpreter> -m <interpreter> -m …` prefixes
@@ -636,7 +636,7 @@ def _pkg_install_match(argv: list):
     if not argv:
         return None
     for _ in range(_MAX_INTERPRETER_PEEL):
-        name = PurePosixPath(argv[0]).name
+        name = venv_install_guard._basename(argv[0])
         if not _PY_EXE_RE.match(name):
             break
         rest = argv[1:]
@@ -653,7 +653,7 @@ def _pkg_install_match(argv: list):
             argv = rest[1:]  # strictly shorter — the `for` cap bounds it too
             continue
         return None
-    name = PurePosixPath(argv[0]).name
+    name = venv_install_guard._basename(argv[0])
     rest = argv[1:]
     if name in ("pip", "pip3"):
         if rest and rest[0] in _PIP_VERBS:
