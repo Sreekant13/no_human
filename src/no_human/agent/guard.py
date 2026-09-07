@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping
 
-from . import venv_install_guard
+from . import fs_roots, venv_install_guard
 
 # Read the platform through a constant, never an inline `os.name` test, so the
 # Windows branch below is reachable from a test on any host.
@@ -403,7 +403,7 @@ def _operand_is_blocked_scan(operand: str, cwd: "str | None") -> bool:
     under `/Users`/`/home` (both system roots) — without that ordering every
     ordinary repo-scoped scan on such a machine would be denied."""
     if not operand.startswith("/"):
-        return False  # relative operands are repo-scoped by construction
+        return fs_roots.is_windows_filesystem_root(operand)  # else repo-scoped
     norm = operand.rstrip("/") or "/"
     for prefix in _SCAN_EXEMPT_PREFIXES:
         if norm == prefix or norm.startswith(prefix + "/"):
@@ -412,7 +412,7 @@ def _operand_is_blocked_scan(operand: str, cwd: "str | None") -> bool:
         cwd_norm = str(cwd).rstrip("/") or "/"
         if norm == cwd_norm or norm.startswith(cwd_norm + "/"):
             return False
-    if norm in ("/", "/*"):
+    if norm in ("/", "/*") or fs_roots.is_windows_filesystem_root(norm):
         return True
     for root in _SYSTEM_ROOTS:
         if norm == root or norm.startswith(root + "/"):

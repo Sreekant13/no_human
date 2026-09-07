@@ -3246,3 +3246,79 @@ def test_the_codex_routing_expression_this_file_restates_still_exists():
     pin it by source."""
     backend = (_SRC_ROOT / "agent" / "codex_backend.py").read_text()
     assert "terminating = severity != guard.GUARD_HYGIENE" in backend
+
+
+# --------------------------------------------------------------------------- #
+# Windows filesystem roots (issue #106)                                        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("operand", [
+    "C:", "C:" + chr(92), "C:/", "c:" + chr(92) + "*", "C:/*", "D:",
+    chr(92) * 2 + "server" + chr(92) + "share",
+    "//server/share",
+    chr(92) * 2 + "server" + chr(92) + "share" + chr(92),
+    "//server/share/*",
+])
+def test_a_whole_windows_volume_or_share_is_a_blocked_scan_target(operand):
+    """`_operand_is_blocked_scan` keyed off a leading `/`, which no Windows
+    absolute path has, so `grep -r secret C:/` was allowed while the identical
+    `grep -r secret /` was denied. The reason in `_REPO_SCOPE_REASON` is about
+    cost and scope, and reading a whole volume costs the same either way.
+
+    The bare `C:` form is not padding: this module tokenises with POSIX shlex,
+    which eats the backslash, so `C:\\` arrives here already reduced to `C:`
+    (issue #105)."""
+    assert guard._operand_is_blocked_scan(operand, None) is True
+
+
+@pytest.mark.parametrize("operand", [
+    "C:" + chr(92) + "repo", "C:/repo", "C:/repo/src",
+    chr(92) * 2 + "server" + chr(92) + "share" + chr(92) + "proj",
+    "//server/share/proj",
+    "src", "./src",
+])
+def test_a_path_inside_a_windows_volume_or_share_is_not_blocked(operand):
+    """Only roots. A checkout at `C:\\repo` is the ordinary case and must stay
+    allowed, exactly as a POSIX checkout under `/Users` does."""
+    assert guard._operand_is_blocked_scan(operand, None) is False
+
+
+@pytest.mark.parametrize("operand", ["/", "/etc", "/usr/lib"])
+def test_posix_roots_are_still_blocked(operand):
+    assert guard._operand_is_blocked_scan(operand, None) is True
+
+
+@pytest.mark.parametrize("operand", ["/tmp", "/tmp/x", "relative"])
+def test_posix_exemptions_are_unchanged(operand):
+    assert guard._operand_is_blocked_scan(operand, None) is False
+
+
+def test_a_windows_root_scan_is_denied_end_to_end():
+    for cmd in ["grep -r secret C:/", "grep -r secret //server/share"]:
+        assert "filesystem-wide scan blocked" in (
+            guard.root_scan_denial(cmd, None) or ""), cmd
+
+
+def test_a_windows_repo_scoped_scan_is_still_allowed_end_to_end():
+    assert guard.root_scan_denial("grep -r secret C:/repo", None) is None
+
+
+def test_a_trailing_lone_backslash_is_skipped_before_any_operand_check():
+    """NOT a passing behaviour, pinned so the gap is visible rather than
+    assumed fixed by the change above.
+
+    `root_scan_denial` parses each segment with `shlex.split`, and a trailing
+    lone backslash raises `ValueError: No escaped character`, which the loop
+    answers with `continue` — the segment is skipped and the command allowed,
+    before any operand is examined. So `grep -r secret C:\\` (one backslash,
+    at end of string) is allowed for a reason that has nothing to do with
+    Windows roots, and adding roots cannot close it.
+
+    Escaped or slash forms of the same target ARE caught, which is what the
+    tests above pin. Raised for discussion on the #105 thread, since deciding
+    what an unparseable command should do is a wider call than this issue."""
+    assert guard.root_scan_denial("grep -r secret C:" + chr(92), None) is None
+    # the same target, in forms shlex can parse, IS denied
+    assert guard.root_scan_denial("grep -r secret C:" + chr(92) * 2, None) is not None
+    assert guard.root_scan_denial("grep -r secret C:/", None) is not None
