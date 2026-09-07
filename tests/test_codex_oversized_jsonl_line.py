@@ -151,21 +151,26 @@ async def test_the_unfixed_readline_raises_the_exact_asyncio_valueerror(
         stderr=asyncio.subprocess.PIPE,
     )  # deliberately no limit= — the default 65536-byte StreamReader
     assert proc.stdin is not None and proc.stdout is not None
+    # Every await below is bounded, like the other async tests in this file.
+    # Unbounded, this test deadlocked a whole -n 4 run to CI's 30-minute
+    # ceiling: the child was already gone and its stdout pipe was at EOF, yet
+    # the loop sat in epoll_wait with nothing left to wake it. See issue #104.
+    # A named timeout failure carries a traceback; a silent half hour does not.
     try:
         proc.stdin.write(b"prompt\n")
-        await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdin.drain(), 30)
         proc.stdin.close()
 
-        first = await proc.stdout.readline()
+        first = await asyncio.wait_for(proc.stdout.readline(), 30)
         assert first, "the small thread.started line must read fine first"
 
         with pytest.raises(ValueError,
                             match=r"Separator is not found, and chunk exceed the limit"):
-            await proc.stdout.readline()
+            await asyncio.wait_for(proc.stdout.readline(), 30)
     finally:
         if proc.returncode is None:
             proc.kill()
-        await proc.wait()
+        await asyncio.wait_for(proc.wait(), 30)
 
 
 # ---------------------------------------------------------------------------
