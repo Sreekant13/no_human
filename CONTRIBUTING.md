@@ -107,8 +107,18 @@ changes only your clone's git config — never the shared repo.
 uv run pytest -q
 ```
 
-About 2,980 tests. On a 4-core machine `-n 4` brings a full run to roughly four
-minutes:
+Over 11,000 tests. The number is not repeated here, because a count committed
+to a file starts going stale the same day it is written -- this one had drifted
+by about 4x. For today's figure on your own tree:
+
+```bash
+uv run pytest --collect-only -q | tail -1
+```
+
+On four cores `-n 4` takes roughly eight minutes. CI's `Python` job is the
+reference measurement rather than a number typed here: on a push to `main` it
+applies no marker filter, so its `Run tests` step is a whole-suite `-n 4` run on
+a four-core `ubuntu-latest` runner, dated and public.
 
 ```bash
 uv run pytest -q -n 4
@@ -216,11 +226,19 @@ there. CI runs this job on Node 20 for that reason.
 ```bash
 cd web
 npm ci
+npm run build
 npm test
 ```
 
-538 tests. These are `node --test` unit tests over the board's pure helpers,
-theme variables, and accessibility logic.
+`npm run build` is not optional. Two tests -- one in `src/cancelFlow.test.mjs`,
+one in `src/eventLabels.test.mjs` -- assert against the built bundle and fail
+CLOSED when `web/dist/assets` is absent, on the principle that an unbuilt tree
+reads as "cannot verify" rather than "clean". Without the build a fresh clone
+reports two failures that are not defects. With it, the suite is green.
+
+Over 1,500 `node --test` unit tests over the board's pure helpers, theme
+variables, and accessibility logic. The run prints the exact count on its
+`# tests` line, which is a better source than a number in this file.
 
 `npm run lint` is broken, and it is broken twice over. It is not wired into CI,
 so neither failure blocks anything today.
@@ -274,7 +292,8 @@ npm ci --ignore-scripts
 node --test $(ls *.test.mjs | grep -v '^uiPages.test.mjs$')
 ```
 
-167 tests. `--ignore-scripts` skips Electron's postinstall, which downloads a
+Nearly 400 tests; as above, the run's own `# tests` line is the figure to
+trust. `--ignore-scripts` skips Electron's postinstall, which downloads a
 platform binary of about 100 MB. The suite does not need it: Electron is
 stubbed through `desktop/testing/electronLoader.mjs`.
 

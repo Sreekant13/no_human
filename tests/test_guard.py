@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from no_human.agent import fs_roots, guard
+from no_human.agent import fs_roots, guard, venv_install_guard
 
 FORBIDDEN = [".env", "secrets/", "*.key", "*.pem"]
 PROTECTED = ["main", "master", "release/*"]
@@ -3361,3 +3361,75 @@ def test_a_trailing_lone_backslash_is_skipped_before_any_operand_check():
     # the same target, in forms shlex can parse, IS denied
     assert guard.root_scan_denial("grep -r secret C:" + chr(92) * 2, None) is not None
     assert guard.root_scan_denial("grep -r secret C:/", None) is not None
+
+
+# --------------------------------------------------------------------------- #
+# .exe-suffixed installer names (issue #107)                                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", [
+    "pip", "pip.exe", "pip3", "pip3.exe", "uv", "uv.exe",
+    "python", "python.exe", "python3.12", "python3.12.exe",
+])
+def test_the_two_layers_agree_on_what_an_installer_is_called(name):
+    """v2 (`venv_install_guard`) strips a `.exe` suffix before deciding whether
+    a name is an installer; v1 (`guard`) did not, so they disagreed on every
+    Windows-shaped argv[0].
+
+    On its own a v1 miss is survivable -- the comment at `_MAX_INTERPRETER_PEEL`
+    says as much, v2's resolution check is the backstop. It stops being
+    survivable on Windows, where v2 is the layer POSIX shlex disables by eating
+    the path separators (issue #105): both layers then miss the same command for
+    unrelated reasons, and defence in depth stops being in depth."""
+    assert guard._is_pkg_manager_name(name) is (
+        venv_install_guard._is_installer_name(venv_install_guard._basename(name)))
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["pip", "install", "foo"], ["foo"]),
+    (["pip.exe", "install", "foo"], ["foo"]),
+    (["pip3.exe", "install", "foo"], ["foo"]),
+    (["uv.exe", "pip", "install", "foo"], ["foo"]),
+    (["python.exe", "-m", "pip", "install", "foo"], ["foo"]),
+    (["python3.12.exe", "-m", "pip", "install", "foo"], ["foo"]),
+])
+def test_a_windows_shaped_install_is_matched_by_v1(argv, expected):
+    """`_pkg_install_match` compared `PurePosixPath(argv[0]).name` against bare
+    strings, so `pip.exe install foo` matched nothing at all. Both the
+    interpreter peel and the verb table now read the name through
+    `venv_install_guard._basename`."""
+    assert guard._pkg_install_match(argv) == expected
+
+
+@pytest.mark.parametrize("argv", [
+    ["pip.exe", "list"],
+    ["pip.exe", "show", "foo"],
+    ["uv.exe", "lock"],
+    ["uv.exe", "venv"],
+    ["notpip.exe", "install", "foo"],
+    ["pipx.exe", "install", "foo"],
+])
+def test_read_only_and_unrelated_windows_commands_are_still_not_matched(argv):
+    """The suffix strip must not widen WHAT counts as an install. `pip list`,
+    `uv lock` and `uv venv` are deliberately unmatched per `_pkg_install_match`'s
+    docstring, and a name that merely ENDS in an installer name is not one."""
+    assert guard._pkg_install_match(argv) is None
+
+
+def test_an_uppercase_name_is_still_missed_and_that_is_pinned_not_fixed():
+    """NOT a passing behaviour. Pinned so the residue stays visible.
+
+    `_basename` lowercases only to TEST for the suffix; it returns the name
+    otherwise unchanged, so `PIP.EXE` becomes `PIP`, which is not in
+    `_PKG_MANAGER_NAMES`. Windows filenames are case-insensitive, so `PIP.EXE`
+    runs the same binary as `pip.exe` and is missed.
+
+    Not fixed here on purpose: case-folding the NAME tables is a wider change
+    than the `.exe` strip issue #107 asked for, it would have to move in both
+    layers together to keep them agreeing, and widening what counts as an
+    installer is exactly the direction that needs a maintainer's call rather
+    than mine."""
+    assert guard._pkg_install_match(["PIP.EXE", "install", "foo"]) is None
+    # the lowercase form, which is what anyone actually types, IS matched
+    assert guard._pkg_install_match(["pip.exe", "install", "foo"]) == ["foo"]
