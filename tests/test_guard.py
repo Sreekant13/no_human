@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from no_human.agent import guard
+from no_human.agent import fs_roots, guard
 
 FORBIDDEN = [".env", "secrets/", "*.key", "*.pem"]
 PROTECTED = ["main", "master", "release/*"]
@@ -3256,9 +3256,7 @@ def test_the_codex_routing_expression_this_file_restates_still_exists():
 @pytest.mark.parametrize("operand", [
     "C:", "C:" + chr(92), "C:/", "c:" + chr(92) + "*", "C:/*", "D:",
     chr(92) * 2 + "server" + chr(92) + "share",
-    "//server/share",
     chr(92) * 2 + "server" + chr(92) + "share" + chr(92),
-    "//server/share/*",
 ])
 def test_a_whole_windows_volume_or_share_is_a_blocked_scan_target(operand):
     """`_operand_is_blocked_scan` keyed off a leading `/`, which no Windows
@@ -3275,7 +3273,6 @@ def test_a_whole_windows_volume_or_share_is_a_blocked_scan_target(operand):
 @pytest.mark.parametrize("operand", [
     "C:" + chr(92) + "repo", "C:/repo", "C:/repo/src",
     chr(92) * 2 + "server" + chr(92) + "share" + chr(92) + "proj",
-    "//server/share/proj",
     "src", "./src",
 ])
 def test_a_path_inside_a_windows_volume_or_share_is_not_blocked(operand):
@@ -3294,7 +3291,49 @@ def test_posix_exemptions_are_unchanged(operand):
     assert guard._operand_is_blocked_scan(operand, None) is False
 
 
-def test_a_windows_root_scan_is_denied_end_to_end():
+@pytest.mark.parametrize("operand", ["//tmp/x", "//home/dev", "//server/share"])
+def test_a_doubled_leading_slash_is_an_ordinary_path_on_posix(operand):
+    """Review catch on PR #106: the first version denied these everywhere.
+
+    A doubled leading slash is a legal POSIX spelling, and on Linux and macOS a
+    UNC root does not exist at all, so denying `//tmp/x` changed behaviour on a
+    platform the issue was not about. It also INVERTED an exemption: `/tmp/x`
+    is allowed by `_SCAN_EXEMPT_PREFIXES`, and `//tmp/x` was not."""
+    assert fs_roots.is_windows_filesystem_root(operand, is_windows=False) is False
+
+
+@pytest.mark.parametrize("operand", ["//server/share", "//server/share/", "//tmp/x"])
+def test_the_same_spelling_IS_a_share_root_on_windows(operand):
+    """On Windows there is no other thing `//server/share` can mean, and that
+    includes `//tmp/x`: the first component is a host, not a directory."""
+    assert fs_roots.is_windows_filesystem_root(operand, is_windows=True) is True
+
+
+@pytest.mark.parametrize("operand", [
+    "C:", "C:/", "C:" + chr(92), chr(92) * 2 + "server" + chr(92) + "share",
+])
+def test_drive_and_backslash_forms_need_no_platform_gate(operand):
+    """A drive specifier and a backslash UNC root are unambiguous on any
+    platform, so they are not gated. Only the forward-slash form is."""
+    assert fs_roots.is_windows_filesystem_root(operand, is_windows=True) is True
+    assert fs_roots.is_windows_filesystem_root(operand, is_windows=False) is True
+
+
+def test_the_end_to_end_gate_follows_the_platform_constant(monkeypatch):
+    """`guard._IS_WINDOWS` is a module constant so a test can flip it, which is
+    what makes the POSIX behaviour testable from a Windows machine and vice
+    versa."""
+    monkeypatch.setattr(guard, "_IS_WINDOWS", False)
+    assert guard.root_scan_denial("grep -r secret //tmp/x", None) is None
+    assert guard.root_scan_denial("grep -r secret //server/share", None) is None
+    # the drive form is not gated, so it is denied on either platform
+    assert guard.root_scan_denial("grep -r secret C:/", None) is not None
+
+    monkeypatch.setattr(guard, "_IS_WINDOWS", True)
+    assert guard.root_scan_denial("grep -r secret //server/share", None) is not None
+
+def test_a_windows_root_scan_is_denied_end_to_end(monkeypatch):
+    monkeypatch.setattr(guard, "_IS_WINDOWS", True)
     for cmd in ["grep -r secret C:/", "grep -r secret //server/share"]:
         assert "filesystem-wide scan blocked" in (
             guard.root_scan_denial(cmd, None) or ""), cmd

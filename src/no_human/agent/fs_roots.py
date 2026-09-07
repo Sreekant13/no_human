@@ -29,14 +29,31 @@ import re
 #: not that separate defect is fixed.
 _DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:[\\/]*\*?$")
 
-#: A UNC root -- `\\server\share` or `//server/share` -- and nothing below it.
+#: A UNC root written with backslashes, `\\server\share`, and nothing below it.
 #: `\\server\share\proj` is a path INSIDE a share, which is the ordinary case
 #: and must stay allowed, exactly as `/Users/dev/repo` does on POSIX.
-_UNC_ROOT_RE = re.compile(r"^[\\/]{2}[^\\/]+[\\/]+[^\\/]+[\\/]*\*?$")
+#:
+#: Not gated on the platform: a leading pair of BACKSLASHES is not an ordinary
+#: POSIX path spelling, so this form cannot mean anything else anywhere.
+_UNC_BACKSLASH_ROOT_RE = re.compile(r"^\\{2}[^\\/]+[\\/]+[^\\/]+[\\/]*\*?$")
+
+#: The same root written with forward slashes, `//server/share`.
+#:
+#: THIS ONE IS GATED ON WINDOWS, and the first version of this module was wrong
+#: not to be. `//tmp/x` and `//home/dev` are ordinary POSIX paths -- a doubled
+#: leading slash is a legal spelling -- and denying them changed behaviour on a
+#: platform where a UNC root does not exist at all. Worse, it inverted an
+#: exemption: `/tmp/x` is allowed by `_SCAN_EXEMPT_PREFIXES` and `//tmp/x` was
+#: not. Caught in review on PR #116.
+_UNC_SLASH_ROOT_RE = re.compile(r"^/{2}[^\\/]+/+[^\\/]+/*\*?$")
 
 
-def is_windows_filesystem_root(operand: str) -> bool:
+def is_windows_filesystem_root(operand: str, *, is_windows: bool) -> bool:
     """True when *operand* names a whole Windows volume or network share.
+
+    *is_windows* comes from `guard._IS_WINDOWS`, which is a module constant
+    precisely so a test can flip it. Only the forward-slash UNC form consults
+    it; a drive specifier and a backslash UNC root are unambiguous everywhere.
 
     Deliberately roots only. `C:\\Users` is the Windows analogue of `/Users` in
     `guard._SYSTEM_ROOTS`, but a Windows system-root list is a wider change
@@ -44,4 +61,6 @@ def is_windows_filesystem_root(operand: str) -> bool:
     care that comment in `_operand_is_blocked_scan` explains, and getting that
     wrong denies every ordinary repo-scoped scan on the platform.
     """
-    return bool(_DRIVE_ROOT_RE.match(operand) or _UNC_ROOT_RE.match(operand))
+    if _DRIVE_ROOT_RE.match(operand) or _UNC_BACKSLASH_ROOT_RE.match(operand):
+        return True
+    return bool(is_windows and _UNC_SLASH_ROOT_RE.match(operand))
