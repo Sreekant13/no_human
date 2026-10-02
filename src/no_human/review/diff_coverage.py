@@ -264,12 +264,15 @@ class InspectionTracker:
     hand-written root `RELEASE_MANIFEST.txt` is exempted too, since this layer
     does not know which repository it reviews.
 
-    Scope, so the gap is recorded rather than discovered: only the PRIMARY
-    diff's cut paths are tracked. `_linked_repos_review_section` drops the cut
-    paths of a linked repo (the `_cut_paths` it names and does not use), so a
-    truncated linked-repo patch can still reach a verdict unread. That is the
-    same failure in a narrower place than the one this closes, and widening
-    the check belongs with whoever gives linked repos coverage that matters.
+    Scope: a linked repo's cut paths are tracked too (#602).
+    `_linked_repos_review_section` now returns them, and `review()` adds them to
+    `required_inspections` alongside the primary diff's — as ABSOLUTE paths, so
+    they never collide with the primary's relative paths and the rejection names
+    which repo was not read. A truncated linked-repo patch is therefore covered
+    by the same guard the primary diff has, closing the narrower case this used
+    to carry. The matching is unchanged: an absolute required path is credited
+    by `_names_path`'s `token == required` branch when the reviewer reads it by
+    the absolute path the linked-repo prompt tells it to use.
     """
 
     def __init__(self, required: Iterable[str] | None = None) -> None:

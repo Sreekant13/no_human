@@ -620,25 +620,24 @@ def _full_file_context(
     return block, sorted(omitted)
 
 
-def _linked_repos_review_section(linked: list[tuple[Path, str]]) -> str:
-    """Render each linked repo's diff for the GATE reviewer.
-
-    Mirrors ``multi_repo.linked_repos_block`` — which tells the PLANNER the
-    linked repos exist — but adapted to a REVIEW: it shows each linked repo's
-    diff so the gate judges the WHOLE task's change, not just the primary repo's.
-    Before this, ``grep -rn linked src/no_human/review`` found nothing: the coder
-    committed into linked repos and the reviewer never saw it.
-
-    ``linked`` is a list of ``(repo_path, before_ref)`` pairs the orchestrator
-    resolves (the same per-repo base it uses for the linked-repo tamper guard).
-    An empty list returns ``""`` so single-repo prompts stay byte-identical.
-    A linked repo the coder did not touch (no diff) is stated as such rather
-    than omitted — "no changes here" is itself a fact the reviewer should judge
-    against the acceptance criteria. Each diff is bounded by ``_git_diff``'s
-    existing ``_DIFF_CAP``, so the section cannot bloat past the primary's.
+def _linked_repos_review_section(
+    linked: list[tuple[Path, str]],
+) -> tuple[str, list[str]]:
+    """Render each linked repo's diff for the GATE reviewer, and return the
+    paths its per-file budget had to cut. Shows each linked repo's diff so the
+    gate judges the WHOLE task's change, not just the primary's. An empty list
+    returns ``("", [])`` (single-repo prompts stay byte-identical); a linked
+    repo with no diff is stated, not omitted; each diff is bounded by
+    ``_git_diff``'s ``_DIFF_CAP``. The cut paths let the caller add them to
+    ``required_inspections``, so a truncated linked patch gets the same
+    inspection guard the primary diff has (#602 — the dropped third
+    ``_git_diff`` value). They are ABSOLUTE: the spelling the reviewer reads a
+    linked repo by, which cannot collide with the primary's relative cut paths,
+    so a rejection names which repo went unread.
     """
     if not linked:
-        return ""
+        return "", []
+    cut_paths: list[str] = []
     parts = [
         "LINKED REPOSITORIES UNDER REVIEW — this task changed more than one\n"
         "repository. The diffs below are part of the SAME task as the primary\n"
@@ -649,7 +648,8 @@ def _linked_repos_review_section(linked: list[tuple[Path, str]]) -> str:
         "you may also read any linked repo by absolute path with your tools.\n"
     ]
     for lpath, lbefore in linked:
-        diff, total, _cut_paths = _git_diff(lpath, lbefore, "HEAD")
+        diff, total, lcut = _git_diff(lpath, lbefore, "HEAD")
+        cut_paths.extend((lpath / rel).as_posix() for rel in lcut)
         if not diff.strip():
             parts.append(
                 f"\n--- linked repo {lpath} — NO CHANGES in this repo ---\n"
@@ -662,7 +662,7 @@ def _linked_repos_review_section(linked: list[tuple[Path, str]]) -> str:
         parts.append(
             f"\n--- linked repo {lpath}{trunc} ---\n```\n{diff}\n```\n"
         )
-    return "".join(parts) + "\n"
+    return "".join(parts) + "\n", cut_paths
 
 
 _INVOCATION_ERROR_RE = re.compile(
@@ -2713,9 +2713,9 @@ class AdversarialReviewer:
         # change. Only in the multi-turn (no diff_override) gate path — the
         # single-turn override path reviews the caller-supplied diff verbatim.
         # Empty/None → byte-identical single-repo prompt and citation behaviour.
-        linked_section = (
+        linked_section, linked_cut_paths = (
             _linked_repos_review_section(linked_repos or [])
-            if not diff_override else ""
+            if not diff_override else ("", [])
         )
         if diff_override:
             # DISCLOSURE, not inspection — the override path has no refs and
@@ -2749,7 +2749,7 @@ class AdversarialReviewer:
         # whole-project type checking on it defeats the routing decision that
         # was just made. Lint and wiring are seconds and stay on both routes.
         route_single_turn = (
-            single_turn and not diff_override
+            single_turn and not diff_override and not linked_cut_paths
             and not omitted_files and diff_total_len == len(diff)
         )
         if not diff_override:
@@ -2811,7 +2811,7 @@ class AdversarialReviewer:
                 prompt, repo_path, before_ref=before_ref,
                 max_turns=self._tier_review_turns(task),
                 extra_repos=linked_repos or None,
-                required_inspections=cut_paths,
+                required_inspections=cut_paths + linked_cut_paths,
             )
 
         # Bounded refute pass (gate path only — see the module-level comment
