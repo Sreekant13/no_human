@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -1447,14 +1446,6 @@ async def test_a_truncated_linked_repo_unreferenced_verdict_is_rejected(
         )
 
 
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="the registered linked path is absolute, and on Windows "
-           "`_path_tokens` splits a drive-letter path at its colon "
-           "(`C:/x` -> `/x`), so the exact-match credit cannot fire. The "
-           "runtime is POSIX, where the absolute path has no colon and "
-           "matches; this is the same `_path_tokens` limitation #504 tracks, "
-           "orthogonal to #602.")
 async def test_a_truncated_linked_repo_referenced_verdict_stands(
         linked_pair, tmp_path, monkeypatch):
     """Control: once the reviewer opens the cut linked file by its absolute
@@ -1521,20 +1512,38 @@ async def test_a_truncated_linked_repo_overrides_single_turn_routing(
         )
 
 
-def test_an_absolute_linked_cut_path_is_credited_when_read_posix():
-    """Platform-independent proof of the two halves the integration tests split
-    across a Windows skip: the rejection NAMES the linked repo (criterion 2),
-    and reading the file by its absolute path CREDITS it so the verdict stands
-    (the guard is coverage, not a block). Uses a POSIX path — the runtime's —
-    so it runs everywhere, unlike the drive-letter path a Windows tmpdir gives.
-    """
+@pytest.mark.parametrize("repo_dir", [
+    "/work/linked/acme-lib",       # plain
+    "/work/linked/My Lib",         # a space
+    "/work/linked/acme (copy)",    # parentheses
+    "C:/Users/u/acme-lib",         # a drive-letter colon (Windows clone)
+])
+def test_an_absolute_linked_cut_path_is_credited_when_read(repo_dir):
+    """#602 review (eyalgolan): a linked repo lives wherever it was cloned, so
+    its registered absolute path can carry a space, parenthesis, or drive-letter
+    colon — none kept by `_PATH_TOKEN`. Reading the EXACT file must still credit
+    it (the guard is coverage, not a wall nobody can pass), and the rejection
+    names which repo. Runs on every platform, so it also covers the Windows
+    behaviour #504 keeps out of CI."""
     from no_human.review.diff_coverage import InspectionTracker
-    abs_path = "/work/linked/acme-lib/lib/math.js"
+    abs_path = f"{repo_dir}/lib/math.js"
     tracker = InspectionTracker([abs_path])
     assert tracker.unreferenced() == [abs_path]
-    assert "acme-lib" in tracker.rejection()  # the reason names which repo
+    assert repo_dir.rsplit("/", 1)[-1] in tracker.rejection()  # names the repo
     tracker.note_event(AgentEvent("tool_use", tool_name="Read",
                                   tool_input={"file_path": abs_path}))
+    assert tracker.rejection() == ""
+
+
+def test_a_windows_spelled_read_credits_the_posix_required_path():
+    """A reviewer on Windows reads with backslashes; the path is stored POSIX
+    (`as_posix`). `note_event` normalizes backslashes, so the exact read still
+    credits it. Runs on every platform (#602 review)."""
+    from no_human.review.diff_coverage import InspectionTracker
+    tracker = InspectionTracker(["C:/Users/u/acme-lib/lib/math.js"])
+    tracker.note_event(AgentEvent(
+        "tool_use", tool_name="Read",
+        tool_input={"file_path": r"C:\Users\u\acme-lib\lib\math.js"}))
     assert tracker.rejection() == ""
 
 
