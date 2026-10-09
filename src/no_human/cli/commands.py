@@ -5216,13 +5216,13 @@ async def _approve_find_ready(store, config):
         base_hint = (t.context or {}).get("base_branch") or ""
         # `head_sha`, not the bare `branch` name: a PR branch usually has no
         # local ref in the approve checkout (only `origin/<branch>` after
-        # `fetch()` above, see `pr_watcher._base_tips`'s docstring) and
-        # `check_landability` -> `conflicting_paths` -> `refs_resolvable`
-        # does a plain `rev-parse --verify branch^{commit}` with no
-        # `origin/` fallback, so the bare name degrades to `state="unknown"`
-        # for exactly the remote-only branches this check exists to cover.
-        # `head_sha` is the same concrete commit `ref` was just resolved to
-        # above and is always resolvable once fetched.
+        # `fetch()` above, see `pr_watcher._base_tips`'s docstring). The sha
+        # pins the exact commit `ref` was just resolved to above, so the
+        # verdict is about the reviewed head and not whatever a later
+        # re-resolution might pick. (`conflicting_paths` now also falls back to
+        # `origin/<branch>` for a bare name, so a branch would resolve rather
+        # than degrade to `state="unknown"` — but the concrete sha is still the
+        # precise thing to ask landability about, and is always resolvable.)
         landability = await check_landability(t.repo_path, head_sha, base_hint=base_hint)
         ready.append(_ReadyTask(t, resolved.url, passed, total,
                                 _verifiers_advisory_note(rules), landability))
