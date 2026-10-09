@@ -1744,7 +1744,11 @@ FROZEN_FILE_LINES = {
     # 9250 -> 9267 (+17): `nh approve --ready` reports an unknown
     # mergeability as its own not-landable category (summary line and the
     # --yes skip message) instead of counting it as landable.
-    "cli/commands.py": 9267,
+    # 9267 -> 9269 (+2): #651 calls `close_draft_pr_on_cancel` from both
+    # `nh task cancel` branches (the cancel and the failed-task re-label), so
+    # a cancelled task's outstanding draft PR is retitled and closed.
+    # Measured on this tree with the scanner below.
+    "cli/commands.py": 9269,
     # api/app.py 5338 -> 5346 (+8): same budget-floor warning surfaced by
     # `send-back`/`reply` as `budget_warning` in the JSON response. Net cost
     # was trimmed from a naive +14 to +8 by computing `Bounds.from_config(...)`
@@ -1937,7 +1941,12 @@ FROZEN_FILE_LINES = {
     # and threading `registration_status` into the persisted onboarding
     # state and the response body. Measured on this tree with the scanner
     # below.
-    "api/app.py": 6366,
+    # 6366 -> 6378 (+12): #651 schedules `close_draft_pr_on_cancel` as a
+    # background task on the cancel and split endpoints (after the response
+    # and broadcast, so neither waits on the forge), plus the
+    # `BackgroundTasks` parameter and import. Measured on this tree with the
+    # scanner below.
+    "api/app.py": 6378,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
