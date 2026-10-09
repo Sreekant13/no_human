@@ -3956,10 +3956,15 @@ async def worker_status(request: Request) -> dict[str, Any]:
         # `tick_stalled` is computed from timestamps inside `health_snapshot`
         # (`since_tick > stall_after`, `stall_after` >= 60s), so it only trips
         # after that threshold has elapsed since the last tick. `lease_lost`
-        # closes that earlier window immediately — the tick that raised
-        # `PoolLeaseLost` already knows dispatch is dead, well before
+        # closes that earlier window immediately — the tick that latched it
+        # already knows dispatch is dead, well before
         # `tick_stalled` would notice the same thing on its own.
         and not out.get("lease_lost")
+        # A refresh currently failing (non-latching, #222): dispatch is
+        # suspended this tick because the refresh did not complete. Not green,
+        # even before it latches `lease_lost` at the `_LEASE_REFRESH_TOLERANCE_S`
+        # bound; a later successful refresh clears it and health goes green.
+        and not out.get("lease_refresh_failed")
     )
     return out
 

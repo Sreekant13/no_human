@@ -1946,7 +1946,11 @@ FROZEN_FILE_LINES = {
     # and broadcast, so neither waits on the forge), plus the
     # `BackgroundTasks` parameter and import. Measured on this tree with the
     # scanner below.
-    "api/app.py": 6378,
+    # 6378 -> 6383 (+5, #222): the worker-status `healthy`
+    # flag now also drops when a per-tick lease refresh is currently failing
+    # (`lease_refresh_failed`), not only when the lease is terminally lost.
+    # Measured on this tree with the scanner below.
+    "api/app.py": 6383,
     # +51: W5 active-time phase writer (phase instrumentation).
     # +84: `list_escalations`/`list_review_fails`/`list_tamper_trips` — the
     # three new failure-signal sources the recurring learning harvest mines.
@@ -2507,7 +2511,18 @@ FROZEN_FILE_LINES = {
     # additions. Measured on this tree with the scanner below: actual 3253,
     # which is what this entry froze at this point. Later entries would
     # move it further.
-    "core/scheduler.py": 3253,
+    # 3253 -> 3367 (+114, #222): `tick`'s per-tick lease refresh no longer
+    # latches `_lease_lost` on ANY exception. Only a proven
+    # `SiblingSchedulerRunning` takeover stays terminal; any other refresh
+    # failure sets a non-latching `_lease_refresh_failed` that the next
+    # successful refresh clears, reported by a `lease_refresh_failing` branch
+    # + field in `health_snapshot`. The outage stays bounded: `_claim_pool_lease`
+    # stamps `_lease_refreshed_at_mono`/`_lease_refreshed_at_wall` beside each
+    # heartbeat `ts` that lands, and a failing tick latches `_lease_lost` once
+    # the older of the two readings plus the poll interval reaches
+    # `_LEASE_REFRESH_TOLERANCE_S` (= `_HEARTBEAT_STALE_S` / 2), or at once
+    # with no landed write. Measured on this tree with the scanner below.
+    "core/scheduler.py": 3367,
 }
 
 
