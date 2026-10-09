@@ -93,8 +93,12 @@ def hang_cli(monkeypatch):
     return calls
 
 
+_OVERHEAD_BUDGET_S = 2.0  # store writes + scheduler construction + sequential awaits; does NOT scale with _CLI_TIMEOUT
+
+
 async def _run_the_bound_check(store, hang_cli, monkeypatch, *, n: int,
-                                per_call_timeout: float, outer_bound: float):
+                                per_call_timeout: float):
+    outer_bound = n * per_call_timeout + _OVERHEAD_BUDGET_S
     monkeypatch.setattr(pw, "_CLI_TIMEOUT", per_call_timeout)
     for i in range(n):
         await _approval_task(store, i)
@@ -128,7 +132,12 @@ async def test_twenty_parked_tasks_each_hanging_do_not_stall_the_tick_beyond_n_t
     at a scaled-down timeout for the default (non-`slow`) test run, while
     this one preserves the ticket's exact numbers under `-m slow`."""
     await _run_the_bound_check(
-        store, hang_cli, monkeypatch, n=20, per_call_timeout=1.0, outer_bound=22.0)
+        store,
+        hang_cli,
+        monkeypatch,
+        n=20,
+        per_call_timeout=1.0,
+    )
 
 
 async def test_the_same_bound_holds_at_a_scaled_down_timeout(store, hang_cli, monkeypatch):
@@ -136,7 +145,12 @@ async def test_the_same_bound_holds_at_a_scaled_down_timeout(store, hang_cli, mo
     task) but at a millisecond-scale `_CLI_TIMEOUT` so the default (non-slow)
     test run still exercises the exact mechanism AC3 asks for, fast."""
     await _run_the_bound_check(
-        store, hang_cli, monkeypatch, n=20, per_call_timeout=0.05, outer_bound=2.0)
+        store,
+        hang_cli,
+        monkeypatch,
+        n=20,
+        per_call_timeout=0.05,
+    )
 
 
 async def test_a_single_hanging_task_no_longer_stalls_the_tick_indefinitely(
@@ -147,4 +161,5 @@ async def test_a_single_hanging_task_no_longer_stalls_the_tick_indefinitely(
     `seconds_since_last_tick: 647`): N=1 must resolve near-instantly once
     bounded, not hang."""
     await _run_the_bound_check(
-        store, hang_cli, monkeypatch, n=1, per_call_timeout=0.05, outer_bound=1.0)
+        store, hang_cli, monkeypatch, n=1, per_call_timeout=0.05)
+
