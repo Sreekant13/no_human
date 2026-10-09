@@ -2042,6 +2042,8 @@ CITATION_TABLE = (
     ("security.md", "vcs/git.py:GitRepo._have_remote_commit:1277", "vcs/git.py",
      '"git", "fetch"'),
     ("security.md", ":GitRepo.fetch:1657", "vcs/git.py", '["fetch", remote]'),
+    ("security.md", "vcs/pr_watcher.py:_resolve_ref_or_commit", "vcs/pr_watcher.py",
+     '"fetch", "--quiet", "origin"'),
     ("security.md", "cli/commands.py:merge_stack_run:3206", "cli/commands.py",
      '"gh", "pr", "merge"'),
     ("security.md", "cli/commands.py:approve:5657", "cli/commands.py",
