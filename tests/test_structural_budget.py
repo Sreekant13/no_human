@@ -1512,7 +1512,14 @@ FROZEN_FILE_LINES = {
     # named refusals on `ProtectedBranch`/`GitError`/a residual `ahead` —
     # plus the `relation_reason["ahead"]` map entry. Measured on this tree
     # with the scanner below.
-    "core/orchestrator.py": 25070,
+    # 25070 -> 25115 (+45): `_gate_already_satisfied` now gates an
+    # off-ship-ref claim on MERGEABILITY (`check_landability`) before parking
+    # it in AWAITING_APPROVAL (#304), plus the module-level `check_landability`
+    # import. A real CONFLICT sends the round back to the coder to re-cut; an
+    # UNDETERMINABLE result (most often a host that cannot run the merge
+    # check) escalates to a human instead of burning coder rounds. Measured on
+    # this tree with the scanner below.
+    "core/orchestrator.py": 25115,
 
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo

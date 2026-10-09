@@ -142,6 +142,7 @@ from ..vcs import (
     promote_draft_pr,
 )
 from ..vcs import ci_rollup, pr_watcher
+from ..vcs.landability import check_landability
 from ..vcs.push_hook import refresh_protected_patterns
 from ..vcs.receipts import verify_pr_receipt
 from ..vcs.recut import already_recut, branch_stem, diverged_state, recut
@@ -11154,6 +11155,51 @@ class Orchestrator:
             return await self._fail_already_satisfied(
                 task, decision, attempt_id=attempt_id, attempt_n=attempt_n,
                 reviewed_sha=reviewed_sha, detail=detail)
+        # #304: a claim whose satisfying commit is NOT already on the ship ref
+        # is only approvable if its delivery LANDS. `_already_satisfied_subject`
+        # proved the commit is pushed, not that it merges — a re-claimed branch
+        # can be pushed yet conflict with a moved base, and parking that strands
+        # the task in "needs you" with nothing `nh approve --ready` can offer.
+        # `check_landability` here probes the default branch, which is what
+        # `land_task` actually merges onto (`vcs/approve_merge.py`), not
+        # `--ready`'s base_branch hint. Fail closed, but route by WHO can act:
+        # a real conflict is the coder's to re-cut; an undeterminable result is
+        # most often a host limit (git < 2.38 lacking `merge-tree --write-tree`),
+        # which no coder round can fix, so it escalates to a human.
+        if not subject_on_main:
+            landability = await check_landability(
+                str(repo.path), reviewed_sha, base_hint=(ship_ref or base or ""))
+            if landability.state == "conflict":
+                detail = (
+                    "already-satisfied claim refused: the delivery conflicts "
+                    f"with the current base — {landability.detail}. Re-cut the "
+                    "work onto the current base so approval has something to "
+                    "merge.")
+                self._emit_review(
+                    "already_satisfied_unlandable", detail,
+                    reviewed_sha=reviewed_sha, branch=branch or "",
+                    merge_state=landability.state, ship_ref=ship_ref,
+                )
+                decision = ReviewDecision(passed=False, checklist=[ChecklistItem(
+                    "already-satisfied delivery lands on the current base",
+                    False, detail, severity="high")])
+                return await self._fail_already_satisfied(
+                    task, decision, attempt_id=attempt_id, attempt_n=attempt_n,
+                    reviewed_sha=reviewed_sha, detail=detail)
+            if landability.state not in ("clean", "derived"):
+                detail = (
+                    "already-satisfied claim's commit is pushed but its "
+                    f"mergeability could not be determined ({landability.detail}); "
+                    "the claim was not reviewed. The cause is most often a host "
+                    "limit (git < 2.38 lacks `merge-tree --write-tree`): fix the "
+                    "named cause, then `nh reply` to retry.")
+                self._emit_review(
+                    "already_satisfied_landability_unknown", detail,
+                    reviewed_sha=reviewed_sha, branch=branch or "",
+                    merge_state=landability.state, ship_ref=ship_ref,
+                )
+                return await self._escalate(
+                    task, detail, repo=repo, branch=branch, goal=task.title)
         advisory_pass = False
         if self.reviewer is None:
             if not (self.config.get("reviewer") or {}).get("allow_advisory", False):
