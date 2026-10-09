@@ -2061,7 +2061,7 @@ CITATION_TABLE = (
     ("security.md", "desktop/updater.mjs:configure:68", "desktop/updater.mjs",
      "autoDownload = false"),
     ("security.md", "ci/gitlab.py:GitLabCI._trigger:403", "ci/gitlab.py", "pipeline"),
-    ("security.md", "ci/jenkins.py:JenkinsCI._curl:306-335", "ci/jenkins.py", "def _curl("),
+    ("security.md", "ci/jenkins.py:JenkinsCI._curl:307-336", "ci/jenkins.py", "def _curl("),
     ("security.md", "ci/jenkins.py:JenkinsCI._run_once:154-169", "ci/jenkins.py",
      'if self.mode == "trigger":'),
     ("security.md", "ci_gate/enrich.py:_curl:70-88", "ci_gate/enrich.py", "def _curl("),

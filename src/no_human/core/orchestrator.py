@@ -1709,10 +1709,18 @@ def _ci_failure_unrelated(ci_result: "CIResult", changed_files: list[str]) -> st
     overlap) — None routes into the bounded fix loop, so we never silently skip a
     failure that might be ours. Matching is by class/file stem, since CI reports
     test classes (``com.acme.analytics-export.AnalyticsExportE2EIT``) while the diff lists paths
-    (``.../AnalyticsExportE2EIT.java``)."""
+    (``.../AnalyticsExportE2EIT.java``).
+
+    Only a failure whose name IS a test id can be compared against the diff:
+    unless every failing result came from a test report (`is_test_case`, set
+    only by Jenkins' `_failing_tests`), return None. A job/check name
+    (GitHub Actions' ``Python``, a GitLab ``test-3.12``) names no file, so its
+    failure is never called unrelated (#429)."""
     failing = [j for j in ci_result.jobs if j.status == "failed"]
     if not failing or not changed_files:
         return None  # not enough evidence to attribute — fix-loop, don't skip
+    if not all(j.is_test_case for j in failing):
+        return None  # a job/check name, not a test id — fix-loop, don't skip
     # File stems from the diff (basename without extension), e.g.
     # ".../AnalyticsExportE2EIT.java" -> "analyticsexporte2eit".
     changed_stems = {

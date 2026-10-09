@@ -1519,7 +1519,12 @@ FROZEN_FILE_LINES = {
     # UNDETERMINABLE result (most often a host that cannot run the merge
     # check) escalates to a human instead of burning coder rounds. Measured on
     # this tree with the scanner below.
-    "core/orchestrator.py": 25115,
+    # 25115 -> 25123 (+8, #429): `_ci_failure_unrelated` returns None unless
+    # every failing result is a test-report case (`JobResult.is_test_case`,
+    # set only by Jenkins' `_failing_tests`), so a job/check name such as a
+    # GitHub Actions "Python" job is never judged unrelated to the diff; the
+    # docstring says so. Measured on this tree with the scanner below.
+    "core/orchestrator.py": 25123,
 
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
@@ -2293,7 +2298,12 @@ FROZEN_FILE_LINES = {
     # the FROZEN_FUNCTION_LINES `_check_pr_conflict` entry above (the
     # whole-file delta equals that function's delta). Measured on this tree
     # with the scanner below.
-    "blockers/wake.py": 2763,
+    # 2763 -> 2783 (+20, #429): `_CI_INFRA_RE` gained the runner-acquisition
+    # outage sentence, anchored to the start of a line (re.M); the infra
+    # classifier scans EVERY failing check instead of failing[0]; and the
+    # send-back and escalation evidence use the link of the job whose log they
+    # show. Measured on this tree with the scanner below.
+    "blockers/wake.py": 2783,
     # +91: `_SCAN_WRAPPER_NAMES` + `_peel_scan_wrappers` — peels
     # timeout/xargs/nice/stdbuf (and siblings) for the scan-severity check
     # only, so a wrapped `find … -delete` in a denied compound classifies

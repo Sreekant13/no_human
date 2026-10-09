@@ -389,7 +389,7 @@ config key that turns it on and the default that keeps it off.
     as the request body (`ci/gitlab.py:GitLabCI._trigger:403`). It has no watch-only mode: if
     it is enabled, it triggers.
   - **Jenkins** (`ci.backend: "jenkins"`) reaches `ci.base_url` over `curl`
-    (`ci/jenkins.py:JenkinsCI._curl:306-335`). `ci.mode` defaults to **`watch`**, which only
+    (`ci/jenkins.py:JenkinsCI._curl:307-336`). `ci.mode` defaults to **`watch`**, which only
     polls `…/lastBuild/api/json`; **`ci.mode: "trigger"` is opt-in** and POSTs
     `…/buildWithParameters` with `ci.variables` in the query string
     (`ci/jenkins.py:JenkinsCI._run_once:154-169`). The same job API is used by the PR-image
