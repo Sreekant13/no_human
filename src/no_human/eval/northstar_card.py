@@ -559,6 +559,24 @@ class NorthStarCard:
                     if _score_field(s, "unscoreable")})
 
     @property
+    def honest_stops_judged(self) -> int:
+        """Rows that stopped honestly WITHOUT expecting to (escalated /
+        awaiting_input / blocked on a spec that did not expect an escalation)
+        and had the judge rate whether the stop was the right call (#424).
+        Counted over ``ran``. These rows are NOT satisfied in any success rate;
+        this is the denominator of the companion "were the stops correct"
+        number, reported beside the success rate, never inside it."""
+        return sum(1 for s in self.ran
+                   if _score_field(s, "stop_judged_correct") is not None)
+
+    @property
+    def honest_stops_judged_correct(self) -> int:
+        """Of ``honest_stops_judged``, the rows the judge rated a correct stop.
+        Visibility only: it never moves a success rate."""
+        return sum(1 for s in self.ran
+                   if _score_field(s, "stop_judged_correct") is True)
+
+    @property
     def pin_rederived_specs(self) -> int:
         """Rows scored against a pin re-derived by date from a rewritten
         history (``bench_task.build_bench_tasks`` — never at run time)
@@ -662,6 +680,12 @@ class NorthStarCard:
                 "measured_specs": len(self.per_spec_passes),
                 "measured_satisfied": sum(
                     1 for s in self.measured_scores if score_succeeded(s)),
+                # #424: a companion to the success rate, never folded into it.
+                # Non-expected honest stops the judge rated, and how many it
+                # rated the correct call. Reported BESIDE the rate so "were the
+                # honest stops right" is answerable without changing any rate.
+                "honest_stops_judged": self.honest_stops_judged,
+                "honest_stops_judged_correct": self.honest_stops_judged_correct,
                 # --- V1: trials & intervals -------------------------------- #
                 # ADDITIVE. Every field above keeps its meaning, so a card
                 # written here still loads into a reader that knows nothing of
@@ -782,6 +806,7 @@ class NorthStarCard:
             nh_role_models=s.get("nh_role_models") or {},
             unscoreable=bool(s.get("unscoreable", False)),
             pin_rederived=bool(s.get("pin_rederived", False)),
+            stop_judged_correct=s.get("stop_judged_correct"),
         ) for s in data.get("scores", [])]
         agg = data.get("aggregate") or {}
         return NorthStarCard(scores=scores,

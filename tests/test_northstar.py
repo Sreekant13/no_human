@@ -207,6 +207,161 @@ def test_skipped_spec_scores_zero_cost(tmp_path):
     assert "credential-gated" in score.notes
 
 
+# ------------------------- #424: pins + honest stops ------------------------ #
+
+@pytest.mark.asyncio
+async def test_run_one_skips_an_unreachable_pin(tmp_path):
+    """#424: an explicit pin that is no longer an object in the source repo is
+    a stale INSTRUMENT, not an agent failure. It must score `skipped` with zero
+    tokens, not `crashed` (which `git reset --hard <pin>` exiting 128 produced
+    for 56 of 146 specs in one run). The note names the pin."""
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    spec.repo["pin"] = "0" * 40
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    score = await runner.run_one(spec, workdir=tmp_path / "wd")
+    assert score.outcome_status == "skipped"
+    assert score.nh_tokens == 0
+    assert "0" * 40 in score.notes
+
+
+@pytest.mark.asyncio
+async def test_run_one_does_not_skip_when_the_pin_probe_cannot_run(
+        tmp_path, monkeypatch):
+    """Fail-open: if `_pin_reachable` returns None (no git, a timeout — the
+    probe did not run), setup proceeds exactly as today rather than skipping a
+    pin that was never proven missing. Stub the probe to None and assert
+    run_one reaches `_setup_sandbox` instead of returning a pin skip."""
+    import no_human.eval.northstar as ns
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    spec.repo["pin"] = "0" * 40
+    monkeypatch.setattr(ns, "_pin_reachable", lambda p, pin: None)
+
+    class _Reached(RuntimeError):
+        pass
+
+    def _boom(spec, workdir):
+        raise _Reached("reached setup")
+
+    monkeypatch.setattr(ns, "_setup_sandbox", _boom)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    with pytest.raises(_Reached):
+        await runner.run_one(spec, workdir=tmp_path / "wd")
+
+
+def test_setup_sandbox_handles_a_detached_source_with_head_pin(tmp_path):
+    """#424: a HEAD/empty-pin copy of a source whose own HEAD is DETACHED must
+    still land on a branch, or `git push origin HEAD` in `_setup_sandbox` fails
+    and the spec is booked crashed with zero tokens (13 specs). The sandbox is
+    always put on `bench-base`."""
+    repo = _src_repo(tmp_path)
+    subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=repo,
+                   check=True, capture_output=True)   # detached source
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    spec = _spec(repo)
+    spec.repo["pin"] = "HEAD"
+    work = _setup_sandbox(spec, workdir)               # must not raise
+    branch = subprocess.run(["git", "symbolic-ref", "--short", "HEAD"],
+                            cwd=work, capture_output=True, text=True).stdout.strip()
+    assert branch == "bench-base"
+
+
+@pytest.mark.asyncio
+async def test_head_pin_is_marked_non_reproducible(tmp_path):
+    """#424: a HEAD or empty pin measures the source tip at run time, not a
+    fixed commit, so the score notes carry a non-reproducible caveat. A fixed
+    pin does not."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    for bad_pin in ("HEAD", ""):
+        spec = _spec(repo)
+        spec.repo["pin"] = bad_pin
+        score = await runner._score(
+            spec, _FakeOutcome(TaskStatus.FAILED), tmp_path, "sha",
+            attempts=[], elapsed=1.0)
+        assert "non-reproducible pin" in score.notes, bad_pin
+    fixed = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.FAILED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert "non-reproducible pin" not in fixed.notes
+
+
+@pytest.mark.asyncio
+async def test_a_non_expected_honest_stop_is_judged_separately(tmp_path):
+    """#424: an escalation on a spec that did NOT expect one stays
+    goal_satisfied False, but the judge rates whether the stop was the correct
+    call into `stop_judged_correct` — never folded into the success rate."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_StubGoalJudge(satisfied=True))
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[{"tokens_used": 50, "turns_used": 1}], elapsed=2.0)
+    assert score.goal_satisfied is False
+    assert score.escalated_honestly is True
+    assert score.stop_judged_correct is True
+    assert "honest stop judged correct" in score.notes
+
+
+@pytest.mark.asyncio
+async def test_a_stop_the_judge_rates_wrong_is_recorded(tmp_path):
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_StubGoalJudge(satisfied=False))
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.BLOCKED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert score.goal_satisfied is False
+    assert score.stop_judged_correct is False
+
+
+@pytest.mark.asyncio
+async def test_a_crash_is_not_judged_as_a_stop(tmp_path):
+    """A hard FAILED is not an honest stop: no judge runs and
+    stop_judged_correct stays None."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_StubGoalJudge(satisfied=True))
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.FAILED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert score.goal_satisfied is False
+    assert score.stop_judged_correct is None
+
+
+@pytest.mark.asyncio
+async def test_an_honest_stop_without_a_judge_records_nothing(tmp_path):
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)  # no judge
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert score.stop_judged_correct is None
+
+
+@pytest.mark.asyncio
+async def test_an_expected_escalation_is_not_stop_judged(tmp_path):
+    """`stop_judged_correct` is only for UNEXPECTED honest stops. An expected
+    escalation keeps its existing scoring and leaves the field None."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_StubGoalJudge(satisfied=False))
+    score = await runner._score(
+        _spec(repo, expect_escalation=True),
+        _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert score.goal_satisfied is True       # unchanged: expected honest stop
+    assert score.stop_judged_correct is None
+
+
 @pytest.mark.asyncio
 async def test_judge_rubric_reaches_the_judge_but_never_the_coder_task(tmp_path):
     """Review D1: acceptance_criteria is DUAL-AUDIENCE — `_bench_task` copies

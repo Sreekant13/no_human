@@ -47,6 +47,27 @@ def test_card_aggregates():
     assert card.corrections_avoided == 3
 
 
+def test_card_reports_honest_stops_beside_the_success_rate():
+    """#424: non-expected honest stops the judge rated are a companion pair in
+    the aggregate, never folded into the success rate."""
+    import dataclasses
+    passed = _score(task_id="a", satisfied=True)
+    s1 = dataclasses.replace(
+        _score(task_id="b", satisfied=False, status="escalated"),
+        stop_judged_correct=True)
+    s2 = dataclasses.replace(
+        _score(task_id="c", satisfied=False, status="blocked"),
+        stop_judged_correct=False)
+    card = NorthStarCard(scores=[passed, s1, s2])
+    assert card.honest_stops_judged == 2
+    assert card.honest_stops_judged_correct == 1
+    # The companion numbers never move the rate: 1 satisfied of 3 ran.
+    assert card.satisfied == 1
+    agg = card.as_dict()["aggregate"]
+    assert agg["honest_stops_judged"] == 2
+    assert agg["honest_stops_judged_correct"] == 1
+
+
 def test_honest_escalation_rate_uses_explicit_field():
     card = NorthStarCard(scores=[
         _score(task_id="a", expected_escalation=True, satisfied=True,
