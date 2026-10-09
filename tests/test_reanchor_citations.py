@@ -755,3 +755,58 @@ def test_check_still_warns_when_a_python_source_fails_to_parse(
     )
     assert code == 0 and "VERDICT=OK" in out
     assert [m for m in caught if "AST parse failed" in m], caught
+
+
+def _absent_ok_mod(tmp_path, *, absent_ok, present, copies=1):
+    """The real checker's line parsing, with `_resolve_source` and
+    `_ABSENT_OK` controlled so each case below changes exactly one of them."""
+    real = ra._load_checker()
+    src = tmp_path / "widget.py"
+    src.write_text("def run():\n    return 1\n", encoding="utf-8")
+    return types.SimpleNamespace(
+        _LEGACY_LINE_SPEC_RE=real._LEGACY_LINE_SPEC_RE,
+        _cited_line=real._cited_line,
+        _token_line_in_symbol=real._token_line_in_symbol,
+        _resolve_source=lambda _p: [src] * copies if present else [],
+        _ABSENT_OK=frozenset(absent_ok),
+    )
+
+
+def test_reconcile_skips_an_absent_ok_row_whose_file_is_absent(tmp_path):
+    """A row in `_ABSENT_OK` whose drop-classified file is absent is skipped,
+    as `tests/test_readme_claims.py` skips it, not reported as unfixable."""
+    row = ("fake.md", "widget.py:run:2", "widget.py", "no-such-token")
+    mod = _absent_ok_mod(tmp_path, absent_ok={row[:2]}, present=False)
+    recons, unfixable = ra.reconcile_plan(mod, [row])
+    assert recons == []
+    assert unfixable == []
+
+
+def test_reconcile_still_refuses_an_absent_row_not_in_absent_ok(tmp_path):
+    """Control: the skip is scoped to `_ABSENT_OK` — any other row whose
+    file does not resolve stays unfixable."""
+    row = ("fake.md", "widget.py:run:2", "widget.py", "no-such-token")
+    mod = _absent_ok_mod(tmp_path, absent_ok=set(), present=False)
+    _recons, unfixable = ra.reconcile_plan(mod, [row])
+    assert [u.reason for u in unfixable] == [
+        "source path does not resolve to exactly one file"]
+
+
+def test_reconcile_still_checks_an_absent_ok_row_whose_file_is_present(tmp_path):
+    """Non-vacuity control: an `_ABSENT_OK` row is skipped only when its file
+    is absent. Where the file exists, a wrong token is still caught."""
+    row = ("fake.md", "widget.py:run:2", "widget.py", "no-such-token")
+    mod = _absent_ok_mod(tmp_path, absent_ok={row[:2]}, present=True)
+    _recons, unfixable = ra.reconcile_plan(mod, [row])
+    assert len(unfixable) == 1
+    assert "not found in source" in unfixable[0].reason
+
+
+def test_reconcile_still_refuses_an_absent_ok_row_that_resolves_twice(tmp_path):
+    """Control: the skip is for a file that is ABSENT, not for any count other
+    than one — an `_ABSENT_OK` row resolving to two files stays unfixable."""
+    row = ("fake.md", "widget.py:run:2", "widget.py", "no-such-token")
+    mod = _absent_ok_mod(tmp_path, absent_ok={row[:2]}, present=True, copies=2)
+    _recons, unfixable = ra.reconcile_plan(mod, [row])
+    assert [u.reason for u in unfixable] == [
+        "source path does not resolve to exactly one file"]

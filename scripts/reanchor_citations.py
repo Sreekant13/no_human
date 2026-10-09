@@ -269,6 +269,10 @@ def reconcile_plan(mod, rows) -> tuple[list[Reconciliation], list[Unfixable]]:
         if cited is None:
             continue
         hits = mod._resolve_source(resolve_path)
+        if not hits and (doc, raw) in mod._ABSENT_OK:
+            # Same skip `tests/test_readme_claims.py` applies: a drop-classified
+            # path that is absent from this tree by design is not a stale row.
+            continue
         if len(hits) != 1:
             unfixable.append(Unfixable(doc, raw, f"source path does not resolve to exactly one file"))
             continue
